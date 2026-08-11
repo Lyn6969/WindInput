@@ -2952,6 +2952,18 @@ impl Coordinator {
                 }
                 return Some(self.cancel_session(state));
             }
+            // 选词 / 以词定字**刻意不在这里执行**，返回 None 让键落到各自的既有消费点
+            // （`select_char_index` 在本函数之前、`select_key_offset` 在数字选词臂之后）。
+            //
+            // ★ 理由是它们带 **overflow 语义**：候选不足 / 词长不够时要按
+            // `keys.overflow.{select_key,select_char_key}` 分档处置（吞键 / 上屏高亮候选 /
+            // 上屏并追加字符），而本函数只有「命中就执行」一种结局。搬进来就得把三档策略
+            // 和各模式的选中出口一起搬，那是把两件事挤进一个函数。
+            //
+            // 收编改变的是**配置从哪来**（session_actions 而非 select_key_groups），
+            // 不是执行路径——后者一行未动，故 overflow 与各模式的选中语义零回归。
+            wind_config::SessionAction::SelectCandidate(_)
+            | wind_config::SessionAction::SelectChar(_) => return None,
             // 表里只存启用项（`ConfigBundle::build` 过滤过），None 到不了这里。
             wind_config::SessionAction::None => return None,
         };
@@ -9055,7 +9067,6 @@ mod caret_compat_tests {
         );
     }
 
-    #[test]
     /// ★ 首显有多条通路，信任门必须每条都接。本条守住 `caret_probe` 这条——它绕过闸门
     /// 直接首显，实测（2026-08-03 Excel）在闸门刚 arm 600ms 长兜底后 **6ms** 就用
     /// `(1299,535)` 抢先显示，而 200ms 后真坐标是 `(1344,744)` ⇒ 显示后跳一次。

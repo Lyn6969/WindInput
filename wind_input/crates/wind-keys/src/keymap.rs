@@ -87,6 +87,15 @@ const SESSION_FUNCTION_KEYS: &[(&str, u32)] = &[
     ("end", VK_END),
     ("capslock", VK_CAPITAL),
     ("caps", VK_CAPITAL),
+    // 纯修饰键：作二三候选键时走 keyup 轻敲（`select_key_groups = ["lrctrl"]` 的收编形态）。
+    // ⚠️ 别名须与 `wind_config::hotkey::session_key_to_vk` 逐字一致——两份表漂移会让绑定
+    // 「进了 TSF 转发白名单却查不到动作」，无任何报错。一期漏了这四个，三期补上。
+    ("lshift", VK_LSHIFT),
+    ("rshift", VK_RSHIFT),
+    ("lctrl", VK_LCONTROL),
+    ("lcontrol", VK_LCONTROL),
+    ("rctrl", VK_RCONTROL),
+    ("rcontrol", VK_RCONTROL),
 ];
 
 /// 会话态键名 → [`SessionKey`]。大小写与首尾空白不敏感；不认的名字返回 `None`。

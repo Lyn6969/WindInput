@@ -628,8 +628,8 @@ impl BoundAction {
 /// - `"page_prev"` / `"page_next"`：上一页 / 下一页
 /// - `"highlight_up"` / `"highlight_down"`：高亮上移 / 下移
 /// - `"cancel"`（别名 `"clear"`）：放弃当前输入，等同 Esc
-///
-/// 选择类（`select_candidate:N` / `select_char:N`）留到三期，届时扩充本枚举即可。
+/// - `"select_candidate:N"`：选中当前页第 N 个候选（N 从 1 起，`2` 即次选键）
+/// - `"select_char:N"`：以词定字，取当前高亮候选词的第 N 个字（N 从 1 起）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     /// 未启用 / 显式禁用。
@@ -650,6 +650,13 @@ pub enum SessionAction {
     /// `"clear"` 因此收作**别名**而非第二个动词：用户按「清空」的心智去写照样能用，
     /// 但内核只有一种行为，不会出现「两个名字行为微妙不同」这种最难查的配置陷阱。
     Cancel,
+    /// 选中当前页第 N 个候选（**N 从 1 起**，1 = 首选）。收编自 `keys.select_key_groups`。
+    ///
+    /// 载荷用「第几个」而非内部的 0-based 偏移：配置是给人读的，`select_candidate:2`
+    /// 一眼就是「次选键」。转换成偏移在消费点做一次即可。
+    SelectCandidate(u8),
+    /// 以词定字：取当前高亮候选词的第 N 个字（**N 从 1 起**）。收编自 `keys.select_char_keys`。
+    SelectChar(u8),
 }
 
 impl SessionAction {
@@ -659,7 +666,22 @@ impl SessionAction {
     /// 后表现为「这个键在会话态没绑定」，与「没配」同形——所以调用方在加载期要 `warn`
     /// （见 [`Self::parse_checked`]）。
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
+        let t = s.trim().to_lowercase();
+        // 带载荷的两个动词。序号从 1 起且限个位数——页内候选与词长都远不到两位数，
+        // 放宽只会让 `select_candidate:99` 这种一定不生效的配置被静默收下。
+        if let Some(n) = t.strip_prefix("select_candidate:") {
+            return match n.trim().parse::<u8>() {
+                Ok(n @ 1..=9) => Self::SelectCandidate(n),
+                _ => Self::None,
+            };
+        }
+        if let Some(n) = t.strip_prefix("select_char:") {
+            return match n.trim().parse::<u8>() {
+                Ok(n @ 1..=9) => Self::SelectChar(n),
+                _ => Self::None,
+            };
+        }
+        match t.as_str() {
             "page_prev" => Self::PagePrev,
             "page_next" => Self::PageNext,
             "highlight_up" => Self::HighlightUp,
@@ -679,10 +701,23 @@ impl SessionAction {
     /// ★ 判据挂在**动作**上而不是写在消费点：消费点有三个（主输入 / mix / 候选导航），
     /// 写在那里就要维护三份一致的守卫，而这类「三处必须一致」的约束本仓已栽过四次。
     pub fn requires_candidates(&self) -> bool {
-        matches!(
-            self,
-            Self::PagePrev | Self::PageNext | Self::HighlightUp | Self::HighlightDown
-        )
+        !matches!(self, Self::None | Self::Cancel)
+    }
+
+    /// 选中第几个候选（1 起）——非选词动词返回 `None`。
+    pub fn candidate_ordinal(&self) -> Option<u8> {
+        match self {
+            Self::SelectCandidate(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// 以词定字取第几个字（1 起）——非取字动词返回 `None`。
+    pub fn char_ordinal(&self) -> Option<u8> {
+        match self {
+            Self::SelectChar(n) => Some(*n),
+            _ => None,
+        }
     }
 
     /// 同 [`Self::parse`]，但把「写错的动词」与「显式 none」区分开，供加载期告警。
@@ -701,23 +736,31 @@ impl SessionAction {
         }
     }
 
-    /// 配置字符串形式（折算与写回用）。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::PagePrev => "page_prev",
-            Self::PageNext => "page_next",
-            Self::HighlightUp => "highlight_up",
-            Self::HighlightDown => "highlight_down",
-            // 别名 `clear` 刻意不回写——规范名只有一个，避免同一份配置在两次保存后
-            // 出现两种写法。
-            Self::Cancel => "cancel",
-        }
-    }
-
     /// 是否启用（非 [`Self::None`]）。
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::None)
+    }
+}
+
+/// 配置字符串形式（折算与写回用）。与 [`SessionAction::parse`] 互为逆运算。
+///
+/// 用 `Display` 而非 `as_str() -> &'static str`：带载荷的动词（`select_candidate:2`）
+/// 拼不出 `'static` 串。**一个真相源**——写回与解析对不上的话，折算出来的配置自己就
+/// 读不回来，而那是启动时才暴露、且看起来像「配置丢了」的一类问题。
+impl std::fmt::Display for SessionAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::PagePrev => f.write_str("page_prev"),
+            Self::PageNext => f.write_str("page_next"),
+            Self::HighlightUp => f.write_str("highlight_up"),
+            Self::HighlightDown => f.write_str("highlight_down"),
+            // 别名 `clear` 刻意不回写——规范名只有一个，避免同一份配置在两次保存后
+            // 出现两种写法。
+            Self::Cancel => f.write_str("cancel"),
+            Self::SelectCandidate(n) => write!(f, "select_candidate:{n}"),
+            Self::SelectChar(n) => write!(f, "select_char:{n}"),
+        }
     }
 }
 
@@ -2162,6 +2205,58 @@ fn highlight_key_group_binds(group: &str) -> &'static [(&'static str, SessionAct
     }
 }
 
+/// 二三候选键**组名** → 折算出的 (键名, 动词) 对。约束同 [`page_key_group_binds`]。
+///
+/// 组内第一个键选**次选**（第 2 个候选）、第二个选**三选**——这是 `select_key_vks` 的
+/// 位置语义（`pos + 1`），折算成显式序号后就不再依赖数组下标。
+///
+/// `lrshift` / `lrctrl` 展开成纯修饰键名：它们走 keyup 轻敲通路，而 `session_key_name_to_vk`
+/// 与 `hotkey::session_key_to_vk` 都认这四个名字。
+fn select_key_group_binds(group: &str) -> &'static [(&'static str, SessionAction)] {
+    match group.trim().to_lowercase().as_str() {
+        "semicolon_quote" => &[
+            ("semicolon", SessionAction::SelectCandidate(2)),
+            ("quote", SessionAction::SelectCandidate(3)),
+        ],
+        "comma_period" => &[
+            ("comma", SessionAction::SelectCandidate(2)),
+            ("period", SessionAction::SelectCandidate(3)),
+        ],
+        "lrshift" => &[
+            ("lshift", SessionAction::SelectCandidate(2)),
+            ("rshift", SessionAction::SelectCandidate(3)),
+        ],
+        "lrctrl" => &[
+            ("lctrl", SessionAction::SelectCandidate(2)),
+            ("rctrl", SessionAction::SelectCandidate(3)),
+        ],
+        _ => &[],
+    }
+}
+
+/// 以词定字键**组名** → 折算出的 (键名, 动词) 对。约束同 [`page_key_group_binds`]。
+///
+/// ⚠️ 值域与 [`select_key_group_binds`] **不同**：这里有 `brackets`、没有修饰键组。
+/// 两者曾被张冠李戴过一次（用选词键组的解析器去解以词定字配置，`brackets` 静默失效），
+/// 所以分成两张表而不是一张带参数的。
+fn select_char_group_binds(group: &str) -> &'static [(&'static str, SessionAction)] {
+    match group.trim().to_lowercase().as_str() {
+        "comma_period" => &[
+            ("comma", SessionAction::SelectChar(1)),
+            ("period", SessionAction::SelectChar(2)),
+        ],
+        "minus_equal" => &[
+            ("minus", SessionAction::SelectChar(1)),
+            ("equal", SessionAction::SelectChar(2)),
+        ],
+        "brackets" => &[
+            ("lbracket", SessionAction::SelectChar(1)),
+            ("rbracket", SessionAction::SelectChar(2)),
+        ],
+        _ => &[],
+    }
+}
+
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
@@ -3238,7 +3333,7 @@ impl Config {
         // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
         // 这里看到的 trigger_keys 已只剩符号键。
         self.migrate_trigger_keys_into_key_actions();
-        self.migrate_nav_keys_into_session_actions();
+        self.migrate_key_groups_into_session_actions();
         self.warn_legacy_special_modes();
     }
 
@@ -3264,25 +3359,44 @@ impl Config {
     /// 本次收编要消除的问题。默认值仍然留在原字段的 `default_*` 函数里（**不能**搬进
     /// `session_actions`），三种情况才都对：没配过→折算出默认、改成别的→折算出新值、
     /// 清空成 `[]`→折算出空。
-    fn migrate_nav_keys_into_session_actions(&mut self) {
-        if self.keys.page_keys.is_empty() && self.keys.highlight_keys.is_empty() {
+    fn migrate_key_groups_into_session_actions(&mut self) {
+        let k = &self.keys;
+        if k.page_keys.is_empty()
+            && k.highlight_keys.is_empty()
+            && k.select_key_groups.is_empty()
+            && k.select_char_keys.is_empty()
+        {
             return;
         }
+        // ★★ 折算顺序 = 消费点的判定顺序，撞键时先折的赢。主输入路径上是
+        //   以词定字（`select_char_index`）→ 翻页/高亮（`apply_session_action`）
+        //   → 二三候选（`select_key_offset`），
+        // 故这里必须同序。`comma_period` 同时出现在多个组里（它既是选词键组也是以词定字
+        // 键组的合法值）时，顺序就是唯一的裁决依据——搞反了的表现是「一直用的 `,` 突然
+        // 从取字变成选次选」，而用户什么都没改。
         let mut folded: Vec<(&'static str, SessionAction)> = Vec::new();
-        for g in &self.keys.page_keys {
+        for g in &k.select_char_keys {
+            folded.extend_from_slice(select_char_group_binds(g));
+        }
+        for g in &k.page_keys {
             folded.extend_from_slice(page_key_group_binds(g));
         }
-        for g in &self.keys.highlight_keys {
+        for g in &k.highlight_keys {
             folded.extend_from_slice(highlight_key_group_binds(g));
+        }
+        for g in &k.select_key_groups {
+            folded.extend_from_slice(select_key_group_binds(g));
         }
         for (key, action) in folded {
             self.keys
                 .session_actions
                 .entry(key.to_string())
-                .or_insert_with(|| action.as_str().to_string());
+                .or_insert_with(|| action.to_string());
         }
         self.keys.page_keys.clear();
         self.keys.highlight_keys.clear();
+        self.keys.select_key_groups.clear();
+        self.keys.select_char_keys.clear();
     }
 
     /// 残留的 `schema.special_modes` 告警（**不迁移**，见 `docs/redesign/overlay-mode-config.md` §5）。
@@ -3972,6 +4086,124 @@ mod tests {
         assert!(c.keys.highlight_keys.is_empty());
     }
 
+    /// 出厂默认的 `select_key_groups = ["semicolon_quote"]` 折算成两条选词绑定。
+    #[test]
+    fn default_select_key_group_folds_into_session_actions() {
+        let mut c = Config::default();
+        c.normalize();
+        let sa = &c.keys.session_actions;
+        assert_eq!(
+            sa.get("semicolon").map(String::as_str),
+            Some("select_candidate:2"),
+            "`;` 应折算成次选键"
+        );
+        assert_eq!(
+            sa.get("quote").map(String::as_str),
+            Some("select_candidate:3"),
+            "`'` 应折算成三选键"
+        );
+        assert!(c.keys.select_key_groups.is_empty(), "折算后原字段须清空");
+    }
+
+    /// 修饰键选词组（走 keyup 轻敲）折算成四个纯修饰键名。
+    ///
+    /// ⚠️ 这些键名必须同时被 `hotkey::session_key_to_vk` 与
+    /// `wind_keys::keymap::session_key_name_to_vk` 认得——一期漏了后者，三期补上，
+    /// 由 wind-coordinator 的跨 crate 测试守。
+    #[test]
+    fn modifier_select_group_folds_to_modifier_key_names() {
+        let mut c = Config::default();
+        c.keys.select_key_groups = vec!["lrctrl".into()];
+        c.normalize();
+        let sa = &c.keys.session_actions;
+        assert_eq!(
+            sa.get("lctrl").map(String::as_str),
+            Some("select_candidate:2")
+        );
+        assert_eq!(
+            sa.get("rctrl").map(String::as_str),
+            Some("select_candidate:3")
+        );
+        // 每个折算出的键名都必须解析得回来，否则绑定静默失效。
+        for name in ["lctrl", "rctrl"] {
+            assert!(
+                crate::hotkey::session_key_to_vk(name).is_some(),
+                "{name} 解析不出 VK，绑定会静默失效"
+            );
+        }
+    }
+
+    /// 以词定字组折算，含 `brackets`——它**不在**选词键组的值域里。
+    ///
+    /// 回归点：两组曾被张冠李戴（用选词键组的解析器解以词定字配置），`brackets` 静默失效。
+    #[test]
+    fn select_char_group_folds_including_brackets() {
+        let mut c = Config::default();
+        c.keys.select_char_keys = vec!["brackets".into()];
+        c.normalize();
+        let sa = &c.keys.session_actions;
+        assert_eq!(
+            sa.get("lbracket").map(String::as_str),
+            Some("select_char:1")
+        );
+        assert_eq!(
+            sa.get("rbracket").map(String::as_str),
+            Some("select_char:2")
+        );
+        assert!(c.keys.select_char_keys.is_empty(), "折算后原字段须清空");
+    }
+
+    /// ★★ 撞键裁决：`comma_period` 同时配给以词定字与选词时，**以词定字赢**。
+    ///
+    /// 这不是随意选的——主输入路径上 `select_char_index` 的判定在 `select_key_offset`
+    /// 之前，折算顺序必须复现那个顺序。搞反了的表现是「一直用的 `,` 突然从取字变成选次选」，
+    /// 而用户什么都没改。
+    #[test]
+    fn select_char_wins_when_group_claimed_by_both() {
+        let mut c = Config::default();
+        c.keys.select_key_groups = vec!["comma_period".into()];
+        c.keys.select_char_keys = vec!["comma_period".into()];
+        c.normalize();
+        assert_eq!(
+            c.keys.session_actions.get("comma").map(String::as_str),
+            Some("select_char:1"),
+            "撞键时以词定字应赢——它在消费链上更靠前"
+        );
+    }
+
+    /// 序号越界 / 非数字的载荷落 `None`，不静默收下一个永不生效的绑定。
+    #[test]
+    fn select_ordinals_are_range_checked() {
+        for bad in [
+            "select_candidate:0",
+            "select_candidate:99",
+            "select_candidate:x",
+            "select_candidate:",
+            "select_char:0",
+        ] {
+            assert_eq!(
+                SessionAction::parse(bad),
+                SessionAction::None,
+                "{bad} 应被拒绝"
+            );
+            assert!(
+                SessionAction::parse_checked(bad).is_none(),
+                "{bad} 应被报成无法识别，而不是静默当成 none"
+            );
+        }
+        assert_eq!(
+            SessionAction::parse("select_candidate:2"),
+            SessionAction::SelectCandidate(2)
+        );
+        // Display 与 parse 互为逆运算——写回读不回来是「配置丢了」那类问题的根源。
+        for a in [
+            SessionAction::SelectCandidate(3),
+            SessionAction::SelectChar(1),
+        ] {
+            assert_eq!(SessionAction::parse(&a.to_string()), a);
+        }
+    }
+
     /// ★ page 组优先于 highlight 组——复现 `NavKeys::classify` 的 `.find()` 语义。
     ///
     /// 两组都声明 `tab` 时（`page_keys=[shift_tab]` + 默认 `highlight_keys=[…, tab]`），
@@ -4020,10 +4252,13 @@ mod tests {
         let mut c = Config::default();
         c.keys.page_keys = vec![];
         c.keys.highlight_keys = vec![];
+        // 选词键组默认非空（semicolon_quote），一并清掉才测得出「清空即无绑定」。
+        c.keys.select_key_groups = vec![];
+        c.keys.select_char_keys = vec![];
         c.normalize();
         assert!(
             c.keys.session_actions.is_empty(),
-            "两组都清空时不应折算出任何绑定，实际 {:?}",
+            "全部清空时不应折算出任何绑定，实际 {:?}",
             c.keys.session_actions
         );
     }
@@ -4067,7 +4302,7 @@ mod tests {
         assert!(page_key_group_binds("nonexistent").is_empty());
         // 每个折算出的动词都必须解析得回来——写错动词字面量会静默落 None。
         for (_, a) in page_key_group_binds("shift_tab") {
-            assert!(SessionAction::parse(a.as_str()).is_enabled());
+            assert!(SessionAction::parse(&a.to_string()).is_enabled());
         }
     }
 
@@ -4081,7 +4316,7 @@ mod tests {
         assert_eq!(SessionAction::parse("cancel"), SessionAction::Cancel);
         assert_eq!(SessionAction::parse("clear"), SessionAction::Cancel);
         assert_eq!(SessionAction::parse("CLEAR"), SessionAction::Cancel);
-        assert_eq!(SessionAction::Cancel.as_str(), "cancel");
+        assert_eq!(SessionAction::Cancel.to_string(), "cancel");
         // 别名也要能通过「值认不认识」的校验，否则加载期会误报成拼写错误。
         assert_eq!(
             SessionAction::parse_checked("clear"),

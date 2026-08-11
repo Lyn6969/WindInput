@@ -406,19 +406,6 @@ impl Compiler {
             }
         }
 
-        // ── KeyDown：选词键组（如 ;'），仅注册转发，由常规逻辑处理 ──
-        // **修饰键组（lrshift / lrctrl）不进这里**，它们走下方的 key_up 段，理由见
-        // `compile_select_modifier_group`。
-        for group in &self.config.keys.select_key_groups {
-            for raw in compile_select_key_group(group) {
-                result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw | HOTKEY_POLICY_FORWARD_ONLY,
-                    match_hash: raw,
-                    action: String::new(),
-                });
-            }
-        }
-
         // ── 会话态按键功能表（keys.session_actions）──
         //
         // 数据源已由 `Config::normalize` 把 `page_keys` / `highlight_keys` 折算进来；本编译器
@@ -470,20 +457,12 @@ impl Compiler {
             }
         }
 
-        // ── KeyUp：修饰键作二三候选键（lrshift / lrctrl）──
-        // 与 toggle 同一套 keyup 轻敲机制（见 `compile_select_modifier_group`）。
-        // 同一个键可能既是切换键又是选词键（两条登记同 hash）：TSF 侧白名单是集合，重复无害；
-        // 服务端按 action 区分——选词看 `keys.select_key_groups`，切换只认 action=="toggle_mode"，
-        // 故消费端**不能**再用「key_up 里有这个 key_code」当切换判据（见 is_toggle_mode_keycode）。
-        for group in &self.config.keys.select_key_groups {
-            for hash in compile_select_modifier_group(group) {
-                result.key_up.push(HotkeyEntry {
-                    tsf_hash: hash,
-                    match_hash: hash,
-                    action: "select_candidate".to_string(),
-                });
-            }
-        }
+        // 二三候选键（含修饰键组 lrshift / lrctrl）的登记已并入上面的 `session_actions` 段
+        // ——它按键的形态自动分流：可打印键进 key_down + FORWARD_ONLY，修饰键进 key_up。
+        //
+        // ⚠️ 同一个键可能既是切换键又是选词键（两条登记同 hash）：TSF 侧白名单是集合，重复
+        // 无害；服务端按 action 区分，切换只认 action=="toggle_mode"，故消费端**不能**用
+        // 「key_up 里有这个 key_code」当切换判据（见 is_toggle_mode_keycode）。
 
         debug!(
             "Compiled hotkeys: {} key_down, {} key_up",
@@ -541,73 +520,20 @@ fn compile_number_hotkey(template: &str) -> Vec<HotkeyEntry> {
         .collect()
 }
 
-/// 选词键组 → keydown raw hash 列表。**只含可打印键**，修饰键组见
-/// [`compile_select_modifier_group`]。
-fn compile_select_key_group(group: &str) -> Vec<u32> {
-    match group.trim().to_lowercase().as_str() {
-        "semicolon_quote" => vec![key_hash(0, VK_OEM_1), key_hash(0, VK_OEM_7)],
-        "comma_period" => vec![key_hash(0, VK_OEM_COMMA), key_hash(0, VK_OEM_PERIOD)],
-        _ => Vec::new(),
-    }
-}
-
-/// 选词键组里的**修饰键组** → keyup hash 列表（含通用位+具体位，与 toggle 键同格式）。
-///
-/// 为什么修饰键必须走 keyup 而不是 keydown（三条各自独立成立）：
-/// - **纯修饰键的 keydown 不能吃**（TSF 侧 `_IsPureModifierKey` 的定论：吃掉会让 AutoCAD
-///   等宿主看不到修饰键，正交模式覆盖失效并卡顿）。而 keydown 白名单的意义就是「让 TSF
-///   吃下并转发」，对修饰键天然不成立。
-/// - keydown 上判定会误触：`Ctrl+A` 的第一下 Ctrl 就会选走第 2 候选。
-/// - 长按会连选：宿主对按住的键重复发 keydown（CAD 实测 28 秒 145 次）。
-///
-/// keyup 通路复用 TSF 已有的「轻敲」机制（`_MarkPendingToggleKey` + 500ms 阈值 +
-/// 中途按别的键即取消），三条问题一次解决。
-///
-/// ⚠ 历史：这两组曾与 `;'` 一起注册进 keydown（带 FORWARD_ONLY），端到端从未生效过——
-/// keydown 白名单查的是 `CalcKeyHash(通用修饰位, wParam)`，而 TSF 给的 wParam 是笼统的
-/// `VK_CONTROL`，与这里登记的「具体位 + VK_LCONTROL」两个维度都对不上，永远不命中。
-fn compile_select_modifier_group(group: &str) -> Vec<u32> {
-    match group.trim().to_lowercase().as_str() {
-        "lrshift" => vec![
-            key_hash(MOD_SHIFT | MOD_LSHIFT, VK_LSHIFT),
-            key_hash(MOD_SHIFT | MOD_RSHIFT, VK_RSHIFT),
-        ],
-        "lrctrl" => vec![
-            key_hash(MOD_CTRL | MOD_LCTRL, VK_LCONTROL),
-            key_hash(MOD_CTRL | MOD_RCTRL, VK_RCONTROL),
-        ],
-        _ => Vec::new(),
-    }
-}
-
-/// 选词键组 → 有序 VK 列表（位置 0 = 次选键/选第2个，位置 1 = 三选键/选第3个）。
-/// 供协调器把按键映射为候选偏移（与 compile_select_key_group / compile_select_modifier_group 同源）。
-///
-/// **含修饰键组**：可打印键在 keydown 路径消费，修饰键在 keyup 路径消费（见
-/// `compile_select_modifier_group`），两条路径共用本表——协调器只按 VK 查偏移，
-/// 不关心它从哪条路来。
-pub fn select_key_vks(group: &str) -> Vec<u32> {
-    match group.trim().to_lowercase().as_str() {
-        "semicolon_quote" => vec![VK_OEM_1, VK_OEM_7],
-        "comma_period" => vec![VK_OEM_COMMA, VK_OEM_PERIOD],
-        "lrshift" => vec![VK_LSHIFT, VK_RSHIFT],
-        "lrctrl" => vec![VK_LCONTROL, VK_RCONTROL],
-        _ => Vec::new(),
-    }
-}
-
-/// 以词定字键组 → 有序 VK 列表（位置 0 = 取第 1 字，位置 1 = 取第 2 字）。
-/// 允许的键组（对齐 Go selectCharAllowedGroups）：comma_period / minus_equal / brackets。
-pub fn select_char_vks(group: &str) -> Vec<u32> {
-    match group.trim().to_lowercase().as_str() {
-        "comma_period" => vec![VK_OEM_COMMA, VK_OEM_PERIOD],
-        "minus_equal" => vec![VK_OEM_MINUS, VK_OEM_PLUS],
-        "brackets" => vec![VK_OEM_4, VK_OEM_6],
-        _ => Vec::new(),
-    }
-}
-
-/// 翻页键组 → raw hash 列表
+// 选词键组 / 以词定字键组的四个解析器（`compile_select_key_group`、
+// `compile_select_modifier_group`、`select_key_vks`、`select_char_vks`）已随三期收编删除。
+//
+// 它们的职责现在由两处承担：**编译**走上面的 `session_actions` 段（按键的形态自动分流到
+// key_down + FORWARD_ONLY 或 key_up），**折算**走 `Config::select_key_group_binds` /
+// `select_char_group_binds`（组名 → 具体键 + 动词）。
+//
+// ★ 删而不是留着不用：这四个函数与 `session_actions` 是**平行的第二套真相源**，留着就是
+// 「两处慢慢漂移」的种子。此前 `select_key_vks`（不含 brackets）与 `select_char_vks`
+// （含 brackets）就被张冠李戴过一次，`brackets` 配置静默失效——收编后两者靠**动词**区分，
+// 那类错配从结构上消失了。
+//
+// 修饰键为什么只能走 keyup（三条独立理由：keydown 不能吃 / `Ctrl+A` 首下会误选 / 长按
+// 连发），见 `keymap::is_key_up_only_vk` 的文档。
 
 /// 计算 key_hash（与 wind-ipc::protocol::calc_key_hash 对齐）
 fn calc_key_hash(modifiers: u32, key_code: u32) -> u32 {
@@ -880,30 +806,30 @@ mod tests {
     fn forward_only_bit_marks_page_and_select_keys_only() {
         let mut cfg = Config::default();
         cfg.keys.toggle_full_width = "shift+space".to_string();
-        cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
-        // 等价于旧的 `page_keys = ["minus_equal", "shift_tab"]` 折算后的样子。
+        // 等价于旧的 `page_keys = ["minus_equal", "shift_tab"]` +
+        // `select_key_groups = ["semicolon_quote"]` 折算后的样子。
         cfg.keys.session_actions = session_actions(&[
             ("minus", "page_prev"),
             ("equal", "page_next"),
             ("shift+tab", "page_prev"),
             ("tab", "page_next"),
+            ("semicolon", "select_candidate:2"),
+            ("quote", "select_candidate:3"),
         ]);
         let compiled = Compiler::new(cfg).compile();
 
         // ⚠ 判据不能用「action 为空」：pin/delete 候选的数字热键 action 同样是空串
         //（动作由服务端按 hash 自认），它们是 session 热键、不该带 FORWARD_ONLY。
-        // 只有会话态键 / 选词键组才是仅注册转发，故按 raw hash 精确点名。
-        let forward_only_raw: Vec<u32> = [
-            compile_select_key_group("semicolon_quote"),
-            vec![
-                key_hash(0, VK_OEM_MINUS),
-                key_hash(0, VK_OEM_PLUS),
-                key_hash(MOD_SHIFT, VK_TAB),
-                key_hash(0, VK_TAB),
-            ],
-        ]
-        .concat();
-        assert_eq!(forward_only_raw.len(), 6, "样例键组应展开出 6 个键");
+        // 只有会话态键才是仅注册转发，故按 raw hash 精确点名。
+        let forward_only_raw: Vec<u32> = vec![
+            key_hash(0, VK_OEM_MINUS),
+            key_hash(0, VK_OEM_PLUS),
+            key_hash(MOD_SHIFT, VK_TAB),
+            key_hash(0, VK_TAB),
+            key_hash(0, VK_OEM_1),
+            key_hash(0, VK_OEM_7),
+        ];
+        assert_eq!(forward_only_raw.len(), 6, "样例绑定应展开出 6 个键");
 
         for e in &compiled.key_down {
             let expected = forward_only_raw.contains(&e.match_hash);
@@ -928,15 +854,24 @@ mod tests {
         assert_eq!(fw.tsf_hash, key_hash(MOD_SHIFT, 0x20));
     }
 
-    /// 修饰键选词组只进 key_up（action=select_candidate），绝不进 key_down。
-    /// 回归点：曾与 `;'` 一起注册进 key_down，而 TSF 的 keydown 查表用的是
-    /// 「通用修饰位 + 笼统 VK_CONTROL」，两个维度都对不上这里登记的「具体位 + VK_LCONTROL」，
-    /// 于是这项配置端到端从未生效过——且即便对上了也不能吃（纯修饰键 keydown 必须放行）。
+    /// 修饰键作选词键时只进 key_up，绝不进 key_down。
+    ///
+    /// 回归点：曾与 `;'` 一起注册进 key_down，而 TSF 的 keydown 查表用的是「通用修饰位 +
+    /// 笼统 VK_CONTROL」，两个维度都对不上这里登记的「具体位 + VK_LCONTROL」，于是这项配置
+    /// 端到端从未生效过——且即便对上了也不能吃（纯修饰键 keydown 必须放行）。
+    ///
+    /// ⚠️ 三期收编后 action 从 `select_candidate` 改为统一的 `session_action`。这是安全的：
+    /// 该 action 名对 keyup 选词**没有功能作用**（`handle_select_key_up` 只按 VK 查偏移），
+    /// 唯一读 action 的是 `is_toggle_mode_keycode`，而它只认 `toggle_mode`。
     #[test]
     fn select_modifier_group_registers_on_key_up_only() {
         let mut cfg = Config::default();
         cfg.keys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
-        cfg.keys.select_key_groups = vec!["lrctrl".into()];
+        // 等价于旧的 `select_key_groups = ["lrctrl"]` 折算后的样子。
+        cfg.keys.session_actions = session_actions(&[
+            ("lctrl", "select_candidate:2"),
+            ("rctrl", "select_candidate:3"),
+        ]);
         let compiled = Compiler::new(cfg).compile();
 
         assert!(
@@ -944,12 +879,12 @@ mod tests {
                 .key_down
                 .iter()
                 .any(|e| matches!(e.match_hash & 0xFFFF, VK_LCONTROL | VK_RCONTROL)),
-            "修饰键选词组不得出现在 key_down"
+            "修饰键选词键不得出现在 key_down"
         );
         let sel: Vec<&HotkeyEntry> = compiled
             .key_up
             .iter()
-            .filter(|e| e.action == "select_candidate")
+            .filter(|e| e.action == SESSION_ACTION)
             .collect();
         assert_eq!(sel.len(), 2, "lrctrl 应展开出左右两个 keyup 登记");
         assert_eq!(
@@ -1056,13 +991,16 @@ mod tests {
         );
     }
 
-    /// 可打印选词组的通路不变：仍在 key_down 且带 FORWARD_ONLY，不进 key_up。
+    /// 可打印选词键的通路不变：仍在 key_down 且带 FORWARD_ONLY，不进 key_up。
     #[test]
     fn printable_select_group_stays_on_key_down() {
         let mut cfg = Config::default();
-        cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
+        cfg.keys.session_actions = session_actions(&[
+            ("semicolon", "select_candidate:2"),
+            ("quote", "select_candidate:3"),
+        ]);
         let compiled = Compiler::new(cfg).compile();
-        for raw in compile_select_key_group("semicolon_quote") {
+        for raw in [key_hash(0, VK_OEM_1), key_hash(0, VK_OEM_7)] {
             let e = compiled
                 .key_down
                 .iter()
@@ -1383,11 +1321,18 @@ mod tests {
         cfg.keys
             .key_actions
             .insert("ctrl+shift+n".into(), "toggle_schema:wubi86".into());
+        // 折算后的选词绑定（本测试直接构造 Compiler、不经 normalize，故显式写出）。
+        // 顺带覆盖一个真实场景：**同一个键 `;` 同时在两张表里**——无会话时是 mix 引导键，
+        // 有会话时是次选键。两张表按触发态分野，本就该能共存。
+        cfg.keys.session_actions = session_actions(&[
+            ("semicolon", "select_candidate:2"),
+            ("quote", "select_candidate:3"),
+        ]);
         let compiled = Compiler::new(cfg).compile();
 
         // ★ 判据是「有没有产生**带这个动词的** key_down 条目」，不是「这个 VK 在不在
-        // key_down 里」——`;` / `'` 本来就被默认的选词键组 `semicolon_quote` 以
-        // FORWARD_ONLY 登记着，按 VK 判会把那条误当成本段的产物，测了个寂寞。
+        // key_down 里」——`;` / `'` 同时被会话态表以 FORWARD_ONLY 登记着，按 VK 判会把
+        // 那条误当成本段的产物，测了个寂寞。
         for verb in ["temp_pinyin", "mix:quick_mix"] {
             assert!(
                 !compiled.key_down.iter().any(|e| e.action == verb),
@@ -1399,14 +1344,14 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        // 反向确认分流真的生效：选词键组那条仍在（action 为空的转发登记），
+        // 反向确认分流真的生效：会话态那条 `;` 仍在（action 为空的转发登记），
         // 说明上面的「没有」不是因为整段编译被跳过了。
         assert!(
             compiled
                 .key_down
                 .iter()
                 .any(|e| (e.match_hash & 0xFFFF) == VK_OEM_1 && e.action.is_empty()),
-            "选词键组的 `;` 转发登记应不受影响"
+            "会话态表里 `;` 的转发登记应不受影响"
         );
 
         // 组合键照常进 key_down（收编不该动这条既有通路）。

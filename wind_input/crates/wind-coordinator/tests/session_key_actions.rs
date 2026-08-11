@@ -104,6 +104,15 @@ fn session_key_tables_agree_across_crates() {
         "slash",
         "backtick",
         "backslash",
+        // 纯修饰键：`select_key_groups = ["lrctrl"]` 折算后的形态。
+        // ⚠️ 一期这几个只有 hotkey.rs 认得、wind-keys 漏了，而当时的键名列表恰好没覆盖
+        // 到它们——**这条测试的覆盖面就是它的全部价值**，漏一个名字等于那个名字没被守。
+        "lshift",
+        "rshift",
+        "lctrl",
+        "lcontrol",
+        "rctrl",
+        "rcontrol",
     ];
     for name in names {
         let a = wind_config::hotkey::session_key_to_vk(name);
@@ -428,6 +437,117 @@ fn escape_still_exits_each_mode_after_convergence() {
         "Esc 在主输入路径应放弃整段，实际: {act:?}"
     );
     assert!(coord.debug_page_texts().is_empty(), "候选应被清空");
+}
+
+// ───────────────────────── 三期：选词键 / 以词定字键收编 ─────────────────────────
+
+const VK_SEMICOLON: u32 = 0xBA;
+const VK_LCONTROL: u32 = 0xA2;
+
+/// ★★ 两张表的核心场景：**同一个键在两种状态下是两个动作**。
+///
+/// `;` 出厂既是快捷输入的引导键（`keys.key_actions`，无会话时）又是次选键
+/// （`keys.session_actions`，有会话时）。这不是冲突，正是分表的理由——若两者合成一张表，
+/// 这个配置根本表达不出来。
+#[test]
+fn semicolon_is_mode_trigger_when_idle_and_select_key_when_composing() {
+    if !has_schemas() {
+        return;
+    }
+    // 空闲态：`;` 进快捷输入。
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    let act = coord.handle_key_event(&key(VK_SEMICOLON, 0, EVENT_KEY_DOWN));
+    assert!(
+        matches!(
+            act,
+            wind_bridge::handler::KeyAction::UpdateComposition { .. }
+        ),
+        "空闲时 `;` 应进快捷输入（无会话态归 key_actions），实际: {act:?}"
+    );
+
+    // 组合态：`;` 选次选。
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    type_until_multipage(&coord);
+    let page = coord.debug_page_texts();
+    assert!(page.len() >= 2, "前置条件：当前页应有至少两个候选");
+    let second = page[1].clone();
+
+    let act = coord.handle_key_event(&key(VK_SEMICOLON, 0, EVENT_KEY_DOWN));
+    match act {
+        wind_bridge::handler::KeyAction::InsertText { text, .. } => assert_eq!(
+            text, second,
+            "有候选时 `;` 应选中次选（有会话态归 session_actions）"
+        ),
+        other => panic!("`;` 应上屏次选，实际: {other:?}"),
+    }
+}
+
+/// ★ 修饰键选词键（`select_key_groups = ["lrctrl"]` 的折算形态）必须进 keyup 转发集。
+///
+/// 这是 keyup 类绑定唯一的可达性来源——不在白名单里，TSF 根本不发这个 keyup。三期把
+/// 编译入口从 `compile_select_modifier_group` 换成了统一的 `session_actions` 段，本测试
+/// 守的就是「换了入口之后这批键仍然到得了」。
+#[test]
+fn modifier_select_key_reaches_key_up_forward_set() {
+    let mut cfg = cfg_with(&[]);
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    let coord = Coordinator::new_headless(cfg, None);
+    let hashes = coord.debug_key_up_hotkeys();
+    assert!(
+        hashes.iter().any(|h| h & 0x0000_FFFF == VK_LCONTROL),
+        "左 Ctrl 未进 keyup 转发集，修饰键选词永不触发。实际: {hashes:02X?}"
+    );
+}
+
+/// 修饰键选词端到端：有候选时轻敲左 Ctrl 选次选。
+///
+/// ⚠️ 走 **keyup**——纯修饰键的 keydown 一律放行（吃掉会让 AutoCAD 看不到修饰键）。
+#[test]
+fn modifier_select_key_picks_second_candidate_on_key_up() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = cfg_with(&[]);
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_until_multipage(&coord);
+    let page = coord.debug_page_texts();
+    assert!(page.len() >= 2, "前置条件：当前页应有至少两个候选");
+    let second = page[1].clone();
+
+    let act = coord.handle_key_event(&key(VK_LCONTROL, 0, EVENT_KEY_UP));
+    match act {
+        wind_bridge::handler::KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, second, "左 Ctrl 的 keyup 应选中次选")
+        }
+        other => panic!("修饰键选词应上屏次选，实际: {other:?}"),
+    }
+}
+
+/// 以词定字折算后仍认 `brackets`——该组**不在**选词键组的值域里。
+///
+/// 回归点：两组曾被张冠李戴（用选词键组的解析器解以词定字配置），`brackets` 静默失效。
+/// 收编后两者靠**动词**区分而非靠解析器区分，那类错配从结构上消失了。
+#[test]
+fn select_char_brackets_still_work_after_fold() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = cfg_with(&[]);
+    cfg.keys.select_char_keys = vec!["brackets".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_until_multipage(&coord);
+    let first = coord.debug_page_texts()[0].clone();
+    let want_first_char: String = first.chars().take(1).collect();
+
+    // `[` = VK_OEM_4 取第 1 字
+    let act = coord.handle_key_event(&key(0xDB, 0, EVENT_KEY_DOWN));
+    match act {
+        wind_bridge::handler::KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, want_first_char, "`[` 应取高亮候选的第 1 字")
+        }
+        other => panic!("以词定字应上屏单字，实际: {other:?}"),
+    }
 }
 
 /// Shift+Tab 与 Tab 是两条独立绑定（`shift+` 前缀），不会互相顶掉。

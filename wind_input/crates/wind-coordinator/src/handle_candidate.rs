@@ -11,7 +11,6 @@ use crate::preedit_cursor;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
-use wind_config::hotkey;
 use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
@@ -1342,14 +1341,20 @@ impl Coordinator {
     }
 
     /// 若 key_code 是配置的二/三候选键，返回页内候选偏移（1=次选/第2项，2=三选/第3项）。
+    ///
+    /// 数据源是 `keys.session_actions`（`select_key_groups` 已在 `normalize` 里折算进去）。
+    /// 配置里写的是**序号**（`select_candidate:2` = 第 2 个候选），这里减 1 换成偏移——
+    /// 配置面向人、偏移面向数组，转换只在这一处发生。
+    ///
+    /// `include_printable = true`：`;` `'` 这类可打印选词键在**所有**模式下都查得到，
+    /// 与折算前逐字一致——各模式要不要让位给输入字符，由各自的消费点判（如临英的
+    /// `temp_english_char_allowed`），不在这里一刀切。
     pub(crate) fn select_key_offset(&self, key_code: u32) -> Option<usize> {
-        for group in &self.rt().config.keys.select_key_groups {
-            let vks = hotkey::select_key_vks(group);
-            if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
-                return Some(pos + 1);
-            }
-        }
-        None
+        self.rt()
+            .session_keys
+            .classify(key_code, false, true)?
+            .candidate_ordinal()
+            .map(|n| n as usize - 1)
     }
 
     /// 选中「当前页第 `offset` 项」（0=首选，1=次选，2=三选），按当前活跃模式派发到各自的
@@ -1459,17 +1464,19 @@ impl Coordinator {
     }
 
     /// 若 key_code 是配置的以词定字键，返回取字下标（0=取第 1 字，1=取第 2 字）。
-    /// 默认 `select_char_keys` 为空 → 恒返回 None（功能禁用，零回归）。
-    /// 键组须用 select_char_vks 解析（支持 comma_period/minus_equal/brackets）；
-    /// select_key_vks 是次/三选键组（不含 brackets），误用会使 brackets 配置静默失效。
+    ///
+    /// 数据源是 `keys.session_actions`（`select_char_keys` 已在 `normalize` 里折算进去）。
+    /// 出厂 `select_char_keys` 为空 → 折算不出 `select_char:*` → 恒返回 None（功能禁用）。
+    ///
+    /// ⚠️ 折算前这里与 [`Self::select_key_offset`] 用的是**两张不同的键组表**，曾被张冠
+    /// 李戴过一次（用选词键组的解析器解以词定字配置，`brackets` 静默失效）。收编进同一张
+    /// 表后，两者靠**动词**区分而不再靠解析器区分，那类错配从结构上消失了。
     pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
-        for group in &self.rt().config.keys.select_char_keys {
-            let vks = hotkey::select_char_vks(group);
-            if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
-                return Some(pos);
-            }
-        }
-        None
+        self.rt()
+            .session_keys
+            .classify(key_code, false, true)?
+            .char_ordinal()
+            .map(|n| n as usize - 1)
     }
 
     /// 当前页候选切片的 [start, end) 区间
