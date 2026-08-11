@@ -1399,9 +1399,16 @@ pub fn get_clipboard_text_cached() -> String {
         }
 
         let mut text = String::new();
+        // 这一轮是否**读到了确定的答案**。要与「读到了空」区分开：剪贴板里放的是图片时
+        // 枚举成功但没有文本 flavor，空串就是正确答案，该缓存；而 API 本身失败（拿不到
+        // flavor 名 / 取项数失败）时空串只是"没读成"，一旦把它连同 primed=true 提交，
+        // 下一次 PasteboardSynchronize 会说"未变更"而直接命中缓存 —— 候选标签里的剪贴板
+        // 内容就此恒为空，直到用户重新复制一次才恢复。
+        let mut read_ok = false;
         let flavor = cfstr(UTF8_FLAVOR);
         let mut n: u64 = 0;
         if !flavor.is_null() && PasteboardGetItemCount(cache.pb, &mut n) == 0 {
+            read_ok = true;
             // 项索引从 1 起（Pasteboard Manager 的约定，不是 0）。
             for i in 1..=n {
                 let mut id: PasteboardItemID = std::ptr::null_mut();
@@ -1426,6 +1433,12 @@ pub fn get_clipboard_text_cached() -> String {
         }
         if !flavor.is_null() {
             CFRelease(flavor as _);
+        }
+        if !read_ok {
+            // 没读成：**不动缓存**（也不置 primed），下次调用照常重试。返回上一次的已知值，
+            // 比返回空串更接近事实——剪贴板内容并没有因为一次 API 失败而消失。
+            tracing::debug!("剪贴板读取失败，沿用上次缓存值");
+            return cache.text.clone();
         }
         cache.text = text.clone();
         cache.primed = true;
