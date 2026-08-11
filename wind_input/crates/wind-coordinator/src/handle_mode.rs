@@ -520,12 +520,18 @@ impl Coordinator {
         text.to_string()
     }
 
-    /// 切换输入方案并持久化 `schema.active` 到用户层配置（重启后保留）。
+    /// 直通命令 `ime.schema("<id>")`：切到指定方案并持久化 `schema.active`。
+    ///
+    /// 与方案直达热键走**同一条路**（[`Self::switch_schema_by_id`]）——两者都是「指名道姓
+    /// 切到这一个」，没有理由分叉出第二套行为。持久化由 `finish_user_schema_switch` 统一
+    /// 负责，因而天然**只在切换成功后**才写。
+    ///
+    /// 这里曾经调一条自带 `is_loaded` 守卫的独立路径，且**无条件**持久化 `schema.active`，
+    /// 于是未启用方案上叠了两个故障：切换被守卫拦掉只弹「准备中…」，配置却已改写。
+    /// 用户侧表现为「按了没反应」，而下次重启/热重载又莫名切了过去（真机现场见
+    /// [`Self::switch_schema_by_id`] 的说明）。
     pub(crate) fn cmd_set_schema(&self, id: &str) {
-        self.switch_schema(id);
-        if let Err(e) = Config::set_user_string(&["schema", "active"], id) {
-            warn!("ime.schema: 持久化 schema.active 失败: {}", e);
-        }
+        self.switch_schema_by_id(id);
     }
 
     /// 循环切换主题并持久化；dir="prev" 向前，其余向后。返回新主题显示名。
@@ -883,50 +889,33 @@ impl Coordinator {
         }
     }
 
-    /// 切换方案：清空输入并推送状态
-    pub(crate) fn switch_schema(&self, schema_id: &str) {
-        // 目标方案缓存尚未就绪（后台预热未到/正在构建）：显示「准备中」并放弃本次切换，
-        // 避免在 IME 线程同步重熔大词库卡顿。预热完成后用户再切即时生效。
-        if !self.engine_mgr.is_loaded(schema_id) {
-            let name = self.engine_mgr.schema_name(schema_id);
-            self.show_tip(&format!(
-                "{}准备中…",
-                if name.is_empty() { schema_id } else { &name }
-            ));
-            return;
-        }
-        if self.engine_mgr.switch_schema(schema_id) {
-            self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
-            self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.input_buffer.clear();
-            state.candidates.clear();
-            drop(state);
-            self.notify_ui_hide();
-            self.push_state_update();
-        }
-    }
-
     pub(crate) fn cycle_schema(&self) {
         if let Some(next) = self.engine_mgr.cycle_schema() {
             self.finish_user_schema_switch(&next, "Cycled to schema");
         }
     }
 
-    /// 方案直达热键：切到指定方案（`keys.schema_hotkeys`）。
+    /// 切到指定方案。方案直达热键（`keys.schema_hotkeys`）与直通命令
+    /// [`Self::cmd_set_schema`] 共用本函数。
     ///
     /// 与循环键走**同一条收尾**（[`Self::finish_user_schema_switch`]），因而持久化、状态归位、
-    /// 工具栏刷新的行为逐项一致——两个入口表达的是同一个用户意图，只是一个"下一个"、
+    /// 工具栏刷新的行为逐项一致——这几个入口表达的是同一个用户意图，只是一个"下一个"、
     /// 一个"这一个"。
     ///
     /// **不要求目标方案已启用或已预热**——`engine_mgr.switch_schema` 内部是懒加载
     /// （`ensure_loaded`），不看 `schema.available`。
     ///
-    /// 这里刻意**没有** [`Self::switch_schema`] 那道 `is_loaded` 守卫。那道守卫防的是
-    /// 「在 IME 线程同步重熔大词库」的卡顿，但预热只覆盖 available 里的方案，对未启用方案
-    /// `is_loaded` 恒为假 —— 于是这条路径的结局只能是弹「准备中…」然后什么都不发生，
-    /// 永远。用户按下的是**指名道姓**的直达热键，同步加载一次（之后就缓存住了）比
-    /// 彻底切不过去合理。这也正是「英文方案不必先启用就能用热键切过去」的实现方式。
+    /// 这里刻意**没有** `is_loaded` 守卫。曾有一条独立的切换路径带着它，防的是「在 IME
+    /// 线程同步重熔大词库」的卡顿，但预热只覆盖 available 里的方案，对未启用方案
+    /// `is_loaded` 恒为假 —— 于是那条路径的结局只能是弹「准备中…」然后什么都不发生，
+    /// 永远。真机现场：用直通命令 `ime.schema` 切一个未启用的方案，**每次重启后的第一次
+    /// 必失败**，只弹「XX准备中…」；而该方案的词库缓存其实齐备，加载不过几百毫秒。
+    /// 用户按下的是**指名道姓**的热键/命令，同步加载一次（之后就缓存住了）比彻底切不
+    /// 过去合理。这也正是「英文方案不必先启用就能用热键切过去」的实现方式。
+    ///
+    /// 守卫连同那条路径已删除；若日后要再加防卡顿闸门，判据应是
+    /// `EngineManager::is_building`（正在建才叫「准备中」），而不是 `is_loaded`——
+    /// 「没在建、也没加载」被谎报成「准备中」，正是上面那个现场里用户被误导的原因。
     ///
     /// 先判幂等再切，是为了让失败提示说得准：`engine_mgr.switch_schema` 对「已是当前方案」
     /// 和「方案加载失败」都返回 false，不分开判就只能二选一——要么给正常的重复按键弹一个

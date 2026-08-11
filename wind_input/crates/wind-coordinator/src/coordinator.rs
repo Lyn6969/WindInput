@@ -2707,6 +2707,15 @@ impl Coordinator {
         self.engine_mgr.active_schema_id()
     }
 
+    /// 当前**已启用**的方案列表（`schema.available`，测试/诊断用）。
+    ///
+    /// 与 [`Self::active_schema_id`] 不同，这里回答的是「哪些方案会被启动预热覆盖」。
+    /// 测试用它守住「目标方案确实未启用」这个前提——失去前提的回归用例会在已启用
+    /// 方案上空跑一遍、永远绿。
+    pub fn debug_available_schemas(&self) -> Vec<String> {
+        self.engine_mgr.available_schemas()
+    }
+
     /// 推给 TSF 的 key_up 热键白名单（测试/诊断用）。
     ///
     /// 这正是 `push_activation_status` 发出去的那份，不是另算一遍——修饰键类绑定

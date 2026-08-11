@@ -127,6 +127,14 @@ impl Coordinator {
         }
     }
 
+    /// 测试入口：按**用户同层**的路径执行一条命令源（如 `ime.schema("pinyin")`）。
+    ///
+    /// 直接调 `cmd_set_schema` 之类的内部函数验不出「这条命令是否真能走到那里」——
+    /// 求值、动作分派、`Services` 装配三段都在这条链上，任一段断了内部函数照样通过。
+    pub fn debug_run_command(&self, src: &str) {
+        self.run_command_candidate(src, "");
+    }
+
     /// 命令动作失败的用户可见反馈。消息取 `CmdbarError` 的 Display（形如
     /// `open: …` / `unknown function: …`），足以指认是哪个函数、什么问题。
     ///
