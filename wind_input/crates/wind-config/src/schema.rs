@@ -273,9 +273,6 @@ pub struct MixedSpec {
     pub primary_schema: String,
     #[serde(default)]
     pub secondary_schema: String,
-    /// 码表精确匹配提权基线（0=未设置，构建时回退 10_000_000）
-    #[serde(default)]
-    pub codetable_weight_boost: i32,
 }
 
 /// 词库规格（[[dictionaries]]）

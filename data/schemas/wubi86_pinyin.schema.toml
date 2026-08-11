@@ -9,11 +9,10 @@ description = "五笔86+拼音混合输入方案"
 [engine]
 type = "mixed"
 
-# 仅引擎固定参数（方案构成 + 内部权重基线）；融合策略已上移至全局 [schema.mix]。
+# 仅引擎固定参数（方案构成）；融合策略已上移至全局 [schema.mix]。
 [engine.mixed]
 primary_schema = "wubi86"
 secondary_schema = "pinyin"
-codetable_weight_boost = 10000000
 
 # 用户数据从引用方案继承：
 #   shadow/userdict → 主方案 (wubi86)

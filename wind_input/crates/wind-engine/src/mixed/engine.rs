@@ -82,13 +82,6 @@ impl MixedEngine {
 #[derive(Debug, Clone)]
 pub struct MixConfig {
     pub min_pinyin_length: usize,
-    /// ⚠️ **已失效，待下线**：码表精确匹配的提权基线。加成拆除后本引擎不再读它——
-    /// 精确/前缀补全的分野改由 [`MixedEngine::truncation_tier`] 表达。
-    ///
-    /// 全仓六个方案文件写的都是 `10000000`，即它自己的默认值，从来没有人用过非默认值。
-    /// 保留字段只为让本步不牵动跨仓（`schema.rs` / 方案 toml / 工具站 / 文档站共十一处），
-    /// 清理计划见 `docs/design/mixed-source-tier-quota.md` §5.2。
-    pub codetable_weight_boost: i32,
     pub auto_commit_block_on_pinyin: bool,
     pub pinyin_only_overflow: bool,
     pub top_code_override_pinyin: bool,
@@ -103,7 +96,6 @@ impl Default for MixConfig {
     fn default() -> Self {
         Self {
             min_pinyin_length: 2,
-            codetable_weight_boost: 10_000_000,
             // ⚠️ 三处同源：本处 / `MixGlobal::default()`（wind-config）/ `data/config.toml
             // [schema.mix]` 必须一致，改默认须同步全部三处。出厂默认以 L1⊕L2 为准（L2 覆盖 L1），
             // 即 data/config.toml 里的值。本处曾长期为 false 而另两处为 true，导致引擎单测跑在一个

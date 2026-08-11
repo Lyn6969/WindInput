@@ -2485,11 +2485,6 @@ impl EngineManager {
                     }),
                 )
             };
-            let boost = if m.codetable_weight_boost > 0 {
-                m.codetable_weight_boost
-            } else {
-                10_000_000
-            };
             // 融合策略走全局 schema.mix（无方案级 override）。
             let min_py = if mix_cfg.min_pinyin_length > 0 {
                 mix_cfg.min_pinyin_length
@@ -2529,7 +2524,6 @@ impl EngineManager {
             );
             let cfg = crate::mixed::MixConfig {
                 min_pinyin_length: min_py,
-                codetable_weight_boost: boost,
                 auto_commit_block_on_pinyin: block_on_pinyin,
                 pinyin_only_overflow: mix_cfg.pinyin_only_overflow,
                 top_code_override_pinyin: mix_cfg.top_code_override_pinyin,

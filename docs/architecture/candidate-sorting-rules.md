@@ -67,7 +67,7 @@
 | `is_sentence_demoted` | bool | 整句已让位（① 精确整词 ② 用完残码的补全；引擎侧把 weight 压到 `max-1`） | 拼音引擎 |
 | `is_phrase` | bool | 全局短语（`self.phrases` 注入的，系统/用户皆然） | 协调器短语注入 |
 | `is_command`/`is_group` | bool | `$CC` 命令 / `$SS·$AA` 组——**决定选中行为，不参与排序** | 短语注入 / `finalize_candidates` |
-| `weight` | i32 | 权重（**一物多用**：真实词频 + 隐式类别加成，见 §3 红线①） | 引擎 + 各套加成 |
+| `weight` | i32 | 权重（**只承载真实词频**；跨来源仍不可比，见 §3 红线①） | 引擎 |
 | `base_order` | i32 | 词库**层级基序档**（`[[dictionaries]].base_order`，默认 0，小整数即分档） | 码表词库配置 |
 | `natural_order` | i32 | **每库局部**出现序（各库从 0 数，仅同 `base_order` 档内可比） | 词库解析 |
 | `consumed_length` | usize | 该候选消费的输入长度（分段上屏用；0=未标注/整串） | 拼音引擎 |
@@ -79,9 +79,13 @@
 
 **① 权重量纲不可比——跨类别比 `weight`，比的其实是类别。**
 词组权重取自词频、单字取自字频，两套量纲不可比（`codetable/engine.rs` 自认）。更有甚者，多套系统往
-`weight` 上叠**巨大常量**来表达「类别」：协调器 `PHRASE_WEIGHT_BASE=40M`、混输 `PHRASE_WEIGHT_BOOST=1M`
-/`PARTIAL_MATCH_BOOST=500K`、拼音 `BARE_INITIAL_SINGLE_CHAR_BOOST=10M`。这些数字**没有物理意义**，
-只是排序占位符。**任何「跨来源比权重」的想法都要先想到这一点。**
+`weight` 上叠**巨大常量**来表达「类别」：协调器 `PHRASE_WEIGHT_BASE=40M`、拼音
+`BARE_INITIAL_SINGLE_CHAR_BOOST=10M`。这些数字**没有物理意义**，只是排序占位符。
+**任何「跨来源比权重」的想法都要先想到这一点。**
+
+> 混输引擎曾是这条红线最重的一处（六个加成常量），已整体拆除，改为显式的
+> **截断优先级档**（§4.3）。拆除记录见 `docs/design/mixed-source-tier-quota.md`——那份文档
+> 也记着拆的过程中发现的两处「加成掩盖了未定义行为」的账。
 
 **② 匹配层/精确档先于权重——胜负常在比权重前就被结构标志定死。**
 `candidate_display_order` 与 `freq_tier` 都把「层级/档位」作为**首要键**，`weight` 只在同层同档内才起作用。
@@ -173,29 +177,39 @@
   两套依据逐键切换。⚠️ 该常量**不是** `COMPLETION_NEAR_SYLLABLES`（后者只管用户词长词上浮，
   两者一度共用一个 2，改动时连带打断 `qingfengshu`→「清风输入法」）。
 
-### 4.3 混输引擎（`mixed/engine.rs`）——**独立的权重分档系统**
+### 4.3 混输引擎（`mixed/engine.rs`）——**截断优先级档**
 
-混输把码表半边 + 拼音半边合并，用**加大常量分档 + 纯按权重排**（`merge_sort_dedup` 只按
-`weight 降 → natural_order 升`，**不走匹配层**）：
+混输把码表半边 + 拼音半边合并，按 `MixedEngine::truncation_tier` **稳定排序**，
+再去重、截断：
 
-| 档 | 加成 | 对象 |
-|---|---|---|
-| 短语 | +`PHRASE_WEIGHT_BOOST` = **1,000,000** | `is_phrase` 候选 |
-| 码表精确全码 | +`codetable_weight_boost`（可配） | `code == input` |
-| 码表前缀补全/拆分 | +`PARTIAL_MATCH_BOOST` = **500,000** | 其余码表候选 |
-| 英文整词 | +`ENGLISH_EXACT_BOOST` = **500,000** | `code == input` 英文 |
-| 英文前缀 | +`ENGLISH_PREFIX_BOOST` = **0** | 其余英文 |
-| 拼音 | **÷ `PINYIN_TIER_SCALE` = 100** | 全部拼音候选 |
+| 档 | 对象 |
+|---|---|
+| 0 | 码表精确全码（`code == 判据串`） |
+| 1 | 短语（**本引擎恒不可达**：`is_phrase` 无生产置位点，短语由协调器在引擎之后合并） |
+| 2 | 码表前缀补全/拆分、英文整词 |
+| 3 | 拼音全部、英文前缀 |
 
-> 例：混输打 `da`，字 矼 的最终权重 `509000 = 矼基础字频(~9000) + PARTIAL_MATCH_BOOST(500000)`。
-> 这套加成是**引擎内**的，之后协调器第 5 步会用匹配层重排、第 8 步 freq 会用档位重排——所以 509000
-> 这个数只在同层同档内才决定先后。
+**本档位只回答「谁活下来」，不回答「谁排前面」**——最终显示序由协调器
+`candidate_display_order` 无条件重排全部候选决定（§6）。
 
-**截断的拼音保底配额**（`truncate_with_pinyin_quota`，`convert` 与 overflow 共用）：码表带 +500K、
-拼音 ÷100 ⇒ 截断时码表恒在前，而五笔 2 码前缀的候选量常常吃满整个配额——实测 **52 个 2 码前缀的
+> ⚠️ **排序键只有「档」一个，档内绝不可再排**。`sort_by_key` 是稳定排序，而候选按
+> `码表 → 拼音 → 英文` 拼接、每段内部已是子引擎排好的序 ⇒ 同档保持传入次序即**子引擎原序**。
+> 档内若按 weight 重排，拼音的 `cmp_match_layers` 就会被抹掉（层级键是布尔的、等价于惩罚 ∞，
+> weight 表达不了），高词频简拼会反超低词频精确候选。
+
+> **历史**：这套档位从前编码在 weight 的**数值大小**里——短语 +1M、码表精确
+> +`codetable_weight_boost`(1e7)、码表前缀补全与英文整词各 +500K、拼音 ÷100，然后全局按 weight
+> 排序。代价是真实词频与类别偏置挤在同一个 `i32`（拼音 p50=34 被整除归零），且偏置随候选一路
+> 泄漏进协调器的显示序。拆除过程见 `docs/design/mixed-source-tier-quota.md`。
+
+**截断的拼音保底配额**（`truncate_with_pinyin_quota`，`convert` 与 overflow 共用）：码表在档 0/2、
+拼音在档 3 ⇒ 截断时码表恒在前，而五笔 2 码前缀的候选量常常吃满整个配额——实测 **52 个 2 码前缀的
 条目数 > 300**（最多 `kh` 663 条），其中 `pu`（495 条）正是「既是五笔 2 码、又是完整拼音音节」的
 交集。那种输入下拼音候选**一条都进不了列表**，协调器 §6 ③ 的拼音精确档就无从下手（提不了不在场的
 候选）。故截断时给拼音留 `max/PINYIN_QUOTA_DIVISOR` 席。
+
+⚠️ **英文没有配额**：档 2/档 3 里的英文候选被码表洪水挤掉时无保底。见
+`mixed-source-tier-quota.md` §3.3。
 
 - **只补不挤空**：尾部确实没有拼音候选时（`kh` 这类非音节码、纯五笔溢出串）一条码表候选都不会被
   挤掉，行为与改动前完全一致（回归测试 `no_pinyin_means_no_codetable_is_evicted`）。
@@ -282,6 +296,7 @@
   （`per_page=5` ⇒ 第 20 页，与真机报告精确吻合）。根因是「精确 vs 前缀」这个维度混输此前
   只承认码表那一半：码表精确 +1e7、码表前缀补全 +500K，拼音**不分精确与补全**统一 ÷100。
   拼音侧的 `is_prefix`/`is_partial` 信息一直齐全，只是在 `normalize_pinyin` 被抹平。
+  （那批加成现已拆除，见 §4.3；本条记录的是问题当初的成因。）
 - **为何是层级键而非权重加成**：拼音词库最高权重是「的」**15,378,475**，任何「不先归一就加
   boost」的写法都会让它越过码表精确档 1e7（打 `de` 首选变「的」）。层级键无量纲陷阱（红线②）。
 - **为何叠 `is_common`**：单音节同音字动辄上百条（`xu` 有 **329** 条，含权重 0 的生僻字）。
@@ -406,11 +421,6 @@
 | 常量 | 值 | 位置 | 作用 |
 |---|---|---|---|
 | `PHRASE_WEIGHT_BASE` | 40,000,000 | `coordinator.rs` | 协调器**精确码短语**权重基（前缀短语已不用，改按 `hit.weight`） |
-| `PHRASE_WEIGHT_BOOST` | 1,000,000 | `mixed/engine.rs` | 混输 `is_phrase` 档 |
-| `PARTIAL_MATCH_BOOST` | 500,000 | `mixed/engine.rs` | 混输码表前缀补全档 |
-| `ENGLISH_EXACT_BOOST` | 500,000 | `mixed/engine.rs` | 混输英文整词 |
-| `ENGLISH_PREFIX_BOOST` | 0 | `mixed/engine.rs` | 混输英文前缀 |
-| `PINYIN_TIER_SCALE` | 100 | `mixed/engine.rs` | 混输拼音 ÷ 降档 |
 | `PINYIN_QUOTA_DIVISOR` | 5 | `mixed/engine.rs` | 截断时拼音**保底配额**分母（`max/5`，300 ⇒ 60 席） |
 | `BARE_INITIAL_SINGLE_CHAR_BOOST` | 10,000,000 | `pinyin/mod.rs` | 裸声母单字提权 |
 | `COMPLETION_WEIGHT_DISCOUNT` | 0.5 | `pinyin/mod.rs` | 前缀补全**每个未输入音节**的权重折扣（`w × 0.5^extra`） |
@@ -449,11 +459,10 @@
 ## 12. 已知待办 / 存疑
 
 - ~~拼音锚定平行漂移~~ **已修**（§7.4）：`rerank_pinyin_decay` 改为只锚定精确码短语，与 `freq_tier` 对齐。
-- **混输加成系统 vs 匹配层**：混输引擎的 500K/1M 加成是「类别编码进权重」的老范式，与
-  `candidate_display_order` 的匹配层是两套语言。长期可考虑统一到「匹配层 + 真实权重」，属较大重构。
-  ✅ **已迈出第一步**：拼音精确档没有沿用加成，而是做成层级键（§6 ③）——正因为拼音权重上限
-  1537 万让「加 boost」这条路走不通（会越过码表精确档 1e7），反过来印证了层级键是对的方向。
-  引擎内 `÷100` 的降档保持不动，仅作为「档内权重」使用。
+- ~~混输加成系统 vs 匹配层~~ **已完成**：六个加成常量全部拆除，引擎侧改为显式的截断优先级档
+  （§4.3），`weight` 从此只承载真实词频。过程与两处「加成掩盖了未定义行为」的发现见
+  `docs/design/mixed-source-tier-quota.md`。
+  - ⏳ **仍待做**：英文没有保底配额（同上文档 §3.3）。
 - **混输拼音的召回面收窄（未做）**：主流实现（微软、冰凌）在混输下**不给拼音做前缀补全/模糊**，
   只认精确音节。本仓已按此方向定案但**尚未实施**，落点是 `pinyin::Config` 新增 `enable_completion`
   + `schema.mix` 开关，经 `manager.rs::build_engine` 注入（与 `enable_pinyin_abbrev` 同一条路）。

@@ -144,7 +144,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 **截断保护精确匹配**：短输入（如单字母）前缀候选可达数百，纯按权重 `truncate` 会把低权重的精确
 全码（五笔一/二级简码等 `code==input`）挤出配额丢失。超额时改为「精确优先」稳定分区截断——精确
 候选必留、其余按 `better` 序填满剩余配额——再恢复 `better` 显示序。**不持久化 `is_prefix`**：跨来源
-权重档位（混输拼音 ÷100 等）与纯码表显示序均不受影响。
+混输的截断档位与纯码表显示序均不受影响。
 
 ### 3.2 上屏策略（CommitOptions，:14-31）
 
@@ -322,21 +322,23 @@ convert(input):
 
 ### 7.2 冲突处理 ①：权重档位（双向夹击）
 
-不同来源候选靠**档位加权**隔离（engine.rs:15-25, 176-196）：
+不同来源候选靠 `MixedEngine::truncation_tier` 的**截断优先级档**隔离，`weight` 一律保持真实词频：
 
-| 档位（高→低） | 加权 |
+| 档 | 对象 |
 |---|---|
-| 码表精确（code==input） | `+codetable_weight_boost`（默认 1e7） |
-| 短语 | `+PHRASE_WEIGHT_BOOST`（1M） |
-| 英文精确（整词） | `+ENGLISH_EXACT_BOOST`（500K）※ |
-| 码表前缀补全 | `+PARTIAL_MATCH_BOOST`（500K） |
-| 英文前缀 | `+0`（保留词库原始权重，防短前缀刷屏） |
-| 拼音 | `÷PINYIN_TIER_SCALE`（÷100，负数归 0）→ 压入 0~100K 低档 |
+| 0 | 码表精确（`code == 判据串`） |
+| 1 | 短语（**本引擎恒不可达**：短语由协调器在引擎之后合并） |
+| 2 | 码表前缀补全、英文整词 |
+| 3 | 拼音全部、英文前缀 |
 
-※ `english_candidates()` 的加权以常量 `ENGLISH_EXACT_BOOST`/`ENGLISH_PREFIX_BOOST` 为准（engine.rs:21-25）。
+⚠️ 本档位只决定**谁活过截断**，不决定显示序（后者由协调器 `candidate_display_order` 无条件重排）。
 
-合并 `merge_sort_dedup()`：码表在前、拼音在后、英文混入 → `weight desc, natural_order asc` 稳定排序 →
-**按 text 去重（HashSet 保留首个）** → 截断。
+合并 `merge_sort_dedup()`：码表在前、拼音在后、英文混入 → **按档稳定排序**（同档保持传入次序
+＝子引擎原序，档内不得再排）→ **按 text 去重（保留首个）** → 截断（拼音有 `max/5` 保底配额，
+英文没有）。
+
+> **历史**：档位从前编码在 weight 的数值大小里（码表精确 +1e7、短语 +1M、码表前缀补全与英文
+> 整词各 +500K、拼音 ÷100），已整体拆除，见 `docs/design/mixed-source-tier-quota.md`。
 
 ### 7.3 冲突处理 ②：拼音否决（veto）—— 统一入口
 
@@ -481,8 +483,8 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
      静态/模板短语、$CC 命令（is_command）、$SS/$AA 组（is_group 二级展开）
      weight = PHRASE_WEIGHT_BASE + hit.weight
 ③ 层级排序：is_fuzzy asc → **is_partial asc** → is_prefix asc → weight desc → natural_order asc
-     （Fuzzy＜子短语＜前缀补全＜完整匹配：与 PinyinEngine 内部排序一致。缺 `is_partial` 时混输 ÷100
-     压缩权重后，高权重子串单字会靠 weight 反超低权重精确词组——如 `pingtan` 在混输下
+     （Fuzzy＜子短语＜前缀补全＜完整匹配：与 PinyinEngine 内部排序一致。缺 `is_partial` 时，
+     高权重子串单字会靠 weight 反超低权重精确词组——如 `pingtan` 下
      平(w=58 part=true)＞平摊(w=4 part=false)，前者插到词组前）
 ④ 按 text 去重（保留首个）+ **把被弃条目所占码位并入幸存者**（merged_codes，见 §8.1.2）
 ⑤ apply_filter：填充 is_common（常用字表；短语豁免，判定作用域见 §8.1.1）→ wind_candidate::filter_candidates
@@ -587,7 +589,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | 词库 | codetable 多层（主+扩展+用户+临时） | rime_pinyin merged.wdb + 用户/临时层 | 同拼音 | 主码表全套 + 拼音全套 + 可选英文 | 码表格式，code 小写化 |
 | 输入预处理 | 无（原始码） | `'` 分段 + DAG 音节切分 + 模糊音扩展 | **先双拼→全拼**（Layout 表 + 位置映射），后同全拼 | 双路各自原样进子引擎 | 小写化 |
 | 候选生成 | 精确 + 前缀 + 空码补全 | 六步：精确/Viterbi 整句/子短语/前缀/简拼/用户层 | 同全拼 | 码表全流程 + 拼音全流程 + 英文，档位加权合并 | 精确 + 前缀 |
-| 引擎内排序 | better()（weight 主导） | 层级（模糊/前缀/子短语）→ weight | 同全拼 | 档位 weight（码表 1e7 >> 短语 1M >> 英文/前缀 500K >> 拼音 ÷100） | weight |
+| 引擎内排序 | better()（weight 主导） | 层级（模糊/前缀/子短语）→ weight | 同全拼 | 截断档（码表精确 > 短语 > 码表前缀/英文整词 > 拼音/英文前缀），**档内保持子引擎原序** | weight |
 | 自动上屏 | 满码唯一精确且无更长后继 | 无 | 无 | 码表意向 + **拼音否决①② + 英文守护 + 存活复核 + 显示首选须码表** | 无 |
 | 顶码 | 超满码顶前 N 码首选，余码续打 | 无 | 无 | 同否决①②后委托码表；`top_code_override_pinyin` 可强制 | 无 |
 | 分段上屏 | 无（consumed_length=0） | consumed_length 前缀消费，余码续转 | 同全拼（映射回双拼键数） | 拼音候选支持；接力强制走 secondary_schema | 无 |
