@@ -136,8 +136,32 @@ capslock = "page_prev"
 |---|---|---|
 | 导航 | `page_prev` `page_next` `highlight_up` `highlight_down` | 收编 `NavAction` |
 | 选择 | `select_candidate:2` `select_candidate:3` `select_char:1` `select_char:2` | 收编 `select_key_groups` / `select_char_keys` |
-| 处置 | `clear` `cancel` `commit_raw` `commit_first` | 收编七处 Esc |
+| 处置 | `cancel`（别名 `clear`） | 收编六处 Esc |
 | — | `none` | 禁用该键在本态的绑定 |
+
+### ★ 处置类只做 `cancel`，`clear` 收作别名（二期实施时定案）
+
+初稿把 `clear`（清空编码）与 `cancel`（等同 Esc）列为**两个**动词，实施时合并成一个：
+
+- 用户诉求原话是「ESC 在日常输入时有些太远」——要的是 **Esc 的替代键**，不是新语义。
+- 「清空但留在模式里」在普通输入下与 `cancel` **完全无区别**（没有模式可退），只有
+  overlay 模式下才分得出来。为一个没人要的差异，要额外定义五个模式各自的边界。
+- 但 `clear` 这个词符合「清空」的心智，所以收作**别名**：用户怎么写都能用，内核只有
+  一种行为。回写只用规范名 `cancel`，避免同一份配置在两次保存后出现两种写法。
+
+★ 判据：**两个名字对应同一个行为是可接受的；两个名字对应微妙不同的行为不可接受**——
+后者是最难查的一类配置陷阱。
+
+`commit_raw` / `commit_first` 未实施：没有对应的用户诉求，且它们与 `input.enter_behavior`
+的取值域正面重叠（§6.1 已论证那属于 Enter 的参数）。真要做，得先想清楚两者的关系。
+
+### ★★ 判据挂在动作上，不挂在消费点上
+
+`requires_candidates()` 是 `SessionAction` 的方法：导航类为真、`cancel` 为假。消费点
+（`apply_session_action`）只问动作要不要候选，自己不写条件。
+
+理由是消费点有**多个**（主输入 / mix / 候选导航），条件写在那里就是多份要保持一致的守卫
+——本仓在「一个能力多条通路」上已经栽过四次。
 
 ## 6. 收编范围：哪些折算，哪些不折算
 
@@ -260,24 +284,48 @@ CapsLock keydown 就必须保证 Rust 侧在该状态下确实产出，否则键
 1. **`printable` 标志不能在收编时丢**。`-` `=` `[` `]` `,` `.` 作导航键时，在临英 / 快捷输入
    里必须回落成输入字符——这就是 `NavKeys::classify(..., include_printable)` 那个参数的由来
    （`wind-keys/src/keymap.rs:135-147`）。换成 Map 表达后要有等价物，否则临英里打不出减号。
-2. **三个调用点都要接**。`apply_nav_key` 现有三处调用：主路径（`coordinator.rs:5938`）、
-   `handle_mix_key`（`handle_mode.rs:1649`）、`handle_candidate_nav_key`
-   （`handle_candidate.rs:1743`）。只接主路径的表现是「快捷输入里 Tab 不翻页」——本仓
-   「一个能力有多条通路、闸门必须每条都接」已反复栽过，混输上屏那组通路栽了四次。
+2. **每条通路都要接**。`apply_session_action` 的消费点是：主路径、`handle_mix_key`，
+   以及 `handle_candidate_nav`（临拼 / 临英 / 特殊模式三个 handler 共用它）。只接主路径
+   的表现是「快捷输入里 Tab 不翻页」——本仓「一个能力多条通路、闸门必须每条都接」已反复
+   栽过，混输上屏那组通路栽了四次。
+
+   > ★★★ **二期实测：网址模式是唯一漏接的那条**，而且是被测试抓出来的，不是审出来的。
+   >
+   > 一期没暴露，因为那时动词全是导航类，而网址模式原样累积文本、**从不产候选**——
+   > 导航在那条路上本就无事可做，漏接与正确行为完全同形。二期的 `cancel` 一加进来，
+   > 缺口立刻变成「Tab 在网址模式里按了没反应」。
+   >
+   > ⇒ 可复用判据：**新增一类动词时，要重查每条通路是否都接了消费点，不能因为「现有
+   > 动词在那条路上没意义」就默认它不需要接。** 「当前无意义」是会随值域扩张而失效的
+   > 隐含前提，而它失效时没有任何编译期或运行期信号。
 3. **模态窗口只共享两个动词**。菜单 / 快捷加词的 `cancel` / `confirm` 跟随本表绑定（用户
    改了「Tab = 取消」，在加词小窗里也该是 Tab），**导航键不跟随**——那是窗口自己的模型。
    这条边界要在实施前定死，别留给临场判断。
 
 ## 9. 分期
 
-| 期 | 内容 | 交付 |
-|---|---|---|
-| 一 | 建 `keys.session_actions`；`page_keys` / `highlight_keys` 折算；CapsLock keyup 通路（含 C++ 那处） | 三个诉求里的两个翻页需求可用；Esc 一行不动 |
-| 二 | `clear` / `cancel` 动词 + 七处 Esc 收敛为单点查表 | 「Tab 清空」；此后同类需求零成本 |
-| 三 | `select_key_groups` / `select_char_keys` 折算 | 二三候选键、以词定字键可自由改绑 |
-| 四 | 设置页改造（wind-setting 仓） | 不必手改 config.toml |
+| 期 | 内容 | 交付 | 状态 |
+|---|---|---|---|
+| 一 | 建 `keys.session_actions`；`page_keys` / `highlight_keys` 折算；CapsLock keyup 通路（含 C++ 那处） | 两个翻页诉求可用；Esc 一行不动 | ✅ 已实施，**未真机** |
+| 二 | `cancel` 动词 + 六处 Esc 收敛为单点 | 「Tab 清空」；此后同类需求零成本 | ✅ 已实施，**未真机** |
+| 三 | `select_key_groups` / `select_char_keys` 折算 | 二三候选键、以词定字键可自由改绑 | 未开始 |
+| 四 | 设置页改造（wind-setting 仓） | 不必手改 config.toml | 未开始 |
 
-一期不碰 Esc：它是七处硬编码，风险与收益都在二期，而用户现在等的是翻页。
+一期不碰 Esc：它是硬编码多处，风险与收益都在二期，而用户当时等的是翻页。
+
+### 二期落地情况
+
+- **`NavKeys` 泛化成 `KeyBinds<A>`**。一期写死 `NavAction` 的表在加 `cancel` 时立刻不够用
+  ——新动词没有对应的 `NavAction`。★ 判据：**一张「键 → 动作」的表，动作类型不该由表来
+  规定**。泛型后 `wind-keys` 仍不认识 `SessionAction`（那住在 `wind-config`，反向依赖会成环），
+  实例化由协调器做。
+- **六处 Esc 收敛为 `cancel_session`**，按 `state.active` 分派回各自的 `exit_*`。收敛前六处
+  形态逐字相同、只有退出函数不同。
+- **菜单与快捷加词刻意不收**（§2 的 C 类模态窗口）：菜单把键直接转发给 UI 窗口自行解释
+  （`UiCommand::MenuKey`），协调器这边不决定语义；加词模式消费全部按键。要让自定义取消键
+  在那两处生效，得改 `wind-ui` 的键解释器，是另一层的事。
+- C++ 两处 CapsLock 判据同步从 `_hasCandidates` 放宽到 `_HasInputSession()`，与服务端的
+  `has_input_session` 保持逐字一致（§7 的 ⚠️ 已预告这一步）。
 
 ## 10. 测试陷阱
 
