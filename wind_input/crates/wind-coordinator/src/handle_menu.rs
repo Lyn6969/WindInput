@@ -1257,16 +1257,22 @@ impl Coordinator {
         let items = if let Some(scope) = scope {
             let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
             let has_rule = self.shadow_has_rule(&scope.schema, &scope.code, &word, cand_id);
-            // 拼音普通候选禁调位：动态权重 + 衰减软置前与 pin 位置语义冲突；命令候选仍可调。
+            // 拼音普通候选**只放行置顶**，前移/后移仍禁（`position=0` 位置语义稳定，
+            // `position=N` 在候选集变动后失去意义）；命令候选不受限。
             // 引擎类型来自 scope：特殊模式问的是它引用的方案，照抄主方案会在「主方案拼音 +
             // 快符码表」时整体误禁调位。
+            //
+            // ⚠️ 判据必须与写端 `candidate_op` 逐字对应：菜单给了入口而写端 return，或反过来，
+            // 都是**完全静默**的错配——用户点得动却毫无反应，或明明能用却是灰的。
             let is_pinyin = matches!(scope.engine_type, Some(wind_engine::EngineType::Pinyin));
             let group_member = candidate_is_group_member(&cand);
-            let movable = !(is_pinyin && !cand.is_command) && !group_member;
+            let pinyin_locked = is_pinyin && !cand.is_command;
+            let can_pin = !group_member;
+            let movable = !pinyin_locked && !group_member;
             let (delete_label, delete_enabled) = candidate_delete_menu(&cand);
 
             vec![
-                M::leaf("置顶", op(CandidateOp::MoveTop), movable && idx > 0, false),
+                M::leaf("置顶", op(CandidateOp::MoveTop), can_pin && idx > 0, false),
                 M::leaf("前移", op(CandidateOp::MoveUp), movable && idx > 0, false),
                 M::leaf(
                     "后移",

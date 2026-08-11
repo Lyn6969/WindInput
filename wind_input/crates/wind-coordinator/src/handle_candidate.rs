@@ -22,8 +22,17 @@ pub(crate) struct CandidateOpScope {
     /// 词库 / shadow 归属方案 id（**原始 id，未经 `data_schema_id` 折叠**——Delete 分支
     /// 还要靠它走 `write_data_schema_id` 的按来源分流）。
     pub schema: String,
-    /// 该模式的编码缓冲：主输入路 = `input_buffer`；特殊模式 = `special_buffer`。
+    /// **候选调整（shadow）专用码**：主输入路取归一形态（双拼 → 全拼码，见
+    /// `shadow_code_of`），特殊模式 = `special_buffer`。只喂 shadow 三件套
+    /// （`pin_shadow` / `shadow_has_rule` / `clear_shadow`）。
     pub code: String,
+    /// **击键原码**：恒等于该模式的编码缓冲，不做任何归一。
+    ///
+    /// 与 `code` 分开，是因为二者服务的键空间不同，而双拼下它们**取值不同**：
+    /// 短语按击键召回（`phrases.lookup(&state.input_buffer, ..)`），其主键就是击键串，
+    /// 拿归一码去 `set_phrase_enabled` 会写到一个永远读不到的键上——短语删除静默失效。
+    /// 全拼/码表下两者恒等，这条差异只在双拼激活时才显形，所以极易漏审。
+    pub raw_code: String,
     /// 出这批候选的引擎类型（调位判据用）；引擎未加载时为 None。
     pub engine_type: Option<wind_engine::EngineType>,
     /// 特殊模式标记：重建候选须走 `update_special_candidates`——主路径的 `update_candidates`
@@ -614,6 +623,9 @@ impl Coordinator {
         state.preedit_split_body = result.preedit_pinyin.clone();
         // 全拼降级形态（双拼下按全拼的切法），供 effective_preedit_body 按高亮候选切换。
         state.preedit_fp_body = result.preedit_fullpinyin.clone();
+        // 候选调整（shadow）的归一编码。双拼下 = 全拼码（`hc`→`hao`），使双拼与全拼共享
+        // 同一条规则；全拼/码表/混输恒空串 = 落回击键，行为不变。见 `State::shadow_code`。
+        state.shadow_code = result.shadow_code.clone();
         let engine_count = result.candidates.len();
         // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
         let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
@@ -853,8 +865,12 @@ impl Coordinator {
             .take_while(|c| !c.is_scope_filtered)
             .count();
         self.apply_freq_rerank(&mut candidates[..rerank_len], &state.input_buffer);
+        // Shadow 的取码口与写端 `candidate_op_scope` 同源（见 `shadow_code_of`）——双拼下
+        // 是归一后的全拼码，其余恒为击键。⚠️ 与上一行的词频记账**刻意不同域**：那条链有
+        // 自己的 `freq_code`（码表按输入码、拼音按候选码），两者别互相照抄。
+        let shadow_code = Self::shadow_code_of(state).to_string();
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
-        self.apply_shadow(&mut candidates, &state.input_buffer);
+        self.apply_shadow(&mut candidates, &shadow_code);
         // ── 空码补全收口 ──────────────────────────────────────────────────────
         // 精确匹配模式下「一条候选都没有」时补一条兜底。判据必须落在**最终列表**上：码表引擎
         // 与短语层各自只看得见自己那一半，谁先跑谁就会拿子集的空当成全局的空——引擎抢先补一条，
@@ -881,7 +897,9 @@ impl Coordinator {
                 // 上面「本会显示在最前的那一条」这句承诺就不成立了）。
                 self.mark_common(&mut completion_pool);
                 self.apply_filter(state, &mut completion_pool);
-                self.apply_shadow(&mut completion_pool, &state.input_buffer);
+                // 补全池必须走同一条过滤链、**同一个码**：主列表隐藏掉的词若在这里被原码
+                // 补回来，用户看到的就是「删了又冒出来」。
+                self.apply_shadow(&mut completion_pool, &shadow_code);
                 completion_pool.sort_by(|a, b| {
                     candidate_display_order(a, b, ignore_weight, mixed, &input_str)
                         .then_with(|| a.text.cmp(&b.text))
@@ -1078,6 +1096,22 @@ impl Coordinator {
         }
     }
 
+    /// 候选调整（shadow）规则的**唯一取码口**——读端、写端、菜单灰显三处都必须走它。
+    ///
+    /// 归一码非空（双拼）取归一码，否则落回击键缓冲。之所以要有这么个单点，是因为三处
+    /// 若各取各的，失配**完全静默**：规则写进 `hc`、读的是 `hao`，界面上看不出任何异常，
+    /// 只表现为「置顶了但没反应」。同款教训见 `candidate_op_scope` 的文档。
+    ///
+    /// 只服务**主输入路**：特殊模式的码在 `special_buffer`（码表方案，无第二编码域），
+    /// 由 `candidate_op_scope` 自己分流。
+    pub(crate) fn shadow_code_of(state: &State) -> &str {
+        if state.shadow_code.is_empty() {
+            &state.input_buffer
+        } else {
+            &state.shadow_code
+        }
+    }
+
     /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。
     pub(crate) fn apply_shadow(&self, candidates: &mut Vec<Candidate>, code: &str) {
         self.apply_shadow_in(None, candidates, code);
@@ -1187,6 +1221,7 @@ impl Coordinator {
         state.preedit = state.input_buffer.clone();
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
+        state.shadow_code.clear();
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
@@ -1844,16 +1879,21 @@ impl Coordinator {
         if state.candidates.is_empty() {
             return None;
         }
-        let (schema, code, special) = match state.active {
+        let (schema, code, raw_code, special) = match state.active {
+            // 主输入路的 shadow 码取**归一形态**（见 `shadow_code_of`）：双拼下是全拼码，
+            // 与读端 `apply_shadow` 同源。全拼/码表下它恒等于 `input_buffer`，行为不变。
             None => (
                 self.engine_mgr.active_schema_id(),
+                Self::shadow_code_of(state).to_string(),
                 state.input_buffer.clone(),
                 false,
             ),
             // 特殊模式（快符 / 生僻字等自定义码表方案）：编码在 special_buffer，归属是它
             // 自己引用的方案——与读端同源取值，见上方 effective_data_schema。
+            // 码表方案没有第二编码域，两个码恒同值。
             Some(ModeKind::Special(_)) => (
                 self.effective_data_schema(state)?,
+                state.special_buffer.clone(),
                 state.special_buffer.clone(),
                 true,
             ),
@@ -1877,6 +1917,7 @@ impl Coordinator {
         Some(CandidateOpScope {
             schema,
             code,
+            raw_code,
             engine_type,
             special,
         })
@@ -2596,6 +2637,7 @@ impl Coordinator {
         let CandidateOpScope {
             schema,
             code,
+            raw_code,
             engine_type,
             special,
         } = scope;
@@ -2604,13 +2646,17 @@ impl Coordinator {
         if crate::handle_menu::candidate_is_group_member(&cand) {
             return;
         }
-        let is_move = matches!(
-            op,
-            CandidateOp::MoveTop | CandidateOp::MoveUp | CandidateOp::MoveDown
-        );
-        // 拼音普通候选禁调位（无稳定位置语义，pin 与衰减软置前冲突）；命令候选例外。
+        // 拼音普通候选**只放行置顶**，前移/后移仍禁；命令候选不受限。
         // 引擎类型取自 scope（特殊模式问的是它引用的方案，不是主方案）。
-        if is_move
+        //
+        // 分野在于位置语义是否稳定：`position=0` 恒等于「第一个」，这个承诺与候选集怎么变
+        // 无关；而 `position=3` 一旦词频衰减、模糊音开关或词库变动改了候选集，指的就是另一
+        // 条候选了——那正是当初对拼音整体禁调位的理由，它对置顶从来不成立。
+        //
+        // ⚠️ shadow 排在装配流水线**最后**（sort → dedup → filter → freq_rerank → shadow），
+        // 因此它能翻过拼音 `cmp_match_layers` 的硬层级闸门——置顶的效力比调频强，是硬规则。
+        // 用户要撤销只能靠右键「恢复默认」或设置页的规则列表。
+        if matches!(op, CandidateOp::MoveUp | CandidateOp::MoveDown)
             && !cand.is_command
             && matches!(engine_type, Some(wind_engine::EngineType::Pinyin))
         {
@@ -2638,7 +2684,10 @@ impl Coordinator {
                 CandidateOp::MoveDown => {
                     store.pin_shadow(&sh_schema, &code, &word, cand_id, (idx + 1).min(last))
                 }
-                CandidateOp::Delete => self.delete_candidate_by_source(&schema, &code, &cand),
+                // ⚠️ Delete 走 `raw_code`（击键）而非归一码：它落的是短语表 / 用户词库，
+                // 两者的键空间都是击键域（短语按 `input_buffer` 召回），与 shadow 不同。
+                // 双拼下混用会让短语删除静默失效——写进 `hao`、读的是 `hc`。
+                CandidateOp::Delete => self.delete_candidate_by_source(&schema, &raw_code, &cand),
                 CandidateOp::Reset => store.remove_shadow_rule(&sh_schema, &code, &word, cand_id),
             };
             if let Err(e) = r {
@@ -3230,6 +3279,99 @@ mod finalize_candidates_tests {
         );
     }
 
+    /// **shadow 的码必须处处归一**：读端 `apply_shadow` 与写端 `candidate_op_scope` 若各取
+    /// 各的，失配是**完全静默**的——双拼下规则写进 `hao`、读的却是击键 `hc`，用户看到的只是
+    /// 「置顶了没反应」，日志、界面、返回值全都正常。
+    ///
+    /// 判据是「第二个实参 ∈ 允许集合」，顺带强制中转变量必须叫 `shadow_code`：任何别的名字
+    /// 都会被拦下，逼新增调用点的人回到这里说明它取的是哪个码域。这套机械扫描是本仓的既有
+    /// 先例（见上面两个测试），因为「N 个调用点都要做同一件事」这类不变量靠注释守不住——
+    /// `freq_code` 那次连红四次才把四处遗漏抓干净。
+    #[test]
+    fn every_shadow_read_goes_through_normalized_code() {
+        // 主输入路：一律走 `shadow_code_of` 取出的中转变量。
+        // 特殊模式：码在 `special_buffer`（码表方案，无第二编码域），恒等即正确。
+        // 空串：特殊模式浏览态的合法键位，见 `apply_shadow_in` 的守卫。
+        const ALLOWED: &[&str] = &[
+            "shadow_code",
+            "state.special_buffer",
+            "\"\"",
+            // 转发层：`apply_shadow` 是 `apply_shadow_in` 的薄包装，原样传自己的参数。
+            "code",
+            // 菜单灰显走 `candidate_op_scope` 的产物，其 `code` 已在那里归一（同写端一处取值）。
+            "scope.code",
+        ];
+        const CALLS: &[&str] = &[
+            ".apply_shadow(",
+            ".apply_shadow_in(",
+            // 「恢复默认」的可用性判据也必须同码，否则菜单项灰着而规则其实存在。
+            ".shadow_has_rule(",
+        ];
+        let sources: &[(&str, &str)] = &[
+            ("coordinator.rs", include_str!("coordinator.rs")),
+            ("handle_candidate.rs", include_str!("handle_candidate.rs")),
+            ("handle_special.rs", include_str!("handle_special.rs")),
+            ("handle_menu.rs", include_str!("handle_menu.rs")),
+        ];
+        let mut checked = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for (name, src) in sources {
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for call in CALLS {
+                // `apply_shadow_in` 多一个前置的 schema 实参，码是第 3 个；`apply_shadow` 是第 2 个。
+                let code_pos = if *call == ".apply_shadow_in(" { 2 } else { 1 };
+                for (off, _) in prod.match_indices(call) {
+                    let args = &prod[off + call.len()..];
+                    // 按括号深度切顶层逗号，取第 code_pos 个实参（实参可能自带括号调用）。
+                    let mut depth = 0i32;
+                    let mut cur = 0usize;
+                    let mut start = 0usize;
+                    let mut found: Option<&str> = None;
+                    for (i, ch) in args.char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' if depth == 0 => {
+                                if cur == code_pos {
+                                    found = Some(&args[start..i]);
+                                }
+                                break;
+                            }
+                            ')' => depth -= 1,
+                            ',' if depth == 0 => {
+                                if cur == code_pos {
+                                    found = Some(&args[start..i]);
+                                    break;
+                                }
+                                cur += 1;
+                                start = i + 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(arg) = found else { continue };
+                    let arg = arg.trim().trim_start_matches('&').trim();
+                    checked += 1;
+                    if !ALLOWED.contains(&arg) {
+                        // 收齐再报：逐个 assert 只暴露第一处，改完重跑才发现还有下一处。
+                        bad.push(format!("{name}: {call}…) 的码实参 `{arg}`"));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "以下 shadow 读取点的码未经归一：\n  {}\n\
+             双拼与全拼折叠为同一个 schema，码若仍取击键，`hc` 与 `hao` 会落成两个互不相认\n\
+             的键。改用 `Self::shadow_code_of(state)`（中转变量命名为 `shadow_code`），\n\
+             确有理由不走的请加进本测试的 ALLOWED 并写明理由。",
+            bad.join("\n  ")
+        );
+        assert!(
+            checked >= 5,
+            "只扫到 {checked} 个 shadow 读取点，少于预期——调用点被改名或扫描失效了，先修测试"
+        );
+    }
+
     #[test]
     fn aa_group_expands_inline_when_code_absent() {
         let c = coord();
@@ -3621,6 +3763,14 @@ mod dynamic_candidate_shadow_tests {
         Coordinator::new_headless_with_store(Config::default(), None, store)
     }
 
+    /// 一条纯文本候选（拼音/码表静态候选，无稳定 id → 规则按 word 匹配）。
+    fn plain(text: &str) -> Candidate {
+        Candidate {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
     /// 一条 `date` 短语候选：`text` 是当日求值结果，`id` 是模板身份。
     fn date_cand(text: &str, template: &str) -> Candidate {
         Candidate {
@@ -3707,6 +3857,71 @@ mod dynamic_candidate_shadow_tests {
         assert_eq!(
             cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
             ["敬", "工"]
+        );
+    }
+
+    /// **双拼击键读得到全拼下写的规则**——这是「拼音候选置顶」在双拼/全拼共用词库时
+    /// 能成立的全部理由。
+    ///
+    /// `data_schema_id` 早已把两种方案折叠成同一个 schema，缺的一直是 code 维度：读写两端
+    /// 都取 `input_buffer`（击键域），于是双拼的 `hc` 与全拼的 `hao` 落成两个互不相认的键。
+    ///
+    /// 反向对照不可省：末尾那段用击键码再读一次，**必须读不到**。没有它，这个测试在
+    /// 「归一码根本没接线、而 apply_shadow 恰好对空列表无操作」之类的情形下也会绿。
+    #[test]
+    fn shuangpin_keystroke_reads_rule_written_under_full_pinyin() {
+        let store = store_at("wind_coord_shadow_norm.redb");
+        let c = coord_with(store.clone());
+        let schema = c
+            .engine_mgr
+            .data_schema_id(&c.engine_mgr.active_schema_id());
+
+        // 全拼下把「好」置顶（或等价地：另一台机器/另一次会话用全拼写下的存量规则）。
+        store.pin_shadow(&schema, "hao", "好", None, 0).unwrap();
+
+        // 双拼击键 `hc`，引擎给出归一码 `hao`（见 ConvertResult::shadow_code）。
+        let code = {
+            let mut state = c.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.input_buffer = "hc".into();
+            state.shadow_code = "hao".into();
+            Coordinator::shadow_code_of(&state).to_string()
+        };
+        assert_eq!(code, "hao", "归一码非空时必须优先于击键缓冲");
+
+        let mut cands = vec![plain("耗"), plain("好"), plain("号")];
+        c.apply_shadow(&mut cands, &code);
+        assert_eq!(
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["好", "耗", "号"],
+            "双拼 hc 应读到全拼 hao 下的置顶规则"
+        );
+
+        // 反向对照：拿击键码去读，规则不该命中——证明上面的绿来自归一，而非别的原因。
+        let mut raw = vec![plain("耗"), plain("好"), plain("号")];
+        c.apply_shadow(&mut raw, "hc");
+        assert_eq!(
+            raw.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["耗", "好", "号"],
+            "击键码 hc 下没有规则，顺序必须原样——否则上面那条断言证明不了归一起了作用"
+        );
+    }
+
+    /// 全拼路径**恒等**：归一码为空时落回击键缓冲，存量规则一条都不用迁。
+    #[test]
+    fn full_pinyin_shadow_code_is_identity() {
+        let c = coord_with(store_at("wind_coord_shadow_identity.redb"));
+        let state = c.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 默认 State：input_buffer 与 shadow_code 均空。
+        assert_eq!(Coordinator::shadow_code_of(&state), "");
+        drop(state);
+
+        let mut state = c.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.input_buffer = "xi'an".into();
+        state.shadow_code.clear(); // 全拼引擎恒给空串
+        assert_eq!(
+            Coordinator::shadow_code_of(&state),
+            "xi'an",
+            "全拼须原样取击键（含手动分隔符——`'` 是硬边界，剥掉会与 xian 撞 key）"
         );
     }
 

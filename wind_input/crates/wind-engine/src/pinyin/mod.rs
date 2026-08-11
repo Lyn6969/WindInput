@@ -2778,6 +2778,38 @@ impl Engine for PinyinEngine {
         let has_partial = !partial_syllable.is_empty();
         let is_empty = candidates.is_empty();
 
+        // 候选调整（shadow）规则的归一编码。契约与各分支理由见 `ConvertResult::shadow_code`；
+        // 这里只解释**双拼分支的两个条件为何缺一不可**：
+        //
+        // - `mixed_covered`：双拼转换结果完整覆盖了整串击键。不成立说明串里有拼不出音节的
+        //   键（无匹配键对原样回写），`full_pinyin` 里混着未翻译的原始字母，不是干净的全拼域。
+        //
+        // 判据**只有** `mixed_covered` 这一条，两个看似更精细的备选都已被否掉：
+        //
+        // ⛔ `!stroke_is_plain_abbrev`（击键是不是简拼形态）—— 实测当场推翻。双拼两键一音节，
+        //    韵母键的字母本身往往也是合法声母（小鹤 `c`=ao，而 `c` 是声母），`is_abbreviation`
+        //    于是对绝大多数双拼两键击键判真，`hc` 首当其冲。用它会把双拼常态整体挡在归一之外，
+        //    功能等于没做。那个变量答的是「要不要去查简拼索引」，不是「查到了没有」。
+        //
+        // ⛔ `!abbrev_full_hit`（简拼是否真的命中整串）—— 语义上更准，能彻底杜绝下面说的串扰，
+        //    但它**依赖词库内容**：用户加一个简拼恰为 `hc` 的词，`hc` 的 key 就从 `hao` 摇摆成
+        //    `hc`，此前那条置顶规则静默失效，删词又摇回来。双拼击键与用户词简拼同为两字母串，
+        //    碰撞频繁。2026-08-11 用户拍板：**稳定性优先**——key 只取决于双拼布局，词库怎么变
+        //    都不动。
+        //
+        // 由此接受一处已知的窄串扰：`nh` 归一为 `nang`，而双拼 `nh` 同时出简拼候选「你好」
+        // （简拼索引按原始击键查，见 `abbr_query`）。若用户**既用全拼又用双拼**、且在全拼
+        // `nang` 下置顶过词，那个词会在双拼敲 `nh` 时被顶上来。纯双拼用户不受影响：pin 与读取
+        // 都落在同一个全拼 key 上，行为正确。实证见
+        // `tests/pinyin_shadow_code_domain.rs::sp_abbrev_and_full_coexist_in_one_keystroke`。
+        //
+        // 全拼恒空串（＝落回击键，恒等变换）：不可剥 `'`，它是硬边界，`xi'an` 与 `xian`
+        // 候选集不同，合并即变更全拼存量行为。
+        let shadow_code = match &sp_result {
+            Some(r) if mixed_covered => r.full_pinyin.clone(),
+            _ => String::new(),
+        };
+
         Ok(ConvertResult {
             candidates,
             // 拼音恒为拆分形态（供混输高亮跟随：高亮拼音候选时取此串）。
@@ -2793,6 +2825,7 @@ impl Engine for PinyinEngine {
             should_clear: false,
             // 拼音无「全码/空码补全」概念（`single_code_*` 是码表专属）。
             completion_hints: Vec::new(),
+            shadow_code,
         })
     }
 

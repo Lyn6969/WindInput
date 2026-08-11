@@ -465,6 +465,18 @@ pub(crate) struct State {
     /// 高亮到 `is_fullpinyin_fallback` 的候选时 preedit 用它；其余情形不读。
     /// 空串 = 无此形态（非双拼 / 开关关 / 支路无产出）。每次 build_candidates 重置。
     pub(crate) preedit_fp_body: String,
+    /// 候选调整（shadow）规则的**归一编码**；空串 = 落回 `input_buffer`（击键原样）。
+    ///
+    /// 取自 `ConvertResult::shadow_code`，与 `preedit_split_body` 同生命周期（每次
+    /// `build_candidates` 重置）。存在的唯一理由是双拼：`data_schema_id` 已把全拼与双拼
+    /// 折叠成同一个 schema，若 key 继续取击键，双拼的 `hc` 与全拼的 `hao` 会落成两个互不
+    /// 相认的键。归一后两者共享同一条规则。全拼恒空串（恒等，存量规则零迁移）。
+    ///
+    /// ⚠️ **读写两端必须同取此值**（`shadow_code_of`）：读端 `apply_shadow`、写端
+    /// `candidate_op_scope`、菜单灰显 `shadow_has_rule` 若有一处漏改，失配是**完全静默**的
+    /// ——规则写得进去、读不出来，界面毫无异常。守门测试见 `handle_candidate.rs` 的
+    /// `every_shadow_read_goes_through_normalized_code`。
+    pub(crate) shadow_code: String,
     pub(crate) candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     pub(crate) selected_index: usize,
@@ -1630,6 +1642,7 @@ impl Coordinator {
                 preedit: String::new(),
                 preedit_split_body: String::new(),
                 preedit_fp_body: String::new(),
+                shadow_code: String::new(),
                 candidates: Vec::new(),
                 selected_index: 0,
                 hover_index: -1,
@@ -3425,6 +3438,7 @@ impl Coordinator {
         state.preedit.clear();
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
+        state.shadow_code.clear();
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
