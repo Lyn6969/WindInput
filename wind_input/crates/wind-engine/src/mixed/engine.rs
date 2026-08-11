@@ -27,6 +27,71 @@ const ENGLISH_PREFIX_BOOST: i32 = 0;
 /// （生产 `max_candidates=300` ⇒ 60 席）。见 [`MixedEngine::truncate_with_pinyin_quota`]。
 const PINYIN_QUOTA_DIVISOR: usize = 5;
 
+/// 判定[截断优先级档](MixedEngine::truncation_tier)所需的两个判据串。
+///
+/// 两者都随调用路径变化，故不能从候选自身推出，必须由调用方按语境传入：
+/// - `codetable_exact`：主路径 = `input`，overflow = **前 N 码前缀**；
+/// - `english_exact`：恒为小写化的 `input`（与 [`MixedEngine::english_candidates`] 同口径）。
+#[derive(Clone, Copy)]
+struct TruncationCtx<'a> {
+    codetable_exact: &'a str,
+    english_exact: &'a str,
+}
+
+impl MixedEngine {
+    /// **截断优先级档**——引擎侧「谁活得下来」的唯一真相源，值越小越先活。
+    ///
+    /// ## 这不是新增的一套排序，是把已有的那套写出来
+    ///
+    /// 六个加成常数一直在表达一套档位，只不过表达方式是**数值大小**：把候选权重加上
+    /// 一个足够大的常数，再全局按 weight 排序，档位就"自然"浮现了。本函数只是把同一套
+    /// 档位显式写成代码，与加成一一对应：
+    ///
+    /// | 档 | 对象 | 现由哪个加成表达 |
+    /// |---|---|---|
+    /// | 0 | 码表精确全码（`code == codetable_exact`） | `+codetable_weight_boost`（1e7） |
+    /// | 1 | 短语 —— **本引擎恒不可达，见下** | `+PHRASE_WEIGHT_BOOST`（1M） |
+    /// | 2 | 码表前缀补全 **与** 英文精确 | 都是 **+500,000** —— 见下 |
+    /// | 3 | 拼音、英文前缀 | `÷PINYIN_TIER_SCALE` / `+0` |
+    ///
+    /// ## ⚠️ 档 1（短语）在本引擎恒不可达
+    ///
+    /// `is_phrase` 在整个 `wind-engine` 里**没有任何生产代码置位**（`freq_rerank` 里的几处
+    /// 全是测试 fixture，且 `apply_freq_rerank` 定义并调用于**协调器**）。短语是协调器合并进
+    /// 候选列表的（`handle_candidate.rs`），发生在引擎返回**之后**，而本函数只看得见
+    /// `primary.convert()`（码表引擎从不置位）、拼音、英文三路。
+    /// ⇒ [`PHRASE_WEIGHT_BOOST`] 的那个分支从未执行过。
+    ///
+    /// 本档保留而非就地删除，是为了让这一步严格等价于加成（加成里也有这个死分支）。
+    ///
+    /// ## ⚠️ 档 2 混着两个来源，是常数碰撞不是设计
+    ///
+    /// [`PARTIAL_MATCH_BOOST`] 与 [`ENGLISH_EXACT_BOOST`] 数值**恰好相等**（都是 500,000），
+    /// 于是「英文精确词」与「码表前缀补全」落进同一档、胜负纯由真实词频决定——而两者的
+    /// 词频根本不同量纲。没有任何文档说过英文精确应当与码表前缀补全平起平坐。
+    ///
+    /// 本函数**如实复刻，不做改善**：改它属于行为变更，与「等价重构」不可混做一步。
+    /// 拆掉加成后英文该拿几席，见 `docs/design/mixed-source-tier-quota.md` §3.3。
+    ///
+    /// ## ⚠️ 一处刻意的收紧
+    ///
+    /// 加成表达的档位是"**只要基础权重不越界**就成立"——档 0 与档 1 之间隔着 9e6，一条
+    /// 权重超过 9e6 的短语就能反超码表精确全码。真实词频到不了那个量级，但那是**数据的
+    /// 性质，不是代码的保证**。改成显式档位后档序**恒定**，不再依赖权重取值范围。
+    ///
+    /// 这是刻意的：一条短语靠调频涨到 9e6 就翻越档位，不是设计，是同一类账没算清。
+    fn truncation_tier(c: &Candidate, ctx: TruncationCtx<'_>) -> u8 {
+        match c.source {
+            // 短语档先判：短语走码表来源，但加成分支里 `is_phrase` 也排在 `code == input` 之前。
+            CandidateSource::CodeTable if c.is_phrase => 1,
+            CandidateSource::CodeTable if c.code == ctx.codetable_exact => 0,
+            CandidateSource::CodeTable => 2,
+            CandidateSource::English if c.code == ctx.english_exact => 2,
+            _ => 3,
+        }
+    }
+}
+
 /// 混输引擎的标量配置（融合策略参数）。引擎部件 primary/secondary/english 单独传入 `new`；
 /// 此处仅聚合可配开关/阈值，避免 `new` 参数膨胀。字段语义见 [`MixedEngine`] 同名字段。
 #[derive(Debug, Clone)]
@@ -336,23 +401,34 @@ impl MixedEngine {
         }
     }
 
-    /// 合并（码表在前、拼音在后）→ 按权重稳定排序 → 按文本去重 → 带拼音保底配额截断。
+    /// 合并（码表在前、拼音在后）→ 按档位稳定排序 → 按文本去重 → 带拼音保底配额截断。
     fn merge_sort_dedup(
         mut codetable: Vec<Candidate>,
         pinyin: Vec<Candidate>,
         max_candidates: usize,
+        ctx: TruncationCtx<'_>,
     ) -> Vec<Candidate> {
         codetable.extend(pinyin);
-        Self::sort_dedup_truncate(&mut codetable, max_candidates);
+        Self::sort_dedup_truncate(&mut codetable, max_candidates, ctx);
         codetable
     }
 
-    /// 按权重稳定排序 → 按文本去重 → 带拼音保底配额截断（`convert` 主路径与 overflow 共用）。
-    fn sort_dedup_truncate(cands: &mut Vec<Candidate>, max_candidates: usize) {
-        cands.sort_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
-                .then(a.natural_order.cmp(&b.natural_order))
+    /// 按**截断优先级档**稳定排序 → 按文本去重 → 带拼音保底配额截断
+    /// （`convert` 主路径与 overflow 共用）。
+    ///
+    /// 排序键 `(档, weight 降, natural_order)`。此前写作「`weight` 降序」——而 `weight` 里
+    /// 混着六个加成常数，档位是靠**加成的数值大小**隐式表达的。见 [`TruncationCtx`]。
+    fn sort_dedup_truncate(
+        cands: &mut Vec<Candidate>,
+        max_candidates: usize,
+        ctx: TruncationCtx<'_>,
+    ) {
+        cands.sort_by_cached_key(|c| {
+            (
+                Self::truncation_tier(c, ctx),
+                std::cmp::Reverse(c.weight),
+                c.natural_order,
+            )
         });
         // 按 text 去重，并把被丢弃那条所占的码位并进幸存者（`Candidate::merged_codes`）：
         // 否则「检索范围」过滤按 (source, code) 分组时会丢掉「该码位下有常用字」这一事实，
@@ -519,16 +595,20 @@ impl MixedEngine {
             // - `codetable_owns_overflow`：**前 N 码**是精确全码而拼音并不主张这一串
             //   （`yijg`+任意字母）。这条才是定长码表的逃生口，与顶码 ⓪ 共用判据。
             let ct_owns = self.codetable_owns_overflow(input);
+            // 截断档位的判据串必须与紧邻的 `boost_codetable` 逐字同源——两个分支的
+            // 「视作精确全码」口径不同（整串 vs 前 N 码前缀），取错会让档 0/档 2 整体错位。
+            let english_exact = input.to_lowercase();
             let mut merged = if has_full_or_longer || ct_owns {
                 Self::normalize_pinyin(&mut pinyin);
-                let mut ct = if has_full_or_longer {
+                // 与候选一同返回本分支的判据串，就地成对产出，不在别处重算一遍。
+                let (mut ct, ct_exact) = if has_full_or_longer {
                     let mut full = self
                         .primary
                         .convert(input, max_candidates)
                         .unwrap_or_default()
                         .candidates;
                     self.boost_codetable(&mut full, input);
-                    full
+                    (full, input.to_string())
                 } else {
                     // 前 N 码前缀候选：前缀视作精确全码加权（同混合 overflow 分支的口径），
                     // 但 `is_exact_code` 归一到**完整输入** —— 前缀恒短于 input，故一律 false，
@@ -558,14 +638,23 @@ impl MixedEngine {
                         c.consumed_length = prefix.len();
                     }
                     self.boost_codetable(&mut pre, &prefix);
-                    pre
+                    (pre, prefix)
                 };
                 ct.extend(english);
-                Self::merge_sort_dedup(ct, pinyin, max_candidates)
+                let ctx = TruncationCtx {
+                    codetable_exact: &ct_exact,
+                    english_exact: &english_exact,
+                };
+                Self::merge_sort_dedup(ct, pinyin, max_candidates, ctx)
             } else if !english.is_empty() {
                 // 纯拼音 + 英文：拼音归一化降档，英文独立档排前。
                 Self::normalize_pinyin(&mut pinyin);
-                Self::merge_sort_dedup(english, pinyin, max_candidates)
+                // 本分支无码表候选，`codetable_exact` 取什么都不影响档位。
+                let ctx = TruncationCtx {
+                    codetable_exact: input,
+                    english_exact: &english_exact,
+                };
+                Self::merge_sort_dedup(english, pinyin, max_candidates, ctx)
             } else {
                 pinyin
             };
@@ -612,7 +701,13 @@ impl MixedEngine {
             let pinyin_split = Self::pinyin_split_of(&py, input);
             let mut pinyin = py.candidates;
             Self::normalize_pinyin(&mut pinyin);
-            let mut merged = Self::merge_sort_dedup(codetable, pinyin, max_candidates);
+            // 判据串与上面的 `boost_codetable(.., &prefix)` 同源——本分支「视作精确全码」的
+            // 是前 N 码前缀，**不是** `input`（后者是 `is_exact_code` 的口径，两者刻意不同）。
+            let ctx = TruncationCtx {
+                codetable_exact: &prefix,
+                english_exact: &input.to_lowercase(),
+            };
+            let mut merged = Self::merge_sort_dedup(codetable, pinyin, max_candidates, ctx);
             if self.show_source_hint {
                 Self::add_source_hints(&mut merged);
             }
@@ -724,7 +819,12 @@ impl Engine for MixedEngine {
         // 英文候选（enable_english 开时）：独立加权档混入，与码表/拼音一同竞争排序。
         merged.extend(self.english_candidates(input, max_candidates));
         // 排序 → 去重 → 带拼音保底配额截断（与 overflow 路径共用，见 `sort_dedup_truncate`）。
-        Self::sort_dedup_truncate(&mut merged, max_candidates);
+        // 判据串与上面那段内联加成逐字同源：码表看 `code == input`，英文看 `code == 小写 input`。
+        let ctx = TruncationCtx {
+            codetable_exact: input,
+            english_exact: &input.to_lowercase(),
+        };
+        Self::sort_dedup_truncate(&mut merged, max_candidates, ctx);
         if self.show_source_hint {
             Self::add_source_hints(&mut merged);
         }
@@ -1061,6 +1161,15 @@ mod tests {
         }
     }
 
+    /// 测试用截断上下文。两个判据串默认取一个**不会命中任何候选**的串，使全部候选落到
+    /// 非精确档——想测档 0 / 档 2 的分野时显式传入对应的码。
+    fn tctx<'a>(codetable_exact: &'a str, english_exact: &'a str) -> TruncationCtx<'a> {
+        TruncationCtx {
+            codetable_exact,
+            english_exact,
+        }
+    }
+
     /// 取 `(source, text)` 集合——**存活集合**判据的统一写法。
     ///
     /// 用 `{:?}` 而非直接排序 `CandidateSource`：给共享 crate 的枚举加 `Ord` 只为一个测试
@@ -1084,7 +1193,7 @@ mod tests {
             .map(|i| ct_cand(&format!("码{i}"), 9000 - i))
             .collect();
         cands.extend((0..5).map(|i| py_cand(&format!("拼{i}"), 100 - i)));
-        MixedEngine::sort_dedup_truncate(&mut cands, 10);
+        MixedEngine::sort_dedup_truncate(&mut cands, 10, tctx("zzzz", "zzzz"));
 
         let mut expect: Vec<(String, String)> = (0..8)
             .map(|i| ("CodeTable".to_string(), format!("码{i}")))
@@ -1105,7 +1214,7 @@ mod tests {
             py_cand_coded("的", "de", 15_378_475 / PINYIN_TIER_SCALE),
             ct_cand_coded("的", "r", 9950 + 10_000_000),
         ];
-        MixedEngine::sort_dedup_truncate(&mut cands, 10);
+        MixedEngine::sort_dedup_truncate(&mut cands, 10, tctx("r", "zzzz"));
         assert_eq!(cands.len(), 1, "同文只留一条");
         assert_eq!(
             cands[0].source,
@@ -1125,7 +1234,7 @@ mod tests {
             ct_cand_coded("的", "r", 900),
             ct_cand_coded("的", "rqto", 100),
         ];
-        MixedEngine::sort_dedup_truncate(&mut same, 10);
+        MixedEngine::sort_dedup_truncate(&mut same, 10, tctx("r", "zzzz"));
         assert_eq!(same.len(), 1);
         assert_eq!(same[0].merged_codes, vec!["rqto"], "同来源并码位");
 
@@ -1133,7 +1242,7 @@ mod tests {
             ct_cand_coded("的", "r", 900),
             py_cand_coded("的", "de", 100),
         ];
-        MixedEngine::sort_dedup_truncate(&mut cross, 10);
+        MixedEngine::sort_dedup_truncate(&mut cross, 10, tctx("r", "zzzz"));
         assert_eq!(cross.len(), 1);
         assert!(
             cross[0].merged_codes.is_empty(),
@@ -1155,7 +1264,7 @@ mod tests {
             weight: 1 + PHRASE_WEIGHT_BOOST,
             ..ct_cand("短语正文", 0)
         });
-        MixedEngine::sort_dedup_truncate(&mut cands, 5);
+        MixedEngine::sort_dedup_truncate(&mut cands, 5, tctx("zzzz", "zzzz"));
         assert!(
             cands.iter().any(|c| c.is_phrase),
             "短语权重虽为 1，靠 +1M 档位活下来"
@@ -1182,23 +1291,46 @@ mod tests {
         );
     }
 
-    /// **[后续步骤会改]** 现状：全局按 weight 排序，**子引擎给出的组内顺序被抹掉**。
+    /// **[改动后必须仍然通过]** 码表精确/补全的分野由**档位**保证，不再靠权重量级。
     ///
-    /// 这正是要修的东西。码表子引擎的 `cmp_exact_first` 把精确候选排在前，但
-    /// `sort_dedup_truncate` 不看层级、只看 weight——生产路径下加成恰好掩盖了它
-    /// （精确 +1e7 > 补全 +500K），一旦拆掉加成就暴露。
+    /// 档位显式化之后，这条在函数层就成立了——此前只有生产路径成立（靠 +1e7 与 +500K
+    /// 的差），直接调本函数时 weight 说了算。
     #[test]
-    fn within_source_order_currently_follows_weight_not_engine_order() {
-        // 模拟码表子引擎的输出：精确在前（cmp_exact_first），但权重更低。
+    fn exact_beats_completion_at_function_level_not_only_via_boosts() {
+        // 模拟码表子引擎的输出：精确在前（cmp_exact_first），但权重低得多、且**不带加成**。
         let mut cands = vec![
             ct_cand_coded("精确低频", "aa", 1),
             ct_cand_coded("补全", "aab", 9000),
         ];
-        MixedEngine::sort_dedup_truncate(&mut cands, 10);
+        MixedEngine::sort_dedup_truncate(&mut cands, 10, tctx("aa", "zzzz"));
         assert_eq!(
             cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            vec!["补全", "精确低频"],
-            "现状：weight 说了算，子引擎的层级链被抹掉"
+            vec!["精确低频", "补全"],
+            "档 0 恒先于档 2，与权重取值范围无关"
+        );
+    }
+
+    /// **[下一步会改]** 现状：**同档之内**仍按 weight 排，拼音子引擎的匹配层级链被抹掉。
+    ///
+    /// 拼音候选全部落进档 3，档内只比 weight——而拼音引擎自己的排序链是
+    /// `cmp_match_layers().then(weight)`，其中层级键（简拼 / 前缀补全 / 子短语 / 全拼降级）
+    /// 是**布尔的、等价于惩罚 ∞**，weight 表达不了。于是高权重的简拼候选在这里反超低权重
+    /// 的精确候选，而子引擎明明把精确排在了前面。
+    ///
+    /// 下一步改成「档内保持子引擎原序」后本测试应当变红，届时改为断言 `["精确","简拼高频"]`。
+    #[test]
+    fn within_tier_order_currently_follows_weight_not_engine_layers() {
+        let abbrev = Candidate {
+            is_abbrev: true,
+            ..py_cand_coded("简拼高频", "n", 9000)
+        };
+        // 子引擎给出的序：精确在前（cmp_match_layers 首键 is_abbrev 判负）。
+        let mut cands = vec![py_cand_coded("精确", "ni", 1), abbrev];
+        MixedEngine::sort_dedup_truncate(&mut cands, 10, tctx("zzzz", "zzzz"));
+        assert_eq!(
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["简拼高频", "精确"],
+            "现状：档内 weight 说了算，子引擎的层级链被抹掉"
         );
     }
 
