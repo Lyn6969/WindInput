@@ -1036,6 +1036,228 @@ mod tests {
         assert_eq!(py, 2, "convert 必须走带配额的截断");
     }
 
+    // ── 截断的**存活集合**契约（`sort_dedup_truncate`）──
+    //
+    // 本组测试是「拆权重加成、改来源分组配额」（`docs/design/mixed-source-tier-quota.md`）
+    // 的第 1 步：**在改动前锁住现状**。上面那组只断言了各来源的候选**数**，而数相等不等于
+    // 集合相等 —— 置顶（shadow pin）在协调器应用、位于引擎截断之后，被截掉的候选规则读得到
+    // 却没有目标可顶，表现为「置顶了但没反应」且完全静默。故判据须是集合。
+    //
+    // 标注 `[改动后必须仍然通过]` 的，是新方案**必须复现**的性质；
+    // 标注 `[后续步骤会改]` 的，锁的是当前实现的顺序，改完应当变红——那正是要看见的信号。
+
+    /// 带编码的码表候选（去重与并码位测试用）。
+    fn ct_cand_coded(text: &str, code: &str, weight: i32) -> Candidate {
+        Candidate {
+            code: code.into(),
+            ..ct_cand(text, weight)
+        }
+    }
+
+    fn py_cand_coded(text: &str, code: &str, weight: i32) -> Candidate {
+        Candidate {
+            code: code.into(),
+            ..py_cand(text, weight)
+        }
+    }
+
+    /// 取 `(source, text)` 集合——**存活集合**判据的统一写法。
+    ///
+    /// 用 `{:?}` 而非直接排序 `CandidateSource`：给共享 crate 的枚举加 `Ord` 只为一个测试
+    /// 排序不值当，且会凭空造出一个「来源有大小」的语义——本设计恰恰在说来源之间不可比。
+    fn survivor_set(cands: &[Candidate]) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = cands
+            .iter()
+            .map(|c| (format!("{:?}", c.source), c.text.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// **[改动后必须仍然通过]** 存活的是**哪些**候选，不只是几条。
+    ///
+    /// 码表 12 条（权重递减）+ 拼音 5 条，`max=10` ⇒ 拼音保底 2 席、码表 8 席。
+    /// 码表留权重最高的 8 条（码0..码7），拼音从被截掉的尾部按序补 2 条（拼0、拼1）。
+    #[test]
+    fn survivor_set_is_the_contract_not_the_count() {
+        let mut cands: Vec<Candidate> = (0..12)
+            .map(|i| ct_cand(&format!("码{i}"), 9000 - i))
+            .collect();
+        cands.extend((0..5).map(|i| py_cand(&format!("拼{i}"), 100 - i)));
+        MixedEngine::sort_dedup_truncate(&mut cands, 10);
+
+        let mut expect: Vec<(String, String)> = (0..8)
+            .map(|i| ("CodeTable".to_string(), format!("码{i}")))
+            .collect();
+        expect.extend((0..2).map(|i| ("Pinyin".to_string(), format!("拼{i}"))));
+        expect.sort();
+        assert_eq!(survivor_set(&cands), expect);
+    }
+
+    /// **[改动后必须仍然通过]** 同 `text` 跨来源时保留**码表**那条。
+    ///
+    /// 现状靠加成保证（码表精确 +1e7 vs 拼音 ÷100，排序后码表在前，去重保留第一条）。
+    /// 拆掉加成后这个隐含保证消失，必须显式定义跨来源保留优先级——本测试就是那条定义。
+    /// 用拼音「的」（真实词频 15,378,475，全表最高之一）作对手：没有档位它会碾压码表。
+    #[test]
+    fn same_text_across_sources_keeps_codetable() {
+        let mut cands = vec![
+            py_cand_coded("的", "de", 15_378_475 / PINYIN_TIER_SCALE),
+            ct_cand_coded("的", "r", 9950 + 10_000_000),
+        ];
+        MixedEngine::sort_dedup_truncate(&mut cands, 10);
+        assert_eq!(cands.len(), 1, "同文只留一条");
+        assert_eq!(
+            cands[0].source,
+            CandidateSource::CodeTable,
+            "跨来源同文须保留码表那条"
+        );
+        assert_eq!(cands[0].code, "r");
+    }
+
+    /// **[改动后必须仍然通过]** 同来源同文并码位；跨来源**不并**（两套编码不同域）。
+    ///
+    /// 反向锁的理由见 `Candidate::absorb_codes_from`：跨来源并入会给码表凭空造出
+    /// 「拼音码位有常用字」的假事实，反过来误滤同码的码表生僻字。
+    #[test]
+    fn dedup_merges_codes_within_source_only() {
+        let mut same = vec![
+            ct_cand_coded("的", "r", 900),
+            ct_cand_coded("的", "rqto", 100),
+        ];
+        MixedEngine::sort_dedup_truncate(&mut same, 10);
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].merged_codes, vec!["rqto"], "同来源并码位");
+
+        let mut cross = vec![
+            ct_cand_coded("的", "r", 900),
+            py_cand_coded("的", "de", 100),
+        ];
+        MixedEngine::sort_dedup_truncate(&mut cross, 10);
+        assert_eq!(cross.len(), 1);
+        assert!(
+            cross[0].merged_codes.is_empty(),
+            "跨来源不并码位——并了会造出假的同码关系"
+        );
+    }
+
+    /// **[改动后必须仍然通过]** 短语必须活过码表洪水。
+    ///
+    /// 现状靠 `PHRASE_WEIGHT_BOOST`(+1M) 压过码表前缀补全的 +500K。短语量本来就极少，
+    /// 被高冲突码挤掉是纯粹的功能缺失。
+    #[test]
+    fn phrase_survives_codetable_flood() {
+        let mut cands: Vec<Candidate> = (0..20)
+            .map(|i| ct_cand(&format!("码{i}"), 1000 + PARTIAL_MATCH_BOOST - i))
+            .collect();
+        cands.push(Candidate {
+            is_phrase: true,
+            weight: 1 + PHRASE_WEIGHT_BOOST,
+            ..ct_cand("短语正文", 0)
+        });
+        MixedEngine::sort_dedup_truncate(&mut cands, 5);
+        assert!(
+            cands.iter().any(|c| c.is_phrase),
+            "短语权重虽为 1，靠 +1M 档位活下来"
+        );
+    }
+
+    /// **[改动后必须仍然通过]** 码表精确全码不被高频前缀补全挤掉（生产路径 `convert`）。
+    ///
+    /// 这是加成在承担的**真正职责**：精确 `code == input` 权重可能远低于某条前缀补全，
+    /// 靠 +1e7 vs +500K 的档差活下来并排在前。新方案必须复现。
+    #[test]
+    fn exact_code_outranks_high_weight_prefix_completion() {
+        let mut entries: Vec<(String, String, i32)> = vec![("aa".into(), "精确低频".into(), 1)];
+        entries.extend((0..8).map(|i| (format!("aab{i}"), format!("补全{i}"), 9000 - i)));
+        let refs: Vec<(&str, &str, i32)> = entries
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = MixedEngine::new(ct_engine(&refs, false), None, None, MixConfig::default());
+        let r = e.convert("aa", 3).unwrap();
+        assert_eq!(
+            r.candidates[0].text, "精确低频",
+            "精确全码权重仅 1，仍须压过权重 9000 的前缀补全"
+        );
+    }
+
+    /// **[后续步骤会改]** 现状：全局按 weight 排序，**子引擎给出的组内顺序被抹掉**。
+    ///
+    /// 这正是要修的东西。码表子引擎的 `cmp_exact_first` 把精确候选排在前，但
+    /// `sort_dedup_truncate` 不看层级、只看 weight——生产路径下加成恰好掩盖了它
+    /// （精确 +1e7 > 补全 +500K），一旦拆掉加成就暴露。
+    #[test]
+    fn within_source_order_currently_follows_weight_not_engine_order() {
+        // 模拟码表子引擎的输出：精确在前（cmp_exact_first），但权重更低。
+        let mut cands = vec![
+            ct_cand_coded("精确低频", "aa", 1),
+            ct_cand_coded("补全", "aab", 9000),
+        ];
+        MixedEngine::sort_dedup_truncate(&mut cands, 10);
+        assert_eq!(
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["补全", "精确低频"],
+            "现状：weight 说了算，子引擎的层级链被抹掉"
+        );
+    }
+
+    /// ⚠️ **[锁住现状]** 英文**没有任何保底席位**——精确与前缀都靠真实词频硬拼。
+    ///
+    /// `ENGLISH_EXACT_BOOST` 与 `PARTIAL_MATCH_BOOST` **数值相等（都是 500,000）**，
+    /// 于是「英文精确词」与「码表前缀补全」落在**同一档**，胜负完全由真实词频决定；
+    /// 而 `ENGLISH_PREFIX_BOOST` 是 **0**，英文前缀连那一档都进不去。
+    ///
+    /// 拼音有 `max/PINYIN_QUOTA_DIVISOR` 保底，**英文一点没有**。
+    #[test]
+    fn english_has_no_quota_and_competes_on_raw_weight() {
+        // 码表 20 条前缀补全（+500K，词频 9000 递减）。
+        let entries: Vec<(String, String, i32)> = (0..20)
+            .map(|i| (format!("hel{i}"), format!("码{i}"), 9000 - i))
+            .collect();
+        let refs: Vec<(&str, &str, i32)> = entries
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let build = |english: Box<dyn Engine>| {
+            MixedEngine::new(
+                ct_engine(&refs, false),
+                None,
+                Some(english),
+                MixConfig {
+                    auto_commit_block_on_pinyin: false,
+                    ..Default::default()
+                },
+            )
+        };
+        let has_english = |r: &ConvertResult| {
+            r.candidates
+                .iter()
+                .any(|c| c.source == CandidateSource::English)
+        };
+
+        // ① 英文精确、词频低于码表 ⇒ 同档拼词频，**输**。
+        let low = build(english_engine(&[("hel", "hel", 1)]));
+        assert!(
+            !has_english(&low.convert("hel", 5).unwrap()),
+            "英文精确 +500K 只是与码表前缀补全同档，词频 1 拼不过 9000"
+        );
+
+        // ② 英文精确、词频高于码表 ⇒ 同档拼词频，**赢**。反向对照，证明 ① 输在词频而非档位。
+        let high = build(english_engine(&[("hel", "hel", 9999)]));
+        assert!(
+            has_english(&high.convert("hel", 5).unwrap()),
+            "同档下词频更高就该赢——否则 ① 的失败另有原因"
+        );
+
+        // ③ 英文**前缀**（`ENGLISH_PREFIX_BOOST` = 0）⇒ 词频再高也进不了那一档。
+        let prefix = build(english_engine(&[("hello", "hello", 9999)]));
+        assert!(
+            !has_english(&prefix.convert("hel", 5).unwrap()),
+            "英文前缀无加成，词频 9999 仍被 +500K 的码表整片压掉"
+        );
+    }
+
     /// 产出多条 `source=Pinyin` 候选的假拼音引擎（`FakePinyin` 只给一条，测不了配额）。
     struct FakePinyinMulti {
         n: usize,
