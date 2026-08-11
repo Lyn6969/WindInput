@@ -419,7 +419,7 @@ function Get-ProfileFor ([string]$cmd) { if ($cmd -match '^d') { "dev" } else { 
 #
 # ⚠️ wind-setting 必须连 wind-ui-rust 一起同步: 它是 **path 依赖**
 # (windui = { path = "../wind-ui-rust" }), 仓不在就直接 "系统找不到指定的路径 (os error 3)"。
-# wind-portable / wind-installer 用的是 crates.io 版本 (0.9 / 0.8), 不需要本地仓。
+# wind-portable / wind-installer 用的是 crates.io 版本 (均 0.11), 不需要本地仓。
 function Get-NeededSiblings ([string]$cmd) {
     if (-not $WIND_REMOTE_SIBLINGS) { return @() }
     $need = switch -Regex ($cmd) {
