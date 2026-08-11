@@ -495,8 +495,9 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 /// 0  码表精确全码（code == input）
 /// 1  精确码短语（is_phrase && is_exact_code）
 /// 2  拼音精确档（is_pinyin_exact_tier：精确音节 + 常用字）  ← 先于码表前缀补全
-/// 3  码表前缀补全 + 前缀短语 + 其余来源
-/// 4  拼音其余（前缀补全/子短语/简拼/模糊/生僻） + 英文
+/// 3  码表前缀补全
+/// 4  前缀短语 + 其余来源
+/// 5  拼音其余（前缀补全/子短语/简拼/模糊/生僻） + 英文
 /// ```
 ///
 /// 五笔优先的硬约束：码表精确全码恒在拼音之上，词频重排只在同档内调整。
@@ -510,11 +511,10 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 ///
 /// 本函数原名 `freq_rerank::freq_tier`，是「跨来源档位」这个语义的**第二份**实现——
 /// 协调器 `candidate_display_order` 的 `cmp_exact_first` + `cmp_pinyin_exact_first`
-/// 是第一份，混输引擎的权重加成（`PHRASE_WEIGHT_BOOST` 等）是第三份。三份必须人工保持
-/// 一致（`docs/architecture/candidate-sorting-rules.md` 红线③），而实际上**已经不一致**：
-/// 混输加成给短语一律 `+1_000_000` 不分精确/前缀，本函数却把前缀短语降到档 3。
-///
-/// 搬到这里是收敛的第一步：让判据只有一个定义，调用方各自决定**在哪一级用它**。
+/// 是第一份，混输引擎的权重加成是第三份。搬到这里是收敛的第一步：让判据只有一个定义，
+/// 调用方各自决定**在哪一级用它**。第三份（混输加成）已随
+/// `docs/design/mixed-source-tier-quota.md` 拆除，引擎侧改用自己的**截断**档位
+/// （`MixedEngine::truncation_tier`，只管「谁活下来」，与本函数的「谁排前面」职责不重叠）。
 ///
 /// ⚠ `c.code == input` 与 [`Candidate::is_exact_code`]（见 [`cmp_exact_first`]）是同一概念的
 /// 两份判据，纯码表路径结论一致。未合并是因为本档位还承载来源语义（`is_phrase` 独占档 1、
@@ -527,17 +527,24 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 /// 于是在引擎里调用本函数，拼音精确候选会静默落到档 4 —— **不报错、不 panic，只是档位悄悄错**。
 ///
 /// 这条约束的后果：混输引擎内部的排序（`sort_dedup_truncate`，决定**截断时谁进得来**）
-/// 无法直接改用本函数，它现在靠权重加成（`PHRASE_WEIGHT_BOOST` / `PARTIAL_MATCH_BOOST` /
-/// `PINYIN_TIER_SCALE`）表达同一套档位。要把那批加成也收敛掉，得先解决「引擎侧拿不到
-/// `is_common`」——那是改截断策略的活，不是删几个常数。
+/// 不能改用本函数。它现在有自己的 `MixedEngine::truncation_tier`——**刻意是另一套**，
+/// 因为两者回答的不是同一个问题：本函数管「谁排前面」（含 `is_common` 这种展示层概念），
+/// 引擎那套管「谁活下来」（只需来源与精确性，不需要 `is_common`）。职责不重叠，
+/// 故不构成红线③所说的并行实现。
 pub fn source_tier(c: &Candidate, input: &str) -> u8 {
     use CandidateSource::*;
     if c.is_phrase {
         // 短语按「完全匹配 vs 前缀匹配」再分档，勿因 is_phrase 一刀切抬到码表前缀补全之上：
         // - 精确码短语（`lookup`，码==输入的完全匹配 → `is_exact_code=true`）留档 1、紧随码表精确；
-        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）降到档 3，与码表前缀补全同档。
+        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）降到码表前缀补全**之后**。
         //   否则混输/拼音下打 `da` 会让 `date` 短语只因 is_phrase 就压过码表前缀补全（如 矼）。
-        return if c.is_exact_code { 1 } else { 3 };
+        //
+        // ⚠️ 前缀短语此前与码表前缀补全**同档**（都是 3），靠 weight 分先后。那从来不是一次
+        // 真正的比较：混输引擎给码表前缀补全 `+PARTIAL_MATCH_BOOST`(500K)，而前缀短语拿的是
+        // 原始权重（`PHRASE_WEIGHT_BASE`=40M 只加给精确码短语），于是码表恒赢。加成拆除后
+        // 两者变成「码表词频 vs 用户设定的短语权重」——两个不同量纲的数硬比，正是本档位
+        // 要消灭的那种比较。故就地拆成两档，把既有次序写成规则。
+        return if c.is_exact_code { 1 } else { 4 };
     }
     if is_pinyin_exact_tier(c, input.len()) {
         return 2;
@@ -545,9 +552,9 @@ pub fn source_tier(c: &Candidate, input: &str) -> u8 {
     match c.source {
         CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
         CodeTable => 3,                    // 码表前缀补全
-        Pinyin => 4,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
-        English => 4,
-        _ => 3,
+        Pinyin => 5,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
+        English => 5,
+        _ => 4,
     }
 }
 

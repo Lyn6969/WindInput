@@ -3464,7 +3464,7 @@ mod finalize_candidates_tests {
         let ct_exact = Candidate {
             text: "弱".into(),
             code: "xu".into(),
-            weight: 10_009_950, // 9950 + codetable_weight_boost(1e7)
+            weight: 9950, // 真实词频（混输引擎已不再加成，见 truncation_tier）
             is_common: true,
             is_exact_code: true,
             source: CandidateSource::CodeTable,
@@ -3481,7 +3481,7 @@ mod finalize_candidates_tests {
         let ct_prefix = Candidate {
             text: "弹幕".into(),
             code: "xuaj".into(),
-            weight: 501_554, // 1554 + PARTIAL_MATCH_BOOST(500K)
+            weight: 1554, // 真实词频（混输引擎已不再加成，见 truncation_tier）
             is_common: true,
             source: CandidateSource::CodeTable,
             ..Default::default()
@@ -3514,7 +3514,34 @@ mod finalize_candidates_tests {
         cands.sort_by(|a, b| candidate_display_order(a, b, false, false, XU_LEN));
         assert_eq!(
             cands[0].text, "弹幕",
-            "非混输时应回落到纯权重序（501554 > 69），拼音精确档不得生效"
+            "非混输时应回落到纯权重序（1554 > 69），拼音精确档不得生效"
+        );
+    }
+
+    /// ★ **前缀短语排在码表前缀补全之后**，且不再依赖权重量级。
+    ///
+    /// 这条次序一直存在，但从前是**加成的副产品**：混输引擎给码表前缀补全 +500K，而前缀短语
+    /// 拿原始权重（`PHRASE_WEIGHT_BASE` 只加给精确码短语），于是码表恒赢，`source_tier` 里
+    /// 二者「同档比 weight」那一步从来没有真正裁决过。加成拆掉后它才第一次生效——而那是
+    /// 「码表词频 vs 用户设定的短语权重」，两个不同量纲的数硬比。故拆成两档写死。
+    ///
+    /// 用**短语权重高于码表**的取值，确保测的是档位而非权重。
+    #[test]
+    fn mixed_prefix_phrase_sits_below_codetable_prefix() {
+        let (_, _, ct_prefix) = xu_scene();
+        let prefix_phrase = Candidate {
+            text: "短语正文".into(),
+            weight: 99_999, // 远高于码表的 1554
+            is_phrase: true,
+            is_exact_code: false, // lookup_prefix 命中
+            source: CandidateSource::Phrase,
+            ..Default::default()
+        };
+        let mut cands = vec![prefix_phrase, ct_prefix];
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
+        assert_eq!(
+            cands[0].text, "弹幕",
+            "码表前缀补全须先于前缀短语，且与两者的权重取值无关"
         );
     }
 

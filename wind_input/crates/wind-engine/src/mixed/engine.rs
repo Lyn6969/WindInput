@@ -12,17 +12,6 @@
 use crate::engine::{ConvertResult, Engine, EngineType};
 use wind_candidate::{Candidate, CandidateSource};
 
-/// 短语候选提权（高于拼音、低于码表词）
-const PHRASE_WEIGHT_BOOST: i32 = 1_000_000;
-/// 码表前缀补全（拆分组合）提权
-const PARTIAL_MATCH_BOOST: i32 = 500_000;
-/// 拼音候选归一化系数（÷ 后落入低档）
-const PINYIN_TIER_SCALE: i32 = 100;
-/// 英文精确匹配（整词 code==input）提权：完整英文词可靠前，但低于码表精确/短语档。
-const ENGLISH_EXACT_BOOST: i32 = 500_000;
-/// 英文前缀补全提权：不额外提权（保留词库原始权重），使前缀英文沉在码表/拼音候选之后，
-/// 避免短前缀（如「d」）刷屏。真机若仍偏高可继续下调。
-const ENGLISH_PREFIX_BOOST: i32 = 0;
 /// 拼音候选的**保底配额分母**：截断时至少给拼音留 `max_candidates / 此值` 席
 /// （生产 `max_candidates=300` ⇒ 60 席）。见 [`MixedEngine::truncate_with_pinyin_quota`]。
 const PINYIN_QUOTA_DIVISOR: usize = 5;
@@ -41,18 +30,24 @@ struct TruncationCtx<'a> {
 impl MixedEngine {
     /// **截断优先级档**——引擎侧「谁活得下来」的唯一真相源，值越小越先活。
     ///
-    /// ## 这不是新增的一套排序，是把已有的那套写出来
+    /// | 档 | 对象 |
+    /// |---|---|
+    /// | 0 | 码表精确全码（`code == codetable_exact`） |
+    /// | 1 | 短语 —— **本引擎恒不可达，见下** |
+    /// | 2 | 码表前缀补全、英文精确 |
+    /// | 3 | 拼音、英文前缀 |
     ///
-    /// 六个加成常数一直在表达一套档位，只不过表达方式是**数值大小**：把候选权重加上
-    /// 一个足够大的常数，再全局按 weight 排序，档位就"自然"浮现了。本函数只是把同一套
-    /// 档位显式写成代码，与加成一一对应：
+    /// ## 这套档位从前写在权重里
     ///
-    /// | 档 | 对象 | 现由哪个加成表达 |
-    /// |---|---|---|
-    /// | 0 | 码表精确全码（`code == codetable_exact`） | `+codetable_weight_boost`（1e7） |
-    /// | 1 | 短语 —— **本引擎恒不可达，见下** | `+PHRASE_WEIGHT_BOOST`（1M） |
-    /// | 2 | 码表前缀补全 **与** 英文精确 | 都是 **+500,000** —— 见下 |
-    /// | 3 | 拼音、英文前缀 | `÷PINYIN_TIER_SCALE` / `+0` |
+    /// 六个加成常数（`+1e7` / `+1M` / `+500K` ×2 / `÷100` / `+0`）一直在表达同一套档位，
+    /// 表达方式是**数值大小**：给候选权重加一个足够大的常数，再全局按 weight 排序，档位
+    /// 就"自然"浮现。那套写法有三个代价，正是拆掉它的理由：
+    ///
+    /// 1. **真实词频与类别偏置挤在同一个 `i32` 里**，量程被吃掉（拼音 p50=34 被 `÷100`
+    ///    整除归零）；
+    /// 2. **档序依赖权重取值范围**——档 0 与档 1 之间隔着 9e6，一条权重超过 9e6 的短语就能
+    ///    反超码表精确全码。真实词频到不了那个量级，但那是**数据的性质，不是代码的保证**；
+    /// 3. 偏置随 `weight` 一路**泄漏到协调器**，把引擎的截断策略混进了显示序。
     ///
     /// ## ⚠️ 档 1（短语）在本引擎恒不可达
     ///
@@ -60,29 +55,19 @@ impl MixedEngine {
     /// 全是测试 fixture，且 `apply_freq_rerank` 定义并调用于**协调器**）。短语是协调器合并进
     /// 候选列表的（`handle_candidate.rs`），发生在引擎返回**之后**，而本函数只看得见
     /// `primary.convert()`（码表引擎从不置位）、拼音、英文三路。
-    /// ⇒ [`PHRASE_WEIGHT_BOOST`] 的那个分支从未执行过。
     ///
-    /// 本档保留而非就地删除，是为了让这一步严格等价于加成（加成里也有这个死分支）。
+    /// 保留本档是因为它零成本且语义正确：真有短语流到这里时它该排在码表前缀补全之前。
     ///
-    /// ## ⚠️ 档 2 混着两个来源，是常数碰撞不是设计
+    /// ## ⚠️ 档 2 混着两个来源，是历史包袱
     ///
-    /// [`PARTIAL_MATCH_BOOST`] 与 [`ENGLISH_EXACT_BOOST`] 数值**恰好相等**（都是 500,000），
-    /// 于是「英文精确词」与「码表前缀补全」落进同一档、胜负纯由真实词频决定——而两者的
-    /// 词频根本不同量纲。没有任何文档说过英文精确应当与码表前缀补全平起平坐。
-    ///
-    /// 本函数**如实复刻，不做改善**：改它属于行为变更，与「等价重构」不可混做一步。
-    /// 拆掉加成后英文该拿几席，见 `docs/design/mixed-source-tier-quota.md` §3.3。
-    ///
-    /// ## ⚠️ 一处刻意的收紧
-    ///
-    /// 加成表达的档位是"**只要基础权重不越界**就成立"——档 0 与档 1 之间隔着 9e6，一条
-    /// 权重超过 9e6 的短语就能反超码表精确全码。真实词频到不了那个量级，但那是**数据的
-    /// 性质，不是代码的保证**。改成显式档位后档序**恒定**，不再依赖权重取值范围。
-    ///
-    /// 这是刻意的：一条短语靠调频涨到 9e6 就翻越档位，不是设计，是同一类账没算清。
+    /// 「英文精确」与「码表前缀补全」同档，源于旧加成里 `PARTIAL_MATCH_BOOST` 与
+    /// `ENGLISH_EXACT_BOOST` **数值恰好相等**（都是 500,000）——常数碰撞，不是设计。
+    /// 本步维持同档，但档内不再比权重（见 [`MixedEngine::sort_dedup_truncate`]），于是英文
+    /// 精确落在码表前缀补全**之后**（按合并顺序）。英文该不该有保底席位，见
+    /// `docs/design/mixed-source-tier-quota.md` §3.3。
     fn truncation_tier(c: &Candidate, ctx: TruncationCtx<'_>) -> u8 {
         match c.source {
-            // 短语档先判：短语走码表来源，但加成分支里 `is_phrase` 也排在 `code == input` 之前。
+            // 短语先判：短语也走码表来源，但优先于「码是否等于输入」。
             CandidateSource::CodeTable if c.is_phrase => 1,
             CandidateSource::CodeTable if c.code == ctx.codetable_exact => 0,
             CandidateSource::CodeTable => 2,
@@ -97,6 +82,12 @@ impl MixedEngine {
 #[derive(Debug, Clone)]
 pub struct MixConfig {
     pub min_pinyin_length: usize,
+    /// ⚠️ **已失效，待下线**：码表精确匹配的提权基线。加成拆除后本引擎不再读它——
+    /// 精确/前缀补全的分野改由 [`MixedEngine::truncation_tier`] 表达。
+    ///
+    /// 全仓六个方案文件写的都是 `10000000`，即它自己的默认值，从来没有人用过非默认值。
+    /// 保留字段只为让本步不牵动跨仓（`schema.rs` / 方案 toml / 工具站 / 文档站共十一处），
+    /// 清理计划见 `docs/design/mixed-source-tier-quota.md` §5.2。
     pub codetable_weight_boost: i32,
     pub auto_commit_block_on_pinyin: bool,
     pub pinyin_only_overflow: bool,
@@ -137,8 +128,6 @@ pub struct MixedEngine {
     secondary: Option<Box<dyn Engine>>,
     /// 拼音生效的最小输入长度
     min_pinyin_length: usize,
-    /// 码表精确匹配提权
-    codetable_weight_boost: i32,
     /// 全码自动上屏 / 顶码上屏 / **满码空码清空**时，若存在拼音候选则否决（保护拼音用户，
     /// 对齐 Go AutoCommitBlockOnPinyin）。**默认开**（三处同源：`MixConfig::default()` /
     /// `MixGlobal::default()` / `data/config.toml`）。粗粒度：整串只要查得出拼音候选就让路，
@@ -190,7 +179,6 @@ impl MixedEngine {
             primary,
             secondary,
             min_pinyin_length: cfg.min_pinyin_length,
-            codetable_weight_boost: cfg.codetable_weight_boost,
             auto_commit_block_on_pinyin: cfg.auto_commit_block_on_pinyin,
             pinyin_only_overflow: cfg.pinyin_only_overflow,
             top_code_override_pinyin: cfg.top_code_override_pinyin,
@@ -377,30 +365,6 @@ impl MixedEngine {
         })
     }
 
-    /// 码表候选按混输策略提权（短语独立档 +1M / 精确 +boost / 前缀补全 +500K）。
-    /// `exact_input` 为「视作精确全码」的判据串（正常路径=input，overflow 混合路径=前 N 码前缀）。
-    fn boost_codetable(&self, candidates: &mut [Candidate], exact_input: &str) {
-        for c in candidates.iter_mut() {
-            if c.is_phrase {
-                c.weight = c.weight.saturating_add(PHRASE_WEIGHT_BOOST);
-            } else if c.code == exact_input {
-                c.weight = c.weight.saturating_add(self.codetable_weight_boost);
-            } else {
-                c.weight = c.weight.saturating_add(PARTIAL_MATCH_BOOST);
-            }
-        }
-    }
-
-    /// 拼音候选归一化降档（÷ PINYIN_TIER_SCALE，与码表/短语档严格隔离）。
-    fn normalize_pinyin(candidates: &mut [Candidate]) {
-        for c in candidates.iter_mut() {
-            c.weight /= PINYIN_TIER_SCALE;
-            if c.weight < 0 {
-                c.weight = 0;
-            }
-        }
-    }
-
     /// 合并（码表在前、拼音在后）→ 按档位稳定排序 → 按文本去重 → 带拼音保底配额截断。
     fn merge_sort_dedup(
         mut codetable: Vec<Candidate>,
@@ -416,20 +380,34 @@ impl MixedEngine {
     /// 按**截断优先级档**稳定排序 → 按文本去重 → 带拼音保底配额截断
     /// （`convert` 主路径与 overflow 共用）。
     ///
-    /// 排序键 `(档, weight 降, natural_order)`。此前写作「`weight` 降序」——而 `weight` 里
-    /// 混着六个加成常数，档位是靠**加成的数值大小**隐式表达的。见 [`TruncationCtx`]。
+    /// ## 排序键只有「档」一个，这是刻意的
+    ///
+    /// `sort_by_key` 是**稳定排序**，同档候选保持原有相对次序。而候选是按
+    /// `码表 → 拼音 → 英文` 拼接的，**每一段内部已经是子引擎排好的序**
+    /// （码表 `cmp_exact_first().then(base_cmp)`，拼音
+    /// `cmp_match_layers().then(weight).then(natural_order)`）。
+    /// ⇒ 只按档位稳定排序 = 档位分组 + **组内保持子引擎原序**，无须额外记录任何索引。
+    ///
+    /// ## ⚠️ 档内绝不可再按 weight 重排
+    ///
+    /// 曾经的写法是全局按（带加成的）weight 排序，那会把子引擎的排序链整个抹掉。代价
+    /// 具体是：拼音的 `cmp_match_layers` 里，层级键（简拼 / 前缀补全 / 子短语 / 全拼降级）
+    /// 是**布尔的、等价于惩罚 ∞**，weight 表达不了——于是一条高词频简拼候选会在这里
+    /// 反超低词频的精确候选，而子引擎明明把精确排在了前面。
+    ///
+    /// 同一条教训另有两处记载：`candidate-sorting-rules.md` 红线，以及协调器
+    /// `candidate_display_order` 的「层级键必须原样复用 `cmp_match_layers`，不要另写一份」。
+    ///
+    /// ## 与协调器的分工
+    ///
+    /// 本函数只决定**谁活下来**。最终显示序由协调器 `candidate_display_order` 无条件重排
+    /// 全部候选决定（`candidate-sorting-rules.md` §6），故这里的组间次序不影响用户所见。
     fn sort_dedup_truncate(
         cands: &mut Vec<Candidate>,
         max_candidates: usize,
         ctx: TruncationCtx<'_>,
     ) {
-        cands.sort_by_cached_key(|c| {
-            (
-                Self::truncation_tier(c, ctx),
-                std::cmp::Reverse(c.weight),
-                c.natural_order,
-            )
-        });
+        cands.sort_by_key(|c| Self::truncation_tier(c, ctx));
         // 按 text 去重，并把被丢弃那条所占的码位并进幸存者（`Candidate::merged_codes`）：
         // 否则「检索范围」过滤按 (source, code) 分组时会丢掉「该码位下有常用字」这一事实，
         // 同一个字打前缀出、打全码反而不出。跨来源（码表 vs 拼音）由 `absorb_codes_from`
@@ -450,8 +428,8 @@ impl MixedEngine {
 
     /// 截断到 `max_candidates`，但**保证拼音候选至少留 `max/PINYIN_QUOTA_DIVISOR` 席**。
     ///
-    /// **为什么需要**：码表候选带 `PARTIAL_MATCH_BOOST`(500K)、拼音 `÷100`，于是截断时码表恒
-    /// 排在前。而五笔 2 码前缀的候选量常常超过整个配额——实测 **52 个 2 码前缀条目数 > 300**
+    /// **为什么需要**：码表候选落在档 0/档 2、拼音在档 3，于是截断时码表恒排在前。
+    /// 而五笔 2 码前缀的候选量常常超过整个配额——实测 **52 个 2 码前缀条目数 > 300**
     /// （最多 `kh` 663 条），其中 `pu`（495 条）正是「既是五笔 2 码、又是完整拼音音节」的交集。
     /// 那种输入下拼音候选**一条都进不了列表**，下游协调器的拼音精确档
     /// （`cmp_pinyin_exact_first`）就无从下手——提档提不了不在场的候选。
@@ -540,9 +518,12 @@ impl MixedEngine {
         }
     }
 
-    /// 英文候选（enable_english 开时）：查英文词库，按精确(整词)/前缀独立加权，供混入合并。
-    /// 英文档独立于拼音（不被 ÷100 降档）：精确 +ENGLISH_EXACT_BOOST(500K)、前缀 +0（保留原始权重）。
+    /// 英文候选（enable_english 开时）：查英文词库，供混入合并。
+    ///
     /// `english` 为 None（关闭）时返回空。输入小写化以匹配英文词库（code 列已小写化）。
+    ///
+    /// 精确/前缀的分野现由 [`MixedEngine::truncation_tier`] 表达（档 2 / 档 3），不再改 weight
+    /// ——`weight` 从此只承载真实词频。
     fn english_candidates(&self, input: &str, max_candidates: usize) -> Vec<Candidate> {
         let Some(eng) = &self.english else {
             return Vec::new();
@@ -555,16 +536,7 @@ impl MixedEngine {
         let Ok(r) = eng.convert(&lower, max_candidates) else {
             return Vec::new();
         };
-        let mut out = r.candidates;
-        for c in &mut out {
-            let boost = if c.code == lower {
-                ENGLISH_EXACT_BOOST
-            } else {
-                ENGLISH_PREFIX_BOOST
-            };
-            c.weight = c.weight.saturating_add(boost);
-        }
-        out
+        r.candidates
     }
 
     /// 超长输入（input_len > max_code_len）分支：按 pinyin_only_overflow 分流。
@@ -585,11 +557,11 @@ impl MixedEngine {
             let py = sec.convert(input, max_candidates).unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let pinyin_split = Self::pinyin_split_of(&py, input);
-            let mut pinyin = py.candidates;
-            // 英文候选（enable_english 开时）：独立加权档，与拼音/码表统一混入（对齐 Go 各路径处理英文）。
+            let pinyin = py.candidates;
+            // 英文候选（enable_english 开时）：与拼音/码表统一混入（对齐 Go 各路径处理英文）。
             let english = self.english_candidates(input, max_candidates);
-            // 码表回捞（两条互补的口子，任一成立即把码表候选并回来，拼音同时归一化降档避免
-            // 档位重叠）：
+            // 码表回捞（两条互补的口子，任一成立即把码表候选并回来；档位隔离由
+            // `truncation_tier` 负责，不再靠给拼音 ÷100 来避免档位重叠）：
             // - 长码特例 `has_full_or_longer`：**整串**在码表有精确匹配/更长后继。只有码长可变
             //   的码表够得着——五笔这类定长码表恒假（4 码封顶，不存在 5 码词条）。
             // - `codetable_owns_overflow`：**前 N 码**是精确全码而拼音并不主张这一串
@@ -599,15 +571,13 @@ impl MixedEngine {
             // 「视作精确全码」口径不同（整串 vs 前 N 码前缀），取错会让档 0/档 2 整体错位。
             let english_exact = input.to_lowercase();
             let mut merged = if has_full_or_longer || ct_owns {
-                Self::normalize_pinyin(&mut pinyin);
                 // 与候选一同返回本分支的判据串，就地成对产出，不在别处重算一遍。
                 let (mut ct, ct_exact) = if has_full_or_longer {
-                    let mut full = self
+                    let full = self
                         .primary
                         .convert(input, max_candidates)
                         .unwrap_or_default()
                         .candidates;
-                    self.boost_codetable(&mut full, input);
                     (full, input.to_string())
                 } else {
                     // 前 N 码前缀候选：前缀视作精确全码加权（同混合 overflow 分支的口径），
@@ -637,7 +607,6 @@ impl MixedEngine {
                         // `is_char_boundary`），而输入缓冲在此恒为 ASCII 码字符，与字符数相等。
                         c.consumed_length = prefix.len();
                     }
-                    self.boost_codetable(&mut pre, &prefix);
                     (pre, prefix)
                 };
                 ct.extend(english);
@@ -647,8 +616,7 @@ impl MixedEngine {
                 };
                 Self::merge_sort_dedup(ct, pinyin, max_candidates, ctx)
             } else if !english.is_empty() {
-                // 纯拼音 + 英文：拼音归一化降档，英文独立档排前。
-                Self::normalize_pinyin(&mut pinyin);
+                // 纯拼音 + 英文：英文精确进档 2、其余与拼音同档 3。
                 // 本分支无码表候选，`codetable_exact` 取什么都不影响档位。
                 let ctx = TruncationCtx {
                     codetable_exact: input,
@@ -693,16 +661,14 @@ impl MixedEngine {
             for c in &mut codetable {
                 c.is_exact_code = c.code == input;
             }
-            self.boost_codetable(&mut codetable, &prefix);
-            // 英文候选（enable_english 开时）：独立加权档并入码表位，与拼音一同竞争。
+            // 英文候选（enable_english 开时）：并入码表位，与拼音一同竞争。
             codetable.extend(self.english_candidates(input, max_candidates));
             let py = sec.convert(input, max_candidates).unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let pinyin_split = Self::pinyin_split_of(&py, input);
-            let mut pinyin = py.candidates;
-            Self::normalize_pinyin(&mut pinyin);
-            // 判据串与上面的 `boost_codetable(.., &prefix)` 同源——本分支「视作精确全码」的
-            // 是前 N 码前缀，**不是** `input`（后者是 `is_exact_code` 的口径，两者刻意不同）。
+            let pinyin = py.candidates;
+            // 本分支「视作精确全码」的是**前 N 码前缀**，不是 `input`（后者是 `is_exact_code`
+            // 的口径，两者刻意不同，见上面那处 `is_exact_code` 归一的说明）。
             let ctx = TruncationCtx {
                 codetable_exact: &prefix,
                 english_exact: &input.to_lowercase(),
@@ -778,18 +744,12 @@ impl Engine for MixedEngine {
         // 那时才由协调器采纳。此处若就地并入 `codetable` 会重蹈引擎自行判空的覆辙——拼音候选
         // 尚未合入，这一层的「空」同样不是最终的空。见 `ConvertResult::completion_hints`。
         let ct_completion_hints = ct.completion_hints;
-        let mut codetable: Vec<Candidate> = ct.candidates;
-        for c in &mut codetable {
-            if c.is_phrase {
-                c.weight = c.weight.saturating_add(PHRASE_WEIGHT_BOOST);
-            } else if c.code == input {
-                c.weight = c.weight.saturating_add(self.codetable_weight_boost);
-            } else {
-                c.weight = c.weight.saturating_add(PARTIAL_MATCH_BOOST);
-            }
-        }
+        // ⚠️ 码表候选**不再改 weight**：精确/前缀补全的分野由 `truncation_tier` 表达。
+        // 从前这里给精确 +1e7、前缀补全 +500K，于是类别偏置与真实词频挤在同一个 i32 里，
+        // 还随候选一路泄漏到协调器，把引擎的截断策略混进了显示序。
+        let codetable: Vec<Candidate> = ct.candidates;
 
-        // 2. 拼音候选（输入达到最小长度）+ 归一化降档
+        // 2. 拼音候选（输入达到最小长度）
         let mut pinyin: Vec<Candidate> = Vec::new();
         // 多音节拼音的组合区分隔显示（如 "ni hao"）：仅当拼音解析出 ≥2 完成音节时采用，
         // 否则保持原始码（单音节如 "cang" 无需分隔，纯五笔码更不应被拆）。
@@ -801,22 +761,21 @@ impl Engine for MixedEngine {
                 if let Ok(py) = sec.convert(input, max_candidates) {
                     pinyin_preedit = Self::pinyin_preedit_of(&py);
                     pinyin_split = Self::pinyin_split_of(&py, input);
+                    // ⚠️ 拼音候选**不再 ÷100**：与码表的隔离由 `truncation_tier` 表达。
+                    // 那个除法是整数除法，拼音词频中位数 34 会被**整除归零**——量程被偏置
+                    // 吃掉的最直接后果。
                     pinyin = py.candidates;
-                    for c in &mut pinyin {
-                        c.weight /= PINYIN_TIER_SCALE;
-                        if c.weight < 0 {
-                            c.weight = 0;
-                        }
-                    }
                 }
             }
         }
 
-        // 3. 合并（码表在前，拼音在后，英文独立档混入）→ 按权重稳定排序 → 按文本去重
+        // 3. 合并 → 按截断档位稳定排序 → 按文本去重
+        //
+        // ⚠️ 拼接顺序即**组内次序**：`sort_dedup_truncate` 只按档位稳定排序，同档保持原有
+        // 相对位置，故各段内部子引擎排好的序原样保留。改动此处的顺序会改变同档内的去留。
         let has_pinyin = !pinyin.is_empty();
         let mut merged = codetable;
         merged.extend(pinyin);
-        // 英文候选（enable_english 开时）：独立加权档混入，与码表/拼音一同竞争排序。
         merged.extend(self.english_candidates(input, max_candidates));
         // 排序 → 去重 → 带拼音保底配额截断（与 overflow 路径共用，见 `sort_dedup_truncate`）。
         // 判据串与上面那段内联加成逐字同源：码表看 `code == input`，英文看 `code == 小写 input`。
@@ -1211,8 +1170,9 @@ mod tests {
     #[test]
     fn same_text_across_sources_keeps_codetable() {
         let mut cands = vec![
-            py_cand_coded("的", "de", 15_378_475 / PINYIN_TIER_SCALE),
-            ct_cand_coded("的", "r", 9950 + 10_000_000),
+            // 真实词频，不带任何加成——拼音「的」是全表最高之一，若无档位它会碾压码表。
+            py_cand_coded("的", "de", 15_378_475),
+            ct_cand_coded("的", "r", 9950),
         ];
         MixedEngine::sort_dedup_truncate(&mut cands, 10, tctx("r", "zzzz"));
         assert_eq!(cands.len(), 1, "同文只留一条");
@@ -1252,16 +1212,19 @@ mod tests {
 
     /// **[改动后必须仍然通过]** 短语必须活过码表洪水。
     ///
-    /// 现状靠 `PHRASE_WEIGHT_BOOST`(+1M) 压过码表前缀补全的 +500K。短语量本来就极少，
-    /// 被高冲突码挤掉是纯粹的功能缺失。
+    /// 短语在档 1、码表前缀补全在档 2 ⇒ 短语权重再低也先活。短语量本来就极少，被高冲突码
+    /// 挤掉是纯粹的功能缺失。
+    ///
+    /// ⚠️ 本引擎目前**收不到**短语候选（`is_phrase` 无生产置位点，见 `truncation_tier`），
+    /// 故这条锁的是函数契约而非生产行为。
     #[test]
     fn phrase_survives_codetable_flood() {
         let mut cands: Vec<Candidate> = (0..20)
-            .map(|i| ct_cand(&format!("码{i}"), 1000 + PARTIAL_MATCH_BOOST - i))
+            .map(|i| ct_cand(&format!("码{i}"), 1000 - i))
             .collect();
         cands.push(Candidate {
             is_phrase: true,
-            weight: 1 + PHRASE_WEIGHT_BOOST,
+            weight: 1,
             ..ct_cand("短语正文", 0)
         });
         MixedEngine::sort_dedup_truncate(&mut cands, 5, tctx("zzzz", "zzzz"));
@@ -1310,16 +1273,16 @@ mod tests {
         );
     }
 
-    /// **[下一步会改]** 现状：**同档之内**仍按 weight 排，拼音子引擎的匹配层级链被抹掉。
+    /// ★ **档内保持子引擎原序**——层级链不再被 weight 抹掉。
     ///
-    /// 拼音候选全部落进档 3，档内只比 weight——而拼音引擎自己的排序链是
-    /// `cmp_match_layers().then(weight)`，其中层级键（简拼 / 前缀补全 / 子短语 / 全拼降级）
-    /// 是**布尔的、等价于惩罚 ∞**，weight 表达不了。于是高权重的简拼候选在这里反超低权重
-    /// 的精确候选，而子引擎明明把精确排在了前面。
+    /// 拼音候选全部落进档 3。若档内按 weight 重排，拼音引擎自己的排序链
+    /// （`cmp_match_layers().then(weight)`）就会被抹掉——其中层级键（简拼 / 前缀补全 /
+    /// 子短语 / 全拼降级）是**布尔的、等价于惩罚 ∞**，weight 表达不了。高词频简拼会因此
+    /// 反超低词频精确候选，而子引擎明明把精确排在了前面。
     ///
-    /// 下一步改成「档内保持子引擎原序」后本测试应当变红，届时改为断言 `["精确","简拼高频"]`。
+    /// 稳定排序 + 只按档位排 ⇒ 同档保持传入次序 = 子引擎原序。
     #[test]
-    fn within_tier_order_currently_follows_weight_not_engine_layers() {
+    fn within_tier_keeps_sub_engine_order() {
         let abbrev = Candidate {
             is_abbrev: true,
             ..py_cand_coded("简拼高频", "n", 9000)
@@ -1329,21 +1292,28 @@ mod tests {
         MixedEngine::sort_dedup_truncate(&mut cands, 10, tctx("zzzz", "zzzz"));
         assert_eq!(
             cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            vec!["简拼高频", "精确"],
-            "现状：档内 weight 说了算，子引擎的层级链被抹掉"
+            vec!["精确", "简拼高频"],
+            "档内须保持子引擎原序：词频 9000 的简拼不得反超词频 1 的精确候选"
         );
     }
 
-    /// ⚠️ **[锁住现状]** 英文**没有任何保底席位**——精确与前缀都靠真实词频硬拼。
+    /// ⚠️ **英文没有任何保底席位**：码表洪水下被整片挤掉，与词频无关。
     ///
-    /// `ENGLISH_EXACT_BOOST` 与 `PARTIAL_MATCH_BOOST` **数值相等（都是 500,000）**，
-    /// 于是「英文精确词」与「码表前缀补全」落在**同一档**，胜负完全由真实词频决定；
-    /// 而 `ENGLISH_PREFIX_BOOST` 是 **0**，英文前缀连那一档都进不去。
+    /// 拼音有 `max/PINYIN_QUOTA_DIVISOR` 保底，**英文一点没有**。英文精确虽与码表前缀补全
+    /// 同档（档 2，历史包袱见 [`MixedEngine::truncation_tier`]），但档内按合并顺序，
+    /// 码表先入 ⇒ 英文恒排其后。
     ///
-    /// 拼音有 `max/PINYIN_QUOTA_DIVISOR` 保底，**英文一点没有**。
+    /// ## ⚠️ 这是拆加成时**唯一一处刻意的行为变化**
+    ///
+    /// 拆之前，`ENGLISH_EXACT_BOOST` 与 `PARTIAL_MATCH_BOOST` 数值恰好相等，于是英文精确
+    /// 与码表前缀补全**拼真实词频**——词频高的英文词能赢。那是常数碰撞的产物：两者的词频
+    /// 根本不同量纲，比较本身没有意义，没有任何文档说过它们应当平起平坐。
+    ///
+    /// 影响面有限：**显示序**由协调器 `source_tier` 决定（英文与拼音其余同档），本档位只
+    /// 决定**截断存活**。英文该不该有保底席位，见 `mixed-source-tier-quota.md` §3.3。
     #[test]
-    fn english_has_no_quota_and_competes_on_raw_weight() {
-        // 码表 20 条前缀补全（+500K，词频 9000 递减）。
+    fn english_has_no_quota_under_codetable_flood() {
+        // 码表 20 条前缀补全（真实词频 9000 递减）。
         let entries: Vec<(String, String, i32)> = (0..20)
             .map(|i| (format!("hel{i}"), format!("码{i}"), 9000 - i))
             .collect();
@@ -1351,9 +1321,9 @@ mod tests {
             .iter()
             .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
             .collect();
-        let build = |english: Box<dyn Engine>| {
+        let build = |ct: &[(&str, &str, i32)], english: Box<dyn Engine>| {
             MixedEngine::new(
-                ct_engine(&refs, false),
+                ct_engine(ct, false),
                 None,
                 Some(english),
                 MixConfig {
@@ -1368,26 +1338,28 @@ mod tests {
                 .any(|c| c.source == CandidateSource::English)
         };
 
-        // ① 英文精确、词频低于码表 ⇒ 同档拼词频，**输**。
-        let low = build(english_engine(&[("hel", "hel", 1)]));
+        // ★ 正向对照必须先立：没有洪水时英文**在场**。
+        //   缺了它，下面三条「不在场」可能只是英文引擎压根没产出，测试变成空转。
+        let calm = build(&[("hel", "好", 100)], english_engine(&[("hel", "hel", 1)]));
         assert!(
-            !has_english(&low.convert("hel", 5).unwrap()),
-            "英文精确 +500K 只是与码表前缀补全同档，词频 1 拼不过 9000"
+            has_english(&calm.convert("hel", 5).unwrap()),
+            "无洪水时英文候选应当在场——否则下面的断言测不到东西"
         );
 
-        // ② 英文精确、词频高于码表 ⇒ 同档拼词频，**赢**。反向对照，证明 ① 输在词频而非档位。
-        let high = build(english_engine(&[("hel", "hel", 9999)]));
+        // ① 英文精确、词频远低于码表 ⇒ 挤掉。
+        let low = build(&refs, english_engine(&[("hel", "hel", 1)]));
+        assert!(!has_english(&low.convert("hel", 5).unwrap()));
+
+        // ② 英文精确、词频**高于**码表 ⇒ 照样挤掉。档内按合并顺序，词频不参与。
+        let high = build(&refs, english_engine(&[("hel", "hel", 9999)]));
         assert!(
-            has_english(&high.convert("hel", 5).unwrap()),
-            "同档下词频更高就该赢——否则 ① 的失败另有原因"
+            !has_english(&high.convert("hel", 5).unwrap()),
+            "英文无保底：词频 9999 也拿不到席位（拆加成前这条会赢，见文档注释）"
         );
 
-        // ③ 英文**前缀**（`ENGLISH_PREFIX_BOOST` = 0）⇒ 词频再高也进不了那一档。
-        let prefix = build(english_engine(&[("hello", "hello", 9999)]));
-        assert!(
-            !has_english(&prefix.convert("hel", 5).unwrap()),
-            "英文前缀无加成，词频 9999 仍被 +500K 的码表整片压掉"
-        );
+        // ③ 英文前缀落在档 3，更靠后。
+        let prefix = build(&refs, english_engine(&[("hello", "hello", 9999)]));
+        assert!(!has_english(&prefix.convert("hel", 5).unwrap()));
     }
 
     /// 产出多条 `source=Pinyin` 候选的假拼音引擎（`FakePinyin` 只给一条，测不了配额）。
