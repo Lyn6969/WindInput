@@ -148,21 +148,21 @@ public class InputController: IMKInputController {
         }
     }
 
-    /// 宿主 app 的 pid, 供服务端做「焦点是否跨应用切入」判定 (clientToken 高 32 位)。
+    /// 宿主 app 的标识, 供服务端做「焦点是否跨应用切入」判定 (clientToken 高 32 位)。
     ///
-    /// 优先取前台 app 的真实 pid, 但**必须核对 bundleID 一致**: 输入法与宿主是两个进程,
-    /// Spotlight / 通知中心等场景下 frontmostApplication 未必就是持有文本框的那个 app,
-    /// 认错了会把 A 应用的模式记到 B 头上。核对不上时退化为 bundleID 的稳定散列 ——
-    /// 它同样满足服务端的全部需求 (同 app 恒等、异 app 相异), 只是重启 app 后仍相等,
-    /// 对「按应用记忆中英」而言反而更合用。
+    /// **一律取 bundleID 的稳定散列, 不取真实 pid。**
+    ///
+    /// 曾经的做法是「前台 app 的 bundleID 对得上就用它的真 pid, 否则退化为散列」。问题在于
+    /// 同一个 app 会因此拿到两个不同的键 —— 输入法与宿主是两个进程, Spotlight 覆盖层、
+    /// 非前台面板等场景下 `frontmostApplication` 不是持有文本框的那个 app, 于是同一个
+    /// 微信一会儿记在 pid 上、一会儿记在散列上, 表现为「按应用记忆的中英状态和 compat 规则
+    /// 时不时自己重置」。
+    ///
+    /// 真 pid 在 macOS 上也换不来任何东西: 服务端拿 pid 只做两件事, 一是当 `pid_names`
+    /// 的键 (散列同样满足「同 app 恒等、异 app 相异」), 二是 `process_name(pid)` 反查进程名
+    /// —— 那个函数在非 Windows 恒返回空串, 宿主名改由 `.app` 随焦点事件直接送 bundleID。
+    /// 散列还有个附带好处: 宿主重启后仍相等, 对「按应用记忆」而言反而更合用。
     private func hostPid(for bundleID: String) -> UInt32 {
-        if !bundleID.isEmpty,
-           let front = NSWorkspace.shared.frontmostApplication,
-           front.bundleIdentifier == bundleID,
-           front.processIdentifier > 0
-        {
-            return UInt32(front.processIdentifier)
-        }
         return Self.stableHash(bundleID)
     }
 
