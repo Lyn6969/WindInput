@@ -228,8 +228,18 @@ function Sync-Tree ([string]$src, [string]$remoteDir, [string]$label) {
         $ex = @()
         foreach ($d in $ExcludeDirs)  { $ex += "--exclude=./$d"; $ex += "--exclude=*/$d" }
         foreach ($f in $ExcludeFiles) { $ex += "--exclude=$f" }
+        # ⚠️ --format=gnutar 不是风格偏好, 是绕开 libarchive 的一个误判 (实测稳定复现):
+        #    解压时 bsdtar 会做「拒绝覆盖归档自身」的保护, 判据是
+        #      归档条目里记录的 dev+ino  ==  归档文件自身的 dev+ino
+        #    但这两个数来自【两台不同的机器】—— 前者是打包时本机磁盘上的源文件, 后者是编译机
+        #    上那个 .tar.gz。撞上纯属巧合, 可一旦撞上就是确定性的: 归档里那个 ino 固定不变,
+        #    而每次同步都删旧包、新包又复用同一条刚释放的 MFT 记录 ⇒ 每次都撞, 报
+        #      "<某个源文件>: Refusing to overwrite archive: No error"  (errno=0, 纯逻辑判断)
+        #    默认的 pax 格式会写 SCHILY.dev / SCHILY.ino, gnutar 格式不写 —— 条目没有这两个
+        #    字段时 archive_entry_dev_is_set() 为假, 整个检查直接跳过。
+        #    gnutar 也没有 ustar 的 255 字符路径与 8 GB 大小限制, 对本仓是安全替换。
         Push-Location $src
-        try { & tar -czf $tgz @ex . } finally { Pop-Location }
+        try { & tar -czf $tgz --format=gnutar @ex . } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tgz)) { ErrMsg "  打包 $label 失败 (tar rc=$LASTEXITCODE)"; return $false }
         $mb = [math]::Round((Get-Item $tgz).Length / 1MB, 2)
 
@@ -400,6 +410,9 @@ if ($Clean) {
         ErrMsg "清理失败"; exit 1
     }
 }
+# 分段计时: 优化前先知道时间花在哪一段。只测量、不改变行为 —— 曾凭「感觉编译慢」去调
+# 并行度, 实测才发现编译只占总时长的一小半, 同步与回传才是大头。
+$tSync = [System.Diagnostics.Stopwatch]::StartNew()
 if ($NoSync) { Gray "[1/3] 跳过源码同步 (-NoSync)" }
 else {
     Say "[1/3] 同步源码到编译机..."
@@ -413,6 +426,7 @@ else {
     }
     if (-not $ok) { ErrMsg "`n源码同步失败, 已中止 —— 未触发远程执行。"; exit 1 }
 }
+$tSync.Stop()
 
 # --- [2/3] 远程执行 ---
 # 流的处理 (三次踩坑后的定稿, 别再动):
@@ -433,12 +447,15 @@ if ($isRaw) {
     Say "[2/3] 在编译机上执行 dev.ps1 $Command ..."
     $inner = "& '$RRoot\scripts\dev.ps1' $Command 6>&1; exit `$LASTEXITCODE"
 }
+$tExec = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not (Invoke-RemotePs $inner)) {
     ErrMsg "`n远程执行失败$(if($localOut){" —— 本机 $outName\ 保持原样, 未回传任何产物。"})"
     exit 1
 }
+$tExec.Stop()
 
 # --- [3/3] 回传产物 ---
+$tFetch = [System.Diagnostics.Stopwatch]::StartNew()
 if ($isRaw -or $NoFetch) {
     Gray "[3/3] 跳过产物回传$(if($isRaw){' (-Raw 模式不产出 build\ 内容)'}else{' (-NoFetch)'})"
 } else {
@@ -446,7 +463,11 @@ if ($isRaw -or $NoFetch) {
     if (-not (Receive-Artifacts $Command $outName $localOut)) { exit 1 }
 }
 
+$tFetch.Stop()
 $sw.Stop()
 Say "`n完成 ($cmdText), 耗时 $([math]::Round($sw.Elapsed.TotalSeconds,1)) s"
+# 三段耗时: 想提速时先看这行, 别对着占比最小的那段调参数。
+Gray ("  同步 {0:N1}s  ·  远程执行 {1:N1}s  ·  回传 {2:N1}s" -f `
+      $tSync.Elapsed.TotalSeconds, $tExec.Elapsed.TotalSeconds, $tFetch.Elapsed.TotalSeconds)
 if ($localOut) { Gray "  产物已在本机 $outName\, 可直接用部署命令 (pdm1 / pdm2 / pd1 ...) 安装。" }
 exit 0
