@@ -96,10 +96,19 @@ public enum DownstreamCmd {
 public enum ExtKind {
     /// 下行：请求打开设置应用。body = `{"args":["--page=dict", …]}`。
     public static let settingsOpen = "settings.open"
-    /// 上行：候选窗被拖动到新位置。body = `{"x":123,"y":456}`（内容左上角屏幕坐标）。
+    /// 上行：候选窗被拖动到新位置。body = `{"x":123,"y":456}`，wire 坐标系（屏幕左上为
+    /// 原点、y 向下）下的**内容左上角**，与配置里的 `ui.candidate.custom_x/y` 同义。
     public static let posCandidate = "pos.candidate"
-    /// 上行：状态提示气泡被拖动到新位置。body 同上。
+    /// 上行：状态提示气泡被拖动到新位置。body 同 `posCandidate`。
     public static let posStatusTip = "pos.status_tip"
+    /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 `posCandidate`。body 空。
+    public static let posCandidateQuery = "pos.candidate.query"
+    /// 下行：问 `.app` 状态气泡此刻在哪，答案走上行 `posStatusTip`。body 空。
+    public static let posStatusTipQuery = "pos.status_tip.query"
+    //
+    // 这两个「位置」要一问一答而不是由服务进程记账：浮窗是 `.app` 侧的原生 NSPanel，
+    // 服务端发下来的只是**建议落点**，这边还会按所在屏可见区钳制、在下方放不下时翻到光标
+    // 上方、以及沿用用户本次组合内拖出来的落位。用户点「固定位置」要以当前看到的位置落盘。
 }
 
 /// 按键组合 (CmdKeyTap/Hold/Release 解码结果, 及 KeySeq 内单项)。
@@ -266,6 +275,17 @@ public struct HostRenderFramePayload: Equatable {
         self.width = width; self.height = height; self.flags = flags
         self.scale = max(1, scale)
     }
+
+    /// 帧可见 (SharedRenderHeader::FLAG_VISIBLE)。
+    public var isVisible: Bool { flags & 0x1 != 0 }
+    /// 位图内已画软件高斯阴影 → 关掉系统窗口阴影, 否则画布边缘出黑边。
+    public var hasSoftwareShadow: Bool { flags & 0x4 != 0 }
+    /// `(x, y)` 是用户**固定位置**的绝对屏幕坐标, 不是按光标推算的落点
+    /// (SharedRenderHeader::FLAG_ABSOLUTE_POS)。
+    ///
+    /// 置位时 panel 只做屏幕边界钳制, 不套用「下方放不下就翻到光标上方」的兜底——窗口
+    /// 本来就不跟光标走, 固定点一旦靠近屏幕底边就会被那套逻辑莫名弹到顶上。
+    public var isAbsolutePos: Bool { flags & 0x8 != 0 }
 }
 
 // MARK: - KeyEvent

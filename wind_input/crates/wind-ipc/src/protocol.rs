@@ -196,10 +196,23 @@ pub const CMD_EXT: u16 = 0x0E01;
 pub mod ext_kind {
     /// 下行：请求 `.app` 打开设置应用。body = `{"args":["--page=dict", …]}`。
     pub const SETTINGS_OPEN: &str = "settings.open";
-    /// 上行：候选窗被拖动到新位置。body = `{"x":123,"y":456}`（内容左上角屏幕坐标）。
+    /// 上行：候选窗被拖动到新位置。body = `{"x":123,"y":456}`，wire 坐标系（屏幕左上为
+    /// 原点、y 向下）下的**内容左上角**，与配置里的 `ui.candidate.custom_x/y` 同义。
     pub const POS_CANDIDATE: &str = "pos.candidate";
-    /// 上行：状态提示气泡被拖动到新位置。body 同上。
+    /// 上行：状态提示气泡被拖动到新位置。body 同 [`POS_CANDIDATE`]。
     pub const POS_STATUS_TIP: &str = "pos.status_tip";
+    /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 [`POS_CANDIDATE`]。body 空。
+    pub const POS_CANDIDATE_QUERY: &str = "pos.candidate.query";
+    /// 下行：问 `.app` 状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。body 空。
+    pub const POS_STATUS_TIP_QUERY: &str = "pos.status_tip.query";
+    //
+    // 为什么这两个「位置」要一问一答，而不是服务进程自己记账：
+    //
+    // 浮窗是 `.app` 侧的原生 NSPanel，服务进程发出去的只是**建议落点**。`.app` 还会按
+    // 所在屏的可见区钳制、在下方放不下时翻到光标上方、以及沿用用户本次组合内拖出来的
+    // 落位——三者都会让实际位置与服务进程发的那个值不同。用户点「固定位置」时要以**当前
+    // 看到的位置**落盘，记账值会把窗口摆到一个它从没出现过的地方（而 Windows 那边读的是
+    // 真 `GetWindowRect`，不存在这个问题）。
 }
 
 // 批处理
@@ -882,6 +895,13 @@ impl SharedRenderHeader {
     pub const FLAG_VISIBLE: u32 = 0x0001;
     pub const FLAG_CONTENT_READY: u32 = 0x0002;
     pub const FLAG_SOFTWARE_SHADOW: u32 = 0x0004;
+    /// 帧里的 `(x, y)` 是**用户固定位置**的绝对屏幕坐标，不是按光标推算出来的落点。
+    ///
+    /// 只对 macOS 的 host-render 路径有意义：`.app` 收到普通帧时会自己做「下方放不下就
+    /// 翻到光标上方」的兜底，那套逻辑在固定位置下是错的——窗口本来就不跟光标走，一旦
+    /// 固定点靠近屏幕底边就会被莫名弹到顶上。置本位即告诉 `.app`：照搬坐标，只做屏幕
+    /// 边界钳制，不要翻转。
+    pub const FLAG_ABSOLUTE_POS: u32 = 0x0008;
 
     pub fn new(x: i32, y: i32, width: u32, height: u32, stride: u32, data_size: u32) -> Self {
         Self {

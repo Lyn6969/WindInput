@@ -152,11 +152,9 @@ impl Forwarder {
                 caret_y,
                 caret_height,
                 caret_valid,
-                // 固定位置模式只对本地自绘窗口（Windows）有意义：macOS 走 IMKit 转发，
-                // 候选窗由系统按光标定位，Rust 侧无从干预，故此处显式丢弃。
-                fixed: _,
-                fixed_x: _,
-                fixed_y: _,
+                fixed,
+                fixed_x,
+                fixed_y,
             } => {
                 tracing::debug!(
                     "forwarder UpdateCandidates: n={} preedit={:?} caret=({},{},{}) valid={}",
@@ -188,6 +186,10 @@ impl Forwarder {
                 );
                 self.win
                     .set_position(caret_x, caret_y, caret_height, caret_valid);
+                // 固定位置：坐标由服务进程算定（`render_frame` 走 place_fixed 分支），
+                // 帧里带 FLAG_ABSOLUTE_POS 告诉 `.app` 照搬、别再按光标翻转。
+                self.win
+                    .set_fixed_position(fixed.then_some((fixed_x, fixed_y)));
                 self.push_current_frame(tip);
             }
             UiCommand::HideCandidates => self.hide_frame(),
@@ -365,6 +367,20 @@ impl Forwarder {
                 };
                 self.push_result_toast(&msg, kind);
             }
+            // 协调器把定位方式切到 fixed 时问「你现在在哪」，好把当前位置落盘成 custom_x/y
+            // ——否则窗口会跳到上次保存（往往是 0,0）的坐标。
+            //
+            // 两者都转成一次**下行询问**而不是在本进程记账：浮窗是 `.app` 侧的原生 NSPanel，
+            // 服务进程推下去的只是建议落点，实际位置还会被那边的屏幕钳制 / 下方放不下时上翻 /
+            // 用户本次组合内的拖动落位改掉。答案经上行 `pos.*` 回来（见 `handle_ext`）。
+            UiCommand::ReportCandidatePos => {
+                self.sink
+                    .push_frame(&encode_ext(ext_kind::POS_CANDIDATE_QUERY, b""));
+            }
+            UiCommand::ReportStatusTipPos => {
+                self.sink
+                    .push_frame(&encode_ext(ext_kind::POS_STATUS_TIP_QUERY, b""));
+            }
             UiCommand::OpenPath(path) => crate::manager::open_path(&path),
             UiCommand::OpenApp { path, args } => crate::manager::open_app(&path, &args),
             UiCommand::Shutdown => {}
@@ -432,13 +448,14 @@ impl Forwarder {
     fn push_current_frame(&mut self, tip: Option<String>) {
         match self.win.render_frame() {
             Some(f) => {
-                let (sx, sy, w, h, scale, soft) = (
+                let (sx, sy, w, h, scale, soft, absolute) = (
                     f.screen_x,
                     f.screen_y,
                     f.width,
                     f.height,
                     f.scale,
                     f.software_shadow,
+                    f.absolute_pos,
                 );
                 // 翻页器命中矩形的内部 tag(HOVER_PAGE_PREV/NEXT=100000/100001)重映射为
                 // Swift/Go 约定的 -1(上页)/-2(下页)，否则 100000>=0 会被 .app 误当候选选中
@@ -468,6 +485,9 @@ impl Forwarder {
                     SharedRenderHeader::FLAG_VISIBLE | SharedRenderHeader::FLAG_CONTENT_READY;
                 if soft {
                     flags |= SharedRenderHeader::FLAG_SOFTWARE_SHADOW;
+                }
+                if absolute {
+                    flags |= SharedRenderHeader::FLAG_ABSOLUTE_POS;
                 }
                 self.sink.push_frame(&encode_host_render_frame(
                     seq,
@@ -607,6 +627,110 @@ mod tests {
     }
 
     /// 造一条最小的 UpdateCandidates，供需要「先显示一帧」的用例复用。
+    /// 取最后一帧 `CMD_HOST_RENDER_FRAME` 的 `(x, y, flags)`。
+    fn last_render_frame(cap: &Arc<Mutex<Vec<Vec<u8>>>>) -> Option<(i32, i32, u32)> {
+        let v = cap.lock().unwrap();
+        let f = v
+            .iter()
+            .rev()
+            .find(|f| cmd_of(f) == CMD_HOST_RENDER_FRAME)?;
+        let p = &f[8..];
+        Some((
+            i32::from_le_bytes(p[4..8].try_into().unwrap()),
+            i32::from_le_bytes(p[8..12].try_into().unwrap()),
+            u32::from_le_bytes(p[20..24].try_into().unwrap()),
+        ))
+    }
+
+    fn show_two_fixed(f: &mut Forwarder, fixed: bool, fx: i32, fy: i32) {
+        f.handle(UiCommand::UpdateCandidates {
+            preedit: "a".into(),
+            preedit_caret: 1,
+            mode_label: "".into(),
+            candidates: vec![item("中"), item("国")],
+            selected: 0,
+            hover: -1,
+            page: 1,
+            total_pages: 1,
+            caret_x: 100,
+            caret_y: 200,
+            caret_height: 20,
+            caret_valid: true,
+            fixed,
+            fixed_x: fx,
+            fixed_y: fy,
+        });
+    }
+
+    /// 固定位置模式：帧坐标就是配置里的 custom_x/y，且带 FLAG_ABSOLUTE_POS。
+    ///
+    /// 回归：这条路径此前被 `fixed: _` 显式丢弃——「候选窗固定位置」在 macOS 上整个是死的，
+    /// 设置里改了没有任何反应。标志位不能省：`.app` 收到普通帧会自作主张做「下方放不下就
+    /// 翻到光标上方」，固定点靠近屏幕底边时窗口会被莫名弹到顶上。
+    #[test]
+    fn fixed_position_frame_carries_absolute_flag_and_coords() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_fixed");
+        show_two_fixed(&mut f, true, 640, 480);
+
+        let (x, y, flags) = last_render_frame(&cap).expect("应推出 host render frame");
+        assert_eq!((x, y), (640, 480), "固定位置必须原样下发，不再按光标推算");
+        assert_ne!(
+            flags & SharedRenderHeader::FLAG_ABSOLUTE_POS,
+            0,
+            "缺 FLAG_ABSOLUTE_POS，.app 会对固定位置套用光标翻转逻辑"
+        );
+    }
+
+    /// 跟随光标模式不得置 FLAG_ABSOLUTE_POS——否则 `.app` 不再做上翻，光标贴屏幕底边时
+    /// 候选窗被钳在底边糊住输入位。
+    #[test]
+    fn follow_caret_frame_has_no_absolute_flag() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_follow");
+        show_two_fixed(&mut f, false, 640, 480);
+
+        let (_, _, flags) = last_render_frame(&cap).expect("应推出 host render frame");
+        assert_eq!(flags & SharedRenderHeader::FLAG_ABSOLUTE_POS, 0);
+    }
+
+    /// `ReportCandidatePos` / `ReportStatusTipPos`（协调器把定位方式切到 fixed 时问「你现在
+    /// 在哪」）在 macOS 只能转成一次下行询问 —— 浮窗是 `.app` 侧的 NSPanel，服务进程推下去
+    /// 的只是建议落点，实际位置还会被那边的屏幕钳制 / 上翻 / 拖动落位改掉。
+    ///
+    /// 回归：这里一度改用「记住最后一帧推的坐标」直接回答，省掉一次往返。那个值在窗口被
+    /// 上翻或拖动过之后就是错的，落盘后窗口会摆到一个它从没出现过的地方。
+    #[test]
+    fn report_pos_sends_query_downstream() {
+        for (cmd, want) in [
+            (UiCommand::ReportCandidatePos, ext_kind::POS_CANDIDATE_QUERY),
+            (
+                UiCommand::ReportStatusTipPos,
+                ext_kind::POS_STATUS_TIP_QUERY,
+            ),
+        ] {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk(cap.clone(), "_t_query");
+            show_two_fixed(&mut f, true, 300, 400);
+            cap.lock().unwrap().clear();
+            while ev.try_recv().is_ok() {}
+
+            f.handle(cmd);
+            let v = cap.lock().unwrap();
+            let ext = v
+                .iter()
+                .find(|f| cmd_of(f) == CMD_EXT)
+                .expect("应发扩展信封问询");
+            let (kind, body) = decode_ext(&ext[8..]).expect("信封应可解");
+            assert_eq!(kind, want);
+            assert!(body.is_empty(), "问询不带 body");
+            assert!(
+                ev.try_recv().is_err(),
+                "不该就地编一个位置事件——答案要等 .app 回"
+            );
+        }
+    }
+
     fn show_two(f: &mut Forwarder) {
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),

@@ -379,6 +379,9 @@ constexpr uint32_t SHARED_RENDER_VERSION = 1;
 // Shared memory flags
 constexpr uint32_t SHARED_FLAG_VISIBLE       = 0x0001; // Window should be visible
 constexpr uint32_t SHARED_FLAG_CONTENT_READY = 0x0002; // New content is ready to render
+// 0x0004 = SOFTWARE_SHADOW, 0x0008 = ABSOLUTE_POS: both are consumed only by the macOS
+// `.app` host, which renders panels itself. Listed here so the bit space stays visible
+// when adding a flag on the Windows side (see wind-ipc/src/protocol.rs SharedRenderHeader).
 
 // Max shared memory size (4MB, covers up to ~1024x1024 BGRA)
 constexpr uint32_t MAX_SHARED_RENDER_SIZE = 4 * 1024 * 1024;

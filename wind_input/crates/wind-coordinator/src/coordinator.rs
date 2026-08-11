@@ -5624,6 +5624,17 @@ impl Coordinator {
     }
 }
 
+/// 解析扩展信封里的 `{"x":123,"y":456}` 落点 body。
+///
+/// 非法/缺字段/越界一律返回 `None` 交调用方忽略，而不是取 0 兜底：位置类消息拿默认值
+/// 比丢掉一次拖动坏得多——`(0,0)` 会被当成合法坐标落盘，候选窗就此跑到屏幕左上角。
+fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let x = v.get("x")?.as_i64()?;
+    let y = v.get("y")?.as_i64()?;
+    Some((i32::try_from(x).ok()?, i32::try_from(y).ok()?))
+}
+
 impl MessageHandler for Coordinator {
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
         info!("Menu command: {}", command);
@@ -5744,6 +5755,28 @@ impl MessageHandler for Coordinator {
             _ => -1,
         };
         self.mouse_hover(target);
+    }
+
+    /// 扩展信封（`CMD_EXT`）：低频消息统一入口。**未知 kind 安静忽略**——旧服务收到新
+    /// `.app` 发的新 kind 只当没看见，而不是解析失败把连接搞坏（见 `ext_kind` 的演进约定）。
+    fn handle_ext(&self, kind: &str, body: &[u8]) {
+        use wind_ipc::protocol::ext_kind;
+        match kind {
+            // 拖动落点回报。落不落盘由 save_* 按当前定位方式自行判定：固定位置=重新摆放，
+            // 跟随光标=只是临时挪开，不写配置。
+            ext_kind::POS_CANDIDATE | ext_kind::POS_STATUS_TIP => {
+                let Some((x, y)) = decode_ext_point(body) else {
+                    tracing::warn!("扩展消息 {kind} 的 body 不是 {{x,y}}，忽略");
+                    return;
+                };
+                if kind == ext_kind::POS_CANDIDATE {
+                    self.save_candidate_pos(x, y);
+                } else {
+                    self.save_status_tip_pos(x, y);
+                }
+            }
+            _ => tracing::debug!("未处理的扩展消息 kind={kind}"),
+        }
     }
 
     /// macOS `.app` 候选右键动作：动作串 → 词条操作/复制，作用于页内下标候选。
@@ -10645,5 +10678,44 @@ mod input_diag_tests {
             !c.password_suppress.load(Relaxed),
             "数字密码位同样受开关约束"
         );
+    }
+}
+
+#[cfg(test)]
+mod ext_envelope_tests {
+    //! 扩展信封 `pos.*` 落点 body 的解析。
+    use super::*;
+
+    #[test]
+    fn decodes_well_formed_point() {
+        assert_eq!(
+            decode_ext_point(br#"{"x":123,"y":-456}"#),
+            Some((123, -456))
+        );
+        // 多余字段照常忽略——JSON body 的向前兼容就靠这条。
+        assert_eq!(
+            decode_ext_point(br#"{"x":1,"y":2,"screen":"builtin"}"#),
+            Some((1, 2))
+        );
+    }
+
+    /// 缺字段 / 非整数 / 越界 / 不是 JSON —— 一律 None。
+    ///
+    /// 关键在于**不能取 0 兜底**：`(0, 0)` 会被当成合法坐标落盘成 custom_x/y，
+    /// 候选窗下次就跑到屏幕左上角，而用户只是拖了一下。
+    #[test]
+    fn rejects_malformed_bodies() {
+        for bad in [
+            &br#"{"x":1}"#[..],            // 缺 y
+            br#"{"y":1}"#,                 // 缺 x
+            br#"{"x":1.5,"y":2}"#,         // 非整数
+            br#"{"x":"1","y":"2"}"#,       // 字符串
+            br#"{"x":99999999999,"y":0}"#, // 越出 i32
+            br#"[1,2]"#,                   // 不是对象
+            b"not json",
+            b"",
+        ] {
+            assert_eq!(decode_ext_point(bad), None, "body={:?} 应被拒", bad);
+        }
     }
 }

@@ -26,6 +26,18 @@ final class CandidateContentView: NSView {
     var onSelect: ((Int) -> Void)?
     var onHover: ((Int) -> Void)?
     var onContextAction: ((Int, String) -> Void)? // (pageLocalIndex, action)
+    var onDragMoved: (() -> Void)?                // 拖动进行中 (每次位移后)
+    var onDragEnded: (() -> Void)?                // 空白区拖动松手 (整窗已移到新位置)
+    /// 拖动起点：光标屏幕位置 + 窗口起始左下角。nil = 未在拖动。
+    /// 记锚点差值而不是每次跟随光标当前点，是为了不把「按下点在窗口内的偏移」丢掉。
+    private var dragAnchor: NSPoint?
+    private var dragOrigin: NSPoint?
+    /// 本次按下是否已越过位移阈值。**没越过就不算拖动**：空白区(编码栏/内边距)的一次普通
+    /// 点击否则会被当成拖动完成——跟随光标模式下窗口被就地冻结一整轮组合，固定位置模式下
+    /// 每次点击还白搭一次 IPC 往返 + 一次配置写盘。
+    private var dragMoved = false
+    /// 阈值取 3pt：小于手指/鼠标在点击瞬间的自然抖动即可，不必更大。
+    private static let dragThreshold: CGFloat = 3
     var unifiedMenuProvider: (() -> [MenuItemData]?)? // 空白处右键: 取统一菜单树
     var onUnifiedAction: ((Int) -> Void)?             // 统一菜单项点击 (menu item id)
     private let unifiedMenuBuilder = UnifiedMenuBuilder() // 与菜单栏共用的统一菜单构建器 (须持有: 作为叶子项 target)
@@ -81,7 +93,34 @@ final class CandidateContentView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        if let idx = hitIndex(event) { onSelect?(idx) }
+        if let idx = hitIndex(event) { onSelect?(idx); return }
+        // 空白区（编码栏/内边距，非候选非翻页键）→ 起拖，整窗跟随光标。与 Windows 侧
+        // WM_LBUTTONDOWN 的同一分支同构（那边用 SetCapture 保证移出窗口后仍收到消息；
+        // AppKit 在 mouseDown 之后会把整条拖动序列都发给本视图，无需额外捕获）。
+        guard let win = window else { return }
+        dragAnchor = NSEvent.mouseLocation
+        dragOrigin = win.frame.origin
+        dragMoved = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let anchor = dragAnchor, let origin = dragOrigin, let win = window else { return }
+        let now = NSEvent.mouseLocation
+        let (dx, dy) = (now.x - anchor.x, now.y - anchor.y)
+        if !dragMoved {
+            guard abs(dx) >= Self.dragThreshold || abs(dy) >= Self.dragThreshold else { return }
+            dragMoved = true
+        }
+        win.setFrameOrigin(NSPoint(x: origin.x + dx, y: origin.y + dy))
+        // 拖动**进行中**就要落 dragPin：候选内容若在此期间刷新 (翻页/继续输入)，show() 会
+        // 按服务端算的位置重摆，把窗口从手底下拽回光标处。对齐 Windows 的 WM_MOUSEMOVE 分支。
+        onDragMoved?()
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { dragAnchor = nil; dragOrigin = nil; dragMoved = false }
+        guard dragAnchor != nil, dragMoved else { return }
+        onDragEnded?()
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -162,6 +201,20 @@ final class CandidatePanel: NSPanel {
         get { content.onUnifiedAction }
         set { content.onUnifiedAction = newValue }
     }
+    /// 拖动落定回调, 参数为 wire 坐标 (top-left) 下的窗口左上角。
+    /// 服务端据当前定位方式决定落不落盘: 固定位置=重新摆放并写配置; 跟随光标=只是临时挪开。
+    var onMoved: ((Int32, Int32) -> Void)?
+
+    /// 本次组合内用户拖动后的落点，**wire 左上角**。
+    ///
+    /// 非 nil 时 `show()` 用它而不是服务端算出的位置 —— 对齐 Windows 的 `drag_pin`: 拖过之后
+    /// 窗口就钉在那儿, 候选内容刷新 (翻页/继续输入) 不会把它拽回光标处。`hidePanel()` 清除,
+    /// 即一次组合结束就恢复跟随光标。固定位置模式下服务端本来就一直发同一个坐标, 两者一致。
+    ///
+    /// 存**左上角**而非 Cocoa 的左下角是必须的（Windows 的 `drag_pin` 同样存内容左上）：
+    /// Cocoa 原点是左下角，直接拿它 `setFrameOrigin` 等于钉住**底边**，组合中窗口高度一变
+    /// （preedit 出现、竖排行数变化），用户看着的上沿就往上爬。
+    private var dragPin: (x: CGFloat, y: CGFloat)?
 
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 200, height: 60),
@@ -177,38 +230,73 @@ final class CandidatePanel: NSPanel {
         self.hidesOnDeactivate = false
         self.becomesKeyOnlyIfNeeded = true
         self.contentView = content
+        content.onDragMoved = { [weak self] in self?.pinCurrentPosition() }
+        content.onDragEnded = { [weak self] in self?.finishDrag() }
     }
 
-    /// 显示候选框: image=BGRA→CGImage 包裹, atScreenPoint=wire top-left, rects=命中矩形。
-    func show(image: NSImage, atScreenPoint p: NSPoint, rects: [CandidateHitRect]) {
+    /// 以窗口**当前真实位置**落 dragPin（避免按位移累加产生误差）。
+    @discardableResult
+    private func pinCurrentPosition() -> (x: Int32, y: Int32)? {
+        guard let p = PanelGeometry.wireTopLeft(of: frame) else { return nil }
+        dragPin = (CGFloat(p.x), CGFloat(p.y))
+        return p
+    }
+
+    /// 拖动松手: 落定并把 wire 坐标回报服务端。
+    private func finishDrag() {
+        guard let p = pinCurrentPosition() else { return }
+        onMoved?(p.x, p.y)
+    }
+
+    /// 显示候选框: image=BGRA→CGImage 包裹, atScreenPoint=wire top-left, rects=命中矩形,
+    /// absolute=该点是用户固定位置的绝对坐标 (见 HostRenderFramePayload.isAbsolutePos)。
+    ///
+    /// 落位三级优先: dragPin (本次组合内已拖过) > absolute (固定位置) > 跟随光标。
+    func show(image: NSImage, atScreenPoint p: NSPoint, rects: [CandidateHitRect],
+              absolute: Bool = false) {
         content.frame = NSRect(origin: .zero, size: image.size)
         content.update(image: image, rects: rects)
         self.setContentSize(image.size)
 
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+        guard let screen = PanelGeometry.referenceScreen else {
             self.orderFrontRegardless()
             return
         }
         let size = image.size
-        let vf = screen.visibleFrame
-        // wire top-left → Cocoa bottom-left。caretBottomLine = panel 默认贴在 caret 下方时的顶边。
-        let caretBottomLine = screen.frame.height - p.y
-        var originX = p.x
-        var originY = caretBottomLine - size.height
 
-        // 水平: 过长候选框右溢/左溢时回拉, 保证整框可见。
-        if originX + size.width > vf.maxX { originX = vf.maxX - size.width }
-        if originX < vf.minX { originX = vf.minX }
+        if let pin = dragPin {
+            // 拖过就钉住: 内容刷新 (翻页/继续输入) 不把窗口拽回光标处。按左上角重新换算 ——
+            // 高度变化时上沿不动; 并夹进可见区, 内容变宽变高后原落点可能已越界。
+            if let origin = PanelGeometry.cocoaOrigin(wireX: pin.x, wireY: pin.y, size: size) {
+                self.setFrameOrigin(origin)
+            }
+        } else if absolute {
+            // 固定位置: 服务端已算好绝对坐标, 照搬 + 边界钳制, **不做上下翻转** ——
+            // 窗口本来就不跟光标走, 翻转只会让靠近屏幕底边的固定点被莫名弹到顶上。
+            if let origin = PanelGeometry.cocoaOrigin(wireX: p.x, wireY: p.y, size: size) {
+                self.setFrameOrigin(origin)
+            }
+        } else {
+            let vf = screen.visibleFrame
+            // wire top-left → Cocoa bottom-left。caretBottomLine = panel 默认贴在 caret 下方时的顶边。
+            let caretBottomLine = WireGeometry.flipY(p.y, screenHeight: screen.frame.height)
+            var originX = p.x
+            var originY = caretBottomLine - size.height
 
-        // 垂直: 下方放不下 → 翻转到 caret 上方 (估算 caret 高 18pt, 避免遮住光标)。
-        if originY < vf.minY {
-            originY = caretBottomLine + 18
+            // 水平: 过长候选框右溢/左溢时回拉, 保证整框可见。
+            if originX + size.width > vf.maxX { originX = vf.maxX - size.width }
+            if originX < vf.minX { originX = vf.minX }
+
+            // 垂直: 下方放不下 → 翻转到 caret 上方 (估算 caret 高 18pt, 避免遮住光标)。
+            if originY < vf.minY {
+                originY = caretBottomLine + 18
+            }
+            // 兜底夹进可见区 (翻转后仍越界, 或屏幕极小)。
+            if originY + size.height > vf.maxY { originY = vf.maxY - size.height }
+            if originY < vf.minY { originY = vf.minY }
+
+            self.setFrameOrigin(NSPoint(x: originX, y: originY))
         }
-        // 兜底夹进可见区 (翻转后仍越界, 或屏幕极小)。
-        if originY + size.height > vf.maxY { originY = vf.maxY - size.height }
-        if originY < vf.minY { originY = vf.minY }
-
-        self.setFrameOrigin(NSPoint(x: originX, y: originY))
         self.orderFrontRegardless()
         // 系统原生窗口阴影按内容 alpha 形状计算且会缓存；内容/尺寸变化后必须 invalidate，
         // 否则阴影残留旧形状或退化为矩形（候选窗为透明背景 + 圆角位图，需据新形状重算）。
@@ -218,6 +306,13 @@ final class CandidatePanel: NSPanel {
     /// 更新命中矩形 (CmdCandidateRects 帧晚于 render 帧到达)。
     func updateRects(_ rects: [CandidateHitRect]) {
         content.setRects(rects)
+    }
+
+    /// 候选窗当前左上角的 wire 坐标; 不可见时返回 nil (没有"当前位置"可言)。
+    /// 应答服务端的 `pos.candidate.query` 用, 与拖动回报共用同一换算。
+    func wireTopLeft() -> (Int32, Int32)? {
+        guard isVisible, let p = PanelGeometry.wireTopLeft(of: frame) else { return nil }
+        return (p.x, p.y)
     }
 
     /// 页内 index 候选的屏幕矩形 (供 tooltip 定位); 不可见或找不到返回 nil。
@@ -232,6 +327,9 @@ final class CandidatePanel: NSPanel {
     }
 
     func hidePanel() {
+        // 组合结束 → 解除拖动冻结, 下次显示重新跟随光标 (固定位置模式则继续由服务端发绝对
+        // 坐标)。对齐 Windows 侧 hide() 里的 reset_drag()。
+        dragPin = nil
         self.orderOut(nil)
     }
 }

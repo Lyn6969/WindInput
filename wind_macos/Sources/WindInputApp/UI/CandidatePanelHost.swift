@@ -65,6 +65,8 @@ public final class CandidatePanelHost {
         panel.onContextAction = { [weak self] index, action in
             self?.sendFrame(BinaryCodec.encodeCandidateContextMenuFrame(index: index, action: action))
         }
+        panel.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posCandidate, x, y) }
+        statusBubble.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posStatusTip, x, y) }
         panel.unifiedMenuProvider = { [weak self] in self?.requestUnifiedMenu() }
         panel.onUnifiedAction = { [weak self] id in self?.sendMenuAction(id) }
         // 菜单栏状态菜单复用候选框空白处右键的同一统一菜单树与回发路径, 保证两处一致。
@@ -79,6 +81,17 @@ public final class CandidatePanelHost {
     public func unifiedMenuItems() -> [MenuItemData]? {
         // IMK 输入源菜单：请求【精简】树(无子菜单，IMK 无法可靠处理嵌套)。
         return requestUnifiedMenu(simplified: true)
+    }
+
+    /// 上报浮窗拖动落点 (wire top-left)。服务端据当前定位方式决定落不落盘。
+    ///
+    /// 走扩展信封而非专用码位: 拖动是低频动作 (用户偶尔摆一次窗口), JSON 的解析开销与
+    /// 加一个协议常量的三处同步成本相比不值一提。见 ext_kind 的两档划分。
+    private func reportPos(_ kind: String, _ x: Int32, _ y: Int32) {
+        // 显式转 Int：JSONSerialization 只认 NSNumber，Int32 虽能桥接但没必要赌桥接细节。
+        guard let body = try? JSONSerialization.data(withJSONObject: ["x": Int(x), "y": Int(y)])
+        else { return }
+        sendFrame(BinaryCodec.encodeExtFrame(kind: kind, body: body))
     }
 
     /// 回发统一菜单项点击 (CmdMenuAction)。三处菜单共用同一发送路径。
@@ -294,6 +307,17 @@ public final class CandidatePanelHost {
                 let args = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
                 let argv = (args?["args"] as? [String]) ?? []
                 ModeStatusController.shared.openSettings(arguments: argv)
+            case ExtKind.posCandidateQuery, ExtKind.posStatusTipQuery:
+                // 服务端问「你现在在哪」(用户点了菜单里的「固定位置」)。浮窗不可见时**不答**:
+                // 那种情况下没有"当前位置"可言, 沉默让服务端保留旧值, 好过报一个上次残留的
+                // 坐标把配置写坏。
+                let isCandidate = (kind == ExtKind.posCandidateQuery)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    let pos = isCandidate ? self.panel.wireTopLeft() : self.statusBubble.wireTopLeft()
+                    guard let (x, y) = pos else { return }
+                    self.reportPos(isCandidate ? ExtKind.posCandidate : ExtKind.posStatusTip, x, y)
+                }
             default:
                 NSLog("WindInput[ext] 未处理的 kind=\(kind)")
             }
@@ -376,11 +400,12 @@ public final class CandidatePanelHost {
         let pt = NSPoint(x: CGFloat(p.x), y: CGFloat(p.y))
         NSLog("CPH.renderFrame showing panel at (\(p.x),\(p.y)) imgSize=\(img.size)")
         let useSoftwareShadow = frame.hasSoftwareShadow
+        let absolute = p.isAbsolutePos
         lock.lock(); currentScale = scale; let rects = Self.scaleRects(latestRects, by: scale); lock.unlock()
         DispatchQueue.main.async { [weak self] in
             // 软件阴影已渲染在 image 中时禁用系统窗口阴影，避免在画布边缘产生黑边。
             self?.panel.hasShadow = !useSoftwareShadow
-            self?.panel.show(image: img, atScreenPoint: pt, rects: rects)
+            self?.panel.show(image: img, atScreenPoint: pt, rects: rects, absolute: absolute)
         }
     }
 

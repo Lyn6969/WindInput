@@ -80,6 +80,9 @@ pub struct RenderedFrame {
     pub scale: f32,
     /// 是否含软件高斯阴影（影响 .app 落位/裁切）
     pub software_shadow: bool,
+    /// `screen_x/screen_y` 是否为用户固定位置的绝对坐标（而非按光标推算的落点）。
+    /// 置位时 `.app` 只做边界钳制，不再套用「下方放不下翻到光标上方」的兜底。
+    pub absolute_pos: bool,
     /// 候选命中矩形（窗口缓冲坐标，内容起点 (ml,mt)）：(index, Rect)
     pub hit_rects: Vec<(i32, crate::view::Rect)>,
     /// 预乘 BGRA 像素缓冲（width×height×4）
@@ -720,7 +723,13 @@ impl CandidateWindow {
         }
 
         // DPI：按光标所在屏取缩放（Retina=2），几何/字号由 self.scale 派生。
-        let new_scale = crate::dpi::scale_for_point(self.x, self.y);
+        // 固定位置模式按**固定点**取——固定位置可能落在与光标不同缩放的另一块屏上，
+        // 按光标算会让窗口用错误的 DPI 渲染（字号忽大忽小）。与 Windows 分支同一判据。
+        let (dpi_x, dpi_y) = match self.fixed_pos {
+            Some(f) if f != (0, 0) => f,
+            _ => (self.x, self.y),
+        };
+        let new_scale = crate::dpi::scale_for_point(dpi_x, dpi_y);
         if (new_scale - self.scale).abs() > 0.01 {
             self.scale = new_scale;
             self.text_renderer
@@ -750,32 +759,59 @@ impl CandidateWindow {
         let width = content_w + ml + mr;
         let height = content_h + mt + mb;
 
-        // 定位：据光标 + 内容尺寸算锚点。place_window 约定 caret_y 为光标【底端】（下方锚点=
-        // 底端+gap），但 macOS .app 的 caretRectToWire 发的是光标行【顶端】(top-left)，故这里
-        // 把行高补上传光标底端 = self.y + self.caret_height，候选窗才落在光标行下方、不遮挡输入。
-        let offset = self.position_offset_px();
-        let (px0, py0, above) = Self::place_window(
-            self.x,
-            self.y + self.caret_height,
-            self.caret_height,
-            content_w,
-            content_h,
-            self.placed_above,
-            offset,
-        );
-        self.placed_above = above;
-        let (px, py) = match self.last_content_pos {
-            Some((lx, ly)) if self.visible => {
-                let thr = (4.0 * self.scale).round().max(1.0) as i32;
-                if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
-                    (lx, ly)
-                } else {
-                    (px0, py0)
-                }
+        // ── 定位：fixed_pos（用户固定位置）> place_window（跟随光标）──
+        //
+        // Windows 那边还有第三级 `drag_pin`（本次组合内冻结拖动落位）。macOS 的拖动发生在
+        // `.app` 侧的 NSPanel 上，服务进程这边的 mouse handler 是不产生事件的 mock，
+        // `drag_pin` 恒为 None——会话内的落位冻结由 `.app` 自己记（见 CandidatePanel.dragPin）。
+        let (px, py, absolute) = match self.fixed_pos {
+            Some(f) => {
+                // 固定位置下窗口不随光标上下移动，"上翻"随之失去意义：placed_above 必须归 false，
+                // 否则 flip_when_above / swap_preedit_when_above 会让内容在一个不动的窗口里倒序。
+                self.placed_above = false;
+                self.last_content_pos = None;
+                let (wx, wy) = Self::place_fixed(
+                    f,
+                    self.x,
+                    self.y,
+                    width,
+                    height,
+                    (ml as i32, mt as i32, mr as i32, mb as i32),
+                );
+                // place_fixed 返回**窗口**左上（含阴影扩边）；macOS 不画软阴影，扩边恒 0，
+                // 故这里窗口左上就是内容左上，与下面跟随光标分支的 (px, py) 同义。
+                (wx, wy, true)
             }
-            _ => (px0, py0),
+            None => {
+                // place_window 约定 caret_y 为光标【底端】（下方锚点=底端+gap），但 macOS .app 的
+                // caretRectToWire 发的是光标行【顶端】(top-left)，故这里把行高补上传光标底端 =
+                // self.y + self.caret_height，候选窗才落在光标行下方、不遮挡输入。
+                let offset = self.position_offset_px();
+                let (px0, py0, above) = Self::place_window(
+                    self.x,
+                    self.y + self.caret_height,
+                    self.caret_height,
+                    content_w,
+                    content_h,
+                    self.placed_above,
+                    offset,
+                );
+                self.placed_above = above;
+                let (px, py) = match self.last_content_pos {
+                    Some((lx, ly)) if self.visible => {
+                        let thr = (4.0 * self.scale).round().max(1.0) as i32;
+                        if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
+                            (lx, ly)
+                        } else {
+                            (px0, py0)
+                        }
+                    }
+                    _ => (px0, py0),
+                };
+                self.last_content_pos = Some((px, py));
+                (px, py, false)
+            }
         };
-        self.last_content_pos = Some((px, py));
         if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
@@ -822,8 +858,9 @@ impl CandidateWindow {
         let mt_l = (mt as f32 / scale).round() as i32;
         // 软阴影上边距是完整 3σ 高斯尾(多为透明)；内容紧贴 caret 时上方约一个 blur 高的【可见浓阴影】
         // 会盖住 caret。故内容较锚点再下移「可见浓阴影」高度(≈blur，换算逻辑点)，使浓阴影恰落 caret
-        // 下方、透明尾不碍观感。above(上翻)不额外下移。
-        let clear_l = if above {
+        // 下方、透明尾不碍观感。above(上翻)不额外下移；固定位置分支 placed_above 恒为 false，
+        // 但那条路上窗口本就不贴 caret，阴影补偿有没有都不影响观感。
+        let clear_l = if self.placed_above {
             0
         } else {
             (shadow.as_ref().map(|s| s.blur).unwrap_or(0.0) / scale).round() as i32
@@ -837,6 +874,7 @@ impl CandidateWindow {
             height,
             scale: self.scale,
             software_shadow: shadow.is_some(),
+            absolute_pos: absolute,
             hit_rects: self.hit_rects.clone(),
             buf,
         })
@@ -1103,9 +1141,9 @@ impl CandidateWindow {
     /// 纯算术、无平台依赖，故【不加 cfg 门控】：调用方 `content_origin` 是未门控的 pub fn，
     /// 若把本对函数限定为 windows-only，非 Windows 目标就会 E0599 找不到函数——这类不对称
     /// 在 Windows 本地开发时永远显现不出来，只有 CI 的 macOS 目标才炸。
-    /// 非 Windows 下 `place_fixed`（windows-only）不参与编译，本函数暂无调用者，故显式
+    /// Linux（既非 windows 也非 macos，仅供跑测试）下 `place_fixed` 无调用者，故显式
     /// allow(dead_code)：它与 `window_to_content` 共用互逆契约和 round-trip 测试，必须成对存在。
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn content_to_window(content: (i32, i32), ml: u32, mt: u32) -> (i32, i32) {
         (content.0 - ml as i32, content.1 - mt as i32)
     }
@@ -1123,7 +1161,11 @@ impl CandidateWindow {
     ///   用户换分辨率或拔掉副屏后会指向不可见区域，候选窗就此"消失"且无法用鼠标拖回来；
     ///   但按含阴影的窗口矩形去钳会让内容离屏幕边还有一整个阴影宽就被拦下，见
     ///   [`clamp_content_to_monitor`]。
-    #[cfg(windows)]
+    ///
+    /// macOS 同样走这里（`.app` 的 NSPanel 只是照搬算好的坐标）：那边不画软阴影，扩边恒 0，
+    /// 且 `clamp_content_to_monitor` 在非 Windows 是恒等函数——真正的屏幕钳制由 `.app` 用
+    /// `NSScreen.visibleFrame` 做，服务进程这边查不到 macOS 的显示器几何。
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn place_fixed(
         fixed: (i32, i32),
         caret_x: i32,
@@ -1151,27 +1193,34 @@ impl CandidateWindow {
     ///
     /// 这里用 `rcWork` 而非 `rcMonitor`：自动落位应避开任务栏，只有用户**手动拖动**
     /// 才允许压到任务栏上。
-    #[cfg(windows)]
+    ///
+    /// 非 Windows 退化为「就落在光标处」：服务进程查不到 macOS 的显示器几何（`.app` 才有
+    /// `NSScreen`），而这只影响「刚打开固定位置、还没拖过」这一瞬——窗口出现在光标旁，
+    /// 用户拖一次就定下来了。与其为此加一轮 IPC 往返，不如让首帧落在最不意外的地方。
+    #[cfg_attr(not(windows), allow(unused_variables))]
     fn default_fixed_anchor(caret_x: i32, caret_y: i32, width: u32) -> (i32, i32) {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-        };
-        unsafe {
-            let pt = POINT {
-                x: caret_x,
-                y: caret_y,
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::POINT;
+            use windows::Win32::Graphics::Gdi::{
+                GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
             };
-            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if GetMonitorInfoW(mon, &mut mi).as_bool() {
-                let wa = mi.rcWork;
-                let x = wa.left + ((wa.right - wa.left) - width as i32) / 2;
-                let y = wa.top + ((wa.bottom - wa.top) * 3) / 4;
-                return (x, y);
+            unsafe {
+                let pt = POINT {
+                    x: caret_x,
+                    y: caret_y,
+                };
+                let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                    let wa = mi.rcWork;
+                    let x = wa.left + ((wa.right - wa.left) - width as i32) / 2;
+                    let y = wa.top + ((wa.bottom - wa.top) * 3) / 4;
+                    return (x, y);
+                }
             }
         }
         (caret_x, caret_y)

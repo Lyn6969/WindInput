@@ -481,8 +481,10 @@ public class InputController: IMKInputController {
             rect = NSRect(x: mouse.x, y: mouse.y, width: 1, height: 16)
         }
 
-        let screen = NSScreen.main ?? NSScreen.screens.first
-        let screenHeight = screen?.frame.height ?? 0
+        // 参照屏必须与浮窗落位那边同源（`PanelGeometry.referenceScreen`，带菜单栏的主屏）。
+        // 这里曾用 `NSScreen.main`：两个方向都用它时误差恰好抵消，一旦落位那边改用主屏，
+        // 两屏高度不同就直接变成候选窗相对光标的垂直偏移——在副屏比主屏高的机器上尤其明显。
+        let screenHeight = PanelGeometry.referenceHeight
         guard screenHeight > 0 else { return }
 
         let (x, y, h) = CaretCoords.caretRectToWire(rect, screenHeight: screenHeight)
