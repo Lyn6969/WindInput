@@ -461,19 +461,19 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         // toggle_mode_keys 时：无候选必须放行，让系统照常翻转大写锁定。吃掉 keydown 会让
         // 大小写在**任何时候**都切不动，而用户只是想给它在打字时加一个用途。
         //
-        // ⚠ 判据用 `_hasCandidates` 而**不是** hasSession —— 必须与服务端 `apply_nav_key`
-        // 的守卫逐字一致。宽一格（有 composition 无候选时也吃）的后果不是「多吃一次」：
-        // 服务端那边不翻页，会落回 CapsLock 的状态同步分支去 take_input_on_mode_switch，
-        // 用户看到的是「大小写没变、正在打的编码却没了」。二期给本表加 clear/cancel 动词、
-        // 服务端守卫放宽到「有编码或有候选」时，**这里要同步放宽**。
-        if (wParam == VK_CAPITAL && !_hasCandidates && pHotkeyMgr != nullptr
+        // ⚠ 判据必须与服务端 `Coordinator::has_input_session` 逐字一致。二期加 `cancel`
+        // 动词后，服务端守卫从「有候选」放宽到「有会话」（overlay 模式 / 有编码 / 有候选），
+        // 这里同步放宽——两侧错位一格的后果不是「多吃一次」：服务端那边不接管，会落回
+        // CapsLock 的状态同步分支去 take_input_on_mode_switch，用户看到的是「大小写没变、
+        // 正在打的编码却没了」。
+        if (wParam == VK_CAPITAL && !hasSession && pHotkeyMgr != nullptr
             && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(keyUpHash))
         {
             *pfEaten = FALSE;
             _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
                             HotkeyType::ToggleMode, _pTextService->IsChineseMode(),
                             _pTextService->HasActiveComposition(), _hasCandidates, hasSession, FALSE,
-                            L"capslock_session_only_no_candidates");
+                            L"capslock_session_only_no_session");
             return S_OK;
         }
         BOOL hasTextCtx = _pTextService->RefreshTextInputContext();
@@ -892,9 +892,9 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         if (wParam == VK_CAPITAL)
         {
             // 与 OnTestKeyDown 的同名判据**必须逐条一致**：那边放行、这边吃就是「吃了再吐」，
-            // 严格 TSF 宿主会直接丢键。详细理由（含为什么用 _hasCandidates 而非 hasSession）
-            // 见 OnTestKeyDown 里 capslock_session_only_no_candidates 那段。
-            if (!_hasCandidates && pHotkeyMgr != nullptr
+            // 严格 TSF 宿主会直接丢键。详细理由见 OnTestKeyDown 里
+            // capslock_session_only_no_session 那段。
+            if (!_HasInputSession() && pHotkeyMgr != nullptr
                 && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(keyUpHash))
             {
                 *pfEaten = FALSE;
@@ -902,7 +902,7 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
                                 HotkeyType::ToggleMode, _pTextService->IsChineseMode(),
                                 _pTextService->HasActiveComposition(), _hasCandidates,
                                 _HasInputSession(), FALSE,
-                                L"capslock_session_only_no_candidates");
+                                L"capslock_session_only_no_session");
                 return S_OK;
             }
             // Just consume the KeyDown, let OnKeyUp handle it
