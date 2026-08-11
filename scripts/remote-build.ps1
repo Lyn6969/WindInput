@@ -499,7 +499,9 @@ if ($isRaw) {
     $inner = "Set-Location -LiteralPath '$RRoot\wind_input'; & { $Raw } 6>&1; exit `$LASTEXITCODE"
 } else {
     Say "[2/3] 在编译机上执行 dev.ps1 $Command ..."
-    $inner = "& '$RRoot\scripts\dev.ps1' $Command 6>&1; exit `$LASTEXITCODE"
+    # 编译机是专用机器, 没有「别把机器压卡」的顾虑, 于是让全构建的四步并行 (见 dev.ps1 的
+    # Invoke-BuildStagesParallel)。开关只在这里注入 —— 本机直接跑 dev.ps1 时行为不变。
+    $inner = "`$env:WIND_PARALLEL_BUILD='1'; & '$RRoot\scripts\dev.ps1' $Command 6>&1; exit `$LASTEXITCODE"
 }
 $tExec = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not (Invoke-RemotePs $inner)) {

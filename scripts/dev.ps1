@@ -571,16 +571,94 @@ function Sync-VersionStamp {
     Set-Content -Path $stampFile -Value $Version -NoNewline
 }
 
+# ---------- 全构建的并行编排 (仅在 $env:WIND_PARALLEL_BUILD 非空时启用) ----------
+# core / tsf / setting / portable 四步互不依赖: 各写各的产物文件, 且 setting 与 portable
+# 用的是各自仓库的 target\, 与主仓的 cargo 锁不冲突。串行跑纯属浪费 —— 实测 48 核编译机
+# 上整个构建期间平均只用到 1 个核, 因为每步内部主要是单线程的链接与 LTO。
+#
+# ⚠️ 默认关闭, 且必须默认关闭: 本机走的是同一段代码, 而在 12 核机器上同时跑四个构建会把
+#    机器压死 —— 那正是当初把编译搬去远程的原因。由 remote-build.ps1 在远程侧注入开启。
+#
+# 用子进程而非 Start-ThreadJob: 这三步各自就是一条现成的子命令 (dm1/dm3/dm4, release 为
+# m1/m3/m4), 直接复用比把函数和几十个脚本级变量搬进独立 runspace 可靠得多。
+# Do-GenData 不参与并行: 它跑 cargo run -p wind-tools, 与 Build-Core 共用主仓的 target
+# 锁, 并行只会互相等锁, 还多占一份内存。
+function Invoke-BuildStagesParallel ([string]$profile, [string]$outdir) {
+    $p = if ($profile -eq "dev") { "d" } else { "" }
+    $stages = @(
+        @{ Cmd = "${p}m1"; Name = "tsf" },
+        @{ Cmd = "${p}m3"; Name = "setting" },
+        @{ Cmd = "${p}m4"; Name = "portable" }
+    )
+    Say "`n[parallel] core 与 tsf / setting / portable 并行构建 ($($stages.Count + 1) 路)..."
+    # 子进程必须带上 WIND_NO_REMOTE: 万一这台机器自身也配了 build.local.ps1, 子进程会把
+    # 命令再转发一次 —— 而转发目标很可能就是它自己。
+    $prevNoRemote = $env:WIND_NO_REMOTE
+    $env:WIND_NO_REMOTE = "1"
+    $pwshPath = (Get-Process -Id $PID).Path
+    $jobs = @()
+    try {
+        foreach ($s in $stages) {
+            $log = Join-Path $env:TEMP "wind-par-$($s.Name)-$PID.log"
+            $proc = Start-Process -FilePath $pwshPath -PassThru -NoNewWindow `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, $s.Cmd) `
+                -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+            $jobs += @{ Proc = $proc; Log = $log; Name = $s.Name }
+        }
+        # 主进程自己跑 core, 与上面三路并发
+        $swCore = [System.Diagnostics.Stopwatch]::StartNew()
+        $ok = Build-Core $profile $outdir
+        $swCore.Stop()
+    } finally { $env:WIND_NO_REMOTE = $prevNoRemote }
+
+    foreach ($j in $jobs) {
+        $j.Proc.WaitForExit()
+        # 子进程输出攒到各自结束后一次性打印 —— 四路实时交织完全没法读
+        foreach ($f in @($j.Log, "$($j.Log).err")) {
+            if (Test-Path $f) {
+                $t = Get-Content $f -Raw -ErrorAction SilentlyContinue
+                if ($t -and $t.Trim()) { Write-Host $t.TrimEnd() }
+                Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($j.Proc.ExitCode -ne 0) {
+            ErrMsg "$($j.Name) 构建失败 (退出码 $($j.Proc.ExitCode))"
+            $ok = $false
+        }
+    }
+    # ⚠️ 每路耗时必须取子进程自己的 ExitTime-StartTime。用外层 Stopwatch 是错的: 停表发生在
+    #    按顺序 WaitForExit 之后, 先结束那几路会把「等主进程轮到自己」的时间一并计入, 四路
+    #    因此显示成同一个数 (踩过一次, 差点据此误判成并行没生效)。
+    $each = $jobs | ForEach-Object {
+        @{ Name = $_.Name; Sec = ($_.Proc.ExitTime - $_.Proc.StartTime).TotalSeconds }
+    }
+    $sum = ($each | ForEach-Object { $_.Sec } | Measure-Object -Sum).Sum + $swCore.Elapsed.TotalSeconds
+    $wall = [math]::Max((($each | ForEach-Object { $_.Sec } | Measure-Object -Maximum).Maximum), $swCore.Elapsed.TotalSeconds)
+    $detail = (@("core {0:N1}s" -f $swCore.Elapsed.TotalSeconds) +
+               ($each | ForEach-Object { "{0} {1:N1}s" -f $_.Name, $_.Sec })) -join "  ·  "
+    Gray "[parallel] $detail"
+    # 判据: 墙钟 ≈ 最慢那一路 = 真并行; 墙钟 ≈ 各路之和 = 卡在了 cargo 的全局 package
+    # cache 锁上 (子进程输出里会出现 "Blocking waiting for file lock on package cache")。
+    Gray ("[parallel] 墙钟 {0:N1}s, 串行则需 {1:N1}s (并行度 {2:N2}x)" -f $wall, $sum, ($sum / [math]::Max($wall, 0.1)))
+    return $ok
+}
+
 function Do-Full ([string]$profile = "release") {
     $outdir = Out-For $profile
     Sync-VersionStamp   # 版本号变化则强制重建关键产物 (确定性保险)
     Say "`n========== 全构建 ($profile) → $outdir =========="
     if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
+    # Sync-VersionStamp 必须已经跑完再分叉: 版本变化时它会 cargo clean + 删 tsf-cmake 缓存,
+    # 几个进程同时干这件事必然打架。跑完之后它对子进程是幂等的 (版本已匹配, 直接 return)。
+    if ($env:WIND_PARALLEL_BUILD) {
+        if (-not (Invoke-BuildStagesParallel $profile $outdir)) { return $false }
+    } else {
     if (-not (Build-Core     $profile $outdir)) { return $false }   # wind_input[_dev].exe
     if (-not (Build-TsfAll   $profile $outdir)) { return $false }   # wind_tsf[_x86][_dev].dll
     if (-not (Build-Setting  $profile $outdir)) { return $false }   # wind_setting[_dev].exe (可选)
     if (-not (Build-Portable $profile $outdir)) { return $false }   # wind_portable.exe (可选)
+    }
     if (-not (Do-GenData     $outdir))          { return $false }   # data/
     if (-not (Verify-DistData $outdir))         { return $false }   # 硬门禁
     Say "`n========== 全构建完成 ($profile) → $outdir =========="
