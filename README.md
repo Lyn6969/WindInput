@@ -68,6 +68,31 @@ macOS 目前仅支持从源码构建，暂未提供安装包。
 
 > 首次提交 PR 需要签署 [贡献者许可协议 (CLA)](CLA.md)。
 
+## 致谢
+
+清风输入法在设计与实现过程中参考了许多优秀的开源输入法项目，
+它们的思路、文档与源码为本项目提供了重要的指引，在此一并致谢：
+
+- **[RIME 中州韵输入法引擎](https://rime.im)**（[librime](https://github.com/rime/librime)）
+  — 方案与词库格式、候选排序与整句解码模型的主要参考；其
+  [小狼毫 Weasel](https://github.com/rime/weasel) 是 Windows TSF 集成语义的对照实现，
+  [鼠须管 Squirrel](https://github.com/rime/squirrel) 是 macOS IMKit 架构的参考
+- **[Fcitx5](https://github.com/fcitx/fcitx5)**（[libime](https://github.com/fcitx/libime)）
+  — 拼音解码（不完整拼音、超长词惩罚）与用户词频模型的重要参考；
+  fcitx5-macos 为 macOS 端的打包与输入源注册细节提供了对照
+- **极点五笔** — 五笔输入的交互习惯与功能来源；
+  五笔 86 码表数据来自其 Rime 移植版
+  [rime-wubi86-jidian](https://github.com/KyleBing/rime-wubi86-jidian)
+- **[白霜拼音 rime-frost](https://github.com/gaboolic/rime-frost)** — 拼音词库与语言模型的数据来源
+- **[pinyin-data](https://github.com/mozillazg/pinyin-data)** — 汉字读音数据来源
+- **[OpenCC](https://github.com/BYVoid/OpenCC)** — 简繁转换词典数据来源
+- **[Windows Classic Samples](https://github.com/microsoft/Windows-classic-samples)** 与
+  [TSF 官方文档](https://learn.microsoft.com/en-us/windows/win32/tsf/text-services-framework)
+  — Windows 输入法框架实现参考
+
+上述项目均为独立作品，本项目仅作实现参考，未复制其源代码；
+数据来源部分适用各自的许可证条款，详见 [NOTICE.md](NOTICE.md)。
+
 ## 许可证
 
 本项目源代码采用 [MIT 许可证](LICENSE)。词库数据来源于

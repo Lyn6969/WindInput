@@ -102,6 +102,36 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 - **许可证**: GPL-3.0
 - **用途**: macOS IMKit 输入法架构参考
 
+### RIME / librime
+
+- **仓库**: https://github.com/rime/librime
+- **许可证**: BSD-3-Clause
+- **用途**: 方案与词库格式（`.dict.yaml` 列序与元数据语义）、候选排序层级、
+  整句解码与补全策略（`enable_completion`）、词频权重模型的设计参考
+
+### 小狼毫 (Weasel)
+
+- **仓库**: https://github.com/rime/weasel
+- **许可证**: GPL-3.0
+- **用途**: Windows TSF 焦点语义、编辑会话与候选窗定位行为的对照参考
+
+### Fcitx5 / libime
+
+- **仓库**: https://github.com/fcitx/fcitx5 、https://github.com/fcitx/libime
+  （实际查阅的是 https://github.com/fcitx5-android/fcitx5-android 内置的 libime 源码）
+- **许可证**: LGPL-2.1
+- **用途**: 拼音解码（不完整拼音、`overLengthCost` 超长词惩罚、`partialLongWordLimit`）、
+  用户词频模型（`HistoryBigram` / `UserLanguageModel`）的设计参考
+
+### fcitx5-macos
+
+- **用途**: macOS 端应用打包、代码签名与输入源注册细节的对照参考
+
+### 极点五笔
+
+- **用途**: 五笔输入的交互习惯与功能参考。
+  其码表数据经由 Rime 移植版 rime-wubi86-jidian 引入，见上文「词库与数据资源」
+
 ## 许可证兼容性说明
 
 本项目源代码采用 [MIT 许可证](LICENSE)。
