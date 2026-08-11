@@ -186,20 +186,56 @@ public class InputController: IMKInputController {
         return (UInt64(pid) << 32) | UInt64(low)
     }
 
-    /// 发前台上下文帧 (CmdFrontContext 0x0211): client app bundle id / 聚焦窗口标题 / 选中文本,
-    /// 供命令直通车 app()/title()/sel() 取值。聚焦时快照 —— app()/title() 稳定; sel() 反映聚焦
-    /// 时选区 (best-effort, 部分 app 不支持取选中文本, 选区随后变化不会刷新)。读掉 ack, 失败仅 log。
+    /// 发前台上下文帧: client app bundle id / 聚焦窗口标题 / 选中文本, 供命令直通车
+    /// app()/title()/sel() 取值。聚焦时快照 —— app()/title() 稳定; sel() 反映聚焦时选区
+    /// (best-effort, 部分 app 不支持取选中文本, 选区随后变化不会刷新)。
+    ///
+    /// **窗口标题与发送一律挪出主线程。** 取标题走 AX, 那是到目标 app 的**同步跨进程调用**,
+    /// 而 `activateServer` 的调用时机恰恰是那个 app 刚被切到前台、正忙着重绘的时候 —— 实测
+    /// (sample 输入法进程 6 秒 / 切 6 次应用) 主线程 3467/4643 个采样点全部堵在这一个
+    /// `AXUIElementCopyAttributeValue` 上, 平均每次切换阻塞约 0.5 秒, 且阻塞期间 AX 的
+    /// mach_msg 会转 runloop, 下一次 activateServer 直接重入叠上来。IMKit 在主线程派发按键,
+    /// 于是表现为「切换应用后刚开始输入非常卡」。
+    ///
+    /// 这份快照只有命令直通车读 (`coordinator.rs::front_ctx_snapshot`), 是个用户偶尔主动触发
+    /// 的功能 —— 为它同步阻塞每一次焦点切换完全不成比例。异步晚到几十毫秒没有任何影响。
     private func sendFrontContext() {
-        guard let bridge = bridge, bridge.isConnected else { return }
         let app = currentClient?.bundleIdentifier() ?? ""
-        let title = frontmostWindowTitle()
-        let sel = selectedClientText()
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        // 选中文本只能在主线程取 (IMKTextInput 的约定), 但**不在 activateServer 里取**:
+        // `selectedRange()` 同样是跨进程调用, 实测占了另外 1191/4643 个采样点。改排到下一轮
+        // 主线程事件, 激活流程即刻返回; 那时 IMKit 已完成激活、目标 app 也缓过来了。
+        DispatchQueue.main.async { [weak self] in
+            let sel = self?.selectedClientText() ?? ""
+            Self.frontCtxQueue.async {
+                let title = pid > 0 ? Self.frontmostWindowTitle(pid: pid) : ""
+                Self.sendFrontContextFrame(app: app, title: title, sel: sel)
+            }
+        }
+    }
+
+    /// 前台上下文的专用串行队列 + 专用连接。
+    ///
+    /// **不能复用 `bridge`**: 那条连接由主线程发按键帧并同步读响应, 从别的线程往里插一帧
+    /// 会与按键帧交错、把两边的读写配对错开。专用连接只被本队列碰, 天然串行。
+    private static let frontCtxQueue = DispatchQueue(label: "to.feng.windinput.frontctx")
+    /// 仅在 `frontCtxQueue` 上访问。
+    private static var frontCtxBridge: BridgeClient?
+
+    private static func sendFrontContextFrame(app: String, title: String, sel: String) {
+        if frontCtxBridge == nil {
+            frontCtxBridge = try? BridgeClient(socketPath: BridgeEndpoints.requestSocket,
+                                               ioTimeoutMs: requestIOTimeoutMs)
+        }
+        guard let c = frontCtxBridge else { return }
         do {
-            try bridge.send(BinaryCodec.encodeFrontContextFrame(app: app, title: title, sel: sel))
-            _ = try bridge.readFrame()
+            try c.send(BinaryCodec.encodeFrontContextFrame(app: app, title: title, sel: sel))
+            _ = try c.readFrame()
         } catch {
+            // 连接陈旧 (服务重启) → 丢弃, 下次聚焦时重建。不重发: 上下文是快照, 丢一次无害。
             NSLog("WindInput[sendFrontContext] io error: \(error)")
-            reconnect()
+            frontCtxBridge?.close()
+            frontCtxBridge = nil
         }
     }
 
@@ -214,20 +250,29 @@ public class InputController: IMKInputController {
         return ""
     }
 
-    /// 取前台应用聚焦窗口标题 (AX)。需辅助功能授权 (本 IME 已为合成按键/移动光标申请);
+    /// 取指定进程聚焦窗口的标题 (AX)。需辅助功能授权 (本 IME 已为合成按键/移动光标申请);
     /// 未授权/取不到返回空, 不弹授权框。
-    private func frontmostWindowTitle() -> String {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return "" }
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    ///
+    /// **只在 `frontCtxQueue` 上调用**: 这是到目标 app 的同步跨进程调用, 目标忙时会一直等。
+    private static func frontmostWindowTitle(pid: pid_t) -> String {
+        let axApp = AXUIElementCreateApplication(pid)
+        // 默认超时是 6 秒。窗口标题是「取不到就算了」的锦上添花, 没有任何理由等那么久 ——
+        // 挂起/无响应的目标 app 会把本队列连同后续每一次聚焦快照一起拖住。
+        AXUIElementSetMessagingTimeout(axApp, axMessagingTimeout)
         var winRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef) == .success,
               let win = winRef else { return "" }
         // swiftlint:disable:next force_cast
+        let window = win as! AXUIElement
+        AXUIElementSetMessagingTimeout(window, axMessagingTimeout)
         var titleRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef) == .success
         else { return "" }
         return (titleRef as? String) ?? ""
     }
+
+    /// AX 跨进程调用的超时上限 (秒)。
+    private static let axMessagingTimeout: Float = 0.5
 
     /// IS_PASSWORD 位 (TSF InputScope 枚举 31) 的 bitmask, 与 Go coordinator 的
     /// inputScopePassword 常量对齐。
