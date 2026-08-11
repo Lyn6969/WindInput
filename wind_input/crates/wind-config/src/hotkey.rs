@@ -408,9 +408,9 @@ impl Compiler {
 
         // ── 会话态按键功能表（keys.session_actions）──
         //
-        // 数据源已由 `Config::normalize` 把 `page_keys` / `highlight_keys` 折算进来；本编译器
-        // 的唯一调用方 `ConfigBundle::build` 保证「先 normalize 后 compile」。⚠️ 顺序反了的
-        // 表现是翻页键全失效——`page_keys` 那一侧已经没有消费者了。
+        // 数据源是 `effective_session_actions()`＝四组键组配置的展开结果 ⊕ `session_actions`
+        // （后者优先）。⚠️ **不能**直接读 `config.keys.session_actions`：那只是用户显式配的
+        // 那部分，漏掉四组键组展开的键，表现是翻页/选词键全失效。
         //
         // ★ 按**键的形态**分两条路，与五c 给 `keys.key_actions` 做的分流同构：
         //   - keyup-only 键（CapsLock / 纯修饰键）→ `key_up` 表，带 SESSION 位，让 C++ 区分
@@ -421,7 +421,7 @@ impl Compiler {
         //    转发，登记与否都能工作。这里**仍照旧全部登记**：旧的 `compile_page_key_group`
         //    就是这么做的，收编时顺手改可达性会把一次配置重构变成一次跨进程行为变更，
         //    而后者只有真机才验得了。
-        for (name, verb) in &self.config.keys.session_actions {
+        for (name, verb) in &self.config.keys.effective_session_actions() {
             if !crate::config::SessionAction::parse(verb).is_enabled() {
                 continue;
             }
@@ -802,9 +802,52 @@ mod tests {
             .collect()
     }
 
+    /// 清空四组键组配置，使 `effective_session_actions()` 只剩显式表。
+    ///
+    /// 出厂默认里 `page_keys` / `highlight_keys` / `select_key_groups` **都非空**，
+    /// 不清的话每个用例都会多出十来个折算来的键，断言「只该有这几个」必然失败。
+    fn only_explicit(cfg: &mut Config) {
+        cfg.keys.page_keys.clear();
+        cfg.keys.highlight_keys.clear();
+        cfg.keys.select_key_groups.clear();
+        cfg.keys.select_char_keys.clear();
+    }
+
+    /// ★★★ 四组键组配置必须经 `effective_session_actions()` 进 TSF 转发表。
+    ///
+    /// 2026-08-11 回归守门：折算从 `normalize` 移到消费层视图后，本编译器若仍直接读
+    /// `config.keys.session_actions`（只有用户显式配的那部分），出厂默认的翻页/选词键
+    /// **一个都不会进转发表**——表现是升级后翻页键、次选键全部失效，而配置文件看着好好的。
+    #[test]
+    fn key_group_config_reaches_forward_set_without_explicit_table() {
+        let cfg = Config::default();
+        assert!(
+            cfg.keys.session_actions.is_empty(),
+            "前置条件：出厂默认不该有显式会话态绑定，否则本测试证明不了什么"
+        );
+        let compiled = Compiler::new(cfg).compile();
+        // 默认 page_keys 含 pageupdown、highlight_keys 含 arrows、select_key_groups 含 semicolon_quote。
+        for (vk, label) in [
+            (VK_PRIOR, "PageUp（page_keys 默认）"),
+            (VK_NEXT, "PageDown（page_keys 默认）"),
+            (VK_UP, "↑（highlight_keys 默认）"),
+            (VK_OEM_1, "分号（select_key_groups 默认）"),
+        ] {
+            assert!(
+                compiled
+                    .key_down
+                    .iter()
+                    .any(|e| e.match_hash & 0xFFFF == vk
+                        && e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0),
+                "{label} 未进 FORWARD_ONLY 转发集——四组键组配置没被编译进去"
+            );
+        }
+    }
+
     #[test]
     fn forward_only_bit_marks_page_and_select_keys_only() {
         let mut cfg = Config::default();
+        only_explicit(&mut cfg);
         cfg.keys.toggle_full_width = "shift+space".to_string();
         // 等价于旧的 `page_keys = ["minus_equal", "shift_tab"]` +
         // `select_key_groups = ["semicolon_quote"]` 折算后的样子。
@@ -979,6 +1022,7 @@ mod tests {
     #[test]
     fn session_actions_skip_disabled_and_unknown_keys() {
         let mut cfg = Config::default();
+        only_explicit(&mut cfg);
         cfg.keys.session_actions =
             session_actions(&[("tab", "none"), ("pgeup", "page_prev"), ("up", "")]);
         let compiled = Compiler::new(cfg).compile();

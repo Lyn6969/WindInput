@@ -724,9 +724,11 @@ impl ConfigBundle {
             }
         }
         warn_unknown_session_actions(&config);
-        // 会话态按键绑定。数据源是折算后的 `keys.session_actions`——上一行的 `normalize()`
-        // 已把 `page_keys` / `highlight_keys` 的组名展开进去（见
-        // `Config::migrate_nav_keys_into_session_actions`）。
+        // 会话态按键绑定。数据源是 `effective_session_actions()`＝四组键组配置的展开结果
+        // ⊕ `session_actions`（后者优先）。
+        //
+        // ★ 合并只在这里发生，**配置文件里两套各自保持原样**——设置页的四个勾选框读的正是
+        // 存储层，折算若写回存储，界面就永远显示为空。判据见该函数的文档。
         //
         // ★ 这里是两个 crate 的接缝：动作值域（`SessionAction`）在 `wind-config`，绑定表
         // （`KeyBinds`）在 `wind-keys`，而 `wind-config` 不能反向依赖 `wind-keys`（后者经
@@ -736,13 +738,12 @@ impl ConfigBundle {
         // 映射在加 `cancel` 时立刻成了瓶颈（新动词没有对应的 `NavAction`）。
         // 显式 `none` 与写错的动词都在此过滤掉；后者由上一行的 `warn_unknown_session_actions`
         // 报出来，静默忽略与「功能坏了」完全同形。
+        let effective_session = config.keys.effective_session_actions();
         let session_keys =
-            keymap::KeyBinds::from_binds(config.keys.session_actions.iter().filter_map(
-                |(name, verb)| {
-                    let action = wind_config::SessionAction::parse(verb);
-                    action.is_enabled().then_some((name.as_str(), action))
-                },
-            ));
+            keymap::KeyBinds::from_binds(effective_session.iter().filter_map(|(name, verb)| {
+                let action = wind_config::SessionAction::parse(verb);
+                action.is_enabled().then_some((name.as_str(), action))
+            }));
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
         let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);

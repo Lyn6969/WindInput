@@ -2287,6 +2287,60 @@ fn select_char_group_binds(group: &str) -> &'static [(&'static str, SessionActio
     }
 }
 
+impl KeysConfig {
+    /// **有效**的会话态按键表：四组键组配置的展开结果 ⊕ `session_actions`（后者优先）。
+    ///
+    /// # ★ 这是消费层的视图，不是存储层的改写
+    ///
+    /// 四组键组（`page_keys` / `highlight_keys` / `select_key_groups` / `select_char_keys`）
+    /// 与 `session_actions` 在配置文件里**各自保持原样**，只在这里合并成运行时的单一真相。
+    ///
+    /// 曾经的做法是在 `normalize()` 里折算并 `clear()` 掉四个原字段，后果是**存储层被视图
+    /// 吃掉**（2026-08-11 用户报「感觉有些乱」时查实）：
+    ///
+    /// - 设置页读 `config.get` → `Config::load` → `normalize`，四项恒为空 ⇒ 出厂默认
+    ///   （`page_keys` 等三项非空）在界面上全显示为未勾选，**每个用户都会遇到**。
+    /// - 用户勾选后保存，重开设置页又变空，像是没保存。
+    /// - 在自定义表里删掉一条折算来的绑定，下次启动又被折算回来，**删不掉**。
+    ///
+    /// ⇒ 判据：**折算属于「怎么解释配置」，不属于「配置是什么」。** 把视图写回存储，就丢掉了
+    /// 用户的原始意图，而设置页读的正是存储。
+    ///
+    /// # 优先级（两层，都必须保持）
+    ///
+    /// 1. **组间**：折算顺序 = 消费点的判定顺序，撞键时先折的赢。主输入路径上是
+    ///    以词定字（`select_char_index`）→ 翻页/高亮（`apply_session_action`）
+    ///    → 二三候选（`select_key_offset`），故这里必须同序。`comma_period` 同时是选词键组
+    ///    与以词定字键组的合法值，顺序就是唯一的裁决依据——搞反了的表现是「一直用的 `,`
+    ///    突然从取字变成选次选」，而用户什么都没改。
+    /// 2. **显式优先**：`session_actions` 里写了的键覆盖折算结果。用户在高级表里改的就该赢。
+    pub fn effective_session_actions(&self) -> BTreeMap<String, String> {
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        let mut folded: Vec<(&'static str, SessionAction)> = Vec::new();
+        for g in &self.select_char_keys {
+            folded.extend_from_slice(select_char_group_binds(g));
+        }
+        for g in &self.page_keys {
+            folded.extend_from_slice(page_key_group_binds(g));
+        }
+        for g in &self.highlight_keys {
+            folded.extend_from_slice(highlight_key_group_binds(g));
+        }
+        for g in &self.select_key_groups {
+            folded.extend_from_slice(select_key_group_binds(g));
+        }
+        for (key, action) in folded {
+            out.entry(key.to_string())
+                .or_insert_with(|| action.to_string());
+        }
+        // 显式表最后覆盖（含显式的 `none`——那是「在打字时禁用该键」，必须能压过折算）。
+        for (key, verb) in &self.session_actions {
+            out.insert(key.clone(), verb.clone());
+        }
+        out
+    }
+}
+
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
@@ -3363,70 +3417,9 @@ impl Config {
         // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
         // 这里看到的 trigger_keys 已只剩符号键。
         self.migrate_trigger_keys_into_key_actions();
-        self.migrate_key_groups_into_session_actions();
+        // ⛔ 这里**不再**把四组键组配置折算进 `session_actions`。折算是**消费层的视图**，
+        // 不是存储层的改写——见 `KeysConfig::effective_session_actions` 的文档。
         self.warn_legacy_special_modes();
-    }
-
-    /// 存量折算：`keys.page_keys` / `keys.highlight_keys` → `keys.session_actions`
-    /// （见 docs/design/session-key-actions.md §6）。
-    ///
-    /// 与 `migrate_trigger_keys_into_key_actions` 同策略：**在内存里做，不写回配置文件**。
-    /// 用户的 config.toml 保持原样，回退一个版本就能照常工作。
-    ///
-    /// # ★ 优先级必须复现 `NavKeys::classify` 的 `.find()` 语义
-    ///
-    /// 旧实现把 page 组与 highlight 组**依次**推进同一个 `binds`，再用 `.find()` 取第一个
-    /// 匹配——于是同一个键（`tab` / `shift+tab`）被两组同时声明时 **page 组赢**。折算必须
-    /// 复现这条：先折 page、后折 highlight，**已占的键不覆盖**。搞反了的表现是「一直用的
-    /// Tab 突然从翻页变成移高亮」，而用户什么都没改，极难联想到是折算干的。
-    ///
-    /// 用户**显式**写在 `session_actions` 里的键最优先，折算一律不覆盖它——新配置优先于
-    /// 存量迁移，同五c 收编 `trigger_keys` 时立的口径。
-    ///
-    /// # 为什么折算完要清空原字段
-    ///
-    /// 消费点已改读 `session_actions`；留着原字段就是僵尸配置——用户改了没反应，而那正是
-    /// 本次收编要消除的问题。默认值仍然留在原字段的 `default_*` 函数里（**不能**搬进
-    /// `session_actions`），三种情况才都对：没配过→折算出默认、改成别的→折算出新值、
-    /// 清空成 `[]`→折算出空。
-    fn migrate_key_groups_into_session_actions(&mut self) {
-        let k = &self.keys;
-        if k.page_keys.is_empty()
-            && k.highlight_keys.is_empty()
-            && k.select_key_groups.is_empty()
-            && k.select_char_keys.is_empty()
-        {
-            return;
-        }
-        // ★★ 折算顺序 = 消费点的判定顺序，撞键时先折的赢。主输入路径上是
-        //   以词定字（`select_char_index`）→ 翻页/高亮（`apply_session_action`）
-        //   → 二三候选（`select_key_offset`），
-        // 故这里必须同序。`comma_period` 同时出现在多个组里（它既是选词键组也是以词定字
-        // 键组的合法值）时，顺序就是唯一的裁决依据——搞反了的表现是「一直用的 `,` 突然
-        // 从取字变成选次选」，而用户什么都没改。
-        let mut folded: Vec<(&'static str, SessionAction)> = Vec::new();
-        for g in &k.select_char_keys {
-            folded.extend_from_slice(select_char_group_binds(g));
-        }
-        for g in &k.page_keys {
-            folded.extend_from_slice(page_key_group_binds(g));
-        }
-        for g in &k.highlight_keys {
-            folded.extend_from_slice(highlight_key_group_binds(g));
-        }
-        for g in &k.select_key_groups {
-            folded.extend_from_slice(select_key_group_binds(g));
-        }
-        for (key, action) in folded {
-            self.keys
-                .session_actions
-                .entry(key.to_string())
-                .or_insert_with(|| action.to_string());
-        }
-        self.keys.page_keys.clear();
-        self.keys.highlight_keys.clear();
-        self.keys.select_key_groups.clear();
-        self.keys.select_char_keys.clear();
     }
 
     /// 残留的 `schema.special_modes` 告警（**不迁移**，见 `docs/redesign/overlay-mode-config.md` §5）。
@@ -4089,9 +4082,8 @@ mod tests {
     /// 折算后必须逐键等价于旧 `NavKeys::from_config` 的产物——否则升级即回归。
     #[test]
     fn nav_keys_fold_into_session_actions_preserving_defaults() {
-        let mut c = Config::default();
-        c.normalize();
-        let sa = &c.keys.session_actions;
+        let c = Config::default();
+        let sa = c.keys.effective_session_actions();
         for (key, want) in [
             ("pageup", "page_prev"),
             ("pagedown", "page_next"),
@@ -4109,19 +4101,21 @@ mod tests {
                 sa.get(key)
             );
         }
-        assert!(
-            c.keys.page_keys.is_empty(),
-            "折算后原字段须清空，否则是僵尸配置"
+        // ★★ 存储层必须保持原样：设置页的四个勾选框读的正是它。曾经在 normalize 里
+        // clear 掉，后果是出厂默认在界面上全显示为未勾选（每个用户都会遇到）。
+        assert_eq!(
+            c.keys.page_keys,
+            default_page_keys(),
+            "折算是消费层的视图，不得改写存储层"
         );
-        assert!(c.keys.highlight_keys.is_empty());
+        assert_eq!(c.keys.highlight_keys, default_highlight_keys());
     }
 
     /// 出厂默认的 `select_key_groups = ["semicolon_quote"]` 折算成两条选词绑定。
     #[test]
     fn default_select_key_group_folds_into_session_actions() {
         let mut c = Config::default();
-        c.normalize();
-        let sa = &c.keys.session_actions;
+        let sa = c.keys.effective_session_actions();
         assert_eq!(
             sa.get("semicolon").map(String::as_str),
             Some("select_candidate:2"),
@@ -4132,7 +4126,11 @@ mod tests {
             Some("select_candidate:3"),
             "`'` 应折算成三选键"
         );
-        assert!(c.keys.select_key_groups.is_empty(), "折算后原字段须清空");
+        assert_eq!(
+            c.keys.select_key_groups,
+            default_select_key_groups(),
+            "折算不得改写存储层"
+        );
     }
 
     /// 修饰键选词组（走 keyup 轻敲）折算成四个纯修饰键名。
@@ -4144,8 +4142,7 @@ mod tests {
     fn modifier_select_group_folds_to_modifier_key_names() {
         let mut c = Config::default();
         c.keys.select_key_groups = vec!["lrctrl".into()];
-        c.normalize();
-        let sa = &c.keys.session_actions;
+        let sa = c.keys.effective_session_actions();
         assert_eq!(
             sa.get("lctrl").map(String::as_str),
             Some("select_candidate:2")
@@ -4170,8 +4167,7 @@ mod tests {
     fn select_char_group_folds_including_brackets() {
         let mut c = Config::default();
         c.keys.select_char_keys = vec!["brackets".into()];
-        c.normalize();
-        let sa = &c.keys.session_actions;
+        let sa = c.keys.effective_session_actions();
         assert_eq!(
             sa.get("lbracket").map(String::as_str),
             Some("select_char:1")
@@ -4180,7 +4176,11 @@ mod tests {
             sa.get("rbracket").map(String::as_str),
             Some("select_char:2")
         );
-        assert!(c.keys.select_char_keys.is_empty(), "折算后原字段须清空");
+        assert_eq!(
+            c.keys.select_char_keys,
+            vec!["brackets".to_string()],
+            "折算不得改写存储层"
+        );
     }
 
     /// ★★ 撞键裁决：`comma_period` 同时配给以词定字与选词时，**以词定字赢**。
@@ -4193,9 +4193,11 @@ mod tests {
         let mut c = Config::default();
         c.keys.select_key_groups = vec!["comma_period".into()];
         c.keys.select_char_keys = vec!["comma_period".into()];
-        c.normalize();
         assert_eq!(
-            c.keys.session_actions.get("comma").map(String::as_str),
+            c.keys
+                .effective_session_actions()
+                .get("comma")
+                .map(String::as_str),
             Some("select_char:1"),
             "撞键时以词定字应赢——它在消费链上更靠前"
         );
@@ -4244,16 +4246,13 @@ mod tests {
         let mut c = Config::default();
         c.keys.page_keys = vec!["shift_tab".into()];
         c.keys.highlight_keys = vec!["tab".into()];
-        c.normalize();
+        let sa = c.keys.effective_session_actions();
         assert_eq!(
-            c.keys.session_actions.get("tab").map(String::as_str),
+            sa.get("tab").map(String::as_str),
             Some("page_next"),
             "tab 两组都配时 page 组应赢"
         );
-        assert_eq!(
-            c.keys.session_actions.get("shift+tab").map(String::as_str),
-            Some("page_prev")
-        );
+        assert_eq!(sa.get("shift+tab").map(String::as_str), Some("page_prev"));
     }
 
     /// 用户**显式**写在 `session_actions` 里的键不被折算覆盖：新配置优先于存量迁移。
@@ -4264,9 +4263,11 @@ mod tests {
         c.keys
             .session_actions
             .insert("tab".into(), "page_next".into());
-        c.normalize();
         assert_eq!(
-            c.keys.session_actions.get("tab").map(String::as_str),
+            c.keys
+                .effective_session_actions()
+                .get("tab")
+                .map(String::as_str),
             Some("page_next"),
             "显式配置应压过默认 highlight_keys 折算出的 highlight_down"
         );
@@ -4285,22 +4286,50 @@ mod tests {
         // 选词键组默认非空（semicolon_quote），一并清掉才测得出「清空即无绑定」。
         c.keys.select_key_groups = vec![];
         c.keys.select_char_keys = vec![];
+        let sa = c.keys.effective_session_actions();
+        assert!(sa.is_empty(), "全部清空时不应折算出任何绑定，实际 {sa:?}");
+    }
+
+    /// ★★★ `normalize` **不得**碰这两处——折算是消费层的视图，不是存储层的改写。
+    ///
+    /// 2026-08-11 回归守门：曾在 normalize 里折算并 clear 四个原字段，后果是设置页读到的
+    /// 四项恒为空（出厂默认非空，每个用户都遇到）、勾选后重开又变空、在高级表里删掉一条
+    /// 折算来的绑定下次又被折算回来。判据见 `effective_session_actions` 的文档。
+    #[test]
+    fn normalize_does_not_rewrite_key_group_storage() {
+        let mut c = Config::default();
+        let before_groups = (
+            c.keys.page_keys.clone(),
+            c.keys.highlight_keys.clone(),
+            c.keys.select_key_groups.clone(),
+            c.keys.select_char_keys.clone(),
+        );
+        let before_explicit = c.keys.session_actions.clone();
         c.normalize();
-        assert!(
-            c.keys.session_actions.is_empty(),
-            "全部清空时不应折算出任何绑定，实际 {:?}",
-            c.keys.session_actions
+        assert_eq!(
+            (
+                c.keys.page_keys.clone(),
+                c.keys.highlight_keys.clone(),
+                c.keys.select_key_groups.clone(),
+                c.keys.select_char_keys.clone(),
+            ),
+            before_groups,
+            "四组键组配置是存储层，normalize 不得清空"
+        );
+        assert_eq!(
+            c.keys.session_actions, before_explicit,
+            "session_actions 只存用户显式配的，normalize 不得往里塞折算结果——             否则高级表里会冒出一堆用户没配过的绑定，且删了下次又回来"
         );
     }
 
-    /// `normalize` 幂等：跑两次结果一致（热重载 / 设置页保存都会重跑）。
+    /// 有效视图是纯函数：多次调用结果一致，且与调用前后的 normalize 无关。
     #[test]
-    fn nav_fold_is_idempotent() {
+    fn effective_session_actions_is_pure() {
         let mut c = Config::default();
+        let a = c.keys.effective_session_actions();
         c.normalize();
-        let once = c.keys.session_actions.clone();
-        c.normalize();
-        assert_eq!(c.keys.session_actions, once, "折算须幂等");
+        let b = c.keys.effective_session_actions();
+        assert_eq!(a, b);
     }
 
     /// ⚠️ 组名展开表里的键名是**跨 crate 拼写契约**（消费端在 `wind-keys` 与
