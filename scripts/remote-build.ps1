@@ -34,8 +34,9 @@
 #   同步 : 本地 tar.gz  →  scp  →  远程解压   (~5 MB, 2~3 秒)
 #   回传 : 按命令只取该模块的产物文件; 全构建才整目录打包
 #
-# ⚠️ 同步是【覆盖式】不是镜像: 本机删掉的源文件在编译机上会残留。对编译无害 (不被 mod
-#    引用就不参与构建), 需要彻底干净时用 -Clean。
+# ⚠️ 同步是【镜像】: 解压后会清掉编译机上多余的文件 (prune), 否则本机删掉的 tests\*.rs
+#    会继续参与编译 —— cargo 自动发现测试目标, 不需要任何引用。清理范围严格等于同步范围,
+#    target\ / build[_dev]\ / dist\ / .cache\ 一律不碰。逃生口: -NoPrune。
 
 [CmdletBinding(DefaultParameterSetName = 'Dev')]
 param(
@@ -45,6 +46,8 @@ param(
     [switch]$NoSync,
     # 只编译不回传
     [switch]$NoFetch,
+    # 不清理编译机上的残留文件 (逃生口; 正常情况下不该用, 见 Sync-Tree 里的说明)
+    [switch]$NoPrune,
     # 先删除编译机上的整个仓库目录再全量同步。⚠️ 连 target\ 一起删, 下次要全量重编 (~9 分钟)
     [switch]$Clean
 )
@@ -234,10 +237,52 @@ function Sync-Tree ([string]$src, [string]$remoteDir, [string]$label) {
             ErrMsg "  scp 上传 $label 失败 (已重试 3 次)"; return $false
         }
 
+        # ---- 清理残留 (prune) ----
+        # tar 解压是【叠加】不是镜像: 只创建和覆盖, 从不删除。本机删掉的文件会永远留在编译机上。
+        # 对 src\ 多半无害 (不被 mod 引用就不参与编译), 但 cargo 会把 tests\ benches\ examples\
+        # 下的每个 .rs **自动发现**为独立编译目标 —— 不需要任何引用就参与构建。于是早已删除的
+        # 测试文件带着对已删字段的引用一起炸, 而报错指向一个 git 和工作区里都找不到的文件。
+        #
+        # 做法: 拿 tar 包自身的清单当「应当存在的集合」, 剪枝遍历远程目录删掉集合外的文件。
+        # ★ 清单直接来自刚传上去的那个包 (tar -tzf), 与实际传输内容【必然】一致 —— 不引入
+        #   第二份需要人工保持同步的规则。
+        # ★ 清理作用域 == 同步作用域, 同一个 $ExcludeDirs/$ExcludeFiles 说了算: 我们从不同步
+        #   的东西, 也就不管它的生死。target\ build[_dev]\ dist\ .cache\ (CMake 缓存) 因此
+        #   全部原样保留 —— 剪枝时遇到这些目录名直接不进去, 连遍历成本都没有。
+        # ★ 只删文件不删目录: 空目录无害, 且天然堵死「误删整个 target」这类不可逆后果。
+        $prune = ""
+        if (-not $NoPrune) {
+            $edLit = ($ExcludeDirs  | ForEach-Object { "'$_'" }) -join ','
+            $efLit = ($ExcludeFiles | ForEach-Object { "'$_'" }) -join ','
+            # 两道自保闸门, 缺一不可:
+            #   $c -eq 0      解压失败时清单不可信, 绝不动手;
+            #   $k.Count -gt 0 清单为空 (tar -tzf 失败) 时会把整棵树判成残留 —— 必须挡住。
+            $prune =
+                "if (`$c -eq 0) { " +
+                  "`$k=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); " +
+                  "tar -tzf '$rTgz' | ForEach-Object { `$p=`$_ -replace '^\./','' -replace '/','\'; " +
+                    "if (`$p -and -not `$p.EndsWith('\')) { [void]`$k.Add(`$p) } }; " +
+                  "if (`$k.Count -gt 0) { " +
+                    "`$ed=@($edLit); `$ef=@($efLit); " +
+                    "`$rl='$remoteDir'.TrimEnd('\').Length+1; " +
+                    "`$pr=[Collections.Generic.List[string]]::new(); " +
+                    "`$st=[Collections.Stack]::new(); `$st.Push('$remoteDir'); " +
+                    "while (`$st.Count) { `$d=`$st.Pop(); " +
+                      "foreach (`$e in (Get-ChildItem -LiteralPath `$d -Force -EA SilentlyContinue)) { " +
+                        "if (`$e.PSIsContainer) { if (`$ed -notcontains `$e.Name) { [void]`$st.Push(`$e.FullName) } } " +
+                        "else { `$sk=`$false; foreach (`$m in `$ef) { if (`$e.Name -like `$m) { `$sk=`$true; break } }; " +
+                          "if (-not `$sk) { `$r=`$e.FullName.Substring(`$rl); " +
+                            "if (-not `$k.Contains(`$r)) { Remove-Item -LiteralPath `$e.FullName -Force -EA SilentlyContinue; `$pr.Add(`$r) } } } } }; " +
+                    "if (`$pr.Count) { `"    [$label] 清理残留 `$(`$pr.Count) 个:`"; " +
+                      "`$pr | Select-Object -First 10 | ForEach-Object { `"      `$_`" }; " +
+                      "if (`$pr.Count -gt 10) { `"      ... 另 `$(`$pr.Count-10) 个`" } } } } "
+        }
+
         # 不加 -Quiet: tar 正常解压本就静默, 一旦出错 (占用/权限/损坏) 那几行才是唯一线索。
         # 静默吞掉它等于把「解压失败」变成一个无法排查的黑盒。
         $inner = "New-Item -ItemType Directory -Force -Path '$remoteDir' | Out-Null; " +
                  "tar -xzf '$rTgz' -C '$remoteDir'; `$c=`$LASTEXITCODE; " +
+                 $prune +
                  "Remove-Item '$rTgz' -Force -EA SilentlyContinue; exit `$c"
         if (-not (Invoke-RemotePs $inner)) { ErrMsg "  远程解压 $label 失败 (退出码见上)"; return $false }
         Gray "  - $label 已同步 ($mb MB)"
