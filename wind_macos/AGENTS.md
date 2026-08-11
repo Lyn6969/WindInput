@@ -22,21 +22,21 @@ Win 的 `m2`=核心 exe ↔ mac 的 `m2`=Rust 服务）。
 ### 与 Windows 的功能差距（待补）
 
 Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益；差距集中在**宿主层**。
-`wind-ui` 的 `UiCommand` 有 42 个变体，`manager_macos.rs` 的 Forwarder 目前接了 27 个。
+`wind-ui` 的 `UiCommand` 有 42 个变体，`manager_macos.rs` 的 Forwarder 目前接了 29 个。
 未接的：
 
 | UiCommand | 影响 | 备注 |
 |---|---|---|
 | `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md` |
-| `ScreenshotStatusTip` / `ScreenshotTooltip` | 状态气泡 / 悬停提示的截图缺失 | **像素不在本进程**：这两者是 `.app` 侧原生 NSPanel，服务只下发文本与配色。要做得由 `.app` 截图并回传，需新增协议码位 |
-| `ReportCandidatePos` / `ReportStatusTipPos` | 候选窗 / 状态气泡的拖动与位置固定缺失 | 拖动在 .app 侧，落点须经上行帧回报给服务持久化（协议要新增码位） |
+| `ScreenshotStatusTip` / `ScreenshotTooltip` | 状态气泡 / 悬停提示的截图缺失 | **像素不在本进程**：这两者是 `.app` 侧原生 NSPanel，服务只下发文本与配色。要做得由 `.app` 截图，经扩展信封回传二进制块（`body` 是不透明字节，正为此设计） |
 | `ShowCandidateMenu` / `HideMenu` / `MenuKey` | 候选右键菜单的键盘导航缺失 | 菜单树本身已走 `CmdMenuShow` + `UnifiedMenuBuilder` |
 | `SetToolbarPos` / `SetToolbarAutoHide` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
 
 已接：`RegisterGlobalHotkeys`（见下）、`OpenPath` / `OpenApp`（`/usr/bin/open`，
 `.app` 包走 `open -a … --args`）、`TakeScreenshot` / `ScreenshotCandidateToClipboard` /
-`CopyTooltipText`（见下）。
+`CopyTooltipText`（见下）、`ReportCandidatePos` / `ReportStatusTipPos`（见下「浮窗拖动
+与位置固定」）。
 
 未接的变体落在 `Forwarder::handle` 的 `other =>` 兜底臂，只打一条 debug 日志。
 **新接一个变体时同步更新本表**。
@@ -112,14 +112,14 @@ vk_to_cgkeycode`（与按键注入同源，禁止另起一张表）。该表已�
 `keys.activate_ime = "ctrl+shift+["` 正落在 `VK_OEM_4` 上，漏了它该功能就开箱即哑。
 仍未覆盖的 VK 跳过并 warn，**不能**当成 keycode 0（那会注册出一个按 `a` 就触发的热键）。
 
-另有两处协议侧的既有约束，不是"漏做"而是设计所限：
+另有一处协议侧的既有约束，不是"漏做"而是设计所限：
 
-- **`CMD_CANDIDATE_SCROLL`（滚轮翻页）macOS 用不了**：0x0211 码位平台双语义，
-  macOS 上行方向已被 `CMD_FRONT_CONTEXT` 占用（见 `wind-ipc/src/protocol.rs` 该处注释）。
-  要做滚轮翻页得复用 `CMD_CANDIDATE_SELECT` 的负 index 约定（-1 上页 / -2 下页），
-  或把 `FRONT_CONTEXT` 迁到空闲码位并同步 Swift 端。
 - **`CMD_INPUT_STATS`（输入统计）无上报端**：Win 侧由 TSF DLL 在英文模式下上报，
   mac 的 `.app` 未采集，故英文输入不计入统计。
+
+（此处曾记有「`CMD_CANDIDATE_SCROLL` 滚轮翻页 macOS 用不了」——那是 0x0211 码位被
+`CMD_FRONT_CONTEXT` 同方向复用所致。macOS 尚未发布，该复用已直接消除：`FRONT_CONTEXT`
+迁到 0x0215，两平台码位含义此后完全一致，滚轮翻页只差 `.app` 侧采集 `scrollWheel`。）
 
 ## 安装与 TIS 注册
 
@@ -159,21 +159,53 @@ Program 公证——已多次实测。
 （`com.wails.` 前缀是历史包袱——设置程序早已是 Rust + windui，不是 Wails。改它要同步
 `scripts/mac/dev.sh` 与所有已安装机器，**不值当**。）
 
-### 设置深链（CmdOpenSettings 0x0507）
+### 设置深链（扩展信封 `settings.open`）
 
 两处约束，都踩过：
 
-1. **载荷是「页名 + 参数」的空格串**，不是单个页名（`handle_menu.rs::open_settings_with`
-   拼出，如 `dict --schema=wubi86 --type=shadow`）。Swift 侧必须按 shell 风格切词
-   （`BinaryCodec.decodeOpenSettingsArguments`，只认双引号，对应 `build_settings_args`
-   对含空白值的加引号），首词非选项时转成 `--page=<页名>`。整串塞进 `--page=` 的后果是
-   设置端解析不出页 id、只开默认页——**冷启动即复现**。
+1. **argv 必须由 Rust 侧切好**。曾经的做法是发「页名 + 参数」的空格串，让 Swift 按 shell
+   风格切词——等于让另一门语言去猜 `build_settings_args` 的引号规则，含空格的值一切就散。
+   现在 `handle_menu.rs::settings_argv` 在 Rust 侧切完，经信封发 `{"args":[…]}`，Swift 只做
+   一次 JSON 取值。（更早还有一版直接把整串塞进 `--page=`，设置端解析不出页 id、只开默认
+   页——**冷启动即复现**。）
 2. **设置程序已在运行时 LaunchServices 不重传 arguments**，只激活窗口。深链要在已开着的
    窗口上生效，靠的是 windui 的单实例转发（`wind-ui-rust/src/single_instance/unix.rs`，
    Unix domain socket）。那一层在 macOS 上一度是空实现，深链因此"时灵时不灵"。
 
 排查入口：设置程序日志里的 `二次实例 argv: [...]`。有这行 = argv 送到了，问题在 cli 解析；
 没有 = 转发层没通。
+
+### 浮窗拖动与位置固定
+
+候选窗与状态气泡都能拖，落点是否**持久化**取决于当前定位方式（两平台同一套语义，判定在
+`handle_menu.rs::save_candidate_pos` / `save_status_tip_pos`）：
+
+- `fixed`（固定位置）→ 写回 `custom_x/custom_y`，永久生效；
+- `follow_caret`（跟随光标）→ **不落盘**，拖动只是把窗口临时挪开。
+
+三处平台差异：
+
+1. **拖动手势在 `.app`**（NSPanel 在那边），落点经上行扩展信封 `pos.candidate` /
+   `pos.status_tip` 回报，body 是 `{"x":…,"y":…}`。走信封而非专用码位：拖动是低频动作，
+   见 `ext_kind` 的两档划分。
+2. **候选窗的固定坐标由服务进程算定**（`candidate_window.rs` macOS 分支的 `place_fixed`），
+   帧里带 `FLAG_ABSOLUTE_POS`(0x8)。这一位不能省：`.app` 收普通帧会自作主张做「下方放不下
+   就翻到光标上方」，而固定位置的窗口本来就不跟光标走，固定点一靠近屏幕底边就被弹到顶上。
+3. **`ReportStatusTipPos` 要多一次往返**。协调器在用户点「固定位置」时问「你现在在哪」，
+   好以当前实际位置落盘（否则气泡会跳到上次保存的坐标）。候选窗的答案服务进程自己有
+   （`Forwarder::last_pos`，即最后一帧下发的坐标）；气泡的落点是 `.app` 按屏幕边界钳出来
+   的，只能下发 `pos.status_tip.query` 去问，答案走上行 `pos.status_tip` 回来。
+
+**坐标换算收口在 `WireGeometry`**（`WindInputKit/IPC/`）。wire 是「主屏左上为原点、y 向下」，
+Cocoa 是「主屏左下为原点、y 向上」。以前只有「服务端算好 → 摆窗」一个方向，换算散在各
+panel 的 `show()` 里；拖动引入了反方向，两边一旦不互逆，每轮「拖动 → 落盘 → 重新显示」都
+累计一次偏移，窗口逐次漂走——`WireGeometryTests.testWireAndCocoaRoundTrip` 就是钉这个的。
+参照屏必须取 `NSScreen.screens.first`（带菜单栏的主屏）而非 `NSScreen.main`（随 key window
+变），两者在单屏机器上恰好相同，所以用错了在开发机上永远显不出来。
+
+`.app` 侧还有个会话内的落位冻结（`CandidatePanel.dragPin`）：拖过之后窗口就钉在那儿，候选
+内容刷新（翻页/继续输入）不会把它拽回光标处，`hidePanel()` 清除。对应 Windows 的 `drag_pin`
+——那边在服务进程里，macOS 的鼠标事件不经过服务进程，只能记在 `.app`。
 
 **关键**：两变体 `.app` 可执行同名 `WindInput`，进程定位须用 `.app` 路径；
 SHM / socket / config 全部变体隔离（漏一处即冲突，如曾漏 SHM → 开机后开发版候选框不显示）。
@@ -184,6 +216,7 @@ SHM / socket / config 全部变体隔离（漏一处即冲突，如曾漏 SHM �
 |------|------|
 | `Package.swift` | SwiftPM 清单，4 个 target（kit / smoke / app / tests） |
 | `Sources/WindInputKit/IPC/ProtocolTypes.swift` | 协议常量 + payload 类型 + endpoint 路径 |
+| `Sources/WindInputKit/IPC/WireGeometry.swift` | 浮窗落位的 wire ↔ Cocoa 坐标换算（双向，互逆性有 round-trip 测试兜底）|
 | `Sources/WindInputKit/IPC/BinaryCodec.swift` | 帧 encode/decode。`encodeFocusGainedFrame(inputScopeMask:)`: FocusGained 帧布局 `pid:u32(0占位) + inputScopeMask:u64`（bit31=IS_PASSWORD 标记密码框；旧版空帧=mask 0） |
 | `Sources/WindInputKit/IPC/BridgeClient.swift` | UDS 阻塞客户端；`init(socketPath:, ioTimeoutMs:)` 可选 I/O 超时（`SO_RCVTIMEO`/`SO_SNDTIMEO`，0=不设）。request 连接设 2s——服务卡死/重启时同步 `readFrame` 超时抛错而非在 IMKit 主线程无限 hang（上层 catch → reconnect 自愈）；push 连接（PushClient）必须保持 0（长期空闲等服务端推送，否则被读超时误判断连）。**`connect()` 必设 `SO_NOSIGPIPE`**: 否则对端（Rust 服务）重启后向死连接 `write` 触发 SIGPIPE → 默认处置直接**杀死 .app 进程**（表现为服务重启后输入法彻底失灵、需强制重启前端）；设此项后 `write` 改返回 EPIPE 由 `send()` 抛错交上层重连。request/push/sendClient 都用此构造，一处覆盖 |
 | `Sources/WindInputKit/IPC/BridgeResponseRouter.swift` | 把响应帧路由到 `TextInputClient` 调用。**新增 cmd 必须在此显式接一臂**——`default` 是"消费按键但不出字"，漏接的表现是按键被吃掉、屏幕上什么都没有（历史案例：`commitThenDefer` 漏接导致码表顶码上屏丢字） |
@@ -193,11 +226,12 @@ SHM / socket / config 全部变体隔离（漏一处即冲突，如曾漏 SHM �
 | `Sources/WindInputApp/Controller/KeyHandler.swift` | `NSEvent.keyCode` → Win VK 映射 + Modifier 编码 + KeyEvent 帧构造 |
 | `Sources/WindInputApp/UI/CandidatePanelHost.swift` | 候选框承载层：订阅 push，收 CmdHostRenderFrame→SHM→NSPanel、CmdCandidateRects→hit-test、CmdModeStatus→ModeStatusController、CmdTooltip*/CmdStatus*→气泡、CmdToast*→ToastPanel; 命令直通车按键：CmdKeyTap/Hold/Release/Seq→`KeySynthesizer` CGEvent 合成，CmdKeyType→`activeResponder.applyPushResponse`→router `insertText` 上屏; 鼠标选词回发。导出 `unifiedMenuItems()`/`sendMenuAction(_:)` 供三处菜单（候选框右键/菜单栏指示器/系统输入菜单）复用同一 IPC 请求与回发路径 |
 | `Sources/WindInputApp/UI/KeySynthesizer.swift` | 命令直通车按键合成（key.tap/seq/hold/release）: canonical 键名→CGKeyCode + 修饰键→CGEventFlags 映射，经 `CGEvent.post(tap: .cgSessionEventTap)` 向聚焦应用注入; **需「辅助功能」授权**，`ensureTrusted()` 未授权时弹一次系统请求并放弃本次（ad-hoc 签名重部署 cdhash 变会使旧授权失效，须重授）。key.type / clip.paste 文本上屏不走此处，走 `client.insertText` 免授权 |
-| `Sources/WindInputApp/UI/CandidatePanel.swift` | 候选框 NSPanel（borderless 浮窗）+ 自绘 bitmap + 鼠标命中/悬停; 空白处右键经 UnifiedMenuBuilder 弹统一菜单 |
+| `Sources/WindInputApp/UI/CandidatePanel.swift` | 候选框 NSPanel（borderless 浮窗）+ 自绘 bitmap + 鼠标命中/悬停; 空白处右键经 UnifiedMenuBuilder 弹统一菜单; 空白处左键**拖动**整窗，松手回报 `pos.candidate`（见「浮窗拖动与位置固定」）|
 | `Sources/WindInputApp/UI/UnifiedMenuBuilder.swift` | 把服务下发的统一菜单树（MenuItemData）构建为原生 NSMenu; 三处共用。两种派发：`.inProcess`（普通 NSMenu，builder 作 target 回调）与 `.imkCommand`（系统输入菜单，target=nil + selector，IMK 经 doCommandBySelector 路由）; 菜单 id 统一经 NSMenuItem.tag 回传 |
 | `Sources/WindInputApp/UI/ModeStatusController.swift` | 菜单栏模式指示器（NSStatusItem）: 收 CmdModeStatus 显示中英/全半角/标点/方案; 下拉菜单（NSMenuDelegate 动态填充）复用统一菜单树，点击回发 CmdMenuAction，服务未就绪时回退只读状态 |
 | `Sources/WindInputApp/UI/TooltipPanel.swift` | 候选悬停 tooltip NSPanel。配色与拆字字根字体路径随 `CmdTooltipShow` 下发（服务侧 `manager_macos.rs` 从主题求值成 `#RRGGBBAA`）; 空串则用内置深色默认 |
-| `Sources/WindInputApp/UI/StatusBubblePanel.swift` | 锚 caret 的模式状态气泡（收 CmdStatusShow） |
+| `Sources/WindInputApp/UI/StatusBubblePanel.swift` | 锚 caret 的模式状态气泡（收 CmdStatusShow）; 可拖动，松手回报 `pos.status_tip`，并应答服务端的 `pos.status_tip.query` |
+| `Sources/WindInputApp/UI/PanelGeometry.swift` | 把 `WireGeometry` 的纯几何接到真实 NSScreen（只决定「哪块屏」这一件事，其余在 kit 里可测）|
 | `Sources/WindInputApp/UI/ToastPanel.swift` | 屏幕级 Toast 通知 NSPanel（词库就绪/错误等）: 收 CmdToastShow（标题+正文+bg/fg/accent+position+时长）渲染暗色圆角卡片 + 左侧 accent 条，按 durationMs 自动隐藏（0=5000，<0 常驻）; 点击穿透 |
 | `Sources/WindInputApp/Resources/Info.plist` | IMK 元数据：ComponentInputModeDict / TISInputSourceID / LSUIElement（**不可**设 LSBackgroundOnly，否则候选 NSPanel 无法显示）/ InputMethodConnectionName = bundleID_Connection。**不可设 `tsInputModeDefaultStateKey`**: 会让 mode 注册即「已启用」却不落盘 AppleEnabledInputSources，导致「+ 添加输入法」列表过滤掉它、主列表又没有 → 中英文分组两头都看不见（Tahoe 实测） |
 | `Sources/WindInputApp/Resources/AppIcon.icns` | 应用图标（Finder/安装器/关于面板），plist `CFBundleIconFile=AppIcon` 引用。与菜单栏单色 `menu_icon.pdf`（`tsInputMethodIconFileKey`）互不相干 |
