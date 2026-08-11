@@ -310,6 +310,16 @@ pub fn run_main_loop() {
         //
         // 它内部照常驱动 CFRunLoop，故上面建的唤醒源、以及 system_theme_macos 的分发通知
         // 观察者都不受影响（已实测：RunApplicationEventLoop 里 CFRunLoopTimer 正常触发）。
+        // 进循环**之前**再查一次退出标志，否则「重启服务」有几率永远等不到。
+        //
+        // 竞态窗口：等重启信号的辅助线程比本函数先起跑。若信号在 WAKE_SOURCE 建好之前就到，
+        // `stop_main_loop` 拿不到唤醒源（或对一个还没跑起来的循环调 CFRunLoopStop），那一下
+        // 就是空操作；而 SHOULD_EXIT 已经是 true，此后再没有人会去戳唤醒源 —— 循环起来后
+        // 无事可做地空转，重启命令挂死。这里补一次检查即可闭合窗口。
+        if SHOULD_EXIT.load(Ordering::SeqCst) {
+            tracing::info!("全局热键: 进主循环前已收到退出请求，直接返回");
+            return;
+        }
         tracing::info!("全局热键: 主线程 Carbon 事件循环启动");
         RunApplicationEventLoop();
         tracing::info!("全局热键: 主线程 Carbon 事件循环退出");
