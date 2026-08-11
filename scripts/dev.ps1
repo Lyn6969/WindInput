@@ -103,6 +103,14 @@ $CdnBase       = "https://dl.windinput.com"
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
 
+# ---------- 远程构建 (可选; 不配置则本行之后一切照旧) ----------
+# 存在 scripts\build.local.ps1 且其中设了 $WIND_REMOTE_HOST 时, Dispatch 会把构建/检查类
+# 命令转发到远程 Windows 编译机执行, 产物回传本机 build[_dev]\ —— 部署链一行不变。
+# 模板与编译机搭建清单见 scripts\build.local.ps1.example。
+# 编译机必须是 Windows 原生 MSVC: clang 交叉编译的 TSF DLL 在加固宿主 COM 激活失败 (6dbc8595)。
+$buildCfg = "$ScriptDir\build.local.ps1"
+if (Test-Path $buildCfg) { . $buildCfg }
+
 # ---------- 静态链接 MSVC CRT(+crt-static) ----------
 # 所有 Rust 产物(wind_input / wind_setting / wind_portable, 及子进程 pack.ps1 的
 # installer stub)自包含, 目标机无需装 VC++ 运行库 —— VCRUNTIME140.dll 非系统内置,
@@ -1656,7 +1664,36 @@ function Show-Menu {
 
 # ---------- 统一分发 (菜单与命令行直调共用; 命令已转小写) ----------
 # 返回 127 = 未知命令 (区别于命令执行失败)。
+# ---------- 远程构建转发 (仅在配了 build.local.ps1 时生效) ----------
+# 走远程的是「吃 CPU 的」命令。刻意排除三类:
+#   · 部署/卸载 (p* / u* / pb* / ub*) —— 要注册 COM、写注册表、装字体, 本机才是目标机;
+#   · 会改源码的 f/fmt —— cargo fmt 改的是编译机上的源码, 下次 /MIR 同步即被本机覆盖,
+#     白改且无声。(ci 走的是 Do-FmtCheck 只读, 故可以远程。)
+#   · 本机状态类 (av* / hooks / r / wtinit / clean) —— Defender 排除项、git hooks、交互
+#     repl, 以及「清哪台的 target」, 都只在本机有意义。
+$RemoteCommands = @(
+    "1", "release", "d1", "dev",
+    "m1", "m2", "m3", "m4", "dm1", "dm2", "dm3", "dm4",
+    "8", "8s", "d8", "d8s", "9", "9s", "d9", "d9s",
+    "k", "check", "l", "clippy", "t", "test", "ci", "fmt-check",
+    "gd", "gen-data"
+)
+function Test-RemoteCommand ([string]$cmd) {
+    # 临时强制本机: `$env:WIND_NO_REMOTE = "1"` (编译机关机 / 不在内网 / 要和远程做对照)。
+    # 这同时是防递归哨兵 —— remote-build.ps1 回落本机时会设上它再回调本脚本, 两边必须同判据。
+    if ($env:WIND_NO_REMOTE) { return $false }
+    if (-not $WIND_REMOTE_HOST) { return $false }   # 未配置 → 一律本机, 行为与从前一致
+    $list = if ($null -ne $WIND_REMOTE_COMMANDS) { $WIND_REMOTE_COMMANDS } else { $RemoteCommands }
+    return ($list -contains $cmd)
+}
+
 function Dispatch ([string]$cmd, [string]$arg) {
+    # 远程转发闸门。未配置时 Test-RemoteCommand 恒 false, 直落下方本机分支; remote-build.ps1
+    # 不入库, 新 worktree 里没有它时同样自动降级为本机构建, 不报错。
+    if ((Test-RemoteCommand $cmd) -and (Test-Path "$ScriptDir\remote-build.ps1")) {
+        & "$ScriptDir\remote-build.ps1" -Command $cmd | Out-Host
+        return $LASTEXITCODE
+    }
     switch ($cmd) {
         { $_ -in @("1", "release") }        { if (Do-Full release) { 0 } else { 1 }; break }
         { $_ -in @("d1", "dev") }           { if (Do-Full dev)   { 0 } else { 1 }; break }

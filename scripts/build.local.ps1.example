@@ -1,0 +1,119 @@
+# 远程构建配置 —— 复制此文件为 build.local.ps1 后生效 (该文件已 gitignore)
+#
+# 【不创建 build.local.ps1 时, dev.ps1 的行为与从前逐字不变】——
+# 本机构建、部署、打包全部照旧, 这里的一切都不会被读到。
+#
+# 作用: 把 cargo / MSVC 编译放到另一台 Windows 机器上跑, 产物自动回传本机 build[_dev]\,
+# 之后照常用 pdm1 / pdm2 / pd1 部署。本机编译期间不再被十几个 rustc 进程占满。
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  一、编译机一次性准备
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  ⚠️ 编译机必须是 Windows —— 不能用 Linux / WSL / macOS。
+#     原因见 scripts\remote-build.ps1 顶部: clang 交叉编译的 wind_tsf.dll 在加固宿主
+#     (企业微信 / TIM / QQ / UU浏览器) 里 COM 激活失败, 已由 A/B 实测锁定。
+#
+#  1. 开 SSH 并配免密 (在编译机的【管理员 PowerShell】里):
+#       Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+#       Start-Service sshd; Set-Service sshd -StartupType Automatic
+#       New-NetFirewallRule -Name sshd-in -DisplayName 'OpenSSH Server' -Enabled True `
+#           -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+#     再把本机 ~\.ssh\id_ed25519.pub 写入编译机:
+#       · 普通账户 → %USERPROFILE%\.ssh\authorized_keys
+#       · 管理员账户 → %ProgramData%\ssh\administrators_authorized_keys
+#         并 icacls 收紧: /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
+#       ⚠️ 两个坑: ① 管理员账户放错文件 → 密钥【静默失效】仍问密码 (sshd_config 末尾有
+#          Match Group administrators 的重定向); ② ACL 过宽 → sshd 直接【忽略整个文件】。
+#       ⚠️ 写文件别用 Set-Content -Encoding UTF8 (PS 5.1 会加 BOM, 密钥解析失败),
+#          用 [IO.File]::WriteAllText()。
+#     校验: 本机 `ssh <用户>@<IP> "echo ok"` 不问密码即返回 ok。
+#
+#  2. 装工具链:
+#       winget install --id Microsoft.PowerShell --exact --silent `
+#           --accept-package-agreements --accept-source-agreements --disable-interactivity
+#       winget install --id Git.Git ...   / --id Kitware.CMake ...
+#     ⚠️ VS 生成工具【不要】用 winget: 它的 --override 值含空格, 经 Start-Process 数组
+#        传参不会自动加引号, winget 会把 --wait 当成自己的参数并打印帮助退出 (实测踩过)。
+#        改用官方引导程序:
+#          Invoke-WebRequest https://aka.ms/vs/17/release/vs_BuildTools.exe -OutFile vs.exe
+#          .\vs.exe --quiet --wait --norestart --nocache `
+#              --add Microsoft.VisualStudio.Workload.VCTools `
+#              --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended
+#     Rust (装在 MSVC 之后, 否则 rustup 会转而提示装 VS):
+#          winget install --id Rustlang.Rustup ...
+#          rustup default stable-x86_64-pc-windows-msvc
+#          rustup target add i686-pc-windows-msvc    # x86 版 TSF DLL 需要
+#
+#  3. 首次全量构建 (建依赖缓存 + 词库 data\, 之后都是增量):
+#       dev.ps1 d1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  二、必填项
+# ══════════════════════════════════════════════════════════════════════════
+
+# 编译机主机名或 IP。不定义此变量 = 远程构建整体关闭。
+$WIND_REMOTE_HOST = "192.168.1.100"
+
+# SSH 登录用户
+$WIND_REMOTE_USER = "Admin"
+
+# 编译机上的仓库路径 (会被本机源码覆盖同步; 不存在则自动创建)
+$WIND_REMOTE_ROOT = "C:\build\WindInput"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  三、可选项
+# ══════════════════════════════════════════════════════════════════════════
+
+# 编译机上用哪个 PowerShell 跑 dev.ps1。默认 pwsh (7.x)。
+# 编译机只有 Windows PowerShell 5.1 时改成 "powershell"。
+# $WIND_REMOTE_PS = "powershell"
+
+# 需要一并同步的伴生仓 (与产品仓平级的目录名)。
+# dm1 / dm2 与细粒度 cargo 用不到; 只有 m3/m4 (setting/portable) 和 8/9 (打包) 才需要。
+# ⚠️ 列漏了不会有明确提示, 只会在编译机上报「系统找不到指定的路径 (os error 3)」——
+#    伴生仓之间还有 path 依赖: wind-setting 依赖 ../wind-ui-rust, 两个都得列。
+# $WIND_REMOTE_SIBLINGS = @("wind-setting", "wind-ui-rust", "wind-portable", "wind-installer")
+
+# 哪些 dev.ps1 命令走远程。不设则用 dev.ps1 里的 $RemoteCommands 默认清单。
+# 只想让核心 exe 走远程、C++ 仍在本机编, 就把 dm1/m1 去掉。
+# $WIND_REMOTE_COMMANDS = @("1","release","d1","dev","m1","m2","dm1","dm2")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  四、环境变量 (临时覆盖, 不写进本文件)
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  $env:WIND_NO_REMOTE = "1"
+#      本会话内一律本机编 —— 编译机关机 / 不在内网 / 想和远程做 A-B 对照时用。
+#      设为 $null 恢复。dev.ps1 与 remote-build.ps1 都认它。
+#
+#  $env:WIND_REMOTE_SLOT = "fx"
+#      把编译机上的【父目录】换成 C:\build-fx\, 供 worktree 并行编译而互不覆盖。
+#      不设时: 在 linked worktree 里按 worktree 目录名自动派生, 主树无槽位 (行为不变)。
+#      设为 "off" / "none" / "0" 可关掉槽位, 与主树共用目录 (串台风险自负)。
+#      ⚠️ 换的是父目录而非主仓目录名 —— 伴生仓与主仓平级, wind-setting 写死了
+#         ../WindInput/wind_input/crates/... 三条 path 依赖, 只改主仓名会让它取到
+#         主树代码, 编译照样成功、错得毫无提示。
+#      ⚠️ 每个槽位各带一份 target\ (几十 GB), 用完记得 -Clean 或直接删掉槽位目录。
+#
+# ══════════════════════════════════════════════════════════════════════════
+#  五、已知陷阱
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  ⚠️ 同步是【覆盖式】不是镜像 —— 本机删掉的源文件会在编译机残留。对编译无害 (不被 mod
+#     引用就不参与构建)。要彻底干净: remote-build.ps1 -Command d1 -Clean
+#     (⚠️ -Clean 连 target\ 一起删, 下次全量重编约 9 分钟)。
+#
+#  ⚠️ 在编译机上直接改源码会被下次同步覆盖。它只当编译器用, 别在上面写代码。
+#
+#  ⚠️ 远程跑测试前编译机必须有 build_dev\data\ —— 否则依赖词库的测试会静默跳过且计数
+#     照绿。remote-build.ps1 会在开跑前拦住这种情况, 不必自己记着。
+#
+#  ⚠️ 改了 C++ 但没改 docs\VERSION 时, CMake 增量构建可能跳过重编 —— 这个坑在远程一样
+#     存在且更难察觉。判据不变: 输出里要有「已构建: wind_tsf_dev.dll」。
+#
+#  ⚠️ 部署始终在本机执行 —— 编译机不注册 COM、不装输入法。远程构建只搬产物, 不碰部署链。

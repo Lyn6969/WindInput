@@ -192,6 +192,52 @@ log_level = "debug"   # 或 "trace"
   setting/portable，前缀 `d` 为 dev）。系统安装：`p1`/`pd1`；安装包：`8`/`d8` → `dist\*-Setup.exe`。
 - 部署目标默认 `C:\Program Files\WindInput[Dev]`，可在 `scripts\deploy.local.ps1` 覆盖。
 
+### 远程编译机（可选，默认不生效）
+
+本机编译吃满 CPU 时，可把构建整体转到另一台 **Windows** 机器，产物回传本机，**部署仍在本机**。
+照 `scripts\build.local.ps1.example` 建出 `scripts\build.local.ps1` 即启用（该文件含内网地址与
+账号，**不入库**）；不建则 `dev.ps1` 行为逐字不变，直接调 `remote-build.ps1` 也只会回落本机执行。
+
+- **照常用 `dev.ps1`**：`dm1` / `d1` / `t` / `ci` 等构建检查类命令自动转发，产物落回 `build[_dev]\`。
+- **细粒度 cargo**：`.\scripts\rc.ps1 test -p wind-coordinator`（直接敲 `cargo` 是在本机跑）。
+- **任意命令**：`.\scripts\remote-build.ps1 -Raw "<命令>"`，在编译机的 `wind_input\` 下执行。
+- **临时回落本机**：`$env:WIND_NO_REMOTE = "1"`（编译机关机 / 不在内网 / 要做 A-B 对照）。
+
+⚠️ **编译机必须是 Windows + 原生 MSVC**：clang / cargo-xwin 交叉编译出的 `wind_tsf.dll` 在带
+安全加固的宿主（企业微信 / TIM / UU 浏览器）里 COM 激活失败，已 A/B 实测锁定在工具链上
+（`6dbc8595` 因此把发布链从 ubuntu 交叉编译改回 windows-latest）。Linux 编译机与 sccache-dist
+（其 build server 官方只支持 Linux）都因此出局。
+
+#### worktree 必须各占一个槽位
+
+多个 worktree 共用一台编译机时，若都同步到同一个远程目录会**无声地互相覆盖**——后一次解压
+盖掉前一次的源码，产物属于哪个分支全看谁最后跑完。`remote-build.ps1` 因此按 **worktree 目录名
+自动派生槽位**（主树派生不出槽位，行为与从前一致），也可用环境变量覆盖：
+
+```powershell
+$env:WIND_REMOTE_SLOT = "fx"     # → C:\build-fx\WindInput
+$env:WIND_REMOTE_SLOT = "off"    # 关掉槽位，与主树共用目录（串台风险自负）
+```
+
+⚠️ 槽位换的是**父目录**，不是主仓的目录名。伴生仓与主仓平级，而 `wind-setting\Cargo.toml` 写死了
+三条相对 path 依赖（`../WindInput/wind_input/crates/` 下的 `wind-ipc` / `wind-rpc` / `wind-config`）：
+只改主仓目录名的话，wind-setting 仍会去 `..\WindInput` 取那三个 crate，**取到的是主树代码、
+编译照样成功、错得毫无提示**。
+
+⚠️ 每个槽位各带一份 `target\`（几十 GB），用完清掉：`remote-build.ps1 -Command <x> -Clean`。
+
+#### 同步语义（三条容易误判的）
+
+- 同步的是**工作树快照**（tar 打包文件系统），不是 git 提交。本地改了没提交的文件照样会过去
+  ——包括被设了 `skip-worktree` 的 `docs/VERSION`。
+- 反过来，**多会话并发改同一棵树时会抓拍到别人的半成品**。远程构建报的错若指向不在你改动集里
+  的文件、且 `git status` 显示它干净，那就是撞上了中间态：别去改那份代码，也别反复重试（结果
+  随机），等它收敛。开跑前可用 `rc.ps1 check --workspace --all-targets` 当门——不做 codegen，
+  半分钟出结果。⚠️ `check -p <单个 crate>` **不能**当这个门：给枚举加变体时，报错的是所有
+  `match` 它的下游 crate，`-p` 只覆盖其中一个。
+- 同步是**覆盖式而非镜像**：本机删掉的源文件在编译机上会残留（不被 mod 引用就不参与构建）；
+  要彻底干净用 `-Clean`。
+
 ### Linux 交叉（MinGW，`scripts/dev.sh`）
 
 - 编译检查：`cargo check --target x86_64-pc-windows-gnu -p <crate>`（`wind_input/` 下）。

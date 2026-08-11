@@ -7,6 +7,10 @@ temp/
 .cache/
 scripts/deploy.local
 scripts/deploy.local.ps1
+# 远程构建的【本机配置】: 含内网地址与账号, 一机一份, 不入库。
+# 脚本本体 (remote-build.ps1 / rc.ps1) 与模板 (.example) 均已入库 —— 没有这个文件时
+# 它们一律回落本机执行, 见 AGENTS.md「远程编译机」。
+scripts/build.local.ps1
 /.remote/
 .superpowers/
 .claude/
