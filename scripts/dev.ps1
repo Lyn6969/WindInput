@@ -148,6 +148,23 @@ function Build-Core ([string]$profile = "release", [string]$outdir = $null) {
     return $true
 }
 
+# ---------- 校验: PE 头的机器类型 ----------
+# x86/x64 共用同一个输出文件名, 改名一旦失手就会把 x64 当 x86 交付, 而 32 位宿主加载它
+# 只是静默失败 (无日志无报错)。故构建后按 PE 头实测一次, 把「产物架构」变成硬判据。
+function Test-PeArch ([string]$path, [string]$platform) {
+    if (-not (Test-Path $path)) { return $false }
+    $want = if ($platform -eq "Win32") { 0x14c } else { 0x8664 }
+    $fs = [IO.File]::OpenRead($path)
+    try {
+        $br = New-Object IO.BinaryReader($fs)
+        $fs.Position = 0x3C
+        $fs.Position = $br.ReadInt32()                            # e_lfanew → PE 签名
+        if ($br.ReadUInt32() -ne 0x00004550) { return $false }    # 'PE\0\0'
+        return ($br.ReadUInt16() -eq $want)                       # COFF Machine
+    } catch { return $false }
+    finally { $fs.Dispose() }
+}
+
 # ---------- 构建: C++ TSF DLL (x64 + x86; CMake/MSVC) ----------
 # CMakeLists 把 DLL 写死输出到 ..\build[_dev], x86/x64 同名 wind_tsf.dll。
 # 故先编 x86 → 改名 _x86, 再编 x64 (保留无后缀名), 避免互相覆盖。
@@ -179,6 +196,12 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
             "-DAPP_VERSION_MAJOR=$vMaj" "-DAPP_VERSION_MINOR=$vMin" "-DAPP_VERSION_PATCH=$vPat" `
             | Out-Null
         if ($LASTEXITCODE -ne 0) { ErrMsg "TSF $($a.A) CMake 配置失败!"; return $false }
+        # CMakeLists 输出到 $outdir\wind_tsf$suffix.dll; x86 需改名加 _x86。
+        # 构建前必须先删这个文件: 两个架构共用它, MSBuild 的增量判据也看它。x86 这轮若
+        # 撞见上一轮 x64 留下的同名文件比输入新, 会判定「已最新」而跳过链接, 下面的改名
+        # 就把那个 x64 产物当成 x86 交付 (实测踩中)。删掉输出即强制重新链接, 不重编 .obj。
+        $produced = "$outdir\wind_tsf$suffix.dll"
+        Remove-Item $produced -Force -ErrorAction SilentlyContinue
         # MSBuild 的编译警告走 stdout, 整条 | Out-Null 会连警告一起吞掉 (C++ 侧等于零编译期
         # 信号)。故只丢进度噪音, 保留 warning/error 行原样打出。Select-String 不改 $LASTEXITCODE
         # (它由最后一个原生命令 cmake 设定), 下面的失败判定照常成立。
@@ -186,12 +209,13 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
             Select-String -Pattern 'warning|error|警告|错误' |
             ForEach-Object { Warn "  $($_.Line.Trim())" }
         if ($LASTEXITCODE -ne 0) { ErrMsg "TSF $($a.A) 构建失败!"; return $false }
-        # CMakeLists 输出到 $outdir\wind_tsf$suffix.dll; x86 需改名加 _x86
-        $produced = "$outdir\wind_tsf$suffix.dll"
         # 末尾化: 架构后缀在前, 变体后缀在后 → wind_tsf_x86_dev.dll
         $final    = "$outdir\wind_tsf$($a.Sfx)$suffix.dll"
         if ((Test-Path $produced) -and ($produced -ne $final)) {
             Move-Item $produced $final -Force
+        }
+        if (-not (Test-PeArch $final $a.A)) {
+            ErrMsg "TSF 产物架构不符: $(Split-Path $final -Leaf) 不是 $($a.A)!"; return $false
         }
     }
     # 清理 CMake 顺带产出的导入库/导出表, 保持 outdir == 安装内容
