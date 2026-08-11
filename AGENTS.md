@@ -208,6 +208,26 @@ log_level = "debug"   # 或 "trace"
 （`6dbc8595` 因此把发布链从 ubuntu 交叉编译改回 windows-latest）。Linux 编译机与 sccache-dist
 （其 build server 官方只支持 Linux）都因此出局。
 
+#### 同一台编译机同时只跑一个构建
+
+看到 `[锁] 编译机正被另一个构建占用 (...), 等待...` 是正常的，它会自动排队并在对方结束后继续。
+这道锁不是为了效率而是**正确性**：`Do-Full` 开头会清空 `build[_dev]/`，两个构建并发时后者
+会把前者的产物整个删掉，而前者浑然不觉地走到打包——产出一个空安装包并报告「打包完成」，
+全程零报错（实测：本该 20 MB 的包出了 2.3 MB）。锁按槽位隔离，不同 worktree 互不排队。
+只读的 `-Raw` 查询可用 `-NoLock` 跳过排队；凡是会写 `target/` 或 `build/` 的命令都不要加。
+
+⚠️ 并发还会让**任何性能测量失效**——同一条命令实测跑出过 83.8 / 96.5 / 103.4 / 135.9 s。
+调优前先确认没有别人在用这台机器。
+
+#### 远程侧的构建是并行的
+
+`remote-build.ps1` 会注入 `WIND_PARALLEL_BUILD=1`，让全构建的 core / tsf / setting / portable
+四步并行（它们各写各的产物，且 setting 与 portable 用各自仓库的 `target/`）。**本机直接跑
+`dev.ps1` 时默认关闭**——12 核机器上同时跑四个构建会把机器压死。想在本机试可自行设该环境变量。
+
+实测并行度约 1.9x 而非 4x：三个 cargo 进程会在**全局 package cache 锁**上排队
+（输出里的 `Blocking waiting for file lock on package cache`），这是 cargo 的固有行为。
+
 #### worktree 必须各占一个槽位
 
 多个 worktree 共用一台编译机时，若都同步到同一个远程目录会**无声地互相覆盖**——后一次解压
