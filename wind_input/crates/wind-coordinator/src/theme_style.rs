@@ -118,12 +118,13 @@ pub fn system_prefers_dark() -> bool {
 /// 主题叠深色文本而不可读）。
 #[cfg(target_os = "macos")]
 pub fn system_prefers_dark() -> bool {
-    use core_foundation_sys::base::{CFRelease, CFTypeRef, kCFAllocatorDefault};
+    use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef, kCFAllocatorDefault};
     use core_foundation_sys::preferences::{
         CFPreferencesCopyAppValue, kCFPreferencesAnyApplication,
     };
     use core_foundation_sys::string::{
-        CFStringCreateWithBytes, CFStringGetCString, CFStringRef, kCFStringEncodingUTF8,
+        CFStringCreateWithBytes, CFStringGetCString, CFStringGetTypeID, CFStringRef,
+        kCFStringEncodingUTF8,
     };
 
     const KEY: &[u8] = b"AppleInterfaceStyle";
@@ -144,8 +145,17 @@ pub fn system_prefers_dark() -> bool {
             // 键不存在 = 浅色（这是浅色模式下的正常状态，不是错误）。
             return false;
         }
-        // 该键的类型契约是字符串；真拿到别的类型时 CFStringGetCString 会失败并返回 false，
-        // 不必先做 CFGetTypeID 判别（多一次 FFI 换不来额外的安全性）。
+        // 必须先验类型再当 CFString 用。
+        //
+        // 这里原先写的是「拿到别的类型时 CFStringGetCString 会失败并返回 false」——**那是错的**：
+        // CoreFoundation 对入参做类型断言，类型不符是直接 abort 整个进程，不是返回 0。偏好键
+        // 理论上只会是字符串，但它是全局可写的（第三方工具、损坏的 plist 都能塞进别的类型），
+        // 而代价是输入法服务当场崩掉、用户完全没法打字。一次 CFGetTypeID 换掉这个风险很划算。
+        if CFGetTypeID(value) != CFStringGetTypeID() {
+            CFRelease(value);
+            tracing::warn!("AppleInterfaceStyle 不是字符串类型，按浅色处理");
+            return false;
+        }
         let mut buf = [0i8; 32];
         let ok = CFStringGetCString(
             value as CFStringRef,
