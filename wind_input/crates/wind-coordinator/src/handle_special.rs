@@ -312,12 +312,8 @@ impl Coordinator {
             return Self::commit_action(out, true);
         }
         match data.key_code {
-            keymap::VK_ESCAPE => {
-                // Esc：放弃退出
-                self.exit_special_mode(state);
-                self.notify_ui_hide();
-                KeyAction::ClearComposition
-            }
+            // Esc：放弃退出，实现收口在 `cancel_session`。
+            keymap::VK_ESCAPE => self.cancel_session(state),
             keymap::VK_BACK | keymap::VK_DELETE => {
                 // 退格删光标前 / Delete 删光标后；缓冲被删空则退出（本就空缓冲时只有退格退出，
                 // 保持原语义）。删除时不触发自动上屏。

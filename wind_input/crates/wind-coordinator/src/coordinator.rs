@@ -626,7 +626,10 @@ pub(crate) struct SmartSymbolArm {
 pub(crate) struct ConfigBundle {
     pub(crate) config: Config,
     pub(crate) compiled_hotkeys: CompiledHotkeys,
-    pub(crate) nav_keys: keymap::NavKeys,
+    /// 会话态按键绑定（`keys.session_actions` 编译一次）。**不只是导航**——二期起还装
+    /// `cancel`，故不叫 `nav_keys`。动作值域在 `wind-config`，表在 `wind-keys`，两者由
+    /// 本结构体所在的 crate 拼起来（唯一同时看得见两边的地方）。
+    pub(crate) session_keys: keymap::KeyBinds<wind_config::SessionAction>,
     pub(crate) cn_pairs: Vec<(char, char)>,
     pub(crate) en_pairs: Vec<(char, char)>,
     /// 配对跳出键的 VK 码集合（预解析自 `auto_pair.jump_out_keys`，空=不启用）。
@@ -705,28 +708,25 @@ impl ConfigBundle {
             }
         }
         warn_unknown_session_actions(&config);
-        // 会话态导航键。数据源是折算后的 `keys.session_actions`——上一行的 `normalize()`
+        // 会话态按键绑定。数据源是折算后的 `keys.session_actions`——上一行的 `normalize()`
         // 已把 `page_keys` / `highlight_keys` 的组名展开进去（见
         // `Config::migrate_nav_keys_into_session_actions`）。
         //
-        // ★ `SessionAction` → `NavAction` 的映射放在**这里**，不放任一侧的 crate：
-        // `wind-keys` 不认识动词值域（那住在 `wind-config`），而 `wind-config` 不能反向
-        // 依赖 `wind-keys`（后者经 `wind-cmdbar` 依赖本 crate，加进去成环）。本函数是唯一
-        // 同时看得见两者的地方，也正是接缝该在的位置。
-        let nav_keys = keymap::NavKeys::from_binds(config.keys.session_actions.iter().filter_map(
-            |(name, verb)| {
-                let action = match wind_config::SessionAction::parse(verb) {
-                    wind_config::SessionAction::PagePrev => keymap::NavAction::PagePrev,
-                    wind_config::SessionAction::PageNext => keymap::NavAction::PageNext,
-                    wind_config::SessionAction::HighlightUp => keymap::NavAction::HighlightUp,
-                    wind_config::SessionAction::HighlightDown => keymap::NavAction::HighlightDown,
-                    // 显式 none / 写错的动词都落这里。写错的那种在加载期由
-                    // `warn_unknown_session_actions` 报出来——静默忽略与「功能坏了」同形。
-                    wind_config::SessionAction::None => return None,
-                };
-                Some((name.as_str(), action))
-            },
-        ));
+        // ★ 这里是两个 crate 的接缝：动作值域（`SessionAction`）在 `wind-config`，绑定表
+        // （`KeyBinds`）在 `wind-keys`，而 `wind-config` 不能反向依赖 `wind-keys`（后者经
+        // `wind-cmdbar` 依赖它，加进去成环）。本函数是唯一同时看得见两者的地方。
+        //
+        // 表**直接持有 `SessionAction`**，不再翻译成某个中间枚举——一期那层 `NavAction`
+        // 映射在加 `cancel` 时立刻成了瓶颈（新动词没有对应的 `NavAction`）。
+        // 显式 `none` 与写错的动词都在此过滤掉；后者由上一行的 `warn_unknown_session_actions`
+        // 报出来，静默忽略与「功能坏了」完全同形。
+        let session_keys =
+            keymap::KeyBinds::from_binds(config.keys.session_actions.iter().filter_map(
+                |(name, verb)| {
+                    let action = wind_config::SessionAction::parse(verb);
+                    action.is_enabled().then_some((name.as_str(), action))
+                },
+            ));
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
         let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
@@ -743,7 +743,7 @@ impl ConfigBundle {
         Self {
             config,
             compiled_hotkeys,
-            nav_keys,
+            session_keys,
             cn_pairs,
             en_pairs,
             jump_out_keys,
@@ -2913,24 +2913,49 @@ impl Coordinator {
         true
     }
 
-    /// 候选导航键的统一执行（配置驱动，见 `keymap::NavKeys`）：高亮上下 + 翻页。
-    /// 普通模式与所有候选模式共用；`include_printable` 区分码表型（`-`/`=` 作翻页）与
-    /// 文本/表达式型（临英/快捷输入，`-`/`=` 作输入，不当导航）。命中返回 Some。
-    pub(crate) fn apply_nav_key(
+    /// 会话态按键绑定的统一执行（配置驱动，见 `keys.session_actions`）：翻页 / 移高亮 /
+    /// 取消。普通模式与所有 overlay 模式共用；`include_printable` 区分码表型（`-`/`=` 作
+    /// 翻页）与文本/表达式型（临英/快捷输入，`-`/`=` 作输入字符，不夺为动作）。
+    ///
+    /// 命中并执行返回 `Some`，未命中或条件不足返回 `None`（键回落调用方的原有处理）。
+    ///
+    /// # ★ 守卫按动作分，不按调用点分
+    ///
+    /// 导航类只在有候选时有意义（`requires_candidates`），`cancel` 则在「打了码还没出
+    /// 候选」时也必须生效。判据挂在 `SessionAction` 上而不是写在这里的 `if`——本函数有
+    /// 三个调用点（主输入 / mix / 候选导航），条件写死在函数体内还好，写到调用点上就是
+    /// 三份要保持一致的守卫，那正是本仓栽过四次的形状。
+    pub(crate) fn apply_session_action(
         &self,
         state: &mut State,
         data: &KeyEventData,
         include_printable: bool,
     ) -> Option<KeyAction> {
-        if state.candidates.is_empty() {
-            return None;
-        }
         let shift = data.modifiers & MOD_SHIFT != 0;
         let action = self
             .rt()
-            .nav_keys
+            .session_keys
             .classify(data.key_code, shift, include_printable)?;
-        let changed = match action {
+        if action.requires_candidates() && state.candidates.is_empty() {
+            return None;
+        }
+        let nav = match action {
+            wind_config::SessionAction::HighlightUp => keymap::NavAction::HighlightUp,
+            wind_config::SessionAction::HighlightDown => keymap::NavAction::HighlightDown,
+            wind_config::SessionAction::PagePrev => keymap::NavAction::PagePrev,
+            wind_config::SessionAction::PageNext => keymap::NavAction::PageNext,
+            wind_config::SessionAction::Cancel => {
+                // 无会话时放行：空闲按 Tab 该是宿主的制表符，不是「取消一个不存在的输入」。
+                // 判据与 `cancel_session` 的适用范围一致，见那里。
+                if !Self::has_input_session(state) {
+                    return None;
+                }
+                return Some(self.cancel_session(state));
+            }
+            // 表里只存启用项（`ConfigBundle::build` 过滤过），None 到不了这里。
+            wind_config::SessionAction::None => return None,
+        };
+        let changed = match nav {
             keymap::NavAction::HighlightUp => self.move_up(state),
             keymap::NavAction::HighlightDown => self.move_down(state),
             keymap::NavAction::PagePrev => self.page_prev(state),
@@ -2967,13 +2992,55 @@ impl Coordinator {
         Some(KeyAction::Consumed)
     }
 
+    /// 当前是否有输入会话：正在 overlay 模式里，或普通输入有编码 / 候选 / 已上屏段。
+    ///
+    /// 与 C++ 的 `_HasInputSession()`（`hasComposition || _hasCandidates`）**语义对齐**：
+    /// overlay 模式一定持有 composition。两侧判据必须同构，否则会出现「C++ 吃了键、
+    /// 服务端这边判定无会话不接管」的丢键，或反过来「C++ 放行了、这边却想处理」。
+    ///
+    /// ⚠️ 不能只判 buffer 非空：overlay 模式在**空缓冲**时按取消键同样要退出模式——
+    /// 那时「退出」本身就是用户要的动作。
+    pub(crate) fn has_input_session(state: &State) -> bool {
+        state.active.is_some()
+            || !state.input_buffer.is_empty()
+            || !state.candidates.is_empty()
+            || !state.committed_text.is_empty()
+    }
+
+    /// 放弃当前输入会话：清掉未上屏内容，并退出所在的 overlay 模式。**Esc 的语义单点**。
+    ///
+    /// # 收敛了六处逐字重复的实现
+    ///
+    /// 主输入路径与五个 overlay handler 此前各写一份 Esc 分支，形态完全一致
+    /// （`exit_X` + `notify_ui_hide` + `ClearComposition`），**差异只在退出函数**，
+    /// 而那按 `state.active` 分派即可。散着的代价不是重复本身，是「回车五条路径」
+    /// 那次的形状：任何一条新逻辑都只惠及主路径，其余五处静默落后。
+    ///
+    /// ⚠️ 菜单（`menu_open`）与快捷加词（`add_word_active`）**刻意不收**：它们是模态窗口，
+    /// 菜单的键直接转发给 UI 窗口自行解释（`UiCommand::MenuKey`），协调器这边根本不决定
+    /// 语义；加词模式则消费全部按键。要让自定义取消键在那两处也生效，得改 `wind-ui` 的
+    /// 键解释器，是另一层的事。
+    pub(crate) fn cancel_session(&self, state: &mut State) -> KeyAction {
+        match state.active {
+            Some(ModeKind::TempPinyin) => self.exit_temp_pinyin(state),
+            Some(ModeKind::TempEnglish) => self.exit_temp_english(state),
+            Some(ModeKind::Url) => self.exit_url_mode(state),
+            Some(ModeKind::Special(_)) => self.exit_special_mode(state),
+            Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
+            // 普通输入：取消整个组合，含已转换前缀（拼音分步上屏的那部分）一并丢弃。
+            None => self.reset_pinyin_composition(state),
+        }
+        self.notify_ui_hide();
+        KeyAction::ClearComposition
+    }
+
     /// keyup-only 键（CapsLock / 纯修饰键）上的会话态绑定（`keys.session_actions`）。
     ///
     /// 这批键**只有 keyup 到得了服务端**：C++ 对纯修饰键的 keydown 一律放行不吃（吃掉会让
     /// AutoCAD 看不到修饰键、正交模式覆盖失效），CapsLock 的 keydown 则压根不转发给服务端。
     /// 所以它们的绑定只能在这里消费——挂到 keydown 链上是配得上、永不触发。
     ///
-    /// 一期只有导航类动词，[`Self::apply_nav_key`] 自带「无候选返回 `None`」的守卫，正好
+    /// 一期只有导航类动词，[`Self::apply_session_action`] 自带「无候选返回 `None`」的守卫，正好
     /// 实现「有会话归绑定、无会话归原语义」：空闲时按 CapsLock 仍然切大小写。
     ///
     /// ⚠️ 二期加 `clear` / `cancel` 时，判据要放宽到「有编码**或**有候选」——那时改**这一处**
@@ -2985,7 +3052,7 @@ impl Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // include_printable 取值在这里无关紧要——keyup-only 键没有一个是可打印的。
         // 传 true 与主输入路径保持一致，免得日后有人照抄这行时带走一个错误的先例。
-        self.apply_nav_key(&mut state, data, true)
+        self.apply_session_action(&mut state, data, true)
     }
 
     /// 该字符此刻能否进输入缓冲：缓冲为空时查**首码集**，否则查码元**全集**。
@@ -3208,8 +3275,14 @@ impl Coordinator {
             if ch.is_ascii_digit() {
                 owners.push("数字选词键");
             }
-            if rt.nav_keys.classify(vk, false, true).is_some() {
-                owners.push("翻页/高亮键");
+            // 会话态绑定：翻页/移高亮/取消都在组码期间抢这个键，故都算占用。
+            // 措辞按实际动作分——设置页把这行原样显示给用户，笼统写「会话态按键」
+            // 等于让用户自己去查是哪个功能占了。
+            if let Some(a) = rt.session_keys.classify(vk, false, true) {
+                owners.push(match a {
+                    wind_config::SessionAction::Cancel => "取消键",
+                    _ => "翻页/高亮键",
+                });
             }
             if self.select_key_offset(vk).is_some() {
                 owners.push("次选键");
@@ -6002,7 +6075,7 @@ impl MessageHandler for Coordinator {
         }
 
         // 以词定字（select_char）：配置的成对标点键从当前高亮候选词逐字上屏（对齐 Go
-        // handleEngineDefault——select_char 优先于翻页键，故置于 apply_nav_key 之前）。默认
+        // handleEngineDefault——select_char 优先于翻页键，故置于 apply_session_action 之前）。默认
         // `select_char_keys` 为空 → select_char_index 恒 None → 跳过（零回归）。仅在缓冲非空或
         // 有候选时拦截；空缓冲且无候选时放行，让 `,`/`.` 作普通标点（对齐 Go 空缓冲回退标点）。
         if data.modifiers & MOD_SHIFT == 0
@@ -6019,7 +6092,7 @@ impl MessageHandler for Coordinator {
 
         // 候选翻页/高亮：配置驱动统一处理（普通模式为码表型，`-`/`=` 可作翻页）。
         // 仅有候选时生效；无候选时下方 match 的回退臂负责透传方向/翻页键。
-        if let Some(act) = self.apply_nav_key(&mut state, data, true) {
+        if let Some(act) = self.apply_session_action(&mut state, data, true) {
             return act;
         }
 
@@ -6066,12 +6139,10 @@ impl MessageHandler for Coordinator {
         }
 
         match data.key_code {
-            keymap::VK_ESCAPE => {
-                // Escape：取消整个组合（含已转换前缀），不上屏
-                self.reset_pinyin_composition(&mut state);
-                self.notify_ui_hide();
-                KeyAction::ClearComposition
-            }
+            // Escape：取消整个组合（含已转换前缀），不上屏。实现收口在 `cancel_session`
+            // ——`keys.session_actions` 里绑 `cancel` 的键走的是同一个函数，两条通路
+            // 行为必然一致。
+            keymap::VK_ESCAPE => self.cancel_session(&mut state),
             keymap::VK_BACK => {
                 // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
                 // 缓冲前部、重转），否则删光标前一个字符。
@@ -6278,7 +6349,7 @@ impl MessageHandler for Coordinator {
                 // 编码区光标移动（对齐 Go handleCursorLeft/Right/Home/End 的三态语义）：
                 // ① 无组合 → 透传，宿主照常移动文档光标；② 有剩余编码 → 编码区内移动；
                 // ③ 已在边界 / 只剩只读的已转换前缀 → 吃掉不透传（否则宿主光标会跳出组合区）。
-                // 左右键若被用户配成翻页/高亮键，上面的 apply_nav_key 已先行拦截，走不到这里
+                // 左右键若被用户配成翻页/高亮键，上面的 apply_session_action 已先行拦截，走不到这里
                 // ——「配了别的功能」即等价于放弃光标移动。
                 if state.input_buffer.is_empty() {
                     if state.committed_text.is_empty() {
@@ -6355,7 +6426,7 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_UP | keymap::VK_DOWN | keymap::VK_PRIOR | keymap::VK_NEXT => {
-                // 方向/翻页键回退臂：有候选时翻页/高亮已由上面的 apply_nav_key（配置驱动）处理，
+                // 方向/翻页键回退臂：有候选时翻页/高亮已由上面的 apply_session_action（配置驱动）处理，
                 // 这里只剩"无候选"情形——无组合则透传给应用，有组合则消费。
                 if state.input_buffer.is_empty() && state.committed_text.is_empty() {
                     KeyAction::PassThrough

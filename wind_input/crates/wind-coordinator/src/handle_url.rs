@@ -127,17 +127,24 @@ impl Coordinator {
         {
             return act;
         }
+        // 会话态按键绑定（`keys.session_actions`）。⚠️ 网址模式此前是**唯一**没接这条的
+        // overlay——另外四个都经 `handle_candidate_nav` 接了。一期没暴露是因为那时的动词
+        // 全是导航类，而网址模式原样累积文本、从不产候选，导航在这里本就无事可做；二期
+        // 的 `cancel` 一加进来，缺口立刻变成「Tab 在网址模式里按了没反应」。
+        //
+        // ★ 判据：**新增一类动词时，要重查每条通路是不是都接了这个消费点**，不能因为
+        // 「现有动词在那条路上没意义」就默认它不需要接。这与本仓「一个能力多条通路、
+        // 闸门必须每条都接」是同一条，那个已经栽过四次。
+        if let Some(act) = self.handle_candidate_nav(state, data) {
+            return act;
+        }
         // 编码区光标移动（左右 / Home / End）
         if let Some(act) = self.overlay_cursor_key(state, data) {
             return act;
         }
         match data.key_code {
-            keymap::VK_ESCAPE => {
-                // Esc：放弃退出（无上屏）
-                self.exit_url_mode(state);
-                self.notify_ui_hide();
-                KeyAction::ClearComposition
-            }
+            // Esc：放弃退出（无上屏），实现收口在 `cancel_session`。
+            keymap::VK_ESCAPE => self.cancel_session(state),
             keymap::VK_BACK | keymap::VK_DELETE => {
                 // 退格删光标前 / Delete 删光标后。缓冲被删空 → 退出模式（无论前删后删，否则会
                 // 留下空组合区）；本就空缓冲时只有退格退出（保持原语义），Delete 只吃键。

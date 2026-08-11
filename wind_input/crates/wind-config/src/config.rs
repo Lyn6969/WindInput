@@ -622,14 +622,14 @@ impl BoundAction {
 /// 「有候选才有意义」的动词（导航类）由**消费点**自己守一行空候选判据，不靠表结构表达
 /// ——状态维度进分发端是加法，进表结构是乘法。
 ///
-/// # 值域（一期只有导航类）
+/// # 值域
 ///
 /// - `"none"`：在本态禁用该键（第三态，非「未声明」）
 /// - `"page_prev"` / `"page_next"`：上一页 / 下一页
 /// - `"highlight_up"` / `"highlight_down"`：高亮上移 / 下移
+/// - `"cancel"`（别名 `"clear"`）：放弃当前输入，等同 Esc
 ///
-/// 处置类（`clear` / `cancel`）与选择类（`select_candidate:N`）留到二、三期，届时扩充本
-/// 枚举即可，不必先拆掉任何机制。
+/// 选择类（`select_candidate:N` / `select_char:N`）留到三期，届时扩充本枚举即可。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     /// 未启用 / 显式禁用。
@@ -638,6 +638,18 @@ pub enum SessionAction {
     PageNext,
     HighlightUp,
     HighlightDown,
+    /// 放弃当前输入：清空编码与候选，并退出 overlay 模式。**语义完全等同 Esc**。
+    ///
+    /// # 为什么不另立一个「只清空不退模式」的 `clear`
+    ///
+    /// 用户诉求原话是「支持自定义输入清空的热键，因为 ESC 在日常输入时有些太远」——
+    /// 要的是 **Esc 的替代键**，不是一个新语义。而「清空但留在模式里」在普通输入下与
+    /// 本动作**完全无区别**（普通输入没有模式可退），只有 overlay 模式下才分得出来，
+    /// 属于没有人要、却要额外定义五个模式各自边界的语义分叉。
+    ///
+    /// `"clear"` 因此收作**别名**而非第二个动词：用户按「清空」的心智去写照样能用，
+    /// 但内核只有一种行为，不会出现「两个名字行为微妙不同」这种最难查的配置陷阱。
+    Cancel,
 }
 
 impl SessionAction {
@@ -652,8 +664,25 @@ impl SessionAction {
             "page_next" => Self::PageNext,
             "highlight_up" => Self::HighlightUp,
             "highlight_down" => Self::HighlightDown,
+            // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
+            "cancel" | "clear" => Self::Cancel,
             _ => Self::None,
         }
+    }
+
+    /// 该动作是否**只在有候选时**才有意义。
+    ///
+    /// 导航类（翻页 / 移高亮）在没有候选时无事可做，消费点据此放行按键、回落原语义；
+    /// 而 `cancel` 在「打了码还没出候选」时恰恰**必须**生效——那正是判据从「有候选」
+    /// 放宽到「有会话」的理由（见 docs/design/session-key-actions.md §4）。
+    ///
+    /// ★ 判据挂在**动作**上而不是写在消费点：消费点有三个（主输入 / mix / 候选导航），
+    /// 写在那里就要维护三份一致的守卫，而这类「三处必须一致」的约束本仓已栽过四次。
+    pub fn requires_candidates(&self) -> bool {
+        matches!(
+            self,
+            Self::PagePrev | Self::PageNext | Self::HighlightUp | Self::HighlightDown
+        )
     }
 
     /// 同 [`Self::parse`]，但把「写错的动词」与「显式 none」区分开，供加载期告警。
@@ -680,6 +709,9 @@ impl SessionAction {
             Self::PageNext => "page_next",
             Self::HighlightUp => "highlight_up",
             Self::HighlightDown => "highlight_down",
+            // 别名 `clear` 刻意不回写——规范名只有一个，避免同一份配置在两次保存后
+            // 出现两种写法。
+            Self::Cancel => "cancel",
         }
     }
 
@@ -4037,6 +4069,45 @@ mod tests {
         for (_, a) in page_key_group_binds("shift_tab") {
             assert!(SessionAction::parse(a.as_str()).is_enabled());
         }
+    }
+
+    /// `clear` 是 `cancel` 的别名，且**只有一个规范名**回写。
+    ///
+    /// 两个名字对应两种心智（「清空」vs「取消」），但内核只有一种行为——否则就成了
+    /// 「两个名字行为微妙不同」这种最难查的配置陷阱。回写只用 `cancel`，避免同一份配置
+    /// 在两次保存后出现两种写法。
+    #[test]
+    fn clear_parses_as_cancel_alias() {
+        assert_eq!(SessionAction::parse("cancel"), SessionAction::Cancel);
+        assert_eq!(SessionAction::parse("clear"), SessionAction::Cancel);
+        assert_eq!(SessionAction::parse("CLEAR"), SessionAction::Cancel);
+        assert_eq!(SessionAction::Cancel.as_str(), "cancel");
+        // 别名也要能通过「值认不认识」的校验，否则加载期会误报成拼写错误。
+        assert_eq!(
+            SessionAction::parse_checked("clear"),
+            Some(SessionAction::Cancel)
+        );
+    }
+
+    /// ★ 「要不要有候选」的判据挂在**动作**上，不在消费点。
+    ///
+    /// 导航类在没有候选时无事可做；`cancel` 则在「打了码还没出候选」时恰恰必须生效——
+    /// 网址模式（原样累积文本、从不产候选）就是这一格。判据写到消费点上就要维护三份
+    /// 一致的守卫，那正是本仓栽过四次的形状。
+    #[test]
+    fn only_navigation_actions_require_candidates() {
+        for a in [
+            SessionAction::PagePrev,
+            SessionAction::PageNext,
+            SessionAction::HighlightUp,
+            SessionAction::HighlightDown,
+        ] {
+            assert!(a.requires_candidates(), "{a:?} 是导航类，无候选时无事可做");
+        }
+        assert!(
+            !SessionAction::Cancel.requires_candidates(),
+            "cancel 在有编码无候选时必须生效，否则网址模式里按了没反应"
+        );
     }
 
     /// 存量迁移：`trigger_keys` 里的 z → `z_key_action`，其余字母丢弃。

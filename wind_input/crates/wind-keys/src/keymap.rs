@@ -135,25 +135,46 @@ pub enum NavAction {
     HighlightDown,
 }
 
-/// 一个导航键绑定：(键码, 是否需 Shift, 动作, 该键是否为可打印字符)。
-/// `printable=true`（如 `-`/`=`/`[`/`]`）在文本/表达式模式（临英/快捷输入）中作输入而非导航，
-/// 由 `classify(..., include_printable=false)` 排除；专用导航键（PageUp/Down、方向键、Tab）恒生效。
+/// 一个会话态按键绑定：(键码, 是否需 Shift, 动作, 该键是否为可打印字符)。
+/// `printable=true`（如 `-`/`=`/`[`/`]`）在文本/表达式模式（临英/快捷输入）中作输入而非动作，
+/// 由 `classify(..., include_printable=false)` 排除；专用功能键（PageUp/Down、方向键、Tab）恒生效。
 #[derive(Clone, Copy)]
-struct NavBind {
+struct Bind<A> {
     key: u32,
     shift: bool,
-    action: NavAction,
+    action: A,
     printable: bool,
 }
 
-/// 配置驱动的候选导航键分类器。从 `keys.page_keys` / `keys.highlight_keys` 组名编译一次，
-/// 普通模式与所有 overlay 模式共用 [`classify`](NavKeys::classify)，消除各处硬编码翻页/高亮判断。
-#[derive(Clone, Default)]
-pub struct NavKeys {
-    binds: Vec<NavBind>,
+/// 配置驱动的会话态按键分类器。从 `keys.session_actions` 编译一次，普通模式与所有 overlay
+/// 模式共用 [`classify`](KeyBinds::classify)，消除各处硬编码的翻页/高亮/取消判断。
+///
+/// # 为什么对动作类型泛型
+///
+/// 动作值域（`SessionAction`）住在 `wind-config`，而本 crate 是它的**下游**——
+/// `wind-config` 经 `wind-cmdbar` 反向依赖本 crate，写死类型就得加依赖，那会成环。
+/// 泛型让本表只管「键名 → 命中」这件事，动作是什么由调用方（协调器，唯一同时看得见
+/// 两个 crate 的地方）决定。
+///
+/// 一期只有导航动词时这里写死的是 `NavAction`，二期加 `cancel` 时立刻不够用了——
+/// ★ 判据：**一张「键 → 动作」的表，动作类型就不该由表来规定**。
+#[derive(Clone)]
+pub struct KeyBinds<A> {
+    binds: Vec<Bind<A>>,
 }
 
-impl NavKeys {
+// 手写 Default：`derive` 会要求 `A: Default`，而动作类型没有、也不该有「默认动作」。
+impl<A> Default for KeyBinds<A> {
+    fn default() -> Self {
+        Self { binds: Vec::new() }
+    }
+}
+
+/// 只装导航动作的绑定表。**本 crate 的单测用**——生产代码走 `KeyBinds<SessionAction>`
+/// （动作值域在 `wind-config`，见 [`KeyBinds`] 的泛型说明）。
+pub type NavKeys = KeyBinds<NavAction>;
+
+impl<A: Copy> KeyBinds<A> {
     /// 从 (键名, 动作) 对编译。键名解析走 [`session_key_name_to_vk`]。
     ///
     /// 数据源是 `keys.session_actions`（旧的 `page_keys` / `highlight_keys` 组名已在
@@ -168,11 +189,11 @@ impl NavKeys {
     ///
     /// 不认的键名**静默跳过**：本函数无日志依赖，告警由调用方在加载期发（那里才分得清
     /// 「拼错了」与「显式 none」）。
-    pub fn from_binds<'a>(binds: impl IntoIterator<Item = (&'a str, NavAction)>) -> Self {
+    pub fn from_binds<'a>(binds: impl IntoIterator<Item = (&'a str, A)>) -> Self {
         let binds = binds
             .into_iter()
             .filter_map(|(name, action)| {
-                session_key_name_to_vk(name).map(|k| NavBind {
+                session_key_name_to_vk(name).map(|k| Bind {
                     key: k.vk,
                     shift: k.shift,
                     action,
@@ -183,14 +204,9 @@ impl NavKeys {
         Self { binds }
     }
 
-    /// 分类一个键。`include_printable=false` 时排除可打印导航键（`-`/`=`/`[`/`]`），
+    /// 分类一个键。`include_printable=false` 时排除可打印键（`-`/`=`/`[`/`]`），
     /// 供输入需要这些字符的模式（临英/快捷输入）使用，避免吞掉输入语义。
-    pub fn classify(
-        &self,
-        key_code: u32,
-        shift: bool,
-        include_printable: bool,
-    ) -> Option<NavAction> {
+    pub fn classify(&self, key_code: u32, shift: bool, include_printable: bool) -> Option<A> {
         self.binds
             .iter()
             .find(|b| b.key == key_code && b.shift == shift && (include_printable || !b.printable))

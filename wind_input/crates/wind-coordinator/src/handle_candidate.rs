@@ -611,7 +611,7 @@ impl Coordinator {
         };
         // 拼音音节拆分形态（供「混输高亮跟随」按高亮候选类型选择显示原始码 / 拆分串）。
         // 码表 / 无拼音 → 空串（恒原始码）。state.preedit 本身由 sync_preedit_to_highlight
-        // 按高亮重算（见 update_candidates 末尾 / apply_nav_key）。
+        // 按高亮重算（见 update_candidates 末尾 / apply_session_action）。
         state.preedit_split_body = result.preedit_pinyin.clone();
         let engine_count = result.candidates.len();
         // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
@@ -1727,7 +1727,7 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         let include_printable = match state.active {
             Some(ModeKind::Special(_)) | Some(ModeKind::TempPinyin) => true,
-            // mix 目前**不经过本函数**（`handle_mix_key` 直接调 `apply_nav_key`）。保留本
+            // mix 目前**不经过本函数**（`handle_mix_key` 直接调 `apply_session_action`）。保留本
             // 分支只为「日后有人把 mix 接过来时规则仍然对」，取值统一问
             // `mix_nav_include_printable`——此前这里独立写了一份且与活代码取值相反。
             Some(ModeKind::Mix(idx)) => self.mix_nav_include_printable(idx),
@@ -1740,7 +1740,7 @@ impl Coordinator {
             }
             _ => false,
         };
-        self.apply_nav_key(state, data, include_printable)
+        self.apply_session_action(state, data, include_printable)
     }
 
     /// 提交某个候选（记录原始简体词频后清空状态），返回上屏文本（按需简繁转换）。

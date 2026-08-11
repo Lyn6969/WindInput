@@ -1483,11 +1483,8 @@ impl Coordinator {
             return Self::commit_action(out, true);
         }
         match data.key_code {
-            keymap::VK_ESCAPE => {
-                self.exit_mix_mode(state);
-                self.notify_ui_hide();
-                KeyAction::ClearComposition
-            }
+            // Esc：放弃退出，实现收口在 `cancel_session`。
+            keymap::VK_ESCAPE => self.cancel_session(state),
             keymap::VK_BACK | keymap::VK_DELETE => {
                 // Backspace：段回退**优先于光标**（文本透镜有已转换段先退回最后一段，你→ni，
                 // 码并回缓冲前部）；否则删光标前一字符。Delete 只删光标后一字符、删空后才回退段
@@ -1645,9 +1642,11 @@ impl Coordinator {
                 // 的键组）必须让位字面输入，否则 `all-in-one` 的 `-` 会被吃成翻页。翻页职责
                 // 转给 PageUp/PageDown ——本模式的数字键与二三候选键本就被选词占着，用户在
                 // 这里本来就该用功能键翻页。关闭自由输入时维持既有的 `true`。
-                if let Some(act) =
-                    self.apply_nav_key(state, data, self.mix_nav_include_printable(state.mix_id))
-                {
+                if let Some(act) = self.apply_session_action(
+                    state,
+                    data,
+                    self.mix_nav_include_printable(state.mix_id),
+                ) {
                     return act;
                 }
 

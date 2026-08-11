@@ -497,12 +497,9 @@ impl Coordinator {
             return Self::commit_action(out, true);
         }
         match data.key_code {
-            keymap::VK_ESCAPE => {
-                // Esc：退出
-                self.exit_temp_pinyin(state);
-                self.notify_ui_hide();
-                KeyAction::ClearComposition
-            }
+            // Esc：放弃退出。实现收口在 `cancel_session`（按 `state.active` 分派回
+            // `exit_temp_pinyin`），与绑了 `cancel` 的自定义键共用同一条路径。
+            keymap::VK_ESCAPE => self.cancel_session(state),
             keymap::VK_BACK | keymap::VK_DELETE => {
                 // Backspace：段回退**优先于光标**（有已转换段先退回最后一段，你→ni，码并回缓冲
                 // 前部）；否则删光标前一字符。Delete 只删光标后一字符、删空后才回退段——与主输入
@@ -901,11 +898,8 @@ impl Coordinator {
             return act;
         }
         match data.key_code {
-            keymap::VK_ESCAPE => {
-                self.exit_temp_english(state);
-                self.notify_ui_hide();
-                KeyAction::ClearComposition
-            }
+            // Esc：放弃退出，实现收口在 `cancel_session`。
+            keymap::VK_ESCAPE => self.cancel_session(state),
             keymap::VK_BACK | keymap::VK_DELETE => {
                 // 退格删光标前 / Delete 删光标后；缓冲被删空则退出（本就空缓冲时只有退格退出）。
                 let backward = data.key_code == keymap::VK_BACK;

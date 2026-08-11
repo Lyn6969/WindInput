@@ -255,6 +255,181 @@ fn capslock_binding_enters_key_up_forward_set() {
     );
 }
 
+// ───────────────────────── 二期：cancel 动词与 Esc 收敛 ─────────────────────────
+
+const VK_ESCAPE: u32 = 0x1B;
+const VK_BACKTICK: u32 = 0xC0;
+const VK_PERIOD: u32 = 0xBE;
+
+fn press(coord: &Coordinator, ch: char) -> wind_bridge::handler::KeyAction {
+    let vk = match ch {
+        'a'..='z' => 0x41 + (ch as u32 - 'a' as u32),
+        '.' => VK_PERIOD,
+        _ => panic!("press() 未覆盖的字符: {ch}"),
+    };
+    coord.handle_key_event(&key(vk, 0, EVENT_KEY_DOWN))
+}
+
+/// 用户诉求三：`tab = "cancel"` 后，打字中途按 Tab 放弃整段（Esc 的替代键）。
+#[test]
+fn cancel_discards_composition_in_normal_input() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[("tab", "cancel")]), Some(&data_dir()));
+    type_until_multipage(&coord);
+    assert!(!coord.debug_page_texts().is_empty(), "前置条件：应有候选");
+
+    let act = coord.handle_key_event(&key(VK_TAB, 0, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, wind_bridge::handler::KeyAction::ClearComposition),
+        "Tab 绑 cancel 后应放弃整段，实际: {act:?}"
+    );
+    assert!(coord.debug_page_texts().is_empty(), "候选应被清空");
+}
+
+/// `clear` 是 `cancel` 的别名——用户按「清空」的心智去写照样能用。
+#[test]
+fn clear_is_an_alias_of_cancel() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[("tab", "clear")]), Some(&data_dir()));
+    type_until_multipage(&coord);
+    let act = coord.handle_key_event(&key(VK_TAB, 0, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, wind_bridge::handler::KeyAction::ClearComposition),
+        "clear 应与 cancel 同义，实际: {act:?}"
+    );
+}
+
+/// ★★★ 判据放宽的守门：**有会话但无候选**时 `cancel` 仍须生效。
+///
+/// 一期的守卫是「无候选就返回 None」，那一格里 Tab 根本不会被接管。网址模式是这一格的
+/// 天然样本——它原样累积文本、从不产候选，而用户此刻显然处在一个输入会话里。
+///
+/// 这条测试若失败，说明 `requires_candidates` 的分派被改回了「一刀切守候选」。
+#[test]
+fn cancel_works_in_session_without_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    // ⚠️ `input.url.enabled` **出厂默认关闭**，测试须显式拨开——否则 `www.` 只是普通编码，
+    // 前置条件不成立。这类「判据依赖一个默认关闭的开关」正是集成测试假绿的常见来源。
+    let mut cfg = cfg_with(&[("tab", "cancel")]);
+    cfg.input.url.enabled = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "www.".chars() {
+        press(&coord, c);
+    }
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("url"),
+        "前置条件：`www.` 应夺取进网址模式"
+    );
+    assert!(
+        coord.debug_page_texts().is_empty(),
+        "前置条件：网址模式不产候选——这正是本测试要覆盖的那一格"
+    );
+
+    coord.handle_key_event(&key(VK_TAB, 0, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "无候选时 cancel 仍须退出网址模式"
+    );
+}
+
+/// `cancel` 在 overlay 模式里等同 Esc：退出模式并放弃内容。
+///
+/// ⚠️ 必须先断言**确实进了临拼**：触发键若没生效，按键会落到主输入路径，而那里的
+/// cancel 返回的 `ClearComposition` 与这里一模一样——不验进入就是假绿。
+#[test]
+fn cancel_exits_overlay_mode() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[("tab", "cancel")]), Some(&data_dir()));
+    coord.handle_key_event(&key(VK_BACKTICK, 0, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("temp_pinyin"),
+        "前置条件：反引号应进入临时拼音"
+    );
+    for c in "ni".chars() {
+        press(&coord, c);
+    }
+
+    coord.handle_key_event(&key(VK_TAB, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_active_mode(), None, "cancel 应退出临时拼音");
+}
+
+/// ★ 无会话时 Tab 不被截走——空闲按 Tab 该是宿主的制表符。
+///
+/// 「有会话归绑定、无会话归原语义」是两张表的分野，这条守的就是那道边界。
+#[test]
+fn cancel_not_triggered_without_session() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[("tab", "cancel")]), Some(&data_dir()));
+    assert!(coord.debug_page_texts().is_empty(), "前置条件：不应有候选");
+
+    let act = coord.handle_key_event(&key(VK_TAB, 0, EVENT_KEY_DOWN));
+    assert!(
+        !matches!(act, wind_bridge::handler::KeyAction::ClearComposition),
+        "空闲时 Tab 不该被 cancel 截走，实际: {act:?}"
+    );
+}
+
+/// ★★ Esc 收敛的回归保护：六处实现合并成 `cancel_session` 后，各模式行为不变。
+///
+/// ⚠️ **每个模式都必须先断言进入**。六处 Esc 的返回值本来就都是 `ClearComposition`，
+/// 触发键没生效、按键落回主输入路径时返回值完全相同——不验进入，这条测试在收敛写错的
+/// 情况下照样全绿。这与 `enter_behavior` 那次的假绿是同一个形状。
+#[test]
+fn escape_still_exits_each_mode_after_convergence() {
+    if !has_schemas() {
+        return;
+    }
+    // 临时拼音
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    coord.handle_key_event(&key(VK_BACKTICK, 0, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("temp_pinyin"),
+        "前置条件：应进临拼"
+    );
+    press(&coord, 'n');
+    coord.handle_key_event(&key(VK_ESCAPE, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_active_mode(), None, "Esc 应退出临拼");
+
+    // 网址模式（总开关出厂默认关闭，须显式拨开）
+    let mut cfg = cfg_with(&[]);
+    cfg.input.url.enabled = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "www.".chars() {
+        press(&coord, c);
+    }
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("url"),
+        "前置条件：应进网址模式"
+    );
+    coord.handle_key_event(&key(VK_ESCAPE, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_active_mode(), None, "Esc 应退出网址模式");
+
+    // 主输入路径
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    type_until_multipage(&coord);
+    let act = coord.handle_key_event(&key(VK_ESCAPE, 0, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, wind_bridge::handler::KeyAction::ClearComposition),
+        "Esc 在主输入路径应放弃整段，实际: {act:?}"
+    );
+    assert!(coord.debug_page_texts().is_empty(), "候选应被清空");
+}
+
 /// Shift+Tab 与 Tab 是两条独立绑定（`shift+` 前缀），不会互相顶掉。
 #[test]
 fn shift_tab_and_tab_bind_independently() {
