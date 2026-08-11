@@ -56,12 +56,20 @@ fn engine_type_label(t: &str) -> &'static str {
     }
 }
 
-/// 按引擎类型的默认适用数据段（与设置页子标签一致：码表四段/拼音三段/混输仅候选调整）。
+/// 按引擎类型的默认适用数据段。
+///
+/// ⚠️ 与设置页的子标签（`wind-setting` 的 `pages::dict::state::tabs_for_domain_at`）**同源
+/// 但不等价**，且这条跨仓契约**没有编译期约束**：
+///
+/// - 必须同增同减的是「**某类数据在这个引擎下存不存在**」。只改一边的表现是「设置页看得见、
+///   导出文件里没有」，用户直到还原时才发现丢了数据。拼音曾是三段（无候选调整），因为那时
+///   拼音下调位被整体屏蔽；置顶放开后两边同步补上 Shadow。
+/// - 允许不同的是「**这里从宽**」：英文域在设置页不显示临时词库（那张表恒空），这里仍走
+///   `_` 分支带上它。导出多一段空数据无害，少一段则是丢数据——两个方向的代价不对称。
 fn default_dict_sections(engine_type: &str) -> Vec<wind_store::dict_export::DictSection> {
     use wind_store::dict_export::DictSection::*;
     match engine_type {
         "mixed" => vec![Shadow],
-        "pinyin" => vec![UserWords, TempWords, Freq],
         _ => vec![UserWords, TempWords, Freq, Shadow],
     }
 }
@@ -759,8 +767,14 @@ impl Coordinator {
                 .search_temp_words_prefix(id, "", 0)
                 .map(|v| v.len())
                 .unwrap_or(0);
+            // 候选调整按 data_schema_id 归属（拼音族折叠到 "pinyin"），与写端 `candidate_op`
+            // 和读端 `shadow.list` 同源。此前直传原始 id：双拼方案（`shuangpin_*`）折叠后
+            // 才是 "pinyin"，拿原始 id 去查恒得 0 条——设置页的规则计数于是永远显示 0。
+            //
+            // ⚠️ 上面 user_words / temp_words **刻意保持原始 id**：它们走
+            // `write_data_schema_id` 的按来源分桶，与 shadow 不是同一套归属规则，别顺手改。
             let shadow_rules = store
-                .list_shadow_rules(id)
+                .list_shadow_rules(&self.engine_mgr.data_schema_id(id))
                 .map(|v| {
                     v.iter()
                         .map(|(_, r)| r.pinned.len() + r.deleted.len())
@@ -3558,6 +3572,82 @@ mod tests {
         assert!(
             items.iter().any(|it| it["text"] == "你好"),
             "双拼应读到拼音下加的词（data_schema_id 共享）"
+        );
+    }
+
+    /// `dict.stats` 的候选调整计数必须走 `data_schema_id` 折叠。
+    ///
+    /// 这里曾是**全仓唯一**一处直传原始方案 id 的 shadow 读取：写端 `candidate_op` 与
+    /// `shadow.list` 都折叠到 `"pinyin"`，统计却拿 `double_pinyin` 去查，于是双拼方案的
+    /// 规则计数恒显示 0——功能明明生效，设置页却像是一条规则都没有。
+    ///
+    /// 反向对照（`user_words`）不可省：它**刻意**保持原始 id（走 `write_data_schema_id`
+    /// 的按来源分桶，与 shadow 不是同一套归属规则）。没有这一条，本测试无法区分
+    /// 「shadow 正确折叠」与「整个函数被改成一律折叠」——后者会悄悄改掉用户词的统计口径。
+    #[test]
+    fn dict_stats_shadow_count_follows_data_schema_folding() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_coord_stats_shadow_fold");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        for name in ["pinyin_simp", "double_pinyin"] {
+            let mut f = std::fs::File::create(schemas.join(format!("{name}.schema.toml"))).unwrap();
+            write!(f, "[engine]\ntype = \"pinyin\"\n").unwrap();
+        }
+
+        let db_path = std::env::temp_dir().join("wind_coord_stats_shadow_fold.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        // `dict.stats` 遍历的是**已启用方案**（`config.schema.available`），不是目录扫描结果
+        // ——只写 schema.toml 不够，两个方案都得在这份清单里才会出现在统计中。
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["pinyin_simp".into(), "double_pinyin".into()];
+        cfg.schema.active = "pinyin_simp".into();
+        let c =
+            Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+
+        // 用全拼方案置顶一条（写端折叠 → 落在 "pinyin"）。
+        c.web_data_rpc(
+            "shadow.pin",
+            &json!({ "schemaId": "pinyin_simp", "code": "hao", "word": "好", "position": 0 }),
+        )
+        .unwrap();
+
+        let stats = c.web_data_rpc("dict.stats", &json!({})).unwrap();
+        let rows = stats.as_array().expect("stats 是数组");
+        let row_of = |id: &str| -> Value {
+            rows.iter()
+                .find(|r| r["schemaId"] == id)
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+
+        assert_eq!(
+            row_of("double_pinyin")["shadowRules"],
+            1,
+            "双拼方案须报出折叠后的规则数（与全拼共享同一条）"
+        );
+        assert_eq!(row_of("pinyin_simp")["shadowRules"], 1, "全拼方案同样报 1");
+    }
+
+    /// 拼音的默认导出段必须含**候选调整**，与设置页子标签同增同减。
+    ///
+    /// 这条跨仓契约没有编译期约束：设置页给了拼音「候选调整」tab、而导出默认不含该段时，
+    /// 用户在设置页看得见规则，导出的文件里却没有，直到还原时才发现丢了数据。
+    #[test]
+    fn pinyin_default_export_sections_include_shadow() {
+        use wind_store::dict_export::DictSection;
+        let py = default_dict_sections("pinyin");
+        assert!(
+            py.contains(&DictSection::Shadow),
+            "拼音默认导出段须含候选调整，实际: {py:?}"
+        );
+        // 反向对照：混输只有候选调整这一段，证明本函数确实在按引擎类型分流，
+        // 而不是被改成了「一律返回全部段」。
+        assert_eq!(
+            default_dict_sections("mixed"),
+            vec![DictSection::Shadow],
+            "混输仍只导出候选调整"
         );
     }
 
