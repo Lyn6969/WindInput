@@ -1533,7 +1533,11 @@ function Do-Installer ([string]$profile = "release", [bool]$skipBuild = $false) 
     }
     $packPs1 = Join-Path $instDir "scripts\pack.ps1"
     if (-not (Test-Path $packPs1)) { ErrMsg "缺少打包脚本: $packPs1"; return $false }
-    $assetsDir = Join-Path $instDir "assets"
+    # 品牌资产 (logo.png / installer.ico) 取本仓 assets\, 不取 wind-installer\assets\ ——
+    # 后者是通用安装器生成器的中性兜底图 (W 字标), 借用它会让安装界面与 Setup.exe 顶着
+    # 别人的标识。且 logo 读不到只警告并回退到 stub 内置默认 (icon 才是硬错误),
+    # 一旦路径失效会静默变成 W, 不会打包失败。
+    $assetsDir = Join-Path $ProductRoot "assets"
 
     # 2. 构建产物 (除非 skip)
     $outdir = Out-For $profile

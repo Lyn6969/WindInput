@@ -100,8 +100,10 @@ compression = "lzma"
 source_dir  = "../build"            # 相对本文件：WindInput/build/（本地默认）
 output_name = "WindInput-Setup"
 output_dir  = "../../wind-installer/dist"
-logo        = "../../wind-installer/assets/logo.png"
-icon        = "../../wind-installer/assets/installer.ico"
+# 品牌资产在本仓 assets\（相对本文件解析）。切勿指回 wind-installer/assets/ ——
+# 那是通用生成器的中性兜底图（W 字标），借用会让安装界面顶着别人的标识。
+logo        = "../assets/logo.png"
+icon        = "../assets/installer.ico"
 
 # ── PE 资源版本信息（供 wind-packer 在打包期注入安装程序/卸载程序的详细信息）──
 [package.version_info]
