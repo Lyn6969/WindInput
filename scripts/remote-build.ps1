@@ -48,6 +48,9 @@ param(
     [switch]$NoFetch,
     # 不清理编译机上的残留文件 (逃生口; 正常情况下不该用, 见 Sync-Tree 里的说明)
     [switch]$NoPrune,
+    # 不抢编译机互斥锁。只用于【只读】的 -Raw 查询 (看文件、看进程) —— 那种命令不写任何
+    # 东西, 没必要排在一次长构建后面等二十分钟。凡是会写 target\ 或 build\ 的命令都别加。
+    [switch]$NoLock,
     # 先删除编译机上的整个仓库目录再全量同步。⚠️ 连 target\ 一起删, 下次要全量重编 (~9 分钟)
     [switch]$Clean
 )
@@ -187,6 +190,50 @@ function Get-RemoteValue ([string]$expr) {
     $v = & ssh @SshOpts $Target "$remotePs -NoProfile -EncodedCommand $enc" 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ($v | Select-Object -Last 1)
+}
+
+# ---------- 编译机互斥锁 ----------
+# 同一个槽位同时只允许一个构建在跑。理由不是效率而是【正确性】: dev.ps1 的 Do-Full 开头会
+# `Remove-Item -Recurse -Force $outdir` 清空 build[_dev]\, 两个构建并发时后者会把前者的产物
+# 整个删掉 —— 而前者浑然不觉, 继续走到打包, 于是打出一个空安装包并报告「打包完成」。
+# 2026-08-11 实测踩中: 本该 20 MB 的安装包产出 2.3 MB, 全程零报错。
+#
+# 锁文件放在槽位目录【旁边】(不在仓库内), 因此既不会被同步覆盖, 也不会被 prune 清掉;
+# 路径含槽位名 ⇒ 不同 worktree 各锁各的, 互不排队。
+$LockFile = "$RRoot.buildlock"
+$LockHolder = "$env:COMPUTERNAME/$env:USERNAME/pid$PID"
+$script:LockOwned = $false
+
+function Enter-RemoteLock {
+    # 最多等 20 分钟 (一次冷全构建的量级); 超时宁可报错也不硬闯, 免得两个构建互相拆台。
+    foreach ($try in 1..120) {
+        # CreateNew + FileShare.None 是原子的: 文件已存在时直接抛异常, 不存在时独占创建。
+        # 用 New-Item / Test-Path 判断则有检查与创建之间的竞态窗口。
+        $r = Get-RemoteValue @"
+try {
+  `$fs = [IO.File]::Open('$LockFile', 'CreateNew', 'Write', 'None')
+  `$sw = New-Object IO.StreamWriter(`$fs); `$sw.Write('$LockHolder'); `$sw.Dispose(); 'OK'
+} catch {
+  `$age = ((Get-Date) - (Get-Item '$LockFile' -EA SilentlyContinue).LastWriteTime).TotalMinutes
+  if (`$age -gt 30) { Remove-Item '$LockFile' -Force -EA SilentlyContinue; 'STALE' }
+  else { 'BUSY:' + ((Get-Content '$LockFile' -Raw -EA SilentlyContinue) -replace '\s','') }
+}
+"@
+        if ($r -eq 'OK') { $script:LockOwned = $true; return $true }
+        if ($r -eq 'STALE') { continue }        # 陈旧锁已清除, 立刻重试抢占
+        if ($null -eq $r)   { return $true }    # 连不上时不因为锁而卡死, 后续步骤自会报错
+        if ($try -eq 1) { Warn "  [锁] 编译机正被另一个构建占用 ($($r -replace '^BUSY:','')), 等待..." }
+        Start-Sleep -Seconds 10
+    }
+    ErrMsg "  [锁] 等待编译机超过 20 分钟仍未空闲, 已放弃。"
+    ErrMsg "       若确认对方已死: 在编译机上删除 $LockFile"
+    return $false
+}
+
+function Exit-RemoteLock {
+    if (-not $script:LockOwned) { return }
+    $script:LockOwned = $false
+    Invoke-RemotePs "Remove-Item -LiteralPath '$LockFile' -Force -EA SilentlyContinue" -Quiet | Out-Null
 }
 
 # ---------- 源码同步 ----------
@@ -410,6 +457,13 @@ if ($Clean) {
         ErrMsg "清理失败"; exit 1
     }
 }
+# 取锁必须【早于同步】: 同步会覆盖对方正在编译的源码, 危害不比清空产物目录小。
+if (-not $NoLock) { if (-not (Enter-RemoteLock)) { exit 1 } }
+
+# ↓↓↓ 从这里到文件末尾的 finally 都在锁内。内部刻意不缩进 —— 这段六十行注释密集,
+#     整体缩进会让 diff 淹没真正的改动。exit 在 try 内同样会触发 finally, 锁不会漏放。
+try {
+
 # 分段计时: 优化前先知道时间花在哪一段。只测量、不改变行为 —— 曾凭「感觉编译慢」去调
 # 并行度, 实测才发现编译只占总时长的一小半, 同步与回传才是大头。
 $tSync = [System.Diagnostics.Stopwatch]::StartNew()
@@ -470,4 +524,7 @@ Say "`n完成 ($cmdText), 耗时 $([math]::Round($sw.Elapsed.TotalSeconds,1)) s"
 Gray ("  同步 {0:N1}s  ·  远程执行 {1:N1}s  ·  回传 {2:N1}s" -f `
       $tSync.Elapsed.TotalSeconds, $tExec.Elapsed.TotalSeconds, $tFetch.Elapsed.TotalSeconds)
 if ($localOut) { Gray "  产物已在本机 $outName\, 可直接用部署命令 (pdm1 / pdm2 / pd1 ...) 安装。" }
+
+}
+finally { Exit-RemoteLock }   # ↑↑↑ 锁区结束。失败退出、Ctrl-C、正常收尾都会走到这里
 exit 0
