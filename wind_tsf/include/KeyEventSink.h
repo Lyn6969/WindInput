@@ -233,32 +233,11 @@ private:
     // 把一个已被我们吃掉的键原样重放给宿主（skip 表标记，避免自己的钩子二次处理）。
     void _ReplayKeyToHost(WORD vk);
 
-    // 回敲一次 CapsLock，把系统已经翻转的大写锁定态复原。
-    //
-    // ★ CapsLock / NumLock / ScrollLock 的锁定态由系统在 TSF 之前的输入线程状态机维护，
-    // **`pfEaten = TRUE` 压不住**（2026-08-11 真机实测；微软 KB127190 亦明确
-    // `SetKeyboardState` 无法改这三个键的锁定态，只能用 keybd_event/SendInput 回敲）。
-    // 故「按 CapsLock 翻页而不动大小写」只能是「让它翻，再翻回来」。
-    //
-    // ★★ 必须在**物理 keyup 处理完之后**才注入。放在 keydown 会让任何「放行自注入事件」
-    // 的时间窗把随后到来的物理 keyup 一起放行，而物理 keyup 正是触发翻页的那个事件。
-    void _RestoreCapsLockToggle();
-
-    // 本次 CapsLock 按下是否被会话态绑定接管（keydown 记、keyup 消费）。
-    // ★ 判据只取一次：若 keyup 时重新判定，中途候选消失就会「吃了 keydown 却不复原」，
-    // 大写锁定被永久翻转，且用户完全无法察觉是哪一下按键造成的。
-    BOOL _capsSessionEaten = FALSE;
-
-    // 自注入复原事件的放行窗口（GetTickCount）。skip 表守不住这里——它只在
-    // OnTestKeyDown/OnTestKeyUp 消费，而 CapsLock 的处理分支在 OnKeyDown/OnKeyUp 也有一份，
-    // 漏防就是「注入→再次命中分支→再注入」的无限递归（2026-08-11 真机撞到，表现为
-    // CapsLock 疯狂闪烁）。窗口只覆盖注入之后的那两个事件，故不会误伤物理按键。
-    DWORD _capsInjectTick = 0;
-    BOOL _IsCapsSelfInjected() const
-    {
-        return _capsInjectTick != 0 && (GetTickCount() - _capsInjectTick) < CAPS_INJECT_WINDOW_MS;
-    }
-    static constexpr DWORD CAPS_INJECT_WINDOW_MS = 150;
+    // ⛔ 这里曾有 CapsLock 的「回敲复原」机制（_RestoreCapsLockToggle / _capsSessionEaten /
+    // 自注入放行窗口），2026-08-11 全部移除——TSF 压不住 CapsLock 的锁定态翻转，而事后
+    // 回敲在快速连按下有竞态且会触发厂商 OSD 弹窗。CapsLock 的会话态绑定改由服务进程的
+    // WH_KEYBOARD_LL 钩子在状态更新前拦截，见 wind-keys 的 capslock_hook 模块。
+    // **不要在 TSF 侧重新实现它。**
 
     WCHAR _lastPassthroughDigit; // Last digit key that passed through (for smart punct fallback in apps where TSF can't read text)
     uint32_t _pendingKeyUpKey;   // Key code of pending KeyUp toggle key

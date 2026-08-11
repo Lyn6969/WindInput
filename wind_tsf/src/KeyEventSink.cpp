@@ -440,37 +440,17 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     }
     uint32_t keyUpHash = CHotkeyManager::CalcKeyHash(modifiers, resolvedVK);
 
-    // ★ CapsLock 的会话态绑定必须用**显式** hash 查表，且必须在 isToggleModeKey 判定之前。
+    // ⛔ CapsLock 的会话态绑定（`keys.session_actions` 里的 capslock）**不在 TSF 处理**，
+    // 别在这里重新加分支——曾加过三版，全部被真机否掉：
     //
-    // 服务端按 CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL) 登记，而 GetCurrentModifiers()
-    // **刻意不并入** CapsLock 锁定态（并入会让大写开着时所有热键失配，见该函数注释）。
-    // 于是上面这个通用 keyUpHash 对 CapsLock 恒等于 CalcKeyHash(0, VK_CAPITAL)——永远查不到，
-    // isToggleModeKey 恒为 FALSE，整块跳过。用通用 hash 写在块内的条件吃键一次都执行不到，
-    // 现象是「配了 capslock = page_prev，大写锁定照常翻转、输入法当场进临时英文态」。
-    if (wParam == VK_CAPITAL && pHotkeyMgr != nullptr
-        && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(CHotkeyManager::CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL)))
-    {
-        // 有会话 → 吃掉 keydown 压住大写翻转，动作交由 OnKeyUp 转发给服务端执行；
-        // 无会话 → 放行，CapsLock 保持系统原语义（用户只是想给它在打字时加一个用途）。
-        //
-        // ⚠ 判据必须与 OnKeyDown 的同名分支逐字一致：那边吃这边放就是「吃了再吐」，
-        // 严格 TSF 宿主直接丢键。两侧同用 _HasInputSession()，它与服务端
-        // `Coordinator::has_input_session` 对齐（有编码 / 有候选 / overlay）。
-        // 自注入的复原事件：放行且不做任何处理（判据与 OnKeyDown 一致）。
-        if (_IsCapsSelfInjected())
-        {
-            *pfEaten = FALSE;
-            return S_OK;
-        }
-        BOOL eat = _HasInputSession();
-        *pfEaten = eat;
-        _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
-                        HotkeyType::ToggleMode, _pTextService->IsChineseMode(),
-                        _pTextService->HasActiveComposition(), _hasCandidates, eat, eat,
-                        eat ? L"capslock_session_eat" : L"capslock_session_only_no_session");
-        return S_OK;
-    }
-
+    // 1. `pfEaten = TRUE` **压不住**锁定态翻转：那是系统在输入线程状态机里做的，位置在本
+    //    回调之前（微软 KB127190 亦称 `SetKeyboardState` 改不了这三个 toggle 键）。
+    // 2. 「让它翻转，再 SendInput 回敲复原」在快速连按下有竞态（物理事件与注入事件的相对
+    //    顺序无法保证，大写会卡住），且那次真实的状态变化会被厂商 OSD 工具观测到并弹窗。
+    //
+    // 现改由服务进程的 `WH_KEYBOARD_LL` 钩子在**状态更新之前**拦截（见 wind-keys 的
+    // `capslock_hook` 模块）。有会话时钩子吃掉整个 CapsLock，TSF 这里根本收不到；无会话时
+    // 钩子放行，走下方原有的状态通知路径。两条路径互补，不重叠。
     if (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyUpHotkey(keyUpHash))
     {
         isToggleModeKey = TRUE;
@@ -890,35 +870,8 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     }
     uint32_t keyUpHash = CHotkeyManager::CalcKeyHash(modifiers, resolvedVK);
 
-    // ★ 与 OnTestKeyDown 的同名分支**逐字一致**（含判据与放置位置）。CapsLock 的登记 hash
-    // 是显式的 CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL)，与上面的通用 keyUpHash 不同源；
-    // 用通用 hash 查会恒为不命中，整个 isToggleModeKey 块跳过。理由详见 OnTestKeyDown。
-    if (wParam == VK_CAPITAL && pHotkeyMgr != nullptr
-        && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(CHotkeyManager::CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL)))
-    {
-        // 自注入的复原事件：放行且不做任何处理，否则会再触发一次复原（无限递归）。
-        if (_IsCapsSelfInjected())
-        {
-            *pfEaten = FALSE;
-            return S_OK;
-        }
-        BOOL eat = _HasInputSession();
-        if (eat)
-        {
-            _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
-            // ★ 吃掉 keydown **压不住**大写锁定翻转——系统在 TSF 之前就改了输入线程状态
-            // （2026-08-11 真机实测推翻了「必须吃掉才能压制」那条注释）。只能回敲复原，
-            // 而复原必须等物理 keyup 处理完（见 _RestoreCapsLockToggle 声明处）。这里只记账。
-            _capsSessionEaten = TRUE;
-        }
-        *pfEaten = eat;
-        _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers,
-                        HotkeyType::ToggleMode, _pTextService->IsChineseMode(),
-                        _pTextService->HasActiveComposition(), _hasCandidates, eat, eat,
-                        eat ? L"capslock_session_eat" : L"capslock_session_only_no_session");
-        return S_OK;
-    }
-
+    // ⛔ CapsLock 的会话态绑定不在 TSF 处理，改由服务进程的 WH_KEYBOARD_LL 钩子拦截。
+    // 三版失败的原因与判据见 OnTestKeyDown 里的同位置注释。
     if (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyUpHotkey(keyUpHash))
     {
         isToggleModeKey = TRUE;
@@ -931,8 +884,7 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
 
     if (isToggleModeKey)
     {
-        // CapsLock has its own special handling in OnKeyUp, don't set pending here.
-        // 会话态绑定的判据不在这里——见上方 capslock_session_eat 分支（hash 不同源）。
+        // CapsLock has its own special handling in OnKeyUp, don't set pending here
         if (wParam == VK_CAPITAL)
         {
             // Just consume the KeyDown, let OnKeyUp handle it
@@ -1414,13 +1366,6 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     // Also handle Caps Lock for indicator
     if (wParam == VK_CAPITAL)
     {
-        // 自注入的复原 keyup：放行，绝不能吃——吃了就会调 OnKeyUp，那里会再发一次
-        // keyup IPC 给服务端，等于按一下 CapsLock 翻两页。
-        if (_IsCapsSelfInjected())
-        {
-            *pfEaten = FALSE;
-            return S_OK;
-        }
         _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
         *pfEaten = TRUE;
         return S_OK;
@@ -1483,12 +1428,6 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
     // Handle Caps Lock key release
     if (wParam == VK_CAPITAL)
     {
-        // 自注入的复原 keyup：放行，不发 IPC（否则按一下翻两页），也不清 _capsSessionEaten。
-        if (_IsCapsSelfInjected())
-        {
-            *pfEaten = FALSE;
-            return S_OK;
-        }
         _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
 
         CHotkeyManager* pHotkeyMgr = _pTextService->GetHotkeyManager();
@@ -1536,19 +1475,6 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
             // IPC failed, fall back to local update
             WIND_LOG_ERROR(L"IPC failed for CapsLock, updating locally");
             _pTextService->UpdateCapsLockState(capsLockOn);
-        }
-
-        // ★ 复原大写锁定态，且必须在 IPC 之后：这次 keyup 正是触发翻页/取消的那个事件，
-        // 提前注入会让「放行自注入事件」的时间窗把它一起放行，动作就不执行了。
-        //
-        // 判据取 keydown 时记下的 _capsSessionEaten，**不**在这里重新判定：中途候选消失
-        // （如引擎异步刷新）会导致「吃了 keydown 却不复原」，大写锁定被永久翻转，而用户
-        // 完全无从知道是哪一下按键干的。无论是否复原都要清标志，避免残留影响下一次。
-        BOOL restore = _capsSessionEaten;
-        _capsSessionEaten = FALSE;
-        if (restore)
-        {
-            _RestoreCapsLockToggle();
         }
 
         *pfEaten = TRUE;
@@ -2738,30 +2664,6 @@ bool CKeyEventSink::_AreModifiersHeld()
     return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
            (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
            (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-}
-
-void CKeyEventSink::_RestoreCapsLockToggle()
-{
-    // ★★ 刻意**不用** skip 表，尽管本文件其它自注入（auto-pair / _ReplayKeyToHost）都用它。
-    //
-    // skip 只在 OnTestKeyDown / OnTestKeyUp 消费，而 CapsLock 的处理分支在 OnKeyDown /
-    // OnKeyUp **也各有一份**。2026-08-11 第一版按 skip 写，真机表现是 CapsLock 疯狂闪烁：
-    // 注入的 down 在 OnTest 层被 skip 放行了，却照样走进 OnKeyDown 的分支，于是再注入一次，
-    // 无限递归。防护的覆盖范围必须与副作用的位置对齐——副作用在 On* 层，防护就不能只守
-    // OnTest* 层。时间窗对四个入口一视同仁，不依赖任何 TSF 调用契约。
-    _capsInjectTick = GetTickCount();
-    if (_capsInjectTick == 0)
-        _capsInjectTick = 1; // 0 是「无窗口」的哨兵值，避开 GetTickCount 的 49.7 天回绕
-
-    INPUT inputs[2] = {};
-    inputs[0].type = INPUT_KEYBOARD;
-    inputs[0].ki.wVk = VK_CAPITAL;
-    inputs[1].type = INPUT_KEYBOARD;
-    inputs[1].ki.wVk = VK_CAPITAL;
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    UINT sent = SendInput(2, inputs, sizeof(INPUT));
-    WIND_LOG_DEBUG_FMT(L"capslock_restore_toggle: sent=%d capsWas=%d\n",
-                       (int)sent, (int)((GetKeyState(VK_CAPITAL) & 0x0001) != 0));
 }
 
 void CKeyEventSink::_PushSkipKey(WORD vk)

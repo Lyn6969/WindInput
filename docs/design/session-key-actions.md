@@ -272,25 +272,63 @@ Space 也有一个 `input.space_on_empty_behavior`，但它管的是**空缓冲*
 ★ 这四个加上 `enter_behavior` 构成一整族「某键/某类键在某情形下的处置策略」。**只折算其中
 一个，表里就混进了异类；全折算，表就退化成配置总汇**，失去「键 → 动词」的单一语义。
 
-## 7. CapsLock：本设计唯一的 C++ 改动
+## 7. CapsLock：不走 TSF，走全局低级键盘钩子
 
-现状（`KeyEventSink.cpp`）：
+> **本节结论是三版真机失败后重写的。TSF 侧原有的所有 CapsLock 会话态代码已全部移除，
+> 且不应重新加回。**
 
-- **keydown**：仅在 `isToggleModeKey` 时被吃（`*pfEaten = TRUE` 直接 return），**从不发服务端**。
-- **keyup**：恒发，带 `KEYMOD_CAPSLOCK`；非切换键时或上 `0x8000` 标记「仅状态通知」。
+### 7.1 为什么 TSF 做不到
 
-作翻页键的通路只能是 **keyup**，与修饰键同族（三条独立理由见 schema-key-actions.md §4.4：
-keydown 不能吃 / `Ctrl+A` 误触发 / 宿主对按住的键重复发 keydown）。
+TSF 里 `*pfEaten = TRUE` 的语义是「这个键事件我处理了」，**不是**「这个键没发生过」。
+CapsLock / NumLock / ScrollLock 的锁定态由系统在**输入线程状态机**里维护，位置在
+`ITfKeyEventSink` 回调**之前**——2026-08-11 真机实测：吃掉 keydown，大写照样翻转。
+旁证：微软 KB127190 明说 `SetKeyboardState()` 改不了这三个键的锁定态。
 
-⚠️ **keydown 必须在有会话时吃掉**，否则每翻一页大小写锁定翻转一次。判据现成：C++ 侧
-`_hasCandidates` 成员已存在，用 §4 的 `hasComp || _hasCandidates` 与其它路径同口径。
+### 7.2 「让它翻转再回敲复原」也不行（第二版，真机否）
 
-⚠️ 守住不变量：**C++ 吃键集必须 ⊆ Rust 出字集**。吃了
-CapsLock keydown 就必须保证 Rust 侧在该状态下确实产出，否则键凭空消失。
+`SendInput` 回敲一次能把状态翻回来，慢速按键下工作正常，但有两个无解问题：
 
-★ 这是唯一的跨进程环节，也**必须真机验证**：单测只能证明 hash 进了集合，证明不了 TSF
-拿到集合后真的转发。schema-key-actions.md 四期在这里栽过一次（绑定写进配置了，但键没进
-`key_up_tsf_hashes()`，配置躺着永不触发）。
+1. **快速连按下有竞态**：物理事件与注入事件在输入队列里的相对顺序无法保证，任何「放行
+   自注入事件」的窗口都可能误放行真实按键，表现为**大写卡住**。
+2. **那次真实的状态变化是可观测的**：厂商 OSD 工具（联想等）会弹出大小写切换提示框。
+
+★ 可复用判据：**事后修正在竞态下没有正确解**。这类需求只能「在它发生之前阻止它发生」。
+
+### 7.3 现方案：`WH_KEYBOARD_LL`（`wind-keys/src/capslock_hook.rs`）
+
+低级键盘钩子是用户态唯一在锁定态更新**之前**的位置（MS 文档：「the callback function is
+called before the asynchronous state of the key is updated」），返回非零即阻止该事件继续传递。
+
+装在**服务进程**，故不需要额外的 Broker 进程，也**不需要 F24 之类的代理键**——服务进程
+本身就持有会话状态，钩子事件直接走进程内 channel。
+
+三条硬约束（都来自文档，违反了都是无声故障）：
+
+| 约束 | 后果 |
+| --- | --- |
+| 回调必须极快返回 | 超时后 Win7+ **静默移除**钩子，且「no way for the application to know」 |
+| 安装线程必须有消息泵 | 钩子靠给该线程发消息来调用 |
+| ★ 必须专用线程，**不能搭 UI 线程** | UI 线程渲染候选窗可能慢过 `LowLevelHooksTimeout`，钩子永久掉且无信号 |
+
+⇒ 回调只做「读一个 `AtomicBool` + 一次非阻塞 `send`」，动作在消费线程里执行。
+
+### 7.4 两条硬门控
+
+1. **没配 `capslock` 就不装钩子**（用户明确要求）。判据取**编译后的绑定表**——动词/键名
+   写错的条目已被 `ConfigBundle::build` 剔除，那些情况装钩子纯属白担风险。
+2. **`SHOULD_EAT` 为真的时间窗必须尽量短**。钩子是全局的，标志滞留意味着用户在**别的
+   应用**里按 CapsLock 也切不动大小写。
+
+   ★★ 闸门的两个方向**后果不对称**：少吃只是「这一次绑定没生效」，多吃是「系统级按键
+   失灵」。凡拿不准一律归零。故 `notify_ui_hide` 与 `handle_focus_lost` 都无条件归零，
+   后者尤其重要——它是「用户去了别处」的最宽路径。
+
+### 7.5 与 TSF 路径的关系：互补，不重叠
+
+有会话时钩子吃掉整个 CapsLock，TSF 根本收不到；无会话时钩子放行，TSF 照常收到 keyup 并
+走原有的大写状态通知路径。`hotkey.rs` 仍把 capslock 编进 `key_up` 表（带 SESSION 位）——
+那个登记现在只用于让 `IsKeyUpSessionOnlyHotkey` 把它**排除在 toggle 语义之外**，
+否则服务端会把它的 keyup 当成模式切换请求。
 
 ## 8. 三条实施约束
 

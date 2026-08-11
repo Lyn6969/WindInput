@@ -859,6 +859,20 @@ pub struct Coordinator {
     pub(crate) last_self_commit: Mutex<Option<std::time::Instant>>,
     /// 自动造词写入计数，供临时词库淘汰按次节流（见 `maybe_evict_temp`）。
     pub(crate) auto_phrase_writes: std::sync::atomic::AtomicUsize,
+    /// CapsLock 全局低级键盘钩子。
+    ///
+    /// ★ **只有用户在 `keys.session_actions` 里真的配了 `capslock` 时才是 `Some`**。没配的
+    /// 用户进程里根本不存在全局键盘钩子——这是本功能唯一的风险控制手段（用户明确要求）。
+    ///
+    /// 为什么非钩子不可：CapsLock 的锁定态由系统在 TSF **之前**维护，`pfEaten` 压不住；
+    /// 而「让它翻转再回敲复原」在快速连按下有竞态（大写会卡住），还会被厂商 OSD 工具
+    /// 观测到并弹窗。详见 `wind_keys::capslock_hook` 模块文档。
+    pub(crate) capslock_hook: Mutex<Option<wind_keys::capslock_hook::CapsLockHook>>,
+    /// 钩子线程 → 动作消费线程的投递口。
+    ///
+    /// 在 `new` 里就建好并起好消费线程（那里才有 `Arc<Self>`），钩子装卸只是复用它。
+    /// 消费线程空闲时阻塞在 channel 上，未装钩子时零开销。
+    capslock_press_tx: std::sync::mpsc::Sender<()>,
     /// 短语层（系统+用户，来自 store，仅 enabled）。变更后可 rebuild_phrases 重建。
     pub(crate) phrases: std::sync::RwLock<wind_phrase::PhraseLayer>,
     /// 最近一次解析的系统短语条目（启动时填充；"恢复默认"重读文件成功后刷新）。
@@ -1207,6 +1221,10 @@ impl Coordinator {
         // 注册 keys.global_hotkeys 全局热键（RegisterHotKey）：启动即注册，
         // 不依赖 IME 激活——全局热键的语义就是在本输入法未激活时也生效。
         coordinator.sync_global_hotkeys();
+
+        // CapsLock 全局钩子：仅当 keys.session_actions 里配了 capslock 才安装。
+        // （动作消费线程已在内部构造函数里起好，见那里。）
+        coordinator.sync_capslock_hook();
 
         // 同步 activate_ime 到 DirectSwitchHotkeys 注册表：同样启动即同步（该热键的
         // 语义就是在本输入法未激活时切换过来），且不依赖 UI 线程创建成功
@@ -1624,6 +1642,7 @@ impl Coordinator {
         } else {
             (d.chinese_mode, d.full_width, d.chinese_punct)
         };
+        let (capslock_press_tx, capslock_press_rx) = std::sync::mpsc::channel::<()>();
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: init_chinese,
@@ -1694,6 +1713,8 @@ impl Coordinator {
             engine_mgr,
             store,
             punct: Mutex::new(punct_conv),
+            capslock_hook: Mutex::new(None),
+            capslock_press_tx,
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             auto_phrase: Mutex::new(crate::auto_phrase::AutoPhraseBuf::new()),
             last_self_commit: Mutex::new(None),
@@ -1768,6 +1789,21 @@ impl Coordinator {
             input_diag_frozen: std::sync::atomic::AtomicBool::new(false),
             input_diag_topmost: std::sync::atomic::AtomicBool::new(true),
         });
+        // CapsLock 钩子的动作消费线程。钩子回调只做非阻塞投递（它超时会被系统静默移除且
+        // 无从察觉），真正的动作在这里执行，可安全加锁。未装钩子时它一直阻塞在 channel 上。
+        // 起在这里而非 `new`：只有此处能同时拿到 `Arc<Self>` 与 receiver。
+        {
+            let c = Arc::clone(&coordinator);
+            std::thread::Builder::new()
+                .name("capslock-action".into())
+                .spawn(move || {
+                    for _ in capslock_press_rx {
+                        c.handle_capslock_hook_press();
+                    }
+                    debug!("CapsLock 钩子事件通道已关闭");
+                })
+                .ok();
+        }
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
@@ -2523,6 +2559,8 @@ impl Coordinator {
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
                 self.sync_direct_switch_hotkey(); // keys.activate_ime 改键/清空即时生效
+                // capslock 绑定的增删即时生效：配上才装全局钩子，删掉立刻卸载。
+                self.sync_capslock_hook();
                 // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
                 self.push_english_pair_config(0);
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
@@ -3604,6 +3642,9 @@ impl Coordinator {
     }
 
     pub(crate) fn notify_ui_update(&self, state: &State) {
+        // CapsLock 钩子闸门：本函数是候选/编码状态变化后的必经出口，挂在这里覆盖面最大。
+        // 放在最前面，使下方的 early return（无候选无编码 → 隐藏）也走得到。
+        self.sync_capslock_gate(state);
         // 模式指示标记（拼/双/快/英/符）：仅在候选为空时显示（进入模式/无候选阶段），
         // 一旦有候选即隐藏，减少干扰。必须纳入下方"空则隐藏"守卫——否则进入模式时
         // 缓冲为空会直接隐藏，标记发不出。
@@ -3979,6 +4020,12 @@ impl Coordinator {
     }
 
     pub(crate) fn notify_ui_hide(&self) {
+        // 候选窗隐藏即会话终结：无条件收回 CapsLock 拦截。
+        //
+        // ★ 这里刻意**不查 state** 而是直接归零。闸门的两个方向后果不对称：少吃只是
+        // 「CapsLock 绑定这一次没生效」，多吃却是「用户在别的应用里 CapsLock 按不动」。
+        // 凡拿不准就归零。
+        wind_keys::capslock_hook::set_should_eat(false);
         let _ = self.ui_tx.send(UiCommand::HideCandidates);
         self.reset_first_show();
     }
@@ -5037,6 +5084,103 @@ impl Coordinator {
             });
         }
         entries
+    }
+
+    /// 配置里是否给 CapsLock 配了会话态绑定（决定要不要装全局钩子）。
+    ///
+    /// 判据取**编译后的绑定表**而非原始配置串：动词写错、键名写错的条目在 `ConfigBundle::build`
+    /// 里已被剔除，那些情况不该装钩子（用户的配置根本不会生效，装了纯属白担全局钩子的风险）。
+    pub fn capslock_bound(&self) -> bool {
+        self.rt()
+            .session_keys
+            .classify(keymap::VK_CAPITAL, false, true)
+            .is_some()
+    }
+
+    /// 按配置装/卸 CapsLock 全局钩子（启动与配置热重载时调用）。
+    ///
+    /// ★ 幂等：已装且仍该装 → 不动（重复 `SetWindowsHookExW` 会留下卸不掉的旧钩子）。
+    pub(crate) fn sync_capslock_hook(&self) {
+        let want = self.capslock_bound();
+        let mut slot = self.capslock_hook.lock().unwrap_or_else(|e| e.into_inner());
+        if want == slot.is_some() {
+            return;
+        }
+        if !want {
+            // Drop 即卸载（内部会先停拦截再停消息泵）。
+            *slot = None;
+            wind_keys::capslock_hook::set_should_eat(false);
+            info!("CapsLock 未配置会话态绑定 → 全局钩子已卸载");
+            return;
+        }
+        // 钩子回调在钩子线程执行，**必须只做非阻塞投递**：它超时会被系统静默移除且无从察觉。
+        // 故这里只 send，真正的动作在 new 起的消费线程里做（可安全加锁）。
+        let tx = self.capslock_press_tx.clone();
+        match wind_keys::capslock_hook::CapsLockHook::install(Box::new(move || {
+            let _ = tx.send(());
+        })) {
+            Ok(h) => {
+                *slot = Some(h);
+                // 立刻按当前会话状态校准一次，避免装好后到下一次按键之间状态为默认值。
+                let eat = {
+                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    Self::has_input_session(&s)
+                };
+                wind_keys::capslock_hook::set_should_eat(eat);
+            }
+            Err(e) => {
+                // 装不上就退化为「CapsLock 绑定不生效」，不影响其余功能。绝不回退到
+                // 「翻转再回敲」——那条路已被真机否掉（竞态 + 厂商 OSD 弹窗）。
+                tracing::error!("CapsLock 全局钩子安装失败，该绑定将不生效: {e}");
+            }
+        }
+    }
+
+    /// 同步「钩子此刻该不该吃 CapsLock」。
+    ///
+    /// ★★ 这个标志为 true 的时间窗必须尽量短。钩子是**全局**的：标志滞留意味着用户在
+    /// **别的应用**里按 CapsLock 也切不动大小写——比功能不生效糟糕得多。故凡是会改变
+    /// 「有没有输入会话」的出口都要调它，宁可多调（幂等的原子写，开销可忽略）。
+    pub(crate) fn sync_capslock_gate(&self, state: &State) {
+        // 未装钩子时也照常写：装钩子那一刻会重新校准，这里写了不会有副作用。
+        wind_keys::capslock_hook::set_should_eat(Self::has_input_session(state));
+    }
+
+    /// 钩子报告「CapsLock 被按下」（在专用消费线程执行，可安全加锁）。
+    ///
+    /// 走的是与键盘路径**同一个** `apply_session_action`，故动词值域、守卫、各模式的翻页
+    /// 出口都不会分叉。钩子只负责「这个键被按了」，「按了该干什么」仍归那一张表。
+    fn handle_capslock_hook_press(&self) {
+        let action = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // 合成一个 keyup 事件：CapsLock 在键盘路径上本来就只有 keyup 到得了这里
+            // （见 `handle_session_action_key_up`），保持同形以免两条路径的守卫产生差异。
+            let data = KeyEventData {
+                key_code: keymap::VK_CAPITAL,
+                scan_code: 0,
+                modifiers: 0,
+                event_type: EVENT_KEY_UP,
+                toggles: 0,
+                event_seq: 0,
+                prev_char: 0,
+            };
+            self.apply_session_action(&mut state, &data, true)
+        };
+        // 候选窗刷新已在 `apply_session_action` 内部完成（`notify_ui_update`），此处无须再推。
+        // 返回值是给 TSF 的按键结果，而钩子路径**没有 TSF 按键上下文**可回传——与既有的
+        // 全局热键路径（`handle_global_hotkey`）同一处境。
+        //
+        // ⚠️ 已知限制：`app_inline`（编码嵌入宿主）模式下，需要回写宿主内联串的结果
+        // （`UpdateComposition` / `ClearComposition`）无法送达，宿主里的编码会滞留到下一次
+        // 真实按键。翻页/高亮在候选窗模式下不受影响——那是本功能的主诉求。
+        match action {
+            Some(KeyAction::Consumed) | None => {}
+            Some(_) => {
+                debug!(
+                    "CapsLock 钩子：该动作需回写宿主内联编码，钩子路径无法回传（app_inline 下会滞留）"
+                );
+            }
+        }
     }
 
     /// 注册/刷新全局热键（启动与配置热重载时调用）。空列表也下发，用于清除旧注册。
@@ -6919,6 +7063,11 @@ impl MessageHandler for Coordinator {
             client_token,
             reason
         );
+        // ★★ CapsLock 钩子闸门兜底归零，**先于 stale 判定**：钩子是全局的，闸门若因任何
+        // 疏漏滞留在 true，用户切到别的应用后按 CapsLock 就完全失灵——这是本功能唯一
+        // 会伤到「没在用输入法的时刻」的故障方向，必须在最宽的路径上归零。
+        // 与 menu_close 同理放在 stale 判定之前：陈旧失焦同样证明用户动了别处。
+        wind_keys::capslock_hook::set_should_eat(false);
         // 关菜单**先于** stale 判定与 reason 分流：菜单的生命周期与输入态无关，
         // 陈旧失焦/噪声层失焦同样证明用户动了别处。详见 menu_close_on_focus_change。
         self.menu_close_on_focus_change("focus_lost");

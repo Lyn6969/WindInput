@@ -172,10 +172,41 @@ fn tab_defaults_to_highlight_not_paging() {
     assert_ne!(sel1, sel0, "默认配置下 Tab 应移动高亮");
 }
 
+/// 用户明确要求的门控：**没配 `capslock` 就不装全局钩子**。
+///
+/// ★ 钩子是全局的（对所有进程的所有按键生效），装了就有代价：安全软件告警、系统超时后
+/// 静默移除、闸门滞留会让别的应用 CapsLock 失灵。绝大多数用户不配这一项，他们的进程里
+/// 就不该存在这个钩子——这是本功能唯一的风险控制手段。
+///
+/// 判据取**编译后的绑定表**而非原始配置串：动词/键名写错的条目已在 `ConfigBundle::build`
+/// 里被剔除，那些情况装钩子纯属白担风险（用户的配置本来也不会生效）。
+#[test]
+fn capslock_hook_installs_only_when_bound() {
+    let bare = Coordinator::new_headless(Config::default(), None);
+    assert!(
+        !bare.capslock_bound(),
+        "默认配置不该装全局钩子——用户没要求这个功能却要承担全局钩子的代价"
+    );
+
+    let bound = Coordinator::new_headless(cfg_with(&[("capslock", "page_next")]), None);
+    assert!(bound.capslock_bound(), "配了 capslock 才装钩子");
+
+    // 动词写错 → 该绑定被 ConfigBundle 剔除 → 不该装钩子。
+    let typo = Coordinator::new_headless(cfg_with(&[("capslock", "page_nextt")]), None);
+    assert!(
+        !typo.capslock_bound(),
+        "动词无法识别时绑定不生效，此时装钩子是白担风险"
+    );
+}
+
 /// 诉求二：`capslock = "page_prev"` 后，有候选时按 CapsLock 翻到上一页。
 ///
-/// ★ 走的是 **keyup**：C++ 对 CapsLock 的 keydown 压根不转发给服务端，绑定挂在 keydown
-/// 链上是配得上、永不触发。
+/// ⚠️ **本测试覆盖的不是真机主路径**。真机上有会话时 CapsLock 被服务进程的
+/// `WH_KEYBOARD_LL` 钩子在 TSF 之前就吃掉了（TSF 根本收不到，见设计文档 §7），动作经
+/// `handle_capslock_hook_press` 走同一个 `apply_session_action`。这里仍按 keyup 喂，
+/// 测的是**动词到动作的映射**那一段；钩子本身跨进程且需 Win32 消息泵，只能真机验。
+///
+/// 保留它的价值：无会话时钩子放行，TSF 照常发 CapsLock keyup，这条路径依然真实存在。
 #[test]
 fn capslock_pages_prev_on_key_up() {
     if !has_schemas() {
