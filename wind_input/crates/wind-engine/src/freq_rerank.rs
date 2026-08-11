@@ -83,8 +83,10 @@ fn freq_tier(c: &Candidate, input: &str) -> u8 {
 }
 
 /// 码表/混输词频重排（§3）：档位感知的**永久** used-first（五笔优先）。
-/// 先按来源档位（码表精确 < 精确码短语 < **拼音精确** < {码表前缀补全, 前缀短语} < 拼音其余），
-/// 档内再 used-first + 策略排序。前缀短语与码表前缀补全同档＝短语不因 is_phrase 抬到补全之上。
+/// 先按来源档位（码表精确 < 精确码短语 < **拼音精确** < 码表前缀补全 < 前缀短语 < 拼音其余），
+/// 档内再 used-first + 策略排序。前缀短语排在码表前缀补全**之后**＝短语不因 is_phrase 抬到
+/// 补全之上。（二者曾同档、由 weight 分先后，但那一步从未真正裁决过——混输给码表前缀补全
+/// +500K 而前缀短语拿原始权重，码表恒赢；加成拆除后已就地拆成两档，见 `source_tier`。）
 /// 稳定排序保证同档无记录者维持引擎权重序，绝不把拼音浮到五笔精确全码之上。
 ///
 /// 策略：`Step`（默认/逐次提升）count 降序、last_used 降序 tiebreak（抗误选）；
@@ -1112,7 +1114,7 @@ mod tests {
     }
 
     /// freq_tier 短语再分档：精确码短语（is_exact_code）tier 1 紧随码表精确；前缀短语
-    /// （!is_exact_code）tier 2 与码表前缀补全同档，**不因 is_phrase 抬到补全之上**。
+    /// （!is_exact_code）排在码表前缀补全**之后**，**不因 is_phrase 抬到补全之上**。
     ///
     /// 回归 `da`→`date` 现场：混输下 `date` 前缀短语曾只因 is_phrase 拿 tier 1、压过码表
     /// 前缀补全（如 矼/509000）。入参按 `candidate_display_order` 的输出序喂入（精确码 →
@@ -1127,13 +1129,13 @@ mod tests {
             c.is_exact_code = true;
             c
         };
-        let completion = ct("dax", "矼", 509_000); // 码表前缀补全 tier 2
+        let completion = ct("dax", "矼", 9000); // 码表前缀补全 tier 3（真实词频，加成已拆除）
         let prefix_phrase = {
-            let mut c = ct("", "date短语", 10); // lookup_prefix 前缀短语 tier 2
+            let mut c = ct("", "date短语", 10);
             c.is_phrase = true;
             c.is_prefix = true; // is_exact_code 默认 false
             c
-        };
+        }; // lookup_prefix 前缀短语 tier 4
         let mut cands = vec![exact_code, exact_phrase, completion, prefix_phrase];
         let r = recs(&[]); // 无词频记录 → 纯按档位 + 稳定序（维持入参显示序）
         rerank_codetable_usedfirst(
@@ -1150,7 +1152,7 @@ mod tests {
         assert_eq!(
             order,
             vec!["左", "精确短语", "矼", "date短语"],
-            "精确码短语 tier1 紧随码表精确；前缀短语 tier2 与码表前缀补全同档、不抬到补全之上"
+            "精确码短语 tier1 紧随码表精确；前缀短语 tier4 排在码表前缀补全(tier3)之后"
         );
     }
 
