@@ -167,12 +167,25 @@ capslock = "page_prev"
 
 | 现有配置 | 形状 | 折算 |
 |---|---|---|
-| `keys.page_keys` | 组名 StrList | ✅ |
-| `keys.highlight_keys` | 组名 StrList | ✅ |
-| `keys.select_key_groups` | 组名 StrList | ✅ |
-| `keys.select_char_keys` | 组名 StrList | ✅ |
+| `keys.page_keys` | 组名 StrList | ✅ 一期 |
+| `keys.highlight_keys` | 组名 StrList | ✅ 一期 |
+| `keys.select_key_groups` | 组名 StrList | ✅ 三期 |
+| `keys.select_char_keys` | 组名 StrList | ✅ 三期 |
 | `keys.overflow.*` | Enum ×3 | ❌ 见 §6.2 |
 | `input.enter_behavior` | Enum | ❌ 见 §6.1 |
+
+### ★★ 折算顺序 = 消费点的判定顺序
+
+四组折算进同一张表后，**一个键只能有一个动词**，而 `comma_period` 同时是选词键组和以词
+定字键组的合法值。撞键时谁赢，唯一正确的依据是**收编前的消费顺序**：主输入路径上是
+以词定字（`select_char_index`）→ 翻页/高亮（`apply_session_action`）→ 二三候选
+（`select_key_offset`），故折算按同序进行、先折的占位。
+
+搞反了的表现是「一直用的 `,` 突然从取字变成选次选」，而用户什么都没改——这类由迁移引起
+的行为漂移最难联想到原因。
+
+> 收编的**副作用是好的**：撞键从「两个函数各自命中、靠消费点顺序隐式裁决」变成「表里
+> 只有一个动词」，隐性冲突变显性。设置页可以据此报冲突，而此前它根本看不见。
 
 折算手法照抄 schema-key-actions.md 五c 的「四处 `trigger_keys` → `keys.key_actions`」，
 连同那条已经用血换来的教训：
@@ -308,7 +321,7 @@ CapsLock keydown 就必须保证 Rust 侧在该状态下确实产出，否则键
 |---|---|---|---|
 | 一 | 建 `keys.session_actions`；`page_keys` / `highlight_keys` 折算；CapsLock keyup 通路（含 C++ 那处） | 两个翻页诉求可用；Esc 一行不动 | ✅ 已实施，**未真机** |
 | 二 | `cancel` 动词 + 六处 Esc 收敛为单点 | 「Tab 清空」；此后同类需求零成本 | ✅ 已实施，**未真机** |
-| 三 | `select_key_groups` / `select_char_keys` 折算 | 二三候选键、以词定字键可自由改绑 | 未开始 |
+| 三 | `select_key_groups` / `select_char_keys` 折算 | 二三候选键、以词定字键可自由改绑 | ✅ 已实施，**未真机** |
 | 四 | 设置页改造（wind-setting 仓） | 不必手改 config.toml | 未开始 |
 
 一期不碰 Esc：它是硬编码多处，风险与收益都在二期，而用户当时等的是翻页。
@@ -326,6 +339,25 @@ CapsLock keydown 就必须保证 Rust 侧在该状态下确实产出，否则键
   在那两处生效，得改 `wind-ui` 的键解释器，是另一层的事。
 - C++ 两处 CapsLock 判据同步从 `_hasCandidates` 放宽到 `_HasInputSession()`，与服务端的
   `has_input_session` 保持逐字一致（§7 的 ⚠️ 已预告这一步）。
+
+### 三期落地情况
+
+- **选词 / 以词定字动词带序号载荷**（`select_candidate:2` / `select_char:1`），配置面向人
+  用「第几个」，转成 0-based 偏移只在消费点做一次。
+- **两个动词刻意不在 `apply_session_action` 里执行**，返回 `None` 让键落到各自的既有消费点。
+  ★ 理由是它们带 **overflow 语义**（候选不足 / 词长不够时按 `keys.overflow.*` 分三档处置），
+  而那个函数只有「命中就执行」一种结局。收编改的是**配置从哪来**，不是执行路径——后者
+  一行未动，overflow 与各模式的选中语义零回归。
+- **删掉四个平行解析器**（`compile_select_key_group` / `compile_select_modifier_group` /
+  `select_key_vks` / `select_char_vks`）。留着不用就是第二套真相源——此前
+  `select_key_vks`（不含 `brackets`）与 `select_char_vks`（含）就被张冠李戴过一次，
+  `brackets` 配置静默失效。收编后两者靠**动词**区分而非靠解析器区分。
+- ⚠️ **补了一个一期的遗漏**：`lshift` / `rctrl` 这类修饰键名 `hotkey.rs` 认得、`wind-keys`
+  的表里没有，而跨 crate 一致性测试的键名列表恰好没覆盖到它们。★ 那条测试的**覆盖面就是
+  它的全部价值**——漏一个名字等于那个名字没被守。三期用到这些键名时才暴露。
+- 顺带删掉 `coordinator.rs` 里一个重复的 `#[test]` 属性（既有，非本次引入）。它本身无害，
+  但会让同类的 `duplicated attribute` 警告淹没在噪音里——而那个警告正是发现「测试函数体
+  丢失」的唯一信号（二期就靠它发现过一处）。
 
 ## 10. 测试陷阱
 
