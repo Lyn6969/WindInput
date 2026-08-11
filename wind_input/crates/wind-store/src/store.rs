@@ -14,6 +14,33 @@ use tracing::{info, warn};
 /// 当前存储版本（迁移锚点）
 pub const CURRENT_VERSION: u32 = 1;
 
+/// redb 页缓存上限。**redb 的默认值是 1 GiB**（`Builder::set_cache_size` 的默认）。
+///
+/// ## 它是上限，不是预分配
+///
+/// 实际占用的上界是 `min(本值, 库文件大小)`——19 万词的库约 34 MB，给 1 GiB 也只会
+/// 占到 34 MB。所以默认值本身并不直接等于「吃掉 1 GiB」。
+///
+/// 旧实现每次按键全表扫描，把整张用户词表拉进缓存并常驻，量级是十几 MB；索引化之后
+/// 常规输入根本填不满缓存，只有设置页的词库列举（全表顺序扫）会填一次。故本值真正的
+/// 作用是**给超大词库一个显式上界**（50 万词的库约 90 MB），而不是解决 19 万词的内存。
+///
+/// ## 取值：由 `perf_cache_size.rs` 双向标定
+///
+/// 读路径（简拼召回 / 前缀补全 / 全量列举）对本值**几乎不敏感**：redb 2.x 不是 mmap，
+/// 未命中走 `read` 系统调用、由 OS 页缓存供数据，是 µs 级 syscall 而非磁盘寻道——
+/// 它下面还垫着一层 OS 页缓存。连 2 MiB 都测不出读性能退化。
+///
+/// **写路径敏感**：`set_cache_size` 把 10% 划给写缓存，19 万词批量导入在写缓存放得下
+/// 全部脏页时一次刷盘，放不下就反复外溢。实测断崖出现在 64↔256 MiB 之间。
+/// 首版取 32 MiB 只测了读就下了结论，导入因此慢 4.6 倍——**只测一半的结论等于没测**。
+pub const DEFAULT_CACHE_SIZE_BYTES: usize = 256 * 1024 * 1024;
+
+/// 按统一配置打开 redb（`open` 与 `resume` 共用，避免两处默认值漂移）。
+fn open_db(path: &Path, cache_bytes: usize) -> Result<Database, redb::DatabaseError> {
+    Database::builder().set_cache_size(cache_bytes).create(path)
+}
+
 // ── 表定义（key 编码见 store.md §2：复合 key 带 schema 前缀，redb 扁平）──
 /// 用户词：key = "{schema}\0{code}\0{text}"，value = 序列化记录
 pub(crate) const USER_WORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("user_words");
@@ -48,20 +75,31 @@ const META_VERSION_KEY: &str = "schema_version";
 pub struct Store {
     path: PathBuf,
     db: Mutex<Option<Database>>,
+    /// 本库的页缓存上限；`resume` 重开时要用同一个值，故随实例存着。
+    cache_bytes: usize,
 }
 
 impl Store {
     /// 打开数据库：创建/打开 redb，建表，运行版本迁移。
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_with_cache_size(path, DEFAULT_CACHE_SIZE_BYTES)
+    }
+
+    /// 指定页缓存上限打开。供 `perf_cache_size.rs` 标定用；生产走 [`Self::open`]。
+    pub fn open_with_cache_size(
+        path: impl AsRef<Path>,
+        cache_bytes: usize,
+    ) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let db = Database::create(&path)?;
+        let db = open_db(&path, cache_bytes)?;
         Self::init_tables(&db)?;
         let store = Self {
             path,
             db: Mutex::new(Some(db)),
+            cache_bytes,
         };
         store.run_migrations()?;
         store.backfill_abbrev_indexes();
@@ -224,7 +262,7 @@ impl Store {
     pub fn resume(&self) -> anyhow::Result<()> {
         let mut guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            let db = Database::create(&self.path)?;
+            let db = open_db(&self.path, self.cache_bytes)?;
             Self::init_tables(&db)?;
             *guard = Some(db);
             info!("Store resumed: {}", self.path.display());

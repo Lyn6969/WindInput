@@ -103,8 +103,11 @@ impl CompositeDict {
         let layers = self.layers.read().unwrap();
         let mut results: Vec<Candidate> = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();
-        // 「同 text 取最短码」只对前缀查询成立：那时各层给的是**不同长度的补全码**。
-        // 精确与简拼查询给的都是整词码，换码就成了「A 层的 code 配 B 层的边界」。
+        // 「同 text 取最短码」**只对前缀查询成立**：那时各层给的是不同长度的补全码，
+        // 取最短即「离输入最近」。精确与简拼查询给的都是整词码，谁短谁长没有这层含义。
+        //
+        // 简拼尤其不能换：候选的 code 必须留全拼码，词频记账走的正是它
+        // （见 step6「保留全拼码」那段——换成别层的码会让同一个词在两条流下各记各的）。
         let is_prefix = matches!(kind, Query::Prefix);
 
         for layer in layers.iter() {
