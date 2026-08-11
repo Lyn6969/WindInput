@@ -28,10 +28,44 @@ public final class BridgeResponseRouter {
     /// app 层注入: 执行 host 光标移动。见 CursorMove。
     public var moveHostCursor: ((CursorMove) -> Void)?
 
+    /// 智能符号 HoldComposition 挂着的待定标点 (作为组合预览显示, 语义 = **待提交**)。
+    ///
+    /// 服务端在下发 PassThrough / UpdateComposition 时会同步清掉自己的 `held_text`
+    /// (`coordinator.rs::handle_key_event_policed`), 因为它假定客户端此刻已经把这个符号
+    /// 收口了 —— Windows 侧确实在这两个分支各调了 `FlushHoldCompositionIfActive` /
+    /// `AbsorbHeldIntoPrefix`。macOS 侧一度什么都没做, 于是:
+    ///   输入 `，` 再输入 `n` → UpdateComposition{"n"} 直接 setMarkedText("n") 覆盖掉
+    ///   marked 的 `，`, **符号凭空消失**, 而服务端已经按上屏记过账。
+    private var heldSymbol: String?
+
+    /// 已「定格」但尚未真正 insertText 的前缀 (对位 Windows 的 `_pendingCommitPrefix`)。
+    ///
+    /// 新组合到来时**不是** commit 旧符号 + 重开组合, 而是把符号并进同一段 marked text,
+    /// 最终由一次 CommitText 收口。Windows 那边试过 commit+重开, 结果在 WPS/微信下被
+    /// 误读成「替换」, 符号被新输入顶掉 —— 同一个坑没必要在 macOS 再踩一遍。
+    private var pendingCommitPrefix: String = ""
+
     public init() {}
 
     public func reset() {
         composition.clear()
+        heldSymbol = nil
+        pendingCommitPrefix = ""
+    }
+
+    /// 把待定标点定格进 `pendingCommitPrefix`, 不上屏、不动文档。
+    /// 定格后不可再被 press2 替换 —— 语义上已承诺提交, 与服务端状态机一致。
+    private func absorbHeldIntoPrefix() {
+        guard let held = heldSymbol else { return }
+        pendingCommitPrefix += held
+        heldSymbol = nil
+    }
+
+    /// 取出「本次上屏该带上的前缀」(定格前缀 + 尚未定格的待定标点) 并清空状态。
+    private func takePendingPrefix() -> String {
+        absorbHeldIntoPrefix()
+        defer { pendingCommitPrefix = "" }
+        return pendingCommitPrefix
     }
 
     /// 路由一个 bridge 响应帧到 client. 返回值同 IMKInputController.handle 的
@@ -40,6 +74,10 @@ public final class BridgeResponseRouter {
     public func apply(_ frame: Frame, to client: TextInputClient?) -> Bool {
         switch frame.cmd {
         case DownstreamCmd.passThrough:
+            // 按键要交回系统 → 待定标点必须**先真上屏**, 否则它挂在 marked text 里没人再管:
+            // 服务端已经清掉 held_text 并按上屏记了账。对位 Windows PassThrough 分支的
+            // FlushHoldCompositionIfActive。
+            flushPendingPrefix(client: client)
             return false
 
         case DownstreamCmd.consumed, DownstreamCmd.ack:
@@ -111,10 +149,10 @@ public final class BridgeResponseRouter {
             // 不实现 timeout 自动提交 —— Win 侧那个计时器是给 TSF 的「吃了再吐」兜底,
             // IMKit 里组合会一直挂到 press2 (CommitTextReplacingHeld) 或失焦清理。
             if let p = try? BinaryCodec.decodeHoldCompositionPayload(frame.payload) {
-                applyUpdateComposition(
-                    BinaryCodec.UpdateCompositionPayload(caretPos: UInt32(p.holdText.count),
-                                                         text: p.holdText),
-                    client: client)
+                // 前一个待定标点先定格 (连打两个不同符号: `，` 后紧跟 `。`)。
+                absorbHeldIntoPrefix()
+                heldSymbol = p.holdText
+                setCompositionRaw(pendingCommitPrefix + p.holdText, client: client)
             }
             return true
 
@@ -130,6 +168,13 @@ public final class BridgeResponseRouter {
                         text: p.commitText,
                         newComposition: p.holdText),
                     client: client)
+                // commitAndHold 的 holdText 是**待定标点**(智能符号 press1 撞上活跃编码：
+                // 先顶屏候选再挂标点)，须登记成 held，否则下一次 UpdateComposition 照样把它
+                // 覆盖掉——与直接 HoldComposition 那条路是同一个坑。
+                // commitThenDefer 的 holdText 是码表顶码后的**余码**，是普通组合，不登记。
+                if frame.cmd == DownstreamCmd.commitAndHold, !p.holdText.isEmpty {
+                    heldSymbol = p.holdText
+                }
             }
             return true
 
@@ -142,6 +187,21 @@ public final class BridgeResponseRouter {
 
     public func applyCommitText(_ p: BinaryCodec.CommitTextPayload, client: TextInputClient?) {
         let notFound = NSRange(location: NSNotFound, length: NSNotFound)
+        // hold 预览态活跃时, 本次提交必须交代那个待定符号的去向 —— 下面的 insertText 会把
+        // marked text 换掉, 而 marked 里此刻显示的正是它, 不处置就被静默覆盖。规则逐字对齐
+        // Windows `CTextService::CommitText`:
+        //   replacingHeld=true (press2): 本就是要拿英文符号换掉它 → 丢弃。
+        //   replacingHeld=false (其余一切): 并入前缀, 与本次文本一起上屏 (追加语义)。
+        // 默认取追加是刻意的: hold 期间能触发提交的路径远不止一处 (全角空格/数字、临时英文、
+        // 各独占模式出字…), 把安全的一侧设为默认, 新增路径自动正确。Windows 那边曾默认丢弃,
+        // 表现为全角下「。」+空格 → 符号消失、只剩全角空格。
+        if p.flags & BinaryCodec.commitFlagReplacingHeld != 0 {
+            heldSymbol = nil
+        } else {
+            absorbHeldIntoPrefix()
+        }
+        let prefix = pendingCommitPrefix
+        pendingCommitPrefix = ""
         // replacingHeld: 这次上屏是在替换先前 HoldComposition 挂着的组合预览 (智能符号
         // press2)。宿主对「marked 未清就 insertText」的处理不统一, 先显式清一次再插,
         // 免得待定标点与替换结果同时留在文本里。仅在本端确实还挂着 marked 时才清。
@@ -151,7 +211,7 @@ public final class BridgeResponseRouter {
                                   replacementRange: notFound)
             composition.clear()
         }
-        client?.insertText(p.text, replacementRange: notFound)
+        client?.insertText(prefix + p.text, replacementRange: notFound)
 
         if !p.newComposition.isEmpty {
             // 内联 preedit: commit 后立即开始新一轮 marked text
@@ -168,7 +228,8 @@ public final class BridgeResponseRouter {
     public func applyCommitTextWithCursor(_ p: BinaryCodec.CommitTextWithCursorPayload,
                                           client: TextInputClient?) {
         let notFound = NSRange(location: NSNotFound, length: NSNotFound)
-        client?.insertText(p.text, replacementRange: notFound)
+        // 同 applyCommitText: 待定符号并入前缀一起上屏, 否则智能配对插入时它会被吃掉。
+        client?.insertText(takePendingPrefix() + p.text, replacementRange: notFound)
         composition.clear()
         // 自动配对插入 `（）` 后, cursorOffset 是从文本末尾向左偏移的字符数 (通常 1),
         // 把光标退回到配对中间。IMKit 无移动宿主光标的标准 API → 经 moveHostCursor
@@ -180,22 +241,58 @@ public final class BridgeResponseRouter {
 
     public func applyUpdateComposition(_ p: BinaryCodec.UpdateCompositionPayload,
                                        client: TextInputClient?) {
-        composition.text = p.text
-        composition.caretRune = Int(p.caretPos)
-        applyMarkedText(text: p.text,
-                        caretRuneInText: Int(p.caretPos),
-                        client: client)
+        // 待定标点定格进前缀, 与新组合内容显示在**同一段** marked text 里 (对位 Windows
+        // UpdateComposition 分支的 AbsorbHeldIntoPrefix)。光标位置随之右移前缀长度,
+        // 否则光标会落在符号里面。
+        absorbHeldIntoPrefix()
+        let text = pendingCommitPrefix + p.text
+        let caret = pendingCommitPrefix.count + Int(p.caretPos)
+        composition.text = text
+        composition.caretRune = caret
+        applyMarkedText(text: text, caretRuneInText: caret, client: client)
     }
 
+    /// 直接摆一段 marked text, **不叠加**待定前缀。供 HoldComposition 自己用:
+    /// 那时符号本身就是组合内容, 走 `applyUpdateComposition` 会把它叠进前缀再显示一遍。
+    private func setCompositionRaw(_ text: String, client: TextInputClient?) {
+        composition.text = text
+        composition.caretRune = countRunes(text)
+        applyMarkedText(text: text, caretRuneInText: composition.caretRune, client: client)
+    }
+
+    /// 结束组合。**待定标点转为提交而非丢弃** —— 失焦/切窗口时符号应直接上屏, 与标准输入
+    /// 流程一致 (Windows EndComposition 同此), 何况服务端已按上屏记过账, 丢了就是凭空少字。
     public func applyClearComposition(client: TextInputClient?) {
+        let prefix = takePendingPrefix()
         let notFound = NSRange(location: NSNotFound, length: NSNotFound)
         client?.setMarkedText("",
                               selectionRange: NSRange(location: 0, length: 0),
                               replacementRange: notFound)
         composition.clear()
+        if !prefix.isEmpty {
+            client?.insertText(prefix, replacementRange: notFound)
+        }
     }
 
     // MARK: - Helpers
+
+    /// 把待定前缀真上屏并清掉 marked text。用于「按键交回系统 / 组合被主动结束」——
+    /// 这两种情况下没有后续的 CommitText 来收口前缀了。
+    ///
+    /// 对位 Windows 的 `OnHoldTimerExpired`(Flush 路径) 与 `EndComposition` 里那段
+    /// 「主动结束组合时转为提交而非放弃, 模拟标准输入流程——切换窗口时符号应直接上屏」。
+    private func flushPendingPrefix(client: TextInputClient?) {
+        let prefix = takePendingPrefix()
+        guard !prefix.isEmpty else { return }
+        let notFound = NSRange(location: NSNotFound, length: NSNotFound)
+        if !composition.text.isEmpty {
+            client?.setMarkedText("",
+                                  selectionRange: NSRange(location: 0, length: 0),
+                                  replacementRange: notFound)
+            composition.clear()
+        }
+        client?.insertText(prefix, replacementRange: notFound)
+    }
 
     private func applyMarkedText(text: String, caretRuneInText: Int, client: TextInputClient?) {
         guard let client = client else { return }

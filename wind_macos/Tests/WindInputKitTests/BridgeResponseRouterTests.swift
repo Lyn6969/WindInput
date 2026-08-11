@@ -303,4 +303,125 @@ final class BridgeResponseRouterTests: XCTestCase {
         XCTAssertEqual(mock.insertCalls.map { $0.text }, [","])
         XCTAssertTrue(r.composition.isEmpty)
     }
+
+    // MARK: - 待定标点的收口 (HoldComposition → 前缀)
+
+    private func holdFrame(_ text: String) -> Frame {
+        var d = Data(count: 8)
+        d.writeUInt32LE(500, at: 0)
+        d.writeUInt32LE(UInt32(text.utf8.count), at: 4)
+        d.append(contentsOf: text.utf8)
+        return Frame(cmd: DownstreamCmd.holdComposition, isAsync: false, payload: d)
+    }
+
+    /// UpdateComposition 载荷: caretPos u32 + 裸 UTF-8 文本 (无长度前缀)。
+    private func updateCompFrame(_ text: String) -> Frame {
+        var d = Data(count: 4)
+        d.writeUInt32LE(UInt32(text.count), at: 0)
+        d.append(contentsOf: text.utf8)
+        return Frame(cmd: DownstreamCmd.updateComposition, isAsync: false, payload: d)
+    }
+
+    private func commitFrame(_ text: String, flags: UInt32 = 0) -> Frame {
+        var c = Data(count: 12)
+        c.writeUInt32LE(flags, at: 0)
+        c.writeUInt32LE(UInt32(text.utf8.count), at: 4)
+        c.writeUInt32LE(0, at: 8)
+        c.append(contentsOf: text.utf8)
+        return Frame(cmd: DownstreamCmd.commitText, isAsync: false, payload: c)
+    }
+
+    /// **回归**: 待定标点后接着输入, 标点被新组合覆盖而凭空消失。
+    ///
+    /// 服务端在下发 UpdateComposition 时已同步清掉自己的 held_text 并按上屏记过账
+    /// (coordinator.rs::handle_key_event_policed), 它假定客户端此刻已把符号收口 ——
+    /// Windows 侧确实调了 AbsorbHeldIntoPrefix。这边一度什么都没做。
+    func testHeldSymbol_SurvivesFollowingComposition() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，"), to: mock)
+        _ = r.apply(updateCompFrame("n"), to: mock)
+
+        XCTAssertEqual(mock.setMarkedCalls.map { $0.text }, ["，", "，n"],
+                       "标点须与新组合显示在同一段 marked text 里, 而不是被覆盖")
+        // 光标落在符号之后, 不能停在符号里面。
+        XCTAssertEqual(mock.setMarkedCalls.last?.selectionRange.location,
+                       ("，n" as NSString).length)
+    }
+
+    /// 组合最终上屏时, 定格的标点必须随之一起 insertText —— 一次收口, 不是两次。
+    /// (Windows 走 `full = _pendingCommitPrefix + text`, 刻意避开 commit+重开组合:
+    ///  那个模式在 WPS/微信下被误读成替换, 符号会被新输入顶掉。)
+    func testHeldSymbol_IsIncludedInFinalCommit() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，"), to: mock)
+        _ = r.apply(updateCompFrame("ni"), to: mock)
+        _ = r.apply(commitFrame("你"), to: mock)
+
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, ["，你"])
+        XCTAssertTrue(r.composition.isEmpty)
+    }
+
+    /// 按键交回系统前必须先把待定标点真上屏: 之后没有任何一帧会再管它,
+    /// 而服务端已经按上屏记了账。对位 Windows PassThrough 分支的 FlushHoldCompositionIfActive。
+    func testHeldSymbol_FlushedOnPassThrough() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，"), to: mock)
+
+        let consumed = r.apply(Frame(cmd: DownstreamCmd.passThrough, isAsync: false, payload: Data()),
+                               to: mock)
+
+        XCTAssertFalse(consumed, "PassThrough 语义不变")
+        XCTAssertEqual(mock.setMarkedCalls.map { $0.text }, ["，", ""])
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, ["，"])
+    }
+
+    /// 失焦 / 主动结束组合时**转为提交而非丢弃** —— 切窗口时符号应直接上屏, 与标准输入
+    /// 流程一致 (Windows EndComposition 同此)。丢了就是用户凭空少一个字。
+    func testHeldSymbol_CommittedOnClearComposition() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，"), to: mock)
+        _ = r.apply(Frame(cmd: DownstreamCmd.clearComposition, isAsync: false, payload: Data()),
+                    to: mock)
+
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, ["，"])
+        XCTAssertTrue(r.composition.isEmpty)
+    }
+
+    /// 普通组合(无待定标点)被清掉时不该凭空插入任何东西。
+    func testClearComposition_WithoutHeld_InsertsNothing() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(updateCompFrame("ni"), to: mock)
+        _ = r.apply(Frame(cmd: DownstreamCmd.clearComposition, isAsync: false, payload: Data()),
+                    to: mock)
+
+        XCTAssertTrue(mock.insertCalls.isEmpty)
+    }
+
+    /// press2 (replacingHeld) 要的是**替换**: 待定符号丢弃, 不许并进前缀跟着一起上屏。
+    func testReplacingHeld_DiscardsHeldInsteadOfPrefixing() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，"), to: mock)
+        _ = r.apply(commitFrame(",", flags: BinaryCodec.commitFlagReplacingHeld), to: mock)
+
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, [","], "不能出现「，,」")
+    }
+
+    /// 连打两个待定标点: 前一个定格进前缀, 两个都要保住。
+    func testTwoHeldSymbols_BothSurvive() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，"), to: mock)
+        _ = r.apply(holdFrame("。"), to: mock)
+
+        XCTAssertEqual(mock.setMarkedCalls.map { $0.text }, ["，", "，。"])
+
+        _ = r.apply(Frame(cmd: DownstreamCmd.passThrough, isAsync: false, payload: Data()), to: mock)
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, ["，。"])
+    }
 }
