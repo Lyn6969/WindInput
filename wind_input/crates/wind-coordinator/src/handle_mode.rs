@@ -235,6 +235,29 @@ impl Coordinator {
             .unwrap_or(true)
     }
 
+    /// 二三候选键（`keys.select_key_groups`，默认 `;` `'`）在本实例上**是否仍作选词键**。
+    ///
+    /// 即「自由输入没开」或「开了但配置为不夺取」。
+    ///
+    /// # ★ 为什么必须是单一真相源
+    ///
+    /// 用户报「数字输入模式下 `;` / `'` 不能选候选」，且把 `free_input` 设为 `off` 也无效。
+    /// 根因是 `handle_mix_key` 第①步的数字臂 [`Self::mix_numeric_input_char`] 收的是
+    /// **一切非字母可打印字符**，口径比 [`MixLens::accepts`]（`is_expr_char`：`0-9 + - * /
+    /// ^ . ( )`）宽得多 —— `;` `'` 按 `accepts` 明明是越界字符，却在①被当表达式字符吞进
+    /// 缓冲并 `return`，第④步的选词判定**成了不可达代码**。`free_on` 的判定在④，救不了①。
+    ///
+    /// 于是①的数字臂与④的选词臂必须问**同一个**谓词：①据此让开，④才够得着。两处各写
+    /// 一份表达式的话，改了一处没改另一处就会退回原样，而且同样不报错、只是静默失效。
+    ///
+    /// **文本透镜不受影响**（①的文本臂只收字母，`;` `'` 本就落到④）；**Free 透镜同样不问
+    /// 本谓词**——那个透镜下「没有任何选词键」是刻意设计（候选窗连序号标签都不画，见
+    /// `coordinator.rs` 的 `hide_index`），字母数字也一并作字面，单把 `;` `'` 挑出来会
+    /// 让「Free = 所见即所得」出现一个无法解释的例外。
+    pub(crate) fn mix_select_keys_active(&self, idx: u8) -> bool {
+        !(self.mix_free_input(idx) != FreeInputMode::Off && self.mix_takes_select_keys(idx))
+    }
+
     /// 当前 mix 缓冲对应的输入透镜 —— **缓冲的纯函数**，见 [`MixLens`]。
     ///
     /// 判据顺序刻意如此：
@@ -1616,6 +1639,24 @@ impl Coordinator {
                     MixLens::Numeric if free_on && shift && is_letter => {
                         Some((b'A' + (data.key_code - keymap::VK_A) as u8) as char)
                     }
+                    // 二三候选键（`;` `'`）在数字透镜下**必须让开**，交给第④步的选词判定。
+                    //
+                    // `mix_numeric_input_char` 收的是「一切非字母可打印字符」，比本透镜的
+                    // `accepts`（`is_expr_char`）宽 —— 不在此让开的话 `;` `'` 会被当表达式
+                    // 字符吞进缓冲并 `return`，④永远够不着，`free_input = off` 也救不回来
+                    // （`free_on` 的判定在④）。这正是「数字输入模式下 `;`/`'` 不能选候选」
+                    // 的根因，与文本透镜下的夺取是两回事。
+                    //
+                    // 夺取生效时（`auto`/`always` + `takes`）本臂不让开，行为逐字节不变：
+                    // 仍由本函数收下作字面，而不是绕一圈让⑤收——两条路径产出相同，但少一次
+                    // 状态穿越。判据与④共用 `mix_select_keys_active`，见那里的 ★。
+                    MixLens::Numeric
+                        if !shift
+                            && self.mix_select_keys_active(state.mix_id)
+                            && self.select_key_offset(data.key_code).is_some() =>
+                    {
+                        None
+                    }
                     MixLens::Numeric => Self::mix_numeric_input_char(data.key_code, shift),
                     // 文本透镜：字母入缓冲。自由输入关闭时 Shift 被丢弃（既有行为，恒小写）；
                     // 开启时大写字母即越界字符，字面入缓冲并把透镜带进 Free。
@@ -1677,7 +1718,10 @@ impl Coordinator {
                     //
                     // 数字键（③）刻意不在夺取范围：它是文本透镜唯一的选词通路，让位就
                     // 一个选词键都不剩。二三候选键则是数字键 2/3 的冗余别名，让位零能力损失。
-                    if !(free_on && self.mix_takes_select_keys(state.mix_id))
+                    //
+                    // ★ 判据与①的数字臂共用 `mix_select_keys_active`：那里不让开，这里就是
+                    // 不可达代码（数字透镜下曾如此，见该函数文档）。
+                    if self.mix_select_keys_active(state.mix_id)
                         && !shift
                         && let Some(offset) = self.select_key_offset(data.key_code)
                     {

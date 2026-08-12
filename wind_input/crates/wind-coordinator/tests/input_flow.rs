@@ -2346,6 +2346,183 @@ fn quick_input_select_keys_kept_when_not_taken() {
     );
 }
 
+/// ★★ 用户报「已把自由输入设为 `off`，`;` / `'` 仍不能选第 2/3 候选」——本测试是该报告的
+/// 判据：`off` 下 `free_on = false`，第④步的夺取条件（`free_on && takes`）整体不成立，
+/// 二三候选键必须**原样保留**。
+///
+/// 与 `quick_input_select_keys_kept_when_not_taken` 刻意分开：那条关的是 `takes` 子开关
+/// （`free_input` 仍是 `auto`），本条关的是 `free_input` 总开关。两个开关各有各的短路点，
+/// 只测一个的话另一个若被写成「无条件夺取」不会被察觉。
+#[test]
+fn quick_input_off_keeps_select_keys() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Off;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入快捷输入
+    press_str(&coord, "rock");
+    let texts = coord.debug_page_texts();
+    assert!(texts.len() >= 3, "需要至少 3 个候选，实际: {:?}", texts);
+    let third = texts[2].clone();
+    let act = press_vk(&coord, 0xDE, false); // '
+    // 判据同 `quick_input_select_keys_kept_when_not_taken`：第 3 候选若是部分匹配会走分步
+    // 确认（组合区保留）、否则整体上屏，两种都说明它被选中了；而字面入缓冲会得到 `rock'`。
+    let out = action_text(&act).unwrap_or_default();
+    assert!(
+        out.contains(&third),
+        "off 下 `'` 应仍选第 3 候选 {:?}，实际动作: {:?}",
+        third,
+        act
+    );
+    assert!(
+        !out.contains("rock'"),
+        "off 下 `'` 不应字面入缓冲，实际: {:?}",
+        out
+    );
+}
+
+/// 同上，测 `;`（第 2 候选键）。**必须与 `'` 分开测**：`;` 同时是本 mix 的引导键，
+/// 它在第④步之前还要过一道「进入键二次按下 → 上屏符号并退出」的判定（`handle_mode.rs`），
+/// 那道判定只要求缓冲空，若哪天守卫写漏，`'` 绿着而 `;` 是红的。
+#[test]
+fn quick_input_off_keeps_semicolon_as_second_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Off;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入快捷输入
+    press_str(&coord, "rock");
+    let texts = coord.debug_page_texts();
+    assert!(texts.len() >= 2, "需要至少 2 个候选，实际: {:?}", texts);
+    let second = texts[1].clone();
+    let act = press_vk(&coord, 0xBA, false); // ;
+    let out = action_text(&act).unwrap_or_default();
+    assert!(
+        out.contains(&second),
+        "off 下 `;` 应仍选第 2 候选 {:?}，实际动作: {:?}",
+        second,
+        act
+    );
+}
+
+/// ★★★ **数字透镜**下的二三候选键——用户报「数字输入模式下 `;` / `'` 选不了候选，
+/// 把自由输入设成 `off` 也没用」的回归锁。
+///
+/// 根因不在夺取判据，而在第①步的口径：`mix_numeric_input_char` 收的是「一切非字母可打印
+/// 字符」，比本透镜 `accepts` 的 `is_expr_char` 宽得多，`;` `'` 被当表达式字符吞进缓冲并
+/// `return`，第④步成了不可达代码 —— `free_on` 的判定在④，救不回来。
+///
+/// 与文本透镜那两条（`quick_input_off_keeps_*`）**必须分开测**：它们走的是①的不同臂，
+/// 文本臂只收字母、天然让开，全绿也说明不了数字臂的死活。
+#[test]
+fn quick_input_numeric_lens_off_keeps_select_keys() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Off;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "123"); // 首字符是数字 → 数字透镜
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.len() >= 2,
+        "数字透镜需要至少 2 个候选才能验证第 2 候选键，实际: {:?}",
+        texts
+    );
+    let second = texts[1].clone();
+    let act = press_vk(&coord, 0xBA, false); // ;
+    let out = action_text(&act).unwrap_or_default();
+    assert!(
+        out.contains(&second),
+        "数字透镜 + off 下 `;` 应选第 2 候选 {:?}，实际动作: {:?}",
+        second,
+        act
+    );
+    assert!(
+        !out.contains("123;"),
+        "`;` 不应被当表达式字符吞进缓冲，实际: {:?}",
+        out
+    );
+}
+
+/// 同上，`'` = 第 3 候选键。与 `;` 分开测：`;` 还是本 mix 的引导键，两者在①之前经过的
+/// 判定不同。
+#[test]
+fn quick_input_numeric_lens_off_keeps_quote_as_third_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Off;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "123");
+    let texts = coord.debug_page_texts();
+    assert!(texts.len() >= 3, "需要至少 3 个候选，实际: {:?}", texts);
+    let third = texts[2].clone();
+    let act = press_vk(&coord, 0xDE, false); // '
+    let out = action_text(&act).unwrap_or_default();
+    assert!(
+        out.contains(&third),
+        "数字透镜 + off 下 `'` 应选第 3 候选 {:?}，实际动作: {:?}",
+        third,
+        act
+    );
+}
+
+/// ★★ **反向对照，缺了它这次改造就等于「无条件让开」而无人察觉**：出厂默认
+/// （`auto` + `takes = true`）下，数字透镜的 `;` 仍必须字面入缓冲。
+///
+/// 让①让开是有条件的——夺取生效时本臂不让，行为逐字节不变。
+#[test]
+fn quick_input_numeric_lens_auto_still_takes_select_keys() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "123");
+    let act = press_vk(&coord, 0xBA, false); // ;
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some(";123;"),
+        "出厂默认（auto + 夺取）下数字透镜的 `;` 应字面入缓冲，实际: {:?}",
+        act
+    );
+}
+
+/// `free_input_takes_select_keys = false` 在**数字透镜**下同样要生效。
+///
+/// 这条修好的是一个连带缺陷：该开关此前只在文本透镜有效，数字透镜下 `;` `'` 在①就被吞了，
+/// 关掉夺取也没用 —— 开关的声明语义（「保住 `;`/`'` 的选词手感」）只兑现了一半。
+#[test]
+fn quick_input_numeric_lens_respects_takes_select_keys_off() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input_takes_select_keys = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "123");
+    let texts = coord.debug_page_texts();
+    assert!(texts.len() >= 2, "需要至少 2 个候选，实际: {:?}", texts);
+    let second = texts[1].clone();
+    let act = press_vk(&coord, 0xBA, false); // ;
+    let out = action_text(&act).unwrap_or_default();
+    assert!(
+        out.contains(&second),
+        "关掉夺取后数字透镜的 `;` 应选第 2 候选 {:?}，实际动作: {:?}",
+        second,
+        act
+    );
+}
+
 /// ★反向对照：数字键**不在**夺取范围——它是文本透镜唯一的选词通路。
 /// 这条同时钉住了已知缺口：`;utf8` 里的 `8` 仍会选词，要打这类串需先切进自由输入。
 #[test]
