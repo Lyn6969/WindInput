@@ -36,7 +36,11 @@ y = ["uai", "v"]
 z = ["ei"]
 ";" = ["ing"]
 
+# 搜狗双拼零声母**一律以 `o` 引导**（与微软双拼同规则），第二键取该音节自身的韵母键：
+#   oa=a  ol=ai  oj=an  oh=ang  ok=ao  oe=e  oz=ei  of=en  og=eng  or=er  oo=o  ob=ou
+# ⚠️ 这里原先抄的是自然码/小鹤式「韵母首字母引导」（a/e/o 三行），于是官方的 oa/ol/oj…
+# 十个击键全部打不出（只有 oo/ob 因恰好列在 o 行里而可用）。
+# 注意「用 O 键作零声母」的是微软/搜狗/智能ABC/紫光四家，**自然码不在其列**
+# （自然码是首字母引导，见 ziranma.toml），两者不可互抄。
 [zero_initials]
-a = ["a", "ai", "an", "ang", "ao"]
-o = ["o", "ou"]
-e = ["e", "ei", "en", "eng", "er"]
+o = ["a", "ai", "an", "ang", "ao", "e", "ei", "en", "eng", "er", "o", "ou"]

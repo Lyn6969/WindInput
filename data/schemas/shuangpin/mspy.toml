@@ -36,7 +36,11 @@ y = ["uai", "v"]
 z = ["ei"]
 ";" = ["ing"]
 
+# 微软双拼零声母**一律以 `o` 引导**，第二键取该音节自身的韵母键：
+#   oa=a  ol=ai  oj=an  oh=ang  ok=ao  oe=e  oz=ei  of=en  og=eng  or=er  oo=o  ob=ou
+# ⚠️ 这里原先抄的是小鹤式「韵母首字母引导」（a/e/o 三行），于是官方的 oa/ol/oj… 十个
+# 击键全部打不出（只有 oo/ob 因恰好列在 o 行里而可用），微软用户被迫改用小鹤打法。
+# 覆盖率门禁抓不到这类缺陷：它只问「存不存在某组击键能打出这个音节」，不问「官方击键
+# 能不能打出」。守卫改由 tests/shuangpin_coverage.rs 的官方击键表正向断言承担。
 [zero_initials]
-a = ["a", "ai", "an", "ang", "ao"]
-o = ["o", "ou"]
-e = ["e", "ei", "en", "eng", "er"]
+o = ["a", "ai", "an", "ang", "ao", "e", "ei", "en", "eng", "er", "o", "ou"]

@@ -378,9 +378,18 @@ impl ShuangpinConverter {
 
         if !self.layout.has_zero_pairs() {
             // 3. 零声母特殊处理：单韵母重复键（aa→a, oo→o, ee→e）。
+            //
+            // ★ 只对**把该键配成零声母引导键、且允许该单韵母**的方案生效。这条规则属于
+            //   「首字母引导」流派（小鹤/自然码）；「O 引导」流派（微软/搜狗/智能ABC）里
+            //   `aa`/`ee` 不是零声母，`a` 只能打 `oa`。
+            //   原先无条件放行，于是方案规则一半写在 TOML、一半写在引擎里：微软双拼即便把
+            //   `[zero_initials]` 收敛成纯 `o` 引导，`aa`/`ee` 照样出「啊/额」，数据说了不算。
             if key1 == key2 {
                 let single = (key1 as char).to_string();
-                if self.is_valid(&single) && !results.iter().any(|r| *r == single) {
+                if self.is_valid(&single)
+                    && self.layout.zero_of(key1).iter().any(|s| *s == single)
+                    && !results.iter().any(|r| *r == single)
+                {
                     results.push(single);
                 }
             }
@@ -1017,16 +1026,17 @@ mod converter_tests {
             ("ziranma", "al", "ai"),
             ("ziranma", "aj", "an"),
             ("ziranma", "ah", "ang"),
-            ("mspy", "ak", "ao"),
-            ("mspy", "aa", "a"),
-            ("mspy", "al", "ai"),
-            ("mspy", "aj", "an"),
-            ("mspy", "ah", "ang"),
-            ("sogou", "ak", "ao"),
-            ("sogou", "aa", "a"),
-            ("sogou", "al", "ai"),
-            ("sogou", "aj", "an"),
-            ("sogou", "ah", "ang"),
+            // 微软/搜狗零声母以 `o` 引导（不是首字母引导——那是自然码/小鹤的规则）。
+            ("mspy", "ok", "ao"),
+            ("mspy", "oa", "a"),
+            ("mspy", "ol", "ai"),
+            ("mspy", "oj", "an"),
+            ("mspy", "oh", "ang"),
+            ("sogou", "ok", "ao"),
+            ("sogou", "oa", "a"),
+            ("sogou", "ol", "ai"),
+            ("sogou", "oj", "an"),
+            ("sogou", "oh", "ang"),
         ];
         for (scheme, input, want) in cases {
             let c = conv(scheme);
@@ -1039,9 +1049,13 @@ mod converter_tests {
     }
 
     // --- TestZeroInitialLiteralAo ---
+    // 测的是零声母的「字面匹配」路径（convert_pair 路径 b）：击键本身就是音节全拼。
+    // ⚠️ 只对**首字母引导**的方案成立。微软/搜狗改为纯 `o` 引导后其 `ao` 走的是常规
+    // 声母路径（a 自映射声母 + o 键的 "o" 韵母），结果同样是 "ao" 但性质不同 ——
+    // 留在这里会假绿地暗示它们的零声母字面路径还在，故移出，改由官方击键表覆盖。
     #[test]
     fn zero_initial_literal_ao() {
-        for scheme in ["xiaohe", "ziranma", "mspy", "sogou"] {
+        for scheme in ["xiaohe", "ziranma"] {
             let c = conv(scheme);
             assert_eq!(
                 c.convert("ao").full_pinyin(),
