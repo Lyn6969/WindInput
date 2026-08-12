@@ -4,6 +4,11 @@ name: Release Published
 #   1. notify-docs  通知文档仓同步更新记录 → data/releases.json → 驱动 /changelog 与 /download
 #   2. sync-to-r2   把安装包与在线升级元数据推到 Cloudflare R2(dl.windinput.com)
 #
+# 两平台各一套元数据:latest.json(exeUrl,Windows)与 latest-mac.json(pkgUrl,macOS)。
+# 键名故意不同,好让「客户端读到另一平台的元数据」在解析阶段就被拒 —— 客户端侧对应实现见
+# wind-setting 的 src/update/mod.rs::Artifact。macOS 产物按「有则同步」处理:补同步老 Release
+# 时它不存在,不该拖垮 Windows 那半。
+#
 # 配置项(Settings → Secrets and variables → Actions)。缺任一项时对应 job 跳过而非失败:
 #   Variables:
 #     DOCS_REPO    文档仓 owner/name,如 huanfeng/WindInputDocs
@@ -93,6 +98,7 @@ jobs:
       # 故 R2 上的对象名必须与之逐字一致,否则在线升级会下到 404。
       - name: 从 Release 下载安装包与发布说明
         if: steps.gate.outputs.skip != 'true'
+        id: dl
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -103,6 +109,17 @@ jobs:
             --pattern "WindInput-Setup-${VERSION}.exe" --dir ./dl
           gh release download "$TAG" --repo "${{ github.repository }}" \
             --pattern "WindInput-Setup-${VERSION}.exe.sha256" --dir ./dl
+          # macOS 包按「有则同步」处理:workflow_dispatch 补同步老 Release 时它并不存在,
+          # 那种情况下缺 mac 产物是正常的,不该让整条 Windows 同步跟着失败。
+          if gh release download "$TAG" --repo "${{ github.repository }}" \
+               --pattern "WindInput-${VERSION}-macOS.pkg" --dir ./dl 2>/dev/null; then
+            gh release download "$TAG" --repo "${{ github.repository }}" \
+              --pattern "WindInput-${VERSION}-macOS.pkg.sha256" --dir ./dl
+            echo "mac=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::该 Release 没有 macOS 安装包,跳过 mac 同步。"
+            echo "mac=false" >> "$GITHUB_OUTPUT"
+          fi
           # 升级元数据里的 releaseNotesUrl 指向它(命名口径见 dev.ps1 New-UpdateManifest)
           gh release view "$TAG" --repo "${{ github.repository }}" --json body -q .body \
             > "./dl/WindInput-${VERSION}-Release.md"
@@ -119,10 +136,14 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         id: prev
         run: |
-          PREV_JSON=$(curl -fsSL "${R2_BASE_URL}/latest.json" || echo "")
-          PREV=$(printf '%s' "$PREV_JSON" | jq -r '.version // empty' 2>/dev/null || echo "")
-          echo "previous version on R2: ${PREV:-<none>}"
+          # 两平台各记各的。macOS 的发布起步晚于 Windows,latest-mac.json 在首次 mac 发布前
+          # 并不存在;共用一个 PREV 会拿 Windows 的版本号去删压根不存在的 mac 对象(无害),
+          # 或反过来在 mac 落后一版时误删仍在服役的 mac 包(有害)。
+          PREV=$(curl -fsSL "${R2_BASE_URL}/latest.json" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || echo "")
+          PREV_MAC=$(curl -fsSL "${R2_BASE_URL}/latest-mac.json" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || echo "")
+          echo "previous on R2: win=${PREV:-<none>} mac=${PREV_MAC:-<none>}"
           echo "version=$PREV" >> "$GITHUB_OUTPUT"
+          echo "mac_version=$PREV_MAC" >> "$GITHUB_OUTPUT"
 
       # 上传顺序是契约:先 exe 后 latest.json。json 是开关,反过来会让客户端
       # 看到新版本却下载到 404(dev.ps1:1181 同款约定)。
@@ -176,6 +197,41 @@ jobs:
             --file latest.json \
             --content-type "application/json; charset=utf-8"
 
+      # macOS:同样的契约,只是安装包字段叫 pkgUrl 而非 exeUrl —— 两平台各用各的键,
+      # 让「客户端读到另一平台的元数据」这类串档在解析阶段就被拒,而不是下完才发现装不上
+      # (客户端侧的对应实现见 wind-setting src/update/mod.rs 的 Artifact)。
+      # 发布说明两平台共用同一份 md,不重复上传。
+      - name: macOS - 上传安装包与 latest-mac.json
+        if: steps.gate.outputs.skip != 'true' && steps.dl.outputs.mac == 'true'
+        run: |
+          PKG="./dl/WindInput-${VERSION}-macOS.pkg"
+          SHA=$(awk '{print $1}' "$PKG.sha256")
+          ACTUAL=$(sha256sum "$PKG" | awk '{print $1}')
+          if [ "$SHA" != "$ACTUAL" ]; then
+            echo "ERROR: sha256 sidecar($SHA) 与安装包实际值($ACTUAL) 不符" >&2
+            exit 1
+          fi
+          SIZE=$(stat -c %s "$PKG")
+          # 顺序同 Windows:先传包,后传 json。json 是开关,反过来会让客户端看到新版本却下到 404。
+          wrangler r2 object put --remote "$R2_BUCKET/WindInput-${VERSION}-macOS.pkg" \
+            --file "$PKG" --content-type "application/octet-stream"
+          wrangler r2 object put --remote "$R2_BUCKET/WindInput-${VERSION}-macOS.pkg.sha256" \
+            --file "$PKG.sha256" --content-type "text/plain; charset=utf-8"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg pkgUrl "${R2_BASE_URL}/WindInput-${VERSION}-macOS.pkg" \
+            --arg sha256 "$SHA" \
+            --argjson size "$SIZE" \
+            --arg releaseNotesUrl "${R2_BASE_URL}/WindInput-${VERSION}-Release.md" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            '{version: $version, tag: $tag, channel: "stable", pkgUrl: $pkgUrl,
+              sha256: $sha256, size: $size, releaseNotesUrl: $releaseNotesUrl,
+              publishedAt: $publishedAt}' > latest-mac.json
+          cat latest-mac.json
+          wrangler r2 object put --remote "$R2_BUCKET/latest-mac.json" \
+            --file latest-mac.json --content-type "application/json; charset=utf-8"
+
       - name: 校验 R2 公开地址可达
         if: steps.gate.outputs.skip != 'true'
         run: |
@@ -208,21 +264,47 @@ jobs:
           check "${R2_BASE_URL}/WindInput-Setup-${VERSION}.exe.sha256" ""
           check "${R2_BASE_URL}/WindInput-${VERSION}-Release.md" ""
           check "${R2_BASE_URL}/latest.json" ""
+          if [ "${{ steps.dl.outputs.mac }}" = "true" ]; then
+            EXPECTED_PKG_SIZE=$(stat -c %s "./dl/WindInput-${VERSION}-macOS.pkg")
+            check "${R2_BASE_URL}/WindInput-${VERSION}-macOS.pkg" "$EXPECTED_PKG_SIZE"
+            check "${R2_BASE_URL}/WindInput-${VERSION}-macOS.pkg.sha256" ""
+            check "${R2_BASE_URL}/latest-mac.json" ""
+          fi
           echo "R2 对象全部校验通过。"
 
       # 校验通过后才清理旧版本,失败时旧版本原样留着仍可下载。
       # 只删按当前命名口径拼出的对象;更早的 Go 版遗留对象(WindInput-<版本>-Setup.exe)
       # 命名不同,不会被误删,需要时手工清理。
       - name: 清理 R2 上的旧版本对象
-        if: steps.gate.outputs.skip != 'true' && steps.prev.outputs.version != ''
+        if: steps.gate.outputs.skip != 'true'
         env:
           PREV_VERSION: ${{ steps.prev.outputs.version }}
+          PREV_MAC: ${{ steps.prev.outputs.mac_version }}
+          MAC_SYNCED: ${{ steps.dl.outputs.mac }}
         run: |
-          if [ "$PREV_VERSION" = "$VERSION" ]; then
-            echo "前一版本与本次相同($VERSION),无需清理"
-            exit 0
+          # macOS 侧此刻指向的版本:本次同步了就是新版本,没同步则仍是原来那个。
+          if [ "$MAC_SYNCED" = "true" ]; then MAC_CUR="$VERSION"; else MAC_CUR="$PREV_MAC"; fi
+
+          if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$VERSION" ]; then
+            echo "清理 Windows 旧版本: $PREV_VERSION"
+            wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe" || true
+            wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe.sha256" || true
+            # 发布说明两平台共用同一份。mac 元数据还指着它时不能删 ——
+            # 两平台版本可能不同步(比如某次只发了 Windows),删了 mac 用户的「更新说明」就 404。
+            if [ "$MAC_CUR" = "$PREV_VERSION" ]; then
+              echo "  发布说明 $PREV_VERSION 仍被 macOS 元数据引用,保留"
+            else
+              wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_VERSION}-Release.md" || true
+            fi
+          else
+            echo "Windows: 无需清理(前一版本为 ${PREV_VERSION:-<none>})"
           fi
-          echo "清理旧版本: $PREV_VERSION"
-          wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe" || true
-          wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe.sha256" || true
-          wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_VERSION}-Release.md" || true
+
+          # 只有本次确实推了新 mac 包,才轮得到清旧 mac 包。
+          if [ "$MAC_SYNCED" = "true" ] && [ -n "$PREV_MAC" ] && [ "$PREV_MAC" != "$VERSION" ]; then
+            echo "清理 macOS 旧版本: $PREV_MAC"
+            wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_MAC}-macOS.pkg" || true
+            wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_MAC}-macOS.pkg.sha256" || true
+          else
+            echo "macOS: 无需清理(本次同步=${MAC_SYNCED:-false}, 前一版本=${PREV_MAC:-<none>})"
+          fi
