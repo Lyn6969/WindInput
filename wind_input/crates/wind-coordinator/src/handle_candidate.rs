@@ -470,7 +470,9 @@ impl Coordinator {
 
     /// 候选词条操作（测试/诊断用）
     pub fn debug_candidate_op(&self, op: CandidateOp, page_local: usize) {
-        self.candidate_op(op, page_local);
+        // 走与右键菜单同一条分发（格式候选 → 格式调整，其余 → 词库 shadow）。
+        // 直接调 `candidate_op` 会绕过格式分流，测试就测不到用户实际走的那条路。
+        self.candidate_or_quick_format_op(op, page_local);
     }
 
     /// 当前状态下词条操作的作用域 `(归属方案, 编码)`；`None` = 右键菜单只给复制（测试/诊断用）。

@@ -62,6 +62,12 @@ pub(crate) const TEMP_ABBREV: TableDefinition<&str, &[u8]> = TableDefinition::ne
 pub(crate) const FREQ: TableDefinition<&str, &[u8]> = TableDefinition::new("freq");
 /// Shadow 规则：key = "{schema}\0{code}"
 pub(crate) const SHADOW: TableDefinition<&str, &[u8]> = TableDefinition::new("shadow");
+/// 快捷输入格式表的用户调整：key = 格式类别（`date` / `number` …），value = 记录 JSON。
+///
+/// **键只到类别**，不带方案与输入码——与 [`SHADOW`] 的分界见 [`crate::quick_format`]
+/// 的模块文档（存错了会表现为「调整当时有效、隔天失效」）。
+/// 新表无需迁移：`init_tables` 在写事务里 `open_table` 即创建。
+pub(crate) const QUICK_FORMAT: TableDefinition<&str, &[u8]> = TableDefinition::new("quick_format");
 /// 全局短语：key = "{code}\0{text}"
 pub(crate) const PHRASES: TableDefinition<&str, &[u8]> = TableDefinition::new("phrases");
 /// 每日统计：key = "YYYY-MM-DD"
@@ -152,6 +158,7 @@ impl Store {
             w.open_table(TEMP_ABBREV)?;
             w.open_table(FREQ)?;
             w.open_table(SHADOW)?;
+            w.open_table(QUICK_FORMAT)?;
             w.open_table(PHRASES)?;
             w.open_table(STATS_DAILY)?;
             w.open_table(META)?;

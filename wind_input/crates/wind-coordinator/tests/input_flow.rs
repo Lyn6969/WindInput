@@ -2668,6 +2668,126 @@ fn test_quick_format_table_is_deployed() {
     );
 }
 
+/// 打开快捷输入并输入一串字符（`;` + chars）。
+fn quick_type(coord: &Coordinator, s: &str) {
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    for c in s.chars() {
+        let vk = match c {
+            '0'..='9' => 0x30 + (c as u32 - '0' as u32),
+            '.' => 0xBE,
+            _ => panic!("quick_type 不支持字符 {c:?}"),
+        };
+        press_vk(coord, vk, false);
+    }
+}
+
+fn quick_coord(store_tag: &str) -> (std::sync::Arc<Coordinator>, std::path::PathBuf) {
+    let p = std::env::temp_dir().join(format!("wind_quickfmt_{store_tag}.redb"));
+    let _ = std::fs::remove_file(&p);
+    let store = std::sync::Arc::new(wind_store::Store::open(&p).unwrap());
+    let coord =
+        Coordinator::new_headless_with_store(config_with("wubi86"), Some(&data_dir()), store);
+    (coord, p)
+}
+
+/// ★ 右键调序对**这一类的所有输入**生效，而不是只对当下这一个日期。
+///
+/// 这是格式调整与候选调整（shadow）最本质的区别：shadow 的键是 `(方案, 输入码)`，
+/// 若把格式调整存进去，用户调完换个日期就失效——症状是「当时有效、隔天失效」，
+/// 间歇性发作且日志干净。本用例正是为钉住这条边界而写。
+#[test]
+fn test_quick_format_move_top_applies_to_other_inputs() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, p) = quick_coord("movetop");
+
+    quick_type(&coord, "2026.6.19");
+    let before = coord.debug_page_texts();
+    let lunar_idx = before
+        .iter()
+        .position(|t| t.starts_with("农历"))
+        .unwrap_or_else(|| panic!("日期候选应含农历，实际: {before:?}"));
+    assert!(lunar_idx > 0, "农历出厂不在首位，实际: {before:?}");
+
+    // 右键「这种格式排最前」
+    coord.debug_candidate_op(CandidateOp::MoveTop, lunar_idx);
+    let after = coord.debug_page_texts();
+    assert!(
+        after[0].starts_with("农历"),
+        "调序应当场生效（不必重启），实际: {after:?}"
+    );
+
+    // ★ 换一个完全不同的日期：调整仍在
+    coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN)); // Esc 退出
+    quick_type(&coord, "2025.12.25");
+    let other = coord.debug_page_texts();
+    assert!(
+        other[0].starts_with("农历"),
+        "格式调整应作用于整类输入，换个日期就失效说明存错了落点，实际: {other:?}"
+    );
+    let _ = std::fs::remove_file(&p);
+}
+
+/// 「不再显示这种格式」→ 该条消失，其余不受影响；「恢复本类默认」把它带回来。
+#[test]
+fn test_quick_format_disable_and_reset() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, p) = quick_coord("disable");
+
+    quick_type(&coord, "2026.6.19");
+    let before = coord.debug_page_texts();
+    let n_before = before.len();
+    let lunar_idx = before.iter().position(|t| t.starts_with("农历")).unwrap();
+
+    coord.debug_candidate_op(CandidateOp::Delete, lunar_idx);
+    let after = coord.debug_page_texts();
+    assert!(
+        !after.iter().any(|t| t.starts_with("农历")),
+        "停用后该条不该出现，实际: {after:?}"
+    );
+    assert_eq!(after.len(), n_before - 1, "只少这一条");
+    assert_eq!(after[0], before[0], "首选不受影响");
+
+    // 恢复本类默认：停用的格式点不到了，只能整类重置——这正是它必须存在的理由
+    coord.debug_candidate_op(CandidateOp::Reset, 0);
+    let back = coord.debug_page_texts();
+    assert_eq!(back, before, "恢复后应与出厂逐条逐序相同");
+    let _ = std::fs::remove_file(&p);
+}
+
+/// 调整只作用于本类：调了日期不影响数字。
+#[test]
+fn test_quick_format_adjust_does_not_leak_across_kinds() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, p) = quick_coord("kinds");
+
+    quick_type(&coord, "123");
+    let num_before = coord.debug_page_texts();
+    coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN));
+
+    quick_type(&coord, "2026.6.19");
+    let d = coord.debug_page_texts();
+    let lunar_idx = d.iter().position(|t| t.starts_with("农历")).unwrap();
+    coord.debug_candidate_op(CandidateOp::MoveTop, lunar_idx);
+    coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN));
+
+    quick_type(&coord, "123");
+    assert_eq!(
+        coord.debug_page_texts(),
+        num_before,
+        "改日期的顺序不该动到数字类"
+    );
+    let _ = std::fs::remove_file(&p);
+}
+
 #[test]
 fn test_quick_input_date_space_commits() {
     if !has_schemas() {

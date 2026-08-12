@@ -9,6 +9,7 @@ pub mod freq;
 pub mod import_formats;
 pub mod migration;
 pub mod phrases;
+pub mod quick_format;
 pub mod shadow;
 pub mod stat_collector;
 pub mod stats;

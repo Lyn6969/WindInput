@@ -24,7 +24,9 @@ pub enum FormatKind {
 }
 
 impl FormatKind {
-    fn parse(s: &str) -> Option<Self> {
+    /// 配置文件里的写法 → 类别。也用于候选 id（`quick:{kind}:{格式 id}`）的反解析，
+    /// 故与 [`Self::as_str`] 必须严格互逆。
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "date" => Some(Self::Date),
             "year_month" => Some(Self::YearMonth),
@@ -129,6 +131,25 @@ const BUILTIN: &[(&str, FormatKind, &str)] = &[
     ("calc.result", FormatKind::Calc, "$RESULT"),
     ("calc.equation", FormatKind::Calc, "$EXPR=$RESULT"),
 ];
+
+/// 用户对某一类格式的调整（右键菜单产生，存在 userdata.redb，**不写回格式表文件**）。
+///
+/// 本类型是「中立数据」：`wind-store` 有自己的可序列化记录，协调器负责转换。
+/// 两处不合并是刻意的——store 不依赖业务类型，与 shadow 同一条纪律。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FormatAdjust {
+    /// 被移动过的条目 `(格式 id, 组内目标下标)`。
+    /// **LIFO，index 0 = 最新**，应用时逆序遍历。
+    pub moved: Vec<(String, usize)>,
+    /// 被停用的格式 id。
+    pub disabled: Vec<String>,
+}
+
+impl FormatAdjust {
+    pub fn is_empty(&self) -> bool {
+        self.moved.is_empty() && self.disabled.is_empty()
+    }
+}
 
 /// 格式表。条目已按 kind 分组、组内按 position 稳定排序。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +270,42 @@ impl FormatTable {
         self.entries.iter().filter(move |e| e.kind == kind)
     }
 
+    /// 某类的条目，**已应用用户调整**（停用剔除 + 移动重排）。
+    ///
+    /// 算法与 `shadow` 的规则应用同构：
+    ///
+    /// 1. 取基表该类条目（已按 `position` 排序）；
+    /// 2. 剔除 `disabled`；
+    /// 3. **逆序**遍历 `moved`，每条：取出该 id，插入到目标下标。
+    ///
+    /// 逆序是 LIFO 语义——最新的操作最后应用，故优先级最高。
+    ///
+    /// **没被碰过的条目保持基表顺序**，所以将来出厂新增一条格式，它不在 `moved`/`disabled`
+    /// 里，会自然落在它的出厂位置；若改存完整 id 序列，就得再定一条「新增格式排哪」的
+    /// 规则，怎么定都会让人意外。
+    ///
+    /// 找不到的 id（高级用户改文件时删掉了那条）静默忽略，不清理——他可能过会儿又加回来。
+    pub fn entries_of_adjusted<'a>(
+        &'a self,
+        kind: FormatKind,
+        adjust: &FormatAdjust,
+    ) -> Vec<&'a FormatEntry> {
+        let mut list: Vec<&FormatEntry> = self
+            .entries_of(kind)
+            .filter(|e| !adjust.disabled.iter().any(|d| d == &e.id))
+            .collect();
+        for (id, position) in adjust.moved.iter().rev() {
+            let Some(from) = list.iter().position(|e| &e.id == id) else {
+                continue; // 孤儿规则：基表里没有这个 id
+            };
+            let entry = list.remove(from);
+            // 下标可能越界：条目被停用、或基表条目数变少（用户改了文件）
+            let to = (*position).min(list.len());
+            list.insert(to, entry);
+        }
+        list
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -314,6 +371,21 @@ struct RawEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ `parse` 与 `as_str` 必须严格互逆——候选 id 靠这对函数往返，
+    /// 一侧改了名字另一侧没改，右键就会认不出这条候选（且没有任何报错）。
+    #[test]
+    fn kind_parse_and_as_str_roundtrip() {
+        for k in [
+            FormatKind::Date,
+            FormatKind::YearMonth,
+            FormatKind::Number,
+            FormatKind::Calc,
+        ] {
+            assert_eq!(FormatKind::parse(k.as_str()), Some(k));
+        }
+        assert!(FormatKind::parse("weather").is_none());
+    }
 
     #[test]
     fn builtin_covers_all_four_kinds() {
@@ -501,6 +573,143 @@ text = "$RESULT"
     #[test]
     fn syntax_error_is_reported_to_caller() {
         assert!(FormatTable::parse("[[formats]]\nid = ").is_err());
+    }
+
+    // ───────── 用户调整（FormatAdjust）─────────
+
+    fn date_ids(t: &FormatTable, a: &FormatAdjust) -> Vec<String> {
+        t.entries_of_adjusted(FormatKind::Date, a)
+            .iter()
+            .map(|e| e.id.clone())
+            .collect()
+    }
+
+    /// 空调整 == 基表原序。
+    #[test]
+    fn empty_adjust_is_identity() {
+        let t = FormatTable::builtin();
+        let base: Vec<String> = t
+            .entries_of(FormatKind::Date)
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(date_ids(&t, &FormatAdjust::default()), base);
+    }
+
+    #[test]
+    fn disabled_entry_is_dropped() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            disabled: vec!["date.basic".into()],
+            ..Default::default()
+        };
+        let ids = date_ids(&t, &a);
+        assert!(!ids.contains(&"date.basic".to_string()));
+        assert!(ids.contains(&"date.cn".to_string()), "其余不受影响");
+    }
+
+    #[test]
+    fn move_to_front() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.lunar".into(), 0)],
+            ..Default::default()
+        };
+        assert_eq!(date_ids(&t, &a)[0], "date.lunar");
+    }
+
+    /// ★ 逆序遍历 = LIFO：后写入的规则（index 0）优先级最高。
+    ///
+    /// 两条规则都想占 0 号位时，最新的那条赢。顺序搞反的话，用户会发现
+    /// 「我刚调的那条被上一次的调整顶掉了」。
+    #[test]
+    fn newest_move_wins() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            // index 0 = 最新
+            moved: vec![("date.iso".into(), 0), ("date.lunar".into(), 0)],
+            ..Default::default()
+        };
+        assert_eq!(date_ids(&t, &a)[0], "date.iso", "最新的规则赢");
+    }
+
+    /// 移到中间位置（上移/下移用的就是这条路径）。
+    #[test]
+    fn move_to_middle() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.lunar".into(), 2)],
+            ..Default::default()
+        };
+        assert_eq!(date_ids(&t, &a)[2], "date.lunar");
+    }
+
+    /// ★ 越界下标不 panic，钳到末尾——条目可能因停用或用户改文件而变少。
+    #[test]
+    fn out_of_range_position_clamps() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.cn".into(), 999)],
+            ..Default::default()
+        };
+        let ids = date_ids(&t, &a);
+        assert_eq!(ids.last().unwrap(), "date.cn");
+        assert_eq!(ids.len(), t.entries_of(FormatKind::Date).count());
+    }
+
+    /// ★ 孤儿规则（基表里没有该 id）静默忽略，不影响其余条目。
+    ///
+    /// 高级用户整份覆盖格式表、删掉了某条时就会这样。
+    #[test]
+    fn orphan_rule_is_ignored() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.nonexistent".into(), 0), ("date.lunar".into(), 0)],
+            disabled: vec!["date.alsogone".into()],
+        };
+        let ids = date_ids(&t, &a);
+        assert_eq!(ids[0], "date.lunar");
+        assert_eq!(ids.len(), t.entries_of(FormatKind::Date).count());
+    }
+
+    /// 停用 + 移动叠加：先剔除再重排，下标按剔除后的列表算。
+    #[test]
+    fn disable_and_move_compose() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.slash".into(), 0)],
+            disabled: vec!["date.cn".into()],
+        };
+        let ids = date_ids(&t, &a);
+        assert_eq!(ids[0], "date.slash");
+        assert!(!ids.contains(&"date.cn".to_string()));
+        assert_eq!(ids.len(), t.entries_of(FormatKind::Date).count() - 1);
+    }
+
+    /// 被停用的条目即使有移动规则也不复活。
+    #[test]
+    fn disabled_entry_stays_out_even_if_moved() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.basic".into(), 0)],
+            disabled: vec!["date.basic".into()],
+        };
+        assert!(!date_ids(&t, &a).contains(&"date.basic".to_string()));
+    }
+
+    /// 调整只作用于本类，不串类。
+    #[test]
+    fn adjust_does_not_leak_across_kinds() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("number.amount".into(), 0)],
+            disabled: vec!["calc.result".into()],
+        };
+        // date 类不含这些 id，故完全不受影响
+        let base: Vec<String> = t
+            .entries_of(FormatKind::Date)
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(date_ids(&t, &a), base);
     }
 
     #[test]

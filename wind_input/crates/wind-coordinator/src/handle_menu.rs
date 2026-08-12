@@ -120,7 +120,7 @@ impl Coordinator {
         };
         self.menu_close();
         match kind {
-            MenuKind::Op(op) => self.candidate_op(op, page_local),
+            MenuKind::Op(op) => self.candidate_or_quick_format_op(op, page_local),
             MenuKind::Copy => {
                 let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
             }
@@ -1324,9 +1324,47 @@ impl Coordinator {
         let word = cand.text.clone();
         let total = state.candidates.len();
         let scope = self.candidate_op_scope(&state);
+        // 快捷输入的格式候选：判据独立于 candidate_op_scope（后者问「有没有词库落点」，
+        // 混输没有，返回 None 是对的）。与写端 `candidate_or_quick_format_op` 同源。
+        let quick = self.quick_format_scope(&state, page_local);
         drop(state);
 
         let op = |o: CandidateOp| MenuKind::Op(o);
+        // 格式候选优先：它调的是「这种写法排第几」，不是词库里的某个词。
+        // 标签也相应改写——操作对象是格式，不是这次算出来的那串文本。
+        if let Some(q) = quick {
+            let has_adjust = {
+                let a = self.quick_adjust_of(q.kind);
+                !a.is_empty()
+            };
+            let items = vec![
+                // 「同类型内」这个限定不能省：置顶只在本类（日期/数字/计算）内生效，
+                // 类与类之间的先后由 `mix_modes.members` 决定，不归本菜单管。
+                M::leaf(
+                    "置顶（同类型内）",
+                    op(CandidateOp::MoveTop),
+                    q.index_in_kind > 0,
+                    false,
+                ),
+                M::leaf("上移", op(CandidateOp::MoveUp), q.index_in_kind > 0, false),
+                M::leaf("下移", op(CandidateOp::MoveDown), true, false),
+                // 面向用户说「隐藏」，存储字段叫 `disabled`——两者刻意不同名：
+                // 菜单里它确实是「看不见了」，而设置页的启用开关要让那一行仍可见、能开回来。
+                M::leaf("隐藏此格式", op(CandidateOp::Delete), true, false),
+                // 整类恢复：被隐藏的格式不出候选、右键点不到，没有这一项就再也开不回来。
+                // 与候选调整菜单的同名项**语义不同**（那边恢复一条，这里恢复整类），
+                // 但两个菜单互斥出现，用户不会同时看到。
+                M::leaf("恢复默认", op(CandidateOp::Reset), has_adjust, false),
+                M::separator(),
+                M::leaf("复制", MenuKind::Copy, true, false),
+            ];
+            self.mark_menu_open(page_local, word);
+            let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+                items,
+                anchor: MenuAnchor::at_point(x, y),
+            });
+            return;
+        }
         // 有词库落点才给词条操作。无落点的两类状态——没有独立词库归属的 overlay（临拼/临英/
         // 混输/网址，编码各持独立缓冲且无处落键）与空码浏览态（特殊模式 show_all_on_enter，
         // 读端 apply_shadow_in 对空码直接 return，写了也永不生效）——仅保留复制。

@@ -1305,16 +1305,33 @@ impl Coordinator {
                 let eval = |text: &str, values: &wind_quick_input::QuickValues| {
                     crate::quick_eval::eval_expr(text, values)
                 };
-                for t in wind_quick_input::generate_with_eval(
+                // 用户调整（右键调序/停用）叠加到格式表之上。整张镜像传下去，由
+                // quick-input 按**实际渲染的类别**取用——`QuickSource::Date` 会产出
+                // date 或 year_month 之一，在这里按 src 猜类别会让年月的调序静默失效。
+                // 取镜像不查库：本函数在每次按键的候选刷新路径上。
+                let adjust = self.quick_adjust_snapshot();
+                for r in wind_quick_input::generate_adjusted(
                     src,
                     &state.mix_buffer,
                     dp,
                     &self.quick_formats,
+                    &adjust,
                     Some(&eval),
                 ) {
-                    if !t.is_empty() && seen.insert(t.clone()) {
+                    if !r.text.is_empty() && seen.insert(r.text.clone()) {
+                        // 稳定 id：右键要认「哪条格式」，而 text 逐次输入都不同。
+                        // 类别由格式表反查（id 在表内唯一）。
+                        let kind = self
+                            .quick_formats
+                            .entries()
+                            .iter()
+                            .find(|e| e.id == r.id)
+                            .map(|e| e.kind);
                         cands.push(Candidate {
-                            text: t,
+                            id: kind
+                                .map(|k| crate::handle_quick_format::quick_cand_id(k, &r.id))
+                                .unwrap_or_default(),
+                            text: r.text,
                             ..Default::default()
                         });
                     }

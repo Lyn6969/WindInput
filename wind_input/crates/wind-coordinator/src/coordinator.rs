@@ -901,6 +901,19 @@ pub struct Coordinator {
     /// 全仓的覆盖点都没有文件监视器。加载失败已在 `FormatTable::load` 内回落内置默认表，
     /// 此处恒是一张可用的表。
     pub(crate) quick_formats: wind_quick_input::FormatTable,
+    /// 快捷输入格式表的**用户调整**（右键调序 / 停用）运行时镜像，键为格式类别。
+    ///
+    /// 真相在 `userdata.redb` 的 `quick_format` 表，这里是读缓存：候选生成在热路径上
+    /// （每次按键都跑），每次去查库不划算。
+    ///
+    /// ⚠️ 右键操作必须**写库 + 更新本镜像**两件都做。只写库不回灌，症状就是
+    /// 「调了没反应、重启才生效」——本仓这个坑踩过不止一次。
+    ///
+    /// 与 `quick_formats`（文件，启动后不变）分开存放是刻意的：GUI 调整绝不回写
+    /// `system.quick.toml`，那会抢走高级用户手写文件的所有权，也会让普通用户
+    /// 点两下右键就永久脱离出厂更新。
+    pub(crate) quick_adjust:
+        std::sync::RwLock<std::collections::HashMap<String, wind_quick_input::FormatAdjust>>,
     /// 拆字资产当前生效状态（库解析路径 / 已下发字根字体），reload 变更检测用。
     pub(crate) chaizi_assets: Mutex<ChaiziAssets>,
     /// 注释词库当前生效的解析路径列表（顺序即优先级），reload 变更检测用。
@@ -1344,6 +1357,9 @@ impl Coordinator {
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
         // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]。
         // 库已在 build 内加载，此处仅补发字体（sync 按变更检测，重复调用幂等）。
+        // 快捷输入格式表的用户调整（右键调序/停用）：真相在 store，这里装载运行时镜像。
+        // 必须在 store 就位之后——构造体内只能给空初值。
+        coordinator.reload_quick_adjust();
         coordinator.sync_chaizi_assets();
         // 注释词库首次加载（`[[ui.comment_dicts]]`，出厂为空数组=不加载任何库）。
         coordinator.sync_comment_dicts();
@@ -1779,6 +1795,9 @@ impl Coordinator {
             current_toolbar_monitor: Mutex::new(None),
             reverse: std::sync::RwLock::new(reverse),
             quick_formats,
+            // 空初值：真正的装载在 new() 里经 `reload_quick_adjust` 完成（需要 store，
+            // 而 store 在本结构体构造之后才可用）。headless 无 store 时保持空 = 出厂顺序。
+            quick_adjust: std::sync::RwLock::new(std::collections::HashMap::new()),
             chaizi_assets: Mutex::new(ChaiziAssets {
                 db: chaizi_db,
                 font: None, // 字体在 new() 经 sync_chaizi_assets 下发（headless 无 UI 不发）

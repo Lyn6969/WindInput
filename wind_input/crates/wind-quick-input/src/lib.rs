@@ -38,7 +38,7 @@ pub mod lunar;
 pub mod template;
 mod vars;
 
-pub use format_table::{FormatEntry, FormatKind, FormatTable};
+pub use format_table::{FormatAdjust, FormatEntry, FormatKind, FormatTable};
 pub use vars::QuickValues;
 
 /// 表达式模板（`{amt(unit='圆')}`）的求值回调，由宿主提供。
@@ -65,18 +65,58 @@ fn builtin_table() -> &'static FormatTable {
 /// - 展开/求值返回 `None`：模板含本类不支持的变量、或表达式求值失败 → 整条作废；
 /// - 结果为空串：该条在本次输入下不适用（如 `$AMT` 遇三位小数）→ 丢弃。
 ///   这是格式表表达「条件」的唯一方式，配置里不写 if。
-fn render(table: &FormatTable, values: &QuickValues, eval: Option<ExprEval>) -> Vec<String> {
+///
+/// 用户调整同样在这里生效（[`FormatTable::entries_of_adjusted`]）：停用的条目不渲染，
+/// 移动过的按新序输出。空调整时与改造前逐条等价。
+fn render(
+    table: &FormatTable,
+    adjust: &FormatAdjustMap,
+    values: &QuickValues,
+    eval: Option<ExprEval>,
+) -> Vec<Rendered> {
+    // ★ 按**实际渲染的类别**取调整，而不是按来源。`QuickSource::Date` 会产出 date
+    // 或 year_month 之一（视输入形态），只有到了这里才知道是哪个——在调用方按 src
+    // 猜类别，年月的调序就会静默不生效。
+    let empty = FormatAdjust::default();
+    let adjust = adjust.get(values.kind().as_str()).unwrap_or(&empty);
     table
-        .entries_of(values.kind())
+        .entries_of_adjusted(values.kind(), adjust)
+        .into_iter()
         .filter_map(|e| {
-            if e.is_expression() {
+            let text = if e.is_expression() {
                 eval.and_then(|f| f(&e.text, values))
             } else {
                 template::expand(&e.text, |name| values.get(name))
-            }
+            }?;
+            (!text.is_empty()).then(|| Rendered {
+                id: e.id.clone(),
+                text,
+            })
         })
-        .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// 一条渲染结果：**格式 id + 候选文本**。
+///
+/// id 是候选的稳定身份——右键调序要知道用户点的是哪条格式，而 `text` 逐次输入都不同
+/// （`2026年6月19日` / `2026年6月20日`），按文本认人必然失配。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    /// 格式表里的条目 id（如 `date.lunar`）。
+    pub id: String,
+    pub text: String,
+}
+
+/// 按类别索引的用户调整，键是 [`FormatKind::as_str`]。
+///
+/// 用 map 而不是单个 [`FormatAdjust`]：一次 `generate_adjusted` 可能渲染 date 或
+/// year_month（视输入形态），只有 `render` 内部才知道实际类别。
+pub type FormatAdjustMap = std::collections::HashMap<String, FormatAdjust>;
+
+/// 丢掉 id 只留文本。不带表/不带调整的公开入口用它保持原返回类型——
+/// 两种入口共用同一条渲染路径，不各写一份。
+fn texts(v: Vec<Rendered>) -> Vec<String> {
+    v.into_iter().map(|r| r.text).collect()
 }
 
 // ───────────────────────── 成员 id ─────────────────────────
@@ -154,10 +194,35 @@ pub fn generate_with_eval(
     table: &FormatTable,
     eval: Option<ExprEval>,
 ) -> Vec<String> {
+    generate_adjusted(
+        src,
+        buffer,
+        decimal_places,
+        table,
+        &FormatAdjustMap::new(),
+        eval,
+    )
+    .into_iter()
+    .map(|r| r.text)
+    .collect()
+}
+
+/// 按来源生成候选，**带格式 id 与用户调整**。协调器走这个入口。
+///
+/// 与 [`generate_with_eval`] 同源（都经 `render`）：那边只是丢掉 id、按空调整渲染。
+/// 两条入口若各自实现，「右键看到的顺序」与「实际出的候选」就会分叉。
+pub fn generate_adjusted(
+    src: QuickSource,
+    buffer: &str,
+    decimal_places: i32,
+    table: &FormatTable,
+    adjust: &FormatAdjustMap,
+    eval: Option<ExprEval>,
+) -> Vec<Rendered> {
     match src {
-        QuickSource::Date => render_date(buffer, table, eval),
-        QuickSource::Calc => render_calc(buffer, decimal_places, table, eval),
-        QuickSource::Number => render_number(buffer, decimal_places, table, eval),
+        QuickSource::Date => render_date(buffer, table, adjust, eval),
+        QuickSource::Calc => render_calc(buffer, decimal_places, table, adjust, eval),
+        QuickSource::Number => render_number(buffer, decimal_places, table, adjust, eval),
     }
 }
 
@@ -222,20 +287,30 @@ fn parse_date_parts(s: &str) -> Option<(i32, u32, u32)> {
 /// **不产出**中文补零写法（`2025年03月05日`）——GB/T 15835 的中文日期不加前导零，
 /// 它与不补零的那条只在月/日 <10 时不同，属纯冗余。
 pub fn generate_date_candidates(input: &str) -> Vec<String> {
-    render_date(input, builtin_table(), None)
+    texts(render_date(
+        input,
+        builtin_table(),
+        &FormatAdjustMap::new(),
+        None,
+    ))
 }
 
 /// 日期渲染：完整日期优先，产出为空再试年月。
 ///
 /// 「为空再试」而非「解析成功即归属」：用户把 date 一组删空时，`2025.12` 这种
 /// 既可解析为完整日期也可解析为年月的输入仍应给出年月候选。
-fn render_date(input: &str, table: &FormatTable, eval: Option<ExprEval>) -> Vec<String> {
+fn render_date(
+    input: &str,
+    table: &FormatTable,
+    adjust: &FormatAdjustMap,
+    eval: Option<ExprEval>,
+) -> Vec<Rendered> {
     let input = trim_pending_tail(input);
-    let ymd = render_full_date(input, table, eval);
+    let ymd = render_full_date(input, table, adjust, eval);
     if !ymd.is_empty() {
         return ymd;
     }
-    render_year_month(input, table, eval)
+    render_year_month(input, table, adjust, eval)
 }
 
 /// 年份的全汉字写法：逐位改写，`2025` → 「二〇二五」（GB/T 15835）。
@@ -266,7 +341,12 @@ pub fn small_int_to_chinese(n: u32) -> String {
 }
 
 /// 完整日期（y.m.d 或 m.d，后者补当前年）。
-fn render_full_date(input: &str, table: &FormatTable, eval: Option<ExprEval>) -> Vec<String> {
+fn render_full_date(
+    input: &str,
+    table: &FormatTable,
+    adjust: &FormatAdjustMap,
+    eval: Option<ExprEval>,
+) -> Vec<Rendered> {
     let (mut year, month, day) = match parse_date_parts(input) {
         Some(v) => v,
         None => return Vec::new(),
@@ -276,6 +356,7 @@ fn render_full_date(input: &str, table: &FormatTable, eval: Option<ExprEval>) ->
     }
     render(
         table,
+        adjust,
         &QuickValues::Date {
             y: year,
             m: month,
@@ -290,10 +371,20 @@ fn render_full_date(input: &str, table: &FormatTable, eval: Option<ExprEval>) ->
 /// 首段 >31 是与「月.日」的分界：`12.25` 只可能是 12 月 25 日，`2025.12` 只可能是年月。
 /// 同样不产出中文补零写法（`2025年06月`）。格式集与完整日期同构：中文 → 全汉字 → ISO → 斜杠。
 pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
-    render_year_month(input, builtin_table(), None)
+    texts(render_year_month(
+        input,
+        builtin_table(),
+        &FormatAdjustMap::new(),
+        None,
+    ))
 }
 
-fn render_year_month(input: &str, table: &FormatTable, eval: Option<ExprEval>) -> Vec<String> {
+fn render_year_month(
+    input: &str,
+    table: &FormatTable,
+    adjust: &FormatAdjustMap,
+    eval: Option<ExprEval>,
+) -> Vec<Rendered> {
     let input = trim_pending_tail(input);
     let parts: Vec<&str> = input.split('.').collect();
     if parts.len() != 2 {
@@ -310,7 +401,7 @@ fn render_year_month(input: &str, table: &FormatTable, eval: Option<ExprEval>) -
     if y <= 31 || !(1..=12).contains(&m) {
         return Vec::new();
     }
-    render(table, &QuickValues::YearMonth { y, m }, eval)
+    render(table, adjust, &QuickValues::YearMonth { y, m }, eval)
 }
 
 // ───────────────────────── 计算器 ─────────────────────────
@@ -356,15 +447,22 @@ fn is_expr_charset(s: &str) -> bool {
 /// 用户手打的 `=` 及其右侧被忽略（取首个 `=` 前求值），使「再按 =」乃至续打答案时
 /// 候选不清空。
 pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> {
-    render_calc(expr, decimal_places, builtin_table(), None)
+    texts(render_calc(
+        expr,
+        decimal_places,
+        builtin_table(),
+        &FormatAdjustMap::new(),
+        None,
+    ))
 }
 
 fn render_calc(
     expr: &str,
     decimal_places: i32,
     table: &FormatTable,
+    adjust: &FormatAdjustMap,
     eval: Option<ExprEval>,
-) -> Vec<String> {
+) -> Vec<Rendered> {
     let lhs = expr.split('=').next().unwrap_or(expr);
     let clean: &str = trim_pending_tail(lhs);
     if clean.is_empty() || !has_binary_operator(clean) || !is_expr_charset(clean) {
@@ -382,6 +480,7 @@ fn render_calc(
     let result = format_calc_result_prec(val, decimal_places);
     render(
         table,
+        adjust,
         &QuickValues::Calc {
             expr: clean.to_string(),
             result,
@@ -786,7 +885,13 @@ fn number_subject(buffer: &str, decimal_places: i32) -> Option<String> {
 ///   中文小写加「元整」不属任何规范；
 /// - 逐位大写「壹贰叁」——逐位读法用于念号码，与财务大写无关，无使用场景。
 pub fn generate_number_candidates(s: &str, decimal_places: i32) -> Vec<String> {
-    render_number(s, decimal_places, builtin_table(), None)
+    texts(render_number(
+        s,
+        decimal_places,
+        builtin_table(),
+        &FormatAdjustMap::new(),
+        None,
+    ))
 }
 
 /// 「>2 位小数无角分写法」这类条件不再写在这里：`$AMT` 此时渲染为空串，由 [`render`] 丢弃。
@@ -794,12 +899,13 @@ fn render_number(
     s: &str,
     decimal_places: i32,
     table: &FormatTable,
+    adjust: &FormatAdjustMap,
     eval: Option<ExprEval>,
-) -> Vec<String> {
+) -> Vec<Rendered> {
     let Some(subject) = number_subject(s, decimal_places) else {
         return Vec::new();
     };
-    render(table, &QuickValues::Number { subject }, eval)
+    render(table, adjust, &QuickValues::Number { subject }, eval)
 }
 
 #[cfg(test)]
