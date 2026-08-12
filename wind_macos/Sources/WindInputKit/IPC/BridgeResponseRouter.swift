@@ -45,12 +45,35 @@ public final class BridgeResponseRouter {
     /// 误读成「替换」, 符号被新输入顶掉 —— 同一个坑没必要在 macOS 再踩一遍。
     private var pendingCommitPrefix: String = ""
 
+    /// 待定标点的自动落定计时器 + 它对应的"这一代"状态。
+    ///
+    /// Windows 侧有同名计时器，但那是 TSF 的刚需（组合必须「吃了再吐」）；IMKit 没有那个
+    /// 约束，故这里**只做一件事**：到点把已是 marked text 的符号**定稿成正文**。文字内容
+    /// 前后完全一样，变的只是它还带不带 marked 的下划线——不加这个计时器，用户打完一个
+    /// 「，」就会看到它一直带着下划线待在文档里，直到下一次按键或失焦才收掉。
+    ///
+    /// 语义上的时限判定不在这里：press2 能否替换由**服务端**的 `smart_symbol_timeout` 说了算
+    /// （见 `handle_punct.rs` 的 `arm.at.elapsed()` 守卫）。这边到点不改变任何可替换性，
+    /// 只收下划线，故两者不会打架。
+    private var holdTimer: Timer?
+    /// 每次状态变化自增；计时器只在"代"没变时才动手，避免过期回调误伤新一轮输入。
+    private var holdGeneration: UInt64 = 0
+
     public init() {}
 
     public func reset() {
         composition.clear()
         heldSymbol = nil
         pendingCommitPrefix = ""
+        cancelHoldTimer()
+    }
+
+    /// 停表并作废在途回调。**任何**改动 heldSymbol / pendingCommitPrefix 的路径都要调它，
+    /// 否则旧计时器会对着新一轮输入的状态动手。
+    private func cancelHoldTimer() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        holdGeneration &+= 1
     }
 
     /// 把待定标点定格进 `pendingCommitPrefix`, 不上屏、不动文档。
@@ -59,11 +82,12 @@ public final class BridgeResponseRouter {
         guard let held = heldSymbol else { return }
         pendingCommitPrefix += held
         heldSymbol = nil
+        cancelHoldTimer()
     }
 
     /// 取出「本次上屏该带上的前缀」(定格前缀 + 尚未定格的待定标点) 并清空状态。
     private func takePendingPrefix() -> String {
-        absorbHeldIntoPrefix()
+        absorbHeldIntoPrefix()   // 内含 cancelHoldTimer
         defer { pendingCommitPrefix = "" }
         return pendingCommitPrefix
     }
@@ -146,13 +170,12 @@ public final class BridgeResponseRouter {
 
         case DownstreamCmd.holdComposition:
             // 智能符号 HoldComposition 方案 press1: 把待定标点作为组合预览显示。
-            // 不实现 timeout 自动提交 —— Win 侧那个计时器是给 TSF 的「吃了再吐」兜底,
-            // IMKit 里组合会一直挂到 press2 (CommitTextReplacingHeld) 或失焦清理。
             if let p = try? BinaryCodec.decodeHoldCompositionPayload(frame.payload) {
-                // 前一个待定标点先定格 (连打两个不同符号: `，` 后紧跟 `。`)。
+                // 前一个待定标点先定格 (连打两个不同符号: `，` 后紧跟 `。`)。内含停表。
                 absorbHeldIntoPrefix()
                 heldSymbol = p.holdText
                 setCompositionRaw(pendingCommitPrefix + p.holdText, client: client)
+                armHoldTimer(ms: p.timeoutMs, client: client)
             }
             return true
 
@@ -292,6 +315,24 @@ public final class BridgeResponseRouter {
             composition.clear()
         }
         client?.insertText(prefix, replacementRange: notFound)
+    }
+
+    /// 到点把待定标点定稿成正文（内容不变，只收掉 marked 的下划线）。
+    ///
+    /// `client` 弱持有: 计时器活得比一次按键长，强持有会把宿主的输入上下文吊住。
+    /// client 已销毁 → 只清本端状态，不去动一个不存在的文本框。
+    private func armHoldTimer(ms: UInt32, client: TextInputClient?) {
+        cancelHoldTimer()
+        guard ms > 0 else { return }   // 0 = 不自动落定
+        let gen = holdGeneration
+        weak var weakClient = client
+        holdTimer = Timer.scheduledTimer(withTimeInterval: Double(ms) / 1000.0,
+                                         repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            // 「代」变了说明这中间已经有过按键/提交/清除，那条路自己处置过了。
+            guard self.holdGeneration == gen, self.heldSymbol != nil else { return }
+            self.flushPendingPrefix(client: weakClient)
+        }
     }
 
     private func applyMarkedText(text: String, caretRuneInText: Int, client: TextInputClient?) {

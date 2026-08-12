@@ -306,9 +306,9 @@ final class BridgeResponseRouterTests: XCTestCase {
 
     // MARK: - 待定标点的收口 (HoldComposition → 前缀)
 
-    private func holdFrame(_ text: String) -> Frame {
+    private func holdFrame(_ text: String, timeoutMs: UInt32 = 500) -> Frame {
         var d = Data(count: 8)
-        d.writeUInt32LE(500, at: 0)
+        d.writeUInt32LE(timeoutMs, at: 0)
         d.writeUInt32LE(UInt32(text.utf8.count), at: 4)
         d.append(contentsOf: text.utf8)
         return Frame(cmd: DownstreamCmd.holdComposition, isAsync: false, payload: d)
@@ -423,5 +423,51 @@ final class BridgeResponseRouterTests: XCTestCase {
 
         _ = r.apply(Frame(cmd: DownstreamCmd.passThrough, isAsync: false, payload: Data()), to: mock)
         XCTAssertEqual(mock.insertCalls.map { $0.text }, ["，。"])
+    }
+
+    /// 转一会儿 runloop 让 Timer 有机会烧。
+    private func spinRunLoop(_ seconds: TimeInterval) {
+        RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    }
+
+    /// 待定标点到点自动定稿：内容不变，只是从 marked text 变成正文。
+    ///
+    /// 不加这个计时器，用户打完一个「，」就会看到它一直带着下划线待在文档里，直到下一次
+    /// 按键或失焦才收掉（Windows 侧靠同名计时器收；那边是 TSF 刚需，这边是观感）。
+    func testHeldSymbol_AutoCommitsAfterTimeout() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，", timeoutMs: 50), to: mock)
+        XCTAssertTrue(mock.insertCalls.isEmpty, "到点前不该上屏")
+
+        spinRunLoop(0.4)
+
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, ["，"], "到点应定稿为正文")
+        XCTAssertTrue(r.composition.isEmpty)
+    }
+
+    /// 期间有过按键 → 那条路自己已经处置过，过期计时器**不得**再动手。
+    /// 漏了这道「代」判据的话，会在新一轮输入里凭空多插一个符号。
+    func testHeldSymbol_TimerDoesNotFireAfterStateMoved() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，", timeoutMs: 50), to: mock)
+        _ = r.apply(updateCompFrame("n"), to: mock)   // 符号定格进前缀, 停表
+
+        spinRunLoop(0.4)
+
+        XCTAssertTrue(mock.insertCalls.isEmpty, "组合还活着, 不该有任何上屏")
+        XCTAssertEqual(mock.setMarkedCalls.last?.text, "，n", "符号仍与组合同段显示")
+    }
+
+    /// timeout=0 表示不自动落定（服务端可据配置下发 0）。
+    func testHeldSymbol_ZeroTimeoutNeverAutoCommits() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        _ = r.apply(holdFrame("，", timeoutMs: 0), to: mock)
+
+        spinRunLoop(0.3)
+
+        XCTAssertTrue(mock.insertCalls.isEmpty)
     }
 }
