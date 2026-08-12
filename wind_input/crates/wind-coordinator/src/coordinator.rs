@@ -895,6 +895,12 @@ pub struct Coordinator {
     /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段随主码表方案
     /// 热重载（见 `sync_chaizi_assets`），拼音段启动加载后不变。
     pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
+    /// 快捷输入格式表（`system.quick.toml`，支持用户目录整份覆盖）。
+    ///
+    /// 启动加载后不变，故无锁：与 `system.phrases.toml` 同语义——**改完必须重启服务**，
+    /// 全仓的覆盖点都没有文件监视器。加载失败已在 `FormatTable::load` 内回落内置默认表，
+    /// 此处恒是一张可用的表。
+    pub(crate) quick_formats: wind_quick_input::FormatTable,
     /// 拆字资产当前生效状态（库解析路径 / 已下发字根字体），reload 变更检测用。
     pub(crate) chaizi_assets: Mutex<ChaiziAssets>,
     /// 注释词库当前生效的解析路径列表（顺序即优先级），reload 变更检测用。
@@ -1628,6 +1634,15 @@ impl Coordinator {
                 }
                 p
             });
+        // 快捷输入格式表：日期/数字/金额/计算候选的文本与组内顺序。同样支持用户整份覆盖，
+        // 是给高频输入者的高级特性，普通用户不会碰到（缺文件时回落内置默认表，行为与出厂一致）。
+        let quick_formats = wind_quick_input::FormatTable::load(
+            Config::resolve_data_file(data_dir, "system.quick.toml").as_deref(),
+        );
+        // 表达式条目在这里预检一次：写错的表达式在运行期只表现为「那条候选不出现」，
+        // 没有预检就没有任何线索（热路径不能每次按键都告警）。
+        crate::quick_eval::precheck(&quick_formats);
+
         // 拼音读音表同样支持用户覆盖（整体替代）：改多音字取音、补生僻字读音都靠换这张表。
         let pinyin_map = Config::resolve_data_file(data_dir, "pinyin_map.txt");
         if pinyin_map.is_none() && data_dir.is_some() {
@@ -1766,6 +1781,7 @@ impl Coordinator {
             toolbar_positions: Mutex::new(toolbar_positions_init),
             current_toolbar_monitor: Mutex::new(None),
             reverse: std::sync::RwLock::new(reverse),
+            quick_formats,
             chaizi_assets: Mutex::new(ChaiziAssets {
                 db: chaizi_db,
                 font: None, // 字体在 new() 经 sync_chaizi_assets 下发（headless 无 UI 不发）

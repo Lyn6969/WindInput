@@ -8,6 +8,7 @@ pub mod calc;
 pub mod config;
 pub mod dict_ime;
 pub mod help;
+pub mod quick;
 pub mod text;
 pub mod util;
 pub mod value;

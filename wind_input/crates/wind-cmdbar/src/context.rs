@@ -28,6 +28,18 @@ pub trait EvalContext {
     fn now(&self) -> DateTime<Local>;
     /// 副作用服务束；纯求值场景可为 None，动作函数须自行防御。
     fn services(&self) -> Option<&Services>;
+
+    /// 快捷输入格式表的取值口：把「本次输入解析出的量」按名交给 `quick.*` 函数族。
+    ///
+    /// 名字与 `system.quick.toml` 的 `$` 变量同名同义（`Y` / `MM` / `YC` / `AMT` …），
+    /// 两条模板路径因此取到的是同一批值。
+    ///
+    /// **默认返回 `None`**：只有快捷输入的上下文有「当前解析出的年月日/数值」这回事，
+    /// 短语与命令栏的上下文没有。故 `{year()}` 写进 `system.phrases.toml` 只会得到空串，
+    /// 而不是拿当前编码硬解出一个假年份——错值比空值难查得多。
+    fn quick_var(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 固定容量的上屏历史环形缓冲。index 1 为最近一次 push。

@@ -5,3 +5,8 @@ edition.workspace = true
 
 [dependencies]
 chrono = "0.4"
+# 格式表 system.quick.toml 的解析与告警。仍不依赖任何 wind-* crate——
+# 本 crate 是 wind-phrase / wind-cmdbar / wind-config 的下游，反向依赖会成环。
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }

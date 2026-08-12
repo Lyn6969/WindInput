@@ -82,6 +82,7 @@
 | 双拼布局 | `schemas/shuangpin/{layout}.toml` | A | `shuangpin` | `EngineManager::scan_shuangpin_layouts` |
 | 主题 | `themes/{id}/theme.toml` | A | `theme` | `wind_theme::theme::find_theme_dir` |
 | 系统短语种子 | `system.phrases.toml` | A | `data` | `coordinator.rs` → `resolve_data_file` |
+| 快捷输入格式表 | `system.quick.toml` | A | `data` | `coordinator.rs` → `resolve_data_file` |
 | 拼音读音表 | `pinyin_map.txt` | A | `data` | `coordinator.rs` → `resolve_data_file` |
 | 主配置 | `config.toml` | B | — | `Config::load` |
 | 应用兼容规则 | `compat.toml` | B | — | `app_compat.rs::load` |

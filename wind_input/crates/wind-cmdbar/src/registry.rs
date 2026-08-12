@@ -140,6 +140,19 @@ impl Registry {
         r.register_all(crate::funcs::config::specs());
         r
     }
+
+    /// 快捷输入格式表（`system.quick.toml`）专用：纯函数 + `quick` 取值函数族。
+    ///
+    /// **刻意不并入 [`Self::full`]**：`year()` / `amt()` 这些只在「有一次输入被解析成
+    /// 日期或数字」的上下文里有意义，混进全局表会让它们出现在短语的函数手册里，
+    /// 而在那里调用只能得到空串。
+    ///
+    /// 不含动作函数：格式表描述的是候选长什么样，不该能改剪贴板、按键或配置。
+    pub fn quick() -> Self {
+        let mut r = Self::with_builtins();
+        r.register_all(crate::funcs::quick::specs());
+        r
+    }
 }
 
 /// 进程级默认注册表（全函数），供 `help()` 等内省函数查询元信息。

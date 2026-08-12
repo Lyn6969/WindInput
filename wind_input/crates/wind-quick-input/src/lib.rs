@@ -15,8 +15,69 @@
 //! 候选格式按国标精简，冗余与不规范写法不再产出（见各来源函数文档）：
 //! - 日期：GB/T 7408（≡ISO 8601）+ GB/T 15835（中文数字用法，月日**不补前导零**）
 //! - 金额：《会计基础工作规范》第五十二条（大写金额与「整」的写法）
+//!
+//! ## 格式表（自定义）
+//!
+//! 上述格式集是**出厂默认**，不是硬编码：候选的文本与组内顺序由 [`FormatTable`] 决定，
+//! 出厂表来自 `data/system.quick.toml`，用户可在配置目录放同名文件整份覆盖
+//! （高级特性，详见 `docs/design/quick-input-format-table.md`）。
+//!
+//! **解析归代码、渲染归配置**：`"2025.12.25"` 怎么切成年月日是本模块的文法，
+//! 切出来之后长什么样才是格式表的事。不带表的 `generate*` 入口一律用
+//! [`FormatTable::builtin`]，与改造前逐条等价。
 
 use chrono::Datelike;
+use std::sync::OnceLock;
+
+mod format_table;
+/// 农历换算。公开供 `wind-phrase` 复用——短语的 `$L*` 绑当前时间、快捷输入的绑
+/// 用户打进去的日期，但「今天农历几号」必须是同一个答案。
+pub mod lunar;
+/// `$` 模板引擎。公开供 `wind-phrase` 的简单模板（`system.phrases.toml`）复用——
+/// 两个配置文件的变量写法必须由同一份解析器决定。
+pub mod template;
+mod vars;
+
+pub use format_table::{FormatEntry, FormatKind, FormatTable};
+pub use vars::QuickValues;
+
+/// 表达式模板（`{amt(unit='圆')}`）的求值回调，由宿主提供。
+///
+/// 本 crate **不依赖 `wind-cmdbar`**：求值器在上层（coordinator 同时依赖两者），
+/// 这里只把「模板 + 本次解析出的量」交出去。返回 `None` = 求值失败（未知函数、
+/// 参数错误…），该条候选被丢弃，宿主负责告警。
+pub type ExprEval<'a> = &'a dyn Fn(&str, &QuickValues) -> Option<String>;
+
+/// 内置默认表的进程级单例。不带表的入口都走它——每次调用重建一份的话，
+/// 每次按键都要重新分配十几个 String。
+fn builtin_table() -> &'static FormatTable {
+    static T: OnceLock<FormatTable> = OnceLock::new();
+    T.get_or_init(FormatTable::builtin)
+}
+
+/// 按格式表渲染某一类的全部候选。
+///
+/// 每条按 [`FormatEntry::is_expression`] 分流：变量模板本地展开，表达式模板交给
+/// 宿主的 `eval`（无 `eval` 时该条静默跳过——不带求值器的调用方拿不到表达式候选，
+/// 但绝不能把 `{amt()}` 当字面量上屏）。
+///
+/// 两道过滤各有分工，都不能省：
+/// - 展开/求值返回 `None`：模板含本类不支持的变量、或表达式求值失败 → 整条作废；
+/// - 结果为空串：该条在本次输入下不适用（如 `$AMT` 遇三位小数）→ 丢弃。
+///   这是格式表表达「条件」的唯一方式，配置里不写 if。
+fn render(table: &FormatTable, values: &QuickValues, eval: Option<ExprEval>) -> Vec<String> {
+    table
+        .entries_of(values.kind())
+        .filter_map(|e| {
+            if e.is_expression() {
+                eval.and_then(|f| f(&e.text, values))
+            } else {
+                template::expand(&e.text, |name| values.get(name))
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
 
 // ───────────────────────── 成员 id ─────────────────────────
 
@@ -67,12 +128,36 @@ impl QuickSource {
     }
 }
 
-/// 按来源生成候选。
+/// 按来源生成候选（用内置默认表）。
 pub fn generate(src: QuickSource, buffer: &str, decimal_places: i32) -> Vec<String> {
+    generate_with(src, buffer, decimal_places, builtin_table())
+}
+
+/// 按来源生成候选，指定格式表。**表达式模板会被跳过**（无求值器）。
+pub fn generate_with(
+    src: QuickSource,
+    buffer: &str,
+    decimal_places: i32,
+    table: &FormatTable,
+) -> Vec<String> {
+    generate_with_eval(src, buffer, decimal_places, table, None)
+}
+
+/// 按来源生成候选，指定格式表与表达式求值器。协调器走这个入口。
+///
+/// `eval` 为 `None` 时表达式模板静默跳过——只有 `{...}` 那几条不出候选，
+/// 变量模板不受影响。
+pub fn generate_with_eval(
+    src: QuickSource,
+    buffer: &str,
+    decimal_places: i32,
+    table: &FormatTable,
+    eval: Option<ExprEval>,
+) -> Vec<String> {
     match src {
-        QuickSource::Date => generate_date_candidates(buffer),
-        QuickSource::Calc => generate_calc_candidates(buffer, decimal_places),
-        QuickSource::Number => generate_number_candidates(buffer, decimal_places),
+        QuickSource::Date => render_date(buffer, table, eval),
+        QuickSource::Calc => render_calc(buffer, decimal_places, table, eval),
+        QuickSource::Number => render_number(buffer, decimal_places, table, eval),
     }
 }
 
@@ -137,12 +222,20 @@ fn parse_date_parts(s: &str) -> Option<(i32, u32, u32)> {
 /// **不产出**中文补零写法（`2025年03月05日`）——GB/T 15835 的中文日期不加前导零，
 /// 它与不补零的那条只在月/日 <10 时不同，属纯冗余。
 pub fn generate_date_candidates(input: &str) -> Vec<String> {
+    render_date(input, builtin_table(), None)
+}
+
+/// 日期渲染：完整日期优先，产出为空再试年月。
+///
+/// 「为空再试」而非「解析成功即归属」：用户把 date 一组删空时，`2025.12` 这种
+/// 既可解析为完整日期也可解析为年月的输入仍应给出年月候选。
+fn render_date(input: &str, table: &FormatTable, eval: Option<ExprEval>) -> Vec<String> {
     let input = trim_pending_tail(input);
-    let ymd = generate_full_date_candidates(input);
+    let ymd = render_full_date(input, table, eval);
     if !ymd.is_empty() {
         return ymd;
     }
-    generate_year_month_candidates(input)
+    render_year_month(input, table, eval)
 }
 
 /// 年份的全汉字写法：逐位改写，`2025` → 「二〇二五」（GB/T 15835）。
@@ -173,7 +266,7 @@ pub fn small_int_to_chinese(n: u32) -> String {
 }
 
 /// 完整日期（y.m.d 或 m.d，后者补当前年）。
-fn generate_full_date_candidates(input: &str) -> Vec<String> {
+fn render_full_date(input: &str, table: &FormatTable, eval: Option<ExprEval>) -> Vec<String> {
     let (mut year, month, day) = match parse_date_parts(input) {
         Some(v) => v,
         None => return Vec::new(),
@@ -181,18 +274,15 @@ fn generate_full_date_candidates(input: &str) -> Vec<String> {
     if year == 0 {
         year = chrono::Local::now().year();
     }
-    vec![
-        format!("{}年{}月{}日", year, month, day),
-        format!(
-            "{}年{}月{}日",
-            year_to_chinese(year),
-            small_int_to_chinese(month),
-            small_int_to_chinese(day)
-        ),
-        format!("{:04}-{:02}-{:02}", year, month, day),
-        format!("{:04}{:02}{:02}", year, month, day),
-        format!("{:04}/{:02}/{:02}", year, month, day),
-    ]
+    render(
+        table,
+        &QuickValues::Date {
+            y: year,
+            m: month,
+            d: day,
+        },
+        eval,
+    )
 }
 
 /// 年月表达式（首段>31，第二段 1-12）。
@@ -200,6 +290,10 @@ fn generate_full_date_candidates(input: &str) -> Vec<String> {
 /// 首段 >31 是与「月.日」的分界：`12.25` 只可能是 12 月 25 日，`2025.12` 只可能是年月。
 /// 同样不产出中文补零写法（`2025年06月`）。格式集与完整日期同构：中文 → 全汉字 → ISO → 斜杠。
 pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
+    render_year_month(input, builtin_table(), None)
+}
+
+fn render_year_month(input: &str, table: &FormatTable, eval: Option<ExprEval>) -> Vec<String> {
     let input = trim_pending_tail(input);
     let parts: Vec<&str> = input.split('.').collect();
     if parts.len() != 2 {
@@ -216,12 +310,7 @@ pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
     if y <= 31 || !(1..=12).contains(&m) {
         return Vec::new();
     }
-    vec![
-        format!("{}年{}月", y, m),
-        format!("{}年{}月", year_to_chinese(y), small_int_to_chinese(m)),
-        format!("{:04}-{:02}", y, m),
-        format!("{:04}/{:02}", y, m),
-    ]
+    render(table, &QuickValues::YearMonth { y, m }, eval)
 }
 
 // ───────────────────────── 计算器 ─────────────────────────
@@ -267,6 +356,15 @@ fn is_expr_charset(s: &str) -> bool {
 /// 用户手打的 `=` 及其右侧被忽略（取首个 `=` 前求值），使「再按 =」乃至续打答案时
 /// 候选不清空。
 pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> {
+    render_calc(expr, decimal_places, builtin_table(), None)
+}
+
+fn render_calc(
+    expr: &str,
+    decimal_places: i32,
+    table: &FormatTable,
+    eval: Option<ExprEval>,
+) -> Vec<String> {
     let lhs = expr.split('=').next().unwrap_or(expr);
     let clean: &str = trim_pending_tail(lhs);
     if clean.is_empty() || !has_binary_operator(clean) || !is_expr_charset(clean) {
@@ -282,7 +380,14 @@ pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> 
         _ => return Vec::new(),
     };
     let result = format_calc_result_prec(val, decimal_places);
-    vec![result.clone(), format!("{}={}", clean, result)]
+    render(
+        table,
+        &QuickValues::Calc {
+            expr: clean.to_string(),
+            result,
+        },
+        eval,
+    )
 }
 
 /// 递归下降求值。支持 `+ - * /`、幂 `^`、一元正负号与括号。返回 None 表示解析失败。
@@ -681,31 +786,20 @@ fn number_subject(buffer: &str, decimal_places: i32) -> Option<String> {
 ///   中文小写加「元整」不属任何规范；
 /// - 逐位大写「壹贰叁」——逐位读法用于念号码，与财务大写无关，无使用场景。
 pub fn generate_number_candidates(s: &str, decimal_places: i32) -> Vec<String> {
+    render_number(s, decimal_places, builtin_table(), None)
+}
+
+/// 「>2 位小数无角分写法」这类条件不再写在这里：`$AMT` 此时渲染为空串，由 [`render`] 丢弃。
+fn render_number(
+    s: &str,
+    decimal_places: i32,
+    table: &FormatTable,
+    eval: Option<ExprEval>,
+) -> Vec<String> {
     let Some(subject) = number_subject(s, decimal_places) else {
         return Vec::new();
     };
-    let (int_part_raw, dec_part) = split_decimal(&subject);
-    let int_part = if int_part_raw.is_empty() {
-        "0"
-    } else {
-        int_part_raw
-    };
-
-    let mut out = Vec::new();
-    if dec_part.is_empty() {
-        out.push(number_to_amount(int_part));
-    } else {
-        // >2 位小数无角分写法，此条为空则跳过
-        let amt = decimal_to_amount(int_part, dec_part);
-        if !amt.is_empty() {
-            out.push(amt);
-        }
-    }
-    out.push(decimal_to_chinese_text(int_part, dec_part, false));
-    out.push(decimal_to_chinese_text(int_part, dec_part, true));
-    out.push(digits_to_chinese_chars(&subject));
-    out.push(format_thousands(int_part, dec_part));
-    out
+    render(table, &QuickValues::Number { subject }, eval)
 }
 
 #[cfg(test)]
@@ -834,9 +928,10 @@ mod tests {
     #[test]
     fn test_date_full_formats() {
         let c = generate_date_candidates("2025.12.25");
+        // 公历五条的内容与次序（农历追加在其后，由 tests/factory_table.rs 把关）
         assert_eq!(
-            c,
-            vec![
+            c[..5],
+            [
                 "2025年12月25日",
                 "二〇二五年十二月二十五日",
                 "2025-12-25",
@@ -845,6 +940,7 @@ mod tests {
             ],
             "中文优先，全汉字次之，且不含补零的中文写法"
         );
+        assert_eq!(c.len(), 7, "外加农历两条");
     }
 
     #[test]

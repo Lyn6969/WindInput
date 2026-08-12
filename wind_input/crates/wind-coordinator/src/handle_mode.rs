@@ -1277,7 +1277,18 @@ impl Coordinator {
                     continue; // 文本模式跳过表达式类来源
                 }
                 let dp = self.rt().config.schema.quick_input.decimal_places;
-                for t in wind_quick_input::generate(src, &state.mix_buffer, dp) {
+                // 表达式模板（`{amt(unit='圆')}`）走 cmdbar 求值；变量模板在 quick-input 内
+                // 本地展开。分发在 quick-input 里按条目形态做，这里只提供求值器。
+                let eval = |text: &str, values: &wind_quick_input::QuickValues| {
+                    crate::quick_eval::eval_expr(text, values)
+                };
+                for t in wind_quick_input::generate_with_eval(
+                    src,
+                    &state.mix_buffer,
+                    dp,
+                    &self.quick_formats,
+                    Some(&eval),
+                ) {
                     if !t.is_empty() && seen.insert(t.clone()) {
                         cands.push(Candidate {
                             text: t,

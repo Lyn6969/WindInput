@@ -1,0 +1,153 @@
+# WindInput 快捷输入格式表
+#
+# 自定义：把本文件拷贝到 %APPDATA%\WindInput\system.quick.toml 后修改，
+# 重启输入法服务生效。用户目录那份整份生效，请在完整副本上改。
+#
+# 字段
+#   id        标识，同 kind 内唯一
+#   kind      类型，取值 date / year_month / number / calc
+#   text      模板，变量见下表；$$ 表示字面 $，${变量} 可显式定界
+#   position  同类内的顺序，升序；省略则按本文件出现顺序
+#
+# 变量
+#   date        输入 12.25 或 2025.12.25
+#     $Y 2025    $YYYY 2025   $YY 25   $YC 二〇二五
+#     $M 3       $MM 03       $MC 三
+#     $D 5       $DD 05       $DC 五
+#     农历（仅 date 可用，以 2026.6.19 为例）
+#     $LMD 五月初五   $LM 五月   $LD 初五
+#     $LY 丙午        $LZ 马     $LF 端午节   $LYN 2026
+#     $LY/$LZ/$LYN 按农历年（正月初一为界），元旦前后与 $Y 可能差 1。
+#     日期超出 1900-2100 时农历条目不出现；$LF 只在节日当天有值，
+#     含 $LF 的条目平常日子不出现。
+#   year_month  输入 2025.12
+#     同 date，无 $D 系列，且不支持农历
+#   number      输入 123.45
+#     $N 123.45           $THOU 1,234,567    $DIG 一二三
+#     $CNL 一百二十三      $CNU 壹佰贰拾叁     $AMT 壹佰贰拾叁元肆角伍分
+#   calc        输入 1+2*3
+#     $EXPR 1+2*3         $RESULT 7
+#
+# 函数写法（变量表达不了时用；一条模板内不能与 $变量 混用）
+#   text = "{amt(unit='圆', zheng='false')}"   → 壹佰贰拾叁圆
+#   year(pad=4, cn='true')     month(...)  day(...)   同 $Y/$MM/$YC 系列
+#   raw()  cn(upper='true')  dig()
+#   thou(sep=' ', group=4)     amt(unit='元', zheng='true')
+#   lunar(part=...)  part 取 md(默认)/month/day/ganzhi/zodiac/year/festival/full
+#   expr()  result()
+#   不带参数时与对应的 $变量 完全相同；开关类参数要加引号（cn='true'）。
+#
+# 渲染结果为空的条目不出现在候选中。
+# 本文件只排同类内部的顺序；各类之间的先后由方案的 mix_modes.members 决定。
+
+# 日期
+[[formats]]
+id = 'date.cn'
+kind = 'date'
+text = '$Y年$M月$D日'
+position = 1
+
+[[formats]]
+id = 'date.cn_hans'
+kind = 'date'
+text = '$YC年$MC月$DC日'
+position = 2
+
+[[formats]]
+id = 'date.iso'
+kind = 'date'
+text = '$YYYY-$MM-$DD'
+position = 3
+
+[[formats]]
+id = 'date.basic'
+kind = 'date'
+text = '$YYYY$MM$DD'
+position = 4
+
+[[formats]]
+id = 'date.slash'
+kind = 'date'
+text = '$YYYY/$MM/$DD'
+position = 5
+
+[[formats]]
+id = 'date.lunar'
+kind = 'date'
+text = '农历$LMD'
+position = 6
+
+[[formats]]
+id = 'date.lunar_ganzhi'
+kind = 'date'
+text = '$LY年$LMD'
+position = 7
+
+# 年月
+[[formats]]
+id = 'year_month.cn'
+kind = 'year_month'
+text = '$Y年$M月'
+position = 1
+
+[[formats]]
+id = 'year_month.cn_hans'
+kind = 'year_month'
+text = '$YC年$MC月'
+position = 2
+
+[[formats]]
+id = 'year_month.iso'
+kind = 'year_month'
+text = '$YYYY-$MM'
+position = 3
+
+[[formats]]
+id = 'year_month.slash'
+kind = 'year_month'
+text = '$YYYY/$MM'
+position = 4
+
+# 数字
+[[formats]]
+id = 'number.amount'
+kind = 'number'
+text = '$AMT'
+position = 1
+
+[[formats]]
+id = 'number.cn_lower'
+kind = 'number'
+text = '$CNL'
+position = 2
+
+[[formats]]
+id = 'number.cn_upper'
+kind = 'number'
+text = '$CNU'
+position = 3
+
+[[formats]]
+id = 'number.digits'
+kind = 'number'
+text = '$DIG'
+position = 4
+
+[[formats]]
+id = 'number.thousands'
+kind = 'number'
+text = '$THOU'
+position = 5
+
+# 计算
+[[formats]]
+id = 'calc.result'
+kind = 'calc'
+text = '$RESULT'
+position = 1
+
+[[formats]]
+id = 'calc.equation'
+kind = 'calc'
+text = '$EXPR=$RESULT'
+position = 2

@@ -637,59 +637,10 @@ impl wind_cmdbar::EvalContext for NavCtx<'_> {
 /// 展开模板字符串；遇到不支持的变量返回 None（该短语项被跳过）。
 /// 支持 `$name`、`${name}`，`$$` 转义为字面 `$`。
 pub fn expand_template(text: &str, now: &DateTime<Local>) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < text.len() {
-        if bytes[i] == b'$' {
-            // $$ → 字面 $
-            if i + 1 < text.len() && bytes[i + 1] == b'$' {
-                out.push('$');
-                i += 2;
-                continue;
-            }
-            // ${name} 或 $name
-            let (name, next) = if i + 1 < text.len() && bytes[i + 1] == b'{' {
-                let rel = text[i + 2..].find('}')?;
-                let close = i + 2 + rel;
-                (&text[i + 2..close], close + 1)
-            } else {
-                let start = i + 1;
-                let mut j = start;
-                while j < text.len() && bytes[j].is_ascii_alphabetic() {
-                    j += 1;
-                }
-                if j == start {
-                    // 孤立的 $，原样输出
-                    out.push('$');
-                    i += 1;
-                    continue;
-                }
-                (&text[start..j], j)
-            };
-            let val = expand_var(name, now)?;
-            out.push_str(&val);
-            i = next;
-        } else {
-            // 拷贝一个 UTF-8 字符
-            let len = utf8_len(bytes[i]);
-            out.push_str(&text[i..i + len]);
-            i += len;
-        }
-    }
-    Some(out)
-}
-
-fn utf8_len(lead: u8) -> usize {
-    if lead < 0x80 {
-        1
-    } else if lead < 0xE0 {
-        2
-    } else if lead < 0xF0 {
-        3
-    } else {
-        4
-    }
+    // 解析规则（`$name` / `${name}` / `$$`）与快捷输入格式表共用同一份实现
+    // （`wind_quick_input::template`）：同一套变量写法若由两份解析器各自实现，
+    // 用户就得在两个配置文件里分别试探边界。本模块只提供取值（[`expand_var`]，绑当前时间）。
+    wind_quick_input::template::expand(text, |name| expand_var(name, now))
 }
 
 const WEEKDAY_CN: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
@@ -711,6 +662,16 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
         "YC" => wind_quick_input::year_to_chinese(now.year()),
         "MC" => wind_quick_input::small_int_to_chinese(now.month()),
         "DC" => wind_quick_input::small_int_to_chinese(now.day()),
+        // 农历（`$LMD` `$LY` `$LZ` `$LM` `$LD` `$LF`）：与快捷输入的日期候选共用
+        // 同一份换算，差别只在数据源——这里绑当前时间，那边绑用户打进去的日期。
+        //
+        // 取不到值时返回 None（整条短语被跳过），有两种情形：系统日期超出 1900–2100，
+        // 以及 `$LF` 在非节日当天——后者是刻意的，好让「今天是$LF」这类短语
+        // 只在节日当天出现，平常日子整条消失而不是产出半截文本。
+        n if wind_quick_input::lunar::is_var(n) => {
+            let d = wind_quick_input::lunar::solar_to_lunar(now.year(), now.month(), now.day())?;
+            wind_quick_input::lunar::var(n, &d)?
+        }
         "ts" => now.timestamp().to_string(),
         "tsms" => now.timestamp_millis().to_string(),
         // 随机 UUID：与命令栏 `{uuid()}` 共用同一份生成逻辑（同 dir_var 的理由——
@@ -774,6 +735,35 @@ mod tests {
             expand_template("${YC}年${MC}月${DC}日", &now).unwrap(),
             "二〇二六年六月十四日"
         );
+    }
+
+    /// 农历变量在短语里可用，取值与快捷输入同源。
+    #[test]
+    fn test_expand_lunar() {
+        let now = fixed(); // 2026-06-14 → 丙午年四月廿九，非节日
+        assert_eq!(expand_template("农历$LMD", &now).unwrap(), "农历四月廿九");
+        assert_eq!(
+            expand_template("$LY年$LMD", &now).unwrap(),
+            "丙午年四月廿九"
+        );
+        assert_eq!(expand_template("${LM}", &now).unwrap(), "四月");
+        assert_eq!(expand_template("${LD}", &now).unwrap(), "廿九");
+        assert_eq!(expand_template("$LZ年", &now).unwrap(), "马年");
+    }
+
+    /// ★ `$LF` 只在节日当天有值；平常日子整条短语被跳过，
+    /// 而不是产出「今天是」这种半截文本。
+    #[test]
+    fn test_expand_lunar_festival_is_conditional() {
+        let plain = fixed(); // 2026-06-14 不是节日
+        assert!(expand_template("今天是$LF", &plain).is_none());
+
+        let duanwu = Local.with_ymd_and_hms(2026, 6, 19, 9, 0, 0).unwrap();
+        assert_eq!(
+            expand_template("今天是$LF", &duanwu).unwrap(),
+            "今天是端午节"
+        );
+        assert_eq!(expand_template("$LMD", &duanwu).unwrap(), "五月初五");
     }
 
     #[test]

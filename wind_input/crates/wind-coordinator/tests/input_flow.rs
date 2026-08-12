@@ -2467,6 +2467,30 @@ fn quick_input_free_always_allows_trigger_key_as_literal() {
     );
 }
 
+/// 格式表必须随 `data/` 部署，且部署的就是出厂表。
+///
+/// 缺文件时 `FormatTable::load` 会**静默回落内置默认表**——候选照常、日志只有一条 warn，
+/// 但用户拿不到那份可拷贝的样板文件，「自定义」这个特性等于不存在。打包漏文件是这类
+/// 数据文件的典型故障（`data/` 是整目录复制，新增文件本不该漏，但没有测试就没人知道）。
+#[test]
+fn test_quick_format_table_is_deployed() {
+    if !has_schemas() {
+        return;
+    }
+    let p = data_dir().join("system.quick.toml");
+    assert!(
+        p.is_file(),
+        "system.quick.toml 未随 data/ 部署到 {}",
+        p.display()
+    );
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert_eq!(
+        wind_quick_input::FormatTable::parse(&text).unwrap(),
+        wind_quick_input::FormatTable::builtin(),
+        "部署出去的格式表与内置默认表不一致"
+    );
+}
+
 #[test]
 fn test_quick_input_date_space_commits() {
     if !has_schemas() {
@@ -2494,15 +2518,24 @@ fn test_quick_input_date_space_commits() {
     );
     // 中文日期是首选（中文输入法场景下最常用），全汉字写法次之，且不产出补零的中文写法
     assert_eq!(texts[0], "2025年12月25日", "实际: {:?}", texts);
+    // 判据含「日」字以排除农历那两条（农历日名是「初六」「廿九」，不带「日」）——
+    // 农历候选也含「年」，只按「年」过滤会把两类混在一起数。
     let cn: Vec<&str> = texts
         .iter()
-        .filter(|t| t.contains('年'))
+        .filter(|t| t.contains('年') && t.contains('日'))
         .map(|s| s.as_str())
         .collect();
     assert_eq!(
         cn,
         vec!["2025年12月25日", "二〇二五年十二月二十五日"],
-        "中文日期恰两条：阿拉伯数字式与全汉字式，均不补零（补零写法不合 GB/T 15835），实际: {:?}",
+        "公历中文日期恰两条：阿拉伯数字式与全汉字式，均不补零（补零写法不合 GB/T 15835），实际: {:?}",
+        texts
+    );
+    // 农历两条追加在公历之后，不得挤占首选
+    assert_eq!(
+        &texts[5..7],
+        ["农历冬月初六", "乙巳年冬月初六"],
+        "农历两条应排在公历五条之后，实际: {:?}",
         texts
     );
     // 空格上屏高亮（首选）
