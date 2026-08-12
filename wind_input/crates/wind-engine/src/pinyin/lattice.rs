@@ -391,7 +391,7 @@ impl LatticeBuilder {
                         continue;
                     };
                     let syls = slice_syllables(code, &offsets);
-                    for (variant, fuzzy_count) in FuzzyMatcher::expand_syllables(&syls, fuzzy) {
+                    for (variant, fuzzy_edits) in FuzzyMatcher::expand_syllables(&syls, fuzzy) {
                         // 全原音节组合 == 原码，属精确命中，已由上面的 search_with_boundary
                         // 循环加入（且带真值边界校验），不可在此重复添加为模糊节点。
                         if variant == code {
@@ -405,7 +405,7 @@ impl LatticeBuilder {
                             // 模糊命中同样按图上那条标注路径计歧义罚：惩罚是**切分**的
                             // 属性（该路径是否踩在歧义接缝上），与词条来源无关。
                             let log_prob = score_node(text, *weight)
-                                - FUZZY_SYLLABLE_LOG_PENALTY * fuzzy_count as f64
+                                - FUZZY_SYLLABLE_LOG_PENALTY * fuzzy_edits as f64
                                 - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
                             nodes[q].push(LatticeNode {
                                 start: p,

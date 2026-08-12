@@ -172,14 +172,18 @@ fn sentence_weight(log_prob: f64, word_count: usize) -> i32 {
 /// 这正是 step 6.5 的模糊降级拆不掉的根因。
 const FUZZY_WEIGHT_SCALE: f64 = 0.5;
 
-/// 对模糊命中施加权重折扣：`weight × 0.5^fuzzy_syllables`，见 [`FUZZY_WEIGHT_SCALE`]。
+/// 对模糊命中施加权重折扣：`weight × 0.5^fuzzy_edits`，见 [`FUZZY_WEIGHT_SCALE`]。
+///
+/// `fuzzy_edits` 是**模糊改动处数**而非音节数：一个音节可以声母、韵母同时模糊
+/// （`sen`→`sheng`），它比只错一处的 `sen`→`shen` 更不可信，该多罚一档。
+/// 参考实现同样按「每个模糊拼写」逐个累加，而非按音节。
 ///
 /// 饱和到 `>= 1`：折扣不该把候选压成 0/负权重而改变它与「无权重」候选的关系。
-fn fuzzy_penalized(weight: i32, fuzzy_syllables: usize) -> i32 {
-    if weight <= 1 || fuzzy_syllables == 0 {
+fn fuzzy_penalized(weight: i32, fuzzy_edits: usize) -> i32 {
+    if weight <= 1 || fuzzy_edits == 0 {
         return weight;
     }
-    let scale = FUZZY_WEIGHT_SCALE.powi(fuzzy_syllables as i32);
+    let scale = FUZZY_WEIGHT_SCALE.powi(fuzzy_edits as i32);
     ((weight as f64) * scale).round().max(1.0) as i32
 }
 
@@ -1212,13 +1216,16 @@ impl PinyinEngine {
             } else {
                 code
             };
-            for variant in fuzzy::FuzzyMatcher::fuzzy_variants(syllable, &self.fuzzy_config) {
+            for (variant, edits) in
+                fuzzy::FuzzyMatcher::fuzzy_variants_scored(syllable, &self.fuzzy_config)
+            {
                 for (text, weight, order) in self.dict.search(&variant) {
                     if seen.insert(text.clone()) {
                         results.push(LookupHit {
                             text,
-                            // 单音节路径恒 1 个模糊音节。
-                            weight: fuzzy_penalized(weight, 1),
+                            // 单音节也可能声母、韵母同时模糊（`sen`→`sheng` 计 2 处），
+                            // 故按变体自带的改动处数罚，不再恒当 1 处。
+                            weight: fuzzy_penalized(weight, edits),
                             order,
                             is_fuzzy: true,
                             boundary: 0,
