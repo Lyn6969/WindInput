@@ -76,6 +76,12 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 复制剪贴板 → 上行 `shot.result` 回报 → 协调器据此弹 Toast。**文件名与文案留在服务端**，
 与 Windows 侧 `manager.rs` 的对应分支逐字一致，两平台同一操作不该有不同措辞。
 
+「截图所有窗口」（高级菜单）同理：候选窗在服务进程就地截，其余三个（状态气泡 /
+悬停提示 / Toast）经同一请求交给 `.app`。**右键菜单不截**——Windows 上它是我们自绘的
+窗口（`popup_menu.rs`），macOS 上却是原生 NSMenu，截它同样只能走屏幕录制授权那条路。
+两侧的成功数由 `already` 字段（服务端放进请求、`.app` 原样带回）相加，合成**一条**
+Toast；分开弹会在四个浮窗都可见时连弹四条。
+
 两个实现细节：
 
 - **不用 `CGWindowListCreateImage`**：那条路自 macOS 14 起要「屏幕录制」授权，而本输入法
@@ -166,10 +172,11 @@ vk_to_cgkeycode`（与按键注入同源，禁止另起一张表）。该表已�
 
 （此处曾记有「`CMD_CANDIDATE_SCROLL` 滚轮翻页 macOS 用不了」——那是 0x0211 码位被
 `CMD_FRONT_CONTEXT` 同方向复用所致，该复用已消除，`FRONT_CONTEXT` 迁到 0x0215。
-但**滚轮翻页本身两个平台都还没实现**：`MessageHandler::handle_candidate_scroll` 是个
-带文档的空实现（“默认不做任何动作，统一接入点便于后续按配置实现”），协调器没有覆写。
-Windows 的 host-render DLL 会发这个帧，服务端收下后什么也不做。要做是**跨平台功能**，
-不是 macOS 补齐——且默认行为需要一个配置项，见该 handler 的注释。）
+滚轮**现已实现**，且是跨平台的一份实现：`Coordinator::handle_candidate_scroll` 把它
+解释成「上下键调整高亮项」，到页边界翻到相邻页。此前它是 trait 上的空实现，Windows 的
+host-render DLL 一直在发这个帧、服务端收下什么也不做——两个平台都无效。
+`.app` 侧在 `CandidateContentView.scrollWheel` 采集，触控板须攒够一格再发：
+`hasPreciseScrollingDeltas` 的一次轻扫会来几十个极小 delta，逐个上报会让高亮飞过整页。）
 
 ## 安装与 TIS 注册
 

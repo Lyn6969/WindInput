@@ -301,42 +301,52 @@ impl Forwarder {
                 // 只入队 + 唤醒主线程；真正的 Carbon 注册在主线程做（见该模块头「线程约定」）。
                 crate::global_hotkey_macos::apply(entries, self.ev_tx.clone());
             }
+            // 「截图所有窗口」：截**我们自己渲染的**每一个可见浮窗。
+            //
+            // 候选窗的像素在本进程（光栅化后经 SHM 推下去），就地截；状态气泡 / 悬停提示 /
+            // Toast 是 `.app` 侧的 NSPanel，转成一次下行请求由那边截。
+            //
+            // **右键菜单不截**：Windows 上它是我们自绘的窗口（`popup_menu.rs`），macOS 上却是
+            // 原生 NSMenu——要截它只能走 `CGWindowListCreateImage`，那需要「屏幕录制」授权
+            // （见 `PanelCapture` 的说明）。为一张菜单截图换一项更敏感的授权不划算，跳过。
             UiCommand::TakeScreenshot { dir } => {
                 let dir = std::path::PathBuf::from(&dir);
-                let (msg, kind) = match self.capture_candidate() {
-                    Some((buf, w, h)) => {
-                        let path =
-                            dir.join(format!("candidate_{}.png", crate::screenshot::timestamp()));
-                        match crate::screenshot::save_bgra_to_png(&buf, w, h, &path) {
-                            Ok(()) => {
-                                tracing::info!("Screenshot saved: {:?}", path);
-                                // 存盘同时进剪贴板（对齐 Windows）：截完直接能粘贴，省去翻目录。
-                                // 剪贴板失败不影响"已存盘"这个既成事实，只在文案里说明。
-                                match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
-                                    Ok(()) => (
-                                        "候选窗口已截图（已存盘并复制）".to_string(),
-                                        ToastKind::Success,
-                                    ),
-                                    Err(e) => {
-                                        tracing::warn!("截图进剪贴板失败: {e}");
-                                        (
-                                            "候选窗口已截图（存盘成功，剪贴板失败）".to_string(),
-                                            ToastKind::Info,
-                                        )
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("截图存盘失败: {e}");
-                                (format!("截图失败：{e}"), ToastKind::Error)
+                let ts = crate::screenshot::timestamp();
+                // 本进程能截的那部分先做完，结果随请求一起带下去，由 `.app` 原样回传，
+                // 好让协调器把两边的数量合成**一条** Toast（而不是各弹各的）。
+                let (mut saved, mut clipboard) = (0usize, false);
+                if let Some((buf, w, h)) = self.capture_candidate() {
+                    let path = dir.join(format!("candidate_{ts}.png"));
+                    match crate::screenshot::save_bgra_to_png(&buf, w, h, &path) {
+                        Ok(()) => {
+                            tracing::info!("Screenshot saved: {:?}", path);
+                            saved += 1;
+                            // 存盘同时进剪贴板（对齐 Windows）：截完直接能粘贴，省去翻目录。
+                            // 剪贴板失败不影响"已存盘"这个既成事实，只在文案里说明。
+                            match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
+                                Ok(()) => clipboard = true,
+                                Err(e) => tracing::warn!("截图进剪贴板失败: {e}"),
                             }
                         }
+                        Err(e) => tracing::warn!("截图存盘失败: {e}"),
                     }
-                    // 状态气泡 / 悬停提示在 .app 侧原生渲染，像素不在本进程，故本命令
-                    // 在 macOS 上只覆盖候选窗——与 Windows 的"有什么截什么"不同。
-                    None => ("候选窗口未显示，无法截图".to_string(), ToastKind::Info),
-                };
-                self.push_result_toast(&msg, kind);
+                }
+                let items: Vec<serde_json::Value> = ["status_tip", "tooltip", "toast"]
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "target": t,
+                            "path": dir.join(format!("{t}_{ts}.png")).to_string_lossy(),
+                        })
+                    })
+                    .collect();
+                self.send_shot_request(serde_json::json!({
+                    "mode": "all",
+                    "dir": dir.to_string_lossy(),
+                    "already": saved,
+                    "already_clipboard": clipboard,
+                    "items": items,
+                }));
             }
             UiCommand::ScreenshotCandidateToClipboard => {
                 let (msg, kind) = match self.capture_candidate() {
@@ -450,7 +460,15 @@ impl Forwarder {
     /// 结果经上行 `shot.result` 回来由协调器弹 Toast（见 `Coordinator::handle_ext`）。
     fn request_panel_shot(&self, target: &str, dir: &std::path::Path) {
         let path = dir.join(format!("{target}_{}.png", crate::screenshot::timestamp()));
-        let body = serde_json::json!({ "target": target, "path": path.to_string_lossy() });
+        self.send_shot_request(serde_json::json!({
+            "mode": "single",
+            "items": [{ "target": target, "path": path.to_string_lossy() }],
+        }));
+    }
+
+    /// 下发截图请求。`.app` 只负责截 `items` 里的每一项，其余字段**原样回传**——
+    /// 文案所需的上下文（数量、目录、候选是否已进剪贴板）因此不必在任何一边留状态。
+    fn send_shot_request(&self, body: serde_json::Value) {
         self.sink.push_frame(&encode_ext(
             ext_kind::SHOT_PANEL,
             body.to_string().as_bytes(),
@@ -815,21 +833,42 @@ mod tests {
             .collect()
     }
 
+    /// 取最后一个扩展信封的 (kind, body-json)。
+    fn last_ext(cap: &Arc<Mutex<Vec<Vec<u8>>>>) -> Option<(String, serde_json::Value)> {
+        let v = cap.lock().unwrap();
+        let f = v.iter().rev().find(|f| cmd_of(f) == CMD_EXT)?;
+        let (kind, body) = decode_ext(&f[8..])?;
+        Some((kind.to_string(), serde_json::from_slice(body).ok()?))
+    }
+
+    /// 候选窗没显示时不能悄悄存一张空图，也不能就地弹 Toast——文案要等 `.app` 那三个
+    /// 浮窗的结果一起算（`already: 0` 随请求带下去）。
     #[test]
-    fn screenshot_without_visible_candidates_reports_instead_of_saving() {
-        // 候选窗没显示时必须如实说"没显示"，不能悄悄存一张空图。
+    fn screenshot_without_visible_candidates_saves_nothing_and_asks_app() {
         let cap = Arc::new(Mutex::new(Vec::new()));
         let (mut f, _ev) = mk(cap.clone(), "_t_shot0");
         let dir = std::env::temp_dir().join("windinput_test_shots_none");
         f.handle(UiCommand::TakeScreenshot {
             dir: dir.display().to_string(),
         });
-        let texts = toast_texts(&cap.lock().unwrap());
-        assert!(
-            texts.iter().any(|t| t.contains("未显示")),
-            "应提示未显示，实际 {texts:?}"
-        );
+
         assert!(!dir.exists(), "不该建目录/落文件");
+        assert!(
+            toast_texts(&cap.lock().unwrap()).is_empty(),
+            "不该就地弹 Toast：数量要与 .app 侧合并后只弹一条"
+        );
+        let (kind, body) = last_ext(&cap).expect("应下发截图请求");
+        assert_eq!(kind, ext_kind::SHOT_PANEL);
+        assert_eq!(body["mode"], "all");
+        assert_eq!(body["already"], 0, "候选窗没截到");
+        // 三个 `.app` 侧浮窗都要问；右键菜单**不在其列**（原生 NSMenu，截它要屏幕录制授权）。
+        let targets: Vec<&str> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["target"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets, ["status_tip", "tooltip", "toast"]);
     }
 
     #[test]

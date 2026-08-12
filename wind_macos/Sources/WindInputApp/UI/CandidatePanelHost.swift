@@ -65,6 +65,9 @@ public final class CandidatePanelHost {
         panel.onContextAction = { [weak self] index, action in
             self?.sendFrame(BinaryCodec.encodeCandidateContextMenuFrame(index: index, action: action))
         }
+        panel.onScroll = { [weak self] delta in
+            self?.sendFrame(BinaryCodec.encodeCandidateScrollFrame(delta: delta))
+        }
         panel.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posCandidate, x, y) }
         statusBubble.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posStatusTip, x, y) }
         panel.unifiedMenuProvider = { [weak self] in self?.requestUnifiedMenu() }
@@ -96,27 +99,43 @@ public final class CandidatePanelHost {
 
     /// 截自家浮窗存盘 + 复制剪贴板, 结果回上行。主线程调用 (要渲染视图层级)。
     ///
-    /// 未知 target **不静默丢弃**: 回一条失败, 免得服务端那边永远等不到答复而毫无线索。
-    private func capturePanel(_ target: String, to path: String) {
-        let panel: NSPanel? = switch target {
-        case "status_tip": statusBubble
-        case "tooltip": tooltip
-        default: nil
-        }
-        var body: [String: Any] = ["target": target, "path": path]
-        if let panel = panel {
-            do {
-                body["clipboard"] = try PanelCapture.snapshot(panel, toPath: path)
-                body["ok"] = true
-            } catch {
-                body["ok"] = false
-                body["reason"] = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+    /// `echo` 里除 `items` 外的字段**原样回传**: 文案所需的上下文 (模式、数量、目录、
+    /// 候选是否已进剪贴板) 由服务端放进来又拿回去, 两边都不必为一次往返留状态。
+    ///
+    /// 未知 target **不静默丢弃**: 回一条失败, 免得服务端那边少一条结果却不知为何。
+    ///
+    /// **右键菜单不在可截之列**: macOS 上那是原生 NSMenu, 截它要走
+    /// `CGWindowListCreateImage` + 屏幕录制授权 (见 `PanelCapture`)。只截我们自己画的。
+    private func capturePanels(_ items: [[String: Any]], echo: [String: Any]) {
+        var results: [[String: Any]] = []
+        for item in items {
+            guard let target = item["target"] as? String,
+                  let path = item["path"] as? String else { continue }
+            var r: [String: Any] = ["target": target, "path": path]
+            let panel: NSPanel? = switch target {
+            case "status_tip": statusBubble
+            case "tooltip": tooltip
+            case "toast": toast
+            default: nil
             }
-        } else {
-            body["ok"] = false
-            body["reason"] = "unknown_target"
+            if let panel = panel {
+                do {
+                    r["clipboard"] = try PanelCapture.snapshot(panel, toPath: path)
+                    r["ok"] = true
+                } catch {
+                    r["ok"] = false
+                    r["reason"] = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                }
+            } else {
+                r["ok"] = false
+                r["reason"] = "unknown_target"
+            }
+            results.append(r)
         }
+        var body = echo
+        body.removeValue(forKey: "items")
+        body["results"] = results
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         sendFrame(BinaryCodec.encodeExtFrame(kind: ExtKind.shotResult, body: data))
     }
@@ -338,12 +357,11 @@ public final class CandidatePanelHost {
                 // 服务端请我们截自家的浮窗（像素不在它那边）。存盘 + 复制剪贴板都在这里做，
                 // 文件名是它给的；结果回上行, 由它统一弹 Toast——两平台文案因此保持一致。
                 guard let o = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
-                      let target = o["target"] as? String,
-                      let path = o["path"] as? String else {
+                      let items = o["items"] as? [[String: Any]] else {
                     NSLog("WindInput[ext] shot.panel 载荷无法解析")
                     break
                 }
-                DispatchQueue.main.async { [weak self] in self?.capturePanel(target, to: path) }
+                DispatchQueue.main.async { [weak self] in self?.capturePanels(items, echo: o) }
             case ExtKind.posCandidateQuery, ExtKind.posStatusTipQuery:
                 // 服务端问「你现在在哪」(用户点了菜单里的「固定位置」)。浮窗不可见时**不答**:
                 // 那种情况下没有"当前位置"可言, 沉默让服务端保留旧值, 好过报一个上次残留的

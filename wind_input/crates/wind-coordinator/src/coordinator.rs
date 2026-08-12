@@ -5635,6 +5635,57 @@ fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
     Some((i32::try_from(x).ok()?, i32::try_from(y).ok()?))
 }
 
+/// `shot.result` → Toast 文案。
+///
+/// 抽成纯函数是为了可测：这里全是措辞分支，而措辞正是**必须与 Windows 侧
+/// `manager.rs` 逐字一致**的东西——两平台同一操作得到不同说法是最没必要的分叉，
+/// 而这种分叉不会有任何编译或运行期信号。
+fn shot_result_message(v: &serde_json::Value) -> (String, ToastKind) {
+    let results = v.get("results").and_then(|r| r.as_array());
+    let ok = |r: &serde_json::Value| r.get("ok").and_then(|b| b.as_bool()) == Some(true);
+    if v.get("mode").and_then(|m| m.as_str()) == Some("all") {
+        // 「截图所有窗口」：本进程截的候选窗数量由请求原样带回，与 `.app` 这边的成功数
+        // 相加，合成**一条** Toast（各弹各的会连弹三四条）。
+        let n = v.get("already").and_then(|n| n.as_u64()).unwrap_or(0) as usize
+            + results.map_or(0, |a| a.iter().filter(|r| ok(r)).count());
+        let dir = v.get("dir").and_then(|d| d.as_str()).unwrap_or("");
+        if n == 0 {
+            return ("没有可见窗口可截图".to_string(), ToastKind::Info);
+        }
+        return if v.get("already_clipboard").and_then(|b| b.as_bool()) == Some(true) {
+            (
+                format!("已保存 {n} 张截图（候选已复制到剪贴板）\n{dir}"),
+                ToastKind::Success,
+            )
+        } else {
+            (format!("已保存 {n} 张截图\n{dir}"), ToastKind::Success)
+        };
+    }
+    // 单窗截图（气泡/提示自身右键菜单里的「截图此窗口」）。
+    let Some(r) = results.and_then(|a| a.first()) else {
+        return ("截图失败：无结果".to_string(), ToastKind::Error);
+    };
+    let label = match r.get("target").and_then(|t| t.as_str()) {
+        Some("tooltip") => "悬停提示",
+        _ => "状态提示气泡",
+    };
+    if ok(r) {
+        let path = r.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let suffix = if r.get("clipboard").and_then(|b| b.as_bool()) == Some(true) {
+            "（已复制到剪贴板）"
+        } else {
+            ""
+        };
+        (format!("{label}已截图{suffix}\n{path}"), ToastKind::Success)
+    } else {
+        match r.get("reason").and_then(|x| x.as_str()) {
+            // 不可见不是错误：用户在气泡消失之后才点的菜单，如实告知即可。
+            Some("not_visible") | None => (format!("{label}未显示，无法截图"), ToastKind::Info),
+            Some(e) => (format!("截图失败：{e}"), ToastKind::Error),
+        }
+    }
+}
+
 impl MessageHandler for Coordinator {
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
         info!("Menu command: {}", command);
@@ -5734,6 +5785,48 @@ impl MessageHandler for Coordinator {
         }
     }
 
+    /// host 候选框的鼠标滚轮。
+    ///
+    /// 语义 = **上下方向键调整高亮项**（`move_up`/`move_down`），到页边界自然翻到相邻页，
+    /// 不是整页翻动。这是 Windows 上既有的行为，两平台共用本实现。
+    ///
+    /// 此前是 trait 上的空实现（"统一接入点便于后续按配置实现"），于是 Windows 的
+    /// host-render DLL 一直在发这个帧、服务端收下什么也不做——滚轮在**两个平台**都无效。
+    /// 不加配置项：滚动候选框就是要动高亮，没有第二种合理解释。
+    ///
+    /// `delta` 是 `WHEEL_DELTA`(120) 的倍数、正=上滚（Win32 约定，macOS 侧按同一约定折算）。
+    /// 一次事件可能跨多格（高速滚轮/触控板惯性），故按格数循环。上限 `MAX_NOTCHES` 防
+    /// 惯性滚动一次跳过几十项——那既不是用户意图，也会让候选窗疯狂重绘。
+    fn handle_candidate_scroll(&self, delta: i32) {
+        const WHEEL_DELTA: i32 = 120;
+        const MAX_NOTCHES: i32 = 5;
+        if delta == 0 {
+            return;
+        }
+        // 不足一格也算一格：触控板的单次轻扫 delta 可能小于 120，直接整除会得 0（滚不动）。
+        let notches = (delta.abs() / WHEEL_DELTA).max(1).min(MAX_NOTCHES);
+        let up = delta > 0;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for _ in 0..notches {
+            let moved = if up {
+                self.move_up(&mut state)
+            } else {
+                self.move_down(&mut state)
+            };
+            if !moved {
+                break; // 已到首/末项，继续滚也没有更多可动
+            }
+            changed = true;
+        }
+        if changed {
+            self.notify_ui_update(&state);
+        }
+    }
+
     /// 鼠标 hover 候选/翻页器：复用进程内路径的 `mouse_hover`（置 hover_index + 重绘高亮帧）。
     /// 两端线约定不同（按编译平台分支，事件源平台互斥）：
     /// - macOS `.app`：候选 ≥0；翻页器 -1(上页)/-2(下页)；无悬停 i32::MIN 哨兵。
@@ -5775,44 +5868,14 @@ impl MessageHandler for Coordinator {
                     self.save_status_tip_pos(x, y);
                 }
             }
-            // 原生浮窗截图的结果（`.app` 动手，服务端只管文案）。文案与 Windows 侧
-            // `manager.rs` 的 ScreenshotStatusTip 分支逐字一致——两平台同一操作
-            // 得到不同措辞是最没必要的分叉。
-            ext_kind::SHOT_RESULT => {
-                let v: serde_json::Value = match serde_json::from_slice(body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("shot.result 载荷无法解析：{e}");
-                        return;
-                    }
-                };
-                let label = match v.get("target").and_then(|t| t.as_str()) {
-                    Some("tooltip") => "悬停提示",
-                    _ => "状态提示气泡",
-                };
-                let (msg, kind) = if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                    let suffix = if v
-                        .get("clipboard")
-                        .and_then(|b| b.as_bool())
-                        .unwrap_or(false)
-                    {
-                        "（已复制到剪贴板）"
-                    } else {
-                        ""
-                    };
-                    (format!("{label}已截图{suffix}\n{path}"), ToastKind::Success)
-                } else {
-                    match v.get("reason").and_then(|r| r.as_str()) {
-                        // 不可见不是错误：用户在气泡消失之后才点的菜单，如实告知即可。
-                        Some("not_visible") | None => {
-                            (format!("{label}未显示，无法截图"), ToastKind::Info)
-                        }
-                        Some(e) => (format!("截图失败：{e}"), ToastKind::Error),
-                    }
-                };
-                self.show_toast(&msg, ToastPosition::BottomRight, kind);
-            }
+            // 原生浮窗截图的结果（`.app` 动手，服务端只管文案）。
+            ext_kind::SHOT_RESULT => match serde_json::from_slice(body) {
+                Ok(v) => {
+                    let (msg, kind) = shot_result_message(&v);
+                    self.show_toast(&msg, ToastPosition::BottomRight, kind);
+                }
+                Err(e) => tracing::warn!("shot.result 载荷无法解析：{e}"),
+            },
             _ => tracing::debug!("未处理的扩展消息 kind={kind}"),
         }
     }
@@ -10721,8 +10784,12 @@ mod input_diag_tests {
 
 #[cfg(test)]
 mod ext_envelope_tests {
-    //! 扩展信封 `pos.*` 落点 body 的解析。
+    //! 扩展信封 `pos.*` / `shot.*` 的 body 解析与文案，以及滚轮的高亮移动。
     use super::*;
+
+    fn coord() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
 
     #[test]
     fn decodes_well_formed_point() {
@@ -10735,6 +10802,158 @@ mod ext_envelope_tests {
             decode_ext_point(br#"{"x":1,"y":2,"screen":"builtin"}"#),
             Some((1, 2))
         );
+    }
+
+    /// 滚轮 = 上下键调整高亮项，到页边界翻到相邻页。
+    ///
+    /// 回归意义：`handle_candidate_scroll` 长期是 trait 上的空实现，Windows 的
+    /// host-render DLL 一直在发这个帧、服务端收下什么也不做——滚轮在两个平台都无效。
+    #[test]
+    fn scroll_moves_highlight_and_crosses_pages() {
+        use wind_candidate::Candidate;
+        let c = coord();
+        let per_page = {
+            let mut s = c.state.lock().unwrap();
+            s.candidates = (0..12)
+                .map(|i| Candidate {
+                    text: i.to_string(),
+                    ..Default::default()
+                })
+                .collect();
+            s.selected_index = 0;
+            s.current_page = 0;
+            drop(s);
+            c.per_page(None)
+        };
+        assert!(per_page >= 2 && per_page < 12, "本用例要求每页 2..12 项");
+
+        // 下滚一格 → 高亮下移一项（不是翻一页）
+        c.handle_candidate_scroll(-120);
+        assert_eq!(c.state.lock().unwrap().selected_index, 1);
+
+        // 一路滚到页尾再一格 → 跨到下一页首项
+        for _ in 0..(per_page - 1) {
+            c.handle_candidate_scroll(-120);
+        }
+        {
+            let s = c.state.lock().unwrap();
+            assert_eq!(s.current_page, 1, "页尾再下滚应翻到下一页");
+            assert_eq!(s.selected_index, 0, "跨页后高亮落在首项");
+        }
+
+        // 上滚回卷到上一页末项
+        c.handle_candidate_scroll(120);
+        {
+            let s = c.state.lock().unwrap();
+            assert_eq!(s.current_page, 0);
+            assert_eq!(s.selected_index, per_page - 1);
+        }
+    }
+
+    /// 触控板一次轻扫的 delta 可能不足一格（<120）——整除会得 0，滚轮就"滚不动"。
+    #[test]
+    fn scroll_with_sub_notch_delta_still_moves_one() {
+        use wind_candidate::Candidate;
+        let c = coord();
+        {
+            let mut s = c.state.lock().unwrap();
+            s.candidates = (0..5)
+                .map(|i| Candidate {
+                    text: i.to_string(),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        c.handle_candidate_scroll(-13);
+        assert_eq!(c.state.lock().unwrap().selected_index, 1);
+    }
+
+    /// 惯性滚动一次可能带来极大的 delta；不设上限会一口气跳过几十项并疯狂重绘。
+    #[test]
+    fn scroll_is_capped_per_event() {
+        use wind_candidate::Candidate;
+        let c = coord();
+        {
+            let mut s = c.state.lock().unwrap();
+            s.candidates = (0..200)
+                .map(|i| Candidate {
+                    text: i.to_string(),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        c.handle_candidate_scroll(-120 * 50);
+        let s = c.state.lock().unwrap();
+        let moved = s.current_page * c.per_page(None) + s.selected_index;
+        assert_eq!(moved, 5, "单次事件最多移动 MAX_NOTCHES 项");
+    }
+
+    /// 无候选时不得有任何动作（也不该 panic）。
+    #[test]
+    fn scroll_without_candidates_is_noop() {
+        let c = coord();
+        c.handle_candidate_scroll(-120);
+        assert_eq!(c.state.lock().unwrap().selected_index, 0);
+    }
+
+    /// 「截图所有窗口」：两侧数量相加，合成一条 Toast。
+    ///
+    /// 分开弹是最容易写出来的实现，也是最烦人的——候选窗 + 气泡 + 提示 + Toast 全可见时
+    /// 会连弹四条通知。`already` 由服务端放进请求、`.app` 原样带回，就是为了不为这一次
+    /// 往返在任何一边留状态。
+    #[test]
+    fn shot_all_sums_both_sides_into_one_message() {
+        let v = serde_json::json!({
+            "mode": "all",
+            "dir": "/tmp/shots",
+            "already": 1,                    // 候选窗（服务进程截的）
+            "already_clipboard": true,
+            "results": [
+                {"target": "status_tip", "ok": true},
+                {"target": "tooltip", "ok": false, "reason": "not_visible"},
+                {"target": "toast", "ok": true},
+            ],
+        });
+        let (msg, kind) = super::shot_result_message(&v);
+        assert_eq!(msg, "已保存 3 张截图（候选已复制到剪贴板）\n/tmp/shots");
+        assert!(matches!(kind, ToastKind::Success));
+    }
+
+    /// 一个都没截到不是错误：用户可能就是在没有任何浮窗时点的菜单。
+    #[test]
+    fn shot_all_with_nothing_visible_is_info() {
+        let v = serde_json::json!({
+            "mode": "all", "already": 0, "dir": "/tmp",
+            "results": [{"target": "status_tip", "ok": false, "reason": "not_visible"}],
+        });
+        let (msg, kind) = super::shot_result_message(&v);
+        assert_eq!(msg, "没有可见窗口可截图");
+        assert!(matches!(kind, ToastKind::Info));
+    }
+
+    /// 单窗截图的三种结局：成功带路径、不可见（Info 不是 Error）、真失败。
+    #[test]
+    fn shot_single_wording_by_outcome() {
+        let mk = |r: serde_json::Value| {
+            super::shot_result_message(&serde_json::json!({ "results": [r] }))
+        };
+        let (msg, kind) = mk(serde_json::json!({
+            "target": "tooltip", "ok": true, "clipboard": true, "path": "/tmp/t.png"
+        }));
+        assert_eq!(msg, "悬停提示已截图（已复制到剪贴板）\n/tmp/t.png");
+        assert!(matches!(kind, ToastKind::Success));
+
+        let (msg, kind) = mk(serde_json::json!({
+            "target": "status_tip", "ok": false, "reason": "not_visible"
+        }));
+        assert_eq!(msg, "状态提示气泡未显示，无法截图");
+        assert!(matches!(kind, ToastKind::Info), "不可见不该报成错误");
+
+        let (msg, kind) = mk(serde_json::json!({
+            "target": "status_tip", "ok": false, "reason": "render_failed"
+        }));
+        assert_eq!(msg, "截图失败：render_failed");
+        assert!(matches!(kind, ToastKind::Error));
     }
 
     /// 缺字段 / 非整数 / 越界 / 不是 JSON —— 一律 None。
