@@ -72,9 +72,14 @@ jobs:
               - 'wind_input/**'
               - 'scripts/mac/**'
 
-  # 轻量 macOS 编译校验: swift build + cargo check(darwin), 不打包 .app。
+  # macOS 门禁: Swift 与 Rust 双侧编译 + 单测, 不打包 .app(打包见 release.yml)。
+  #
+  # 为什么这里必须真跑测试和 clippy, 而不是像原来那样只 build/check:
+  # 上面的 check job 全程针对 x86_64-pc-windows-msvc, 一切 #[cfg(target_os = "macos")]
+  # 的代码对它都不存在 —— 而 macOS 侧的定位/截图/主题/热键都是大段 cfg 独有实现。
+  # 只 cargo check 也不够: check 不做单态化与代码生成, 测试更是完全不跑。
   macos-check:
-    name: macOS Build Check
+    name: macOS Build & Test
     needs: changes
     if: needs.changes.outputs.macos == 'true'
     runs-on: macos-14
@@ -82,6 +87,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -91,6 +98,14 @@ jobs:
         working-directory: wind_macos
         run: swift build
 
-      - name: Check wind_input (Rust core, darwin)
+      - name: Test wind_macos (Swift)
+        working-directory: wind_macos
+        run: swift test
+
+      - name: Clippy wind_input (darwin)
         working-directory: wind_input
-        run: cargo check --workspace
+        run: cargo clippy --workspace
+
+      - name: Test wind_input (Rust core, darwin)
+        working-directory: wind_input
+        run: cargo test --workspace
