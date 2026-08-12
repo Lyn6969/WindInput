@@ -78,6 +78,12 @@ pub struct SystemDictLayer {
     /// 用于**无权重的附加库**——与带权重主库合并、按权重排序时，让其条目落在设计者选定的权重档，
     /// 而非因 weight=0 全部沉底。None = 用词库自身权重。
     default_weight: Option<i32>,
+    /// 权重归一化（`[dictionaries.weight_spec]`）：Some 时把本库权重映射回约定值域
+    /// `0~WEIGHT_RANGE_MAX`，使其与短语权重同轴可比。None = 不归一化（守约词库的常态）。
+    ///
+    /// 与 `default_weight` 的分工：后者**抹平**整库权重（退化为文件顺序），前者**保序压缩**。
+    /// 两者同时配时 `default_weight` 优先——它是更强的声明（「本库不参与权重排序」）。
+    weight_norm: Option<crate::WeightNorm>,
 }
 
 impl SystemDictLayer {
@@ -94,6 +100,7 @@ impl SystemDictLayer {
             enabled: std::sync::atomic::AtomicBool::new(enabled),
             base_order: 0,
             default_weight: None,
+            weight_norm: None,
         }
     }
 
@@ -107,6 +114,29 @@ impl SystemDictLayer {
     pub fn with_default_weight(mut self, default_weight: Option<i32>) -> Self {
         self.default_weight = default_weight;
         self
+    }
+
+    /// 链式设置权重归一化（`[dictionaries.weight_spec]`）。见字段文档与
+    /// `docs/design/dict-weight-normalization.md`。
+    pub fn with_weight_norm(mut self, weight_norm: Option<crate::WeightNorm>) -> Self {
+        self.weight_norm = weight_norm;
+        self
+    }
+
+    /// 本层最终对外的权重：`default_weight` 覆盖 > `weight_norm` 归一化 > 词库原值。
+    ///
+    /// ⚠️ 在**查询时**换算而非加载时改写：词库可能是 mmap 共享的只读产物（wdat），改不得；
+    /// 且同一份词库可被多个方案以不同 `weight_spec` 引用。每次查询至多 `limit` 条、
+    /// 每条两次 `ln`，开销可忽略。
+    #[inline]
+    fn effective_weight(&self, raw: i32) -> i32 {
+        match self.default_weight {
+            Some(w) => w,
+            None => match &self.weight_norm {
+                Some(n) => n.apply(raw),
+                None => raw,
+            },
+        }
     }
 
     /// 系统层条目总数（日志/调试用）。
@@ -142,7 +172,6 @@ impl DictLayer for SystemDictLayer {
     }
 
     fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {
-        let dw = self.default_weight;
         // 用 search_with_boundary 而非 search：把词典的音节真值边界带进候选（wdat v4）。
         // 非拼音词库（五笔等）与旧格式的 boundary 恒 0，消费方据此降级，行为不变。
         let mut v: Vec<Candidate> = self
@@ -152,7 +181,7 @@ impl DictLayer for SystemDictLayer {
             .map(|hit| Candidate {
                 text: hit.text,
                 code: code.to_string(),
-                weight: dw.unwrap_or(hit.weight),
+                weight: self.effective_weight(hit.weight),
                 natural_order: hit.order,
                 boundary: hit.boundary,
                 source: CandidateSource::None,
@@ -167,7 +196,6 @@ impl DictLayer for SystemDictLayer {
     }
 
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
-        let dw = self.default_weight;
         let mut v: Vec<Candidate> = self
             .dict
             .search_prefix_with_boundary(prefix, limit)
@@ -175,7 +203,7 @@ impl DictLayer for SystemDictLayer {
             .map(|hit| Candidate {
                 text: hit.text,
                 code: hit.code,
-                weight: dw.unwrap_or(hit.weight),
+                weight: self.effective_weight(hit.weight),
                 natural_order: hit.order,
                 boundary: hit.boundary,
                 source: CandidateSource::None,

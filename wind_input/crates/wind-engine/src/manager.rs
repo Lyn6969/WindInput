@@ -132,6 +132,41 @@ struct MixPinyinOpts {
     abbrev: bool,
 }
 
+/// 一个待注册的码表词库层（[`EngineManager::load_codetable_layers`] 的产出）。
+///
+/// 此前是个 5 元组。加 `weight_norm` 后到 6 项，且末三项同为「权重相关的可选值」，
+/// 位置错配编译器不报——具名后消费点 `l.default_weight` / `l.weight_norm` 自证。
+struct CodetableLayer {
+    name: String,
+    dict: CachedDict,
+    enabled: bool,
+    /// `[[dictionaries]].base_order`：库间硬分档。
+    base_order: i32,
+    /// `[[dictionaries]].default_weight`：抹平整库权重。
+    default_weight: Option<i32>,
+    /// `[dictionaries.weight_spec]`：保序压缩回约定值域。见 [`weight_norm_of`]。
+    weight_norm: Option<wind_dict::WeightNorm>,
+}
+
+/// `[dictionaries.weight_spec]` → [`wind_dict::WeightNorm`]。
+///
+/// 未配置 → `None`（守约词库的常态，不做任何换算）。
+///
+/// ⚠️ **配了但参数不自洽时告警而非静默跳过**：那会让方案作者以为「配了就生效了」，
+/// 而实际什么也没发生——本仓「配置就位、消费点不可达」那一类静默失效的同款形态。
+fn weight_norm_of(spec: &DictSpec) -> Option<wind_dict::WeightNorm> {
+    let ws = spec.weight_spec.as_ref()?;
+    let norm = wind_dict::WeightNorm::from_parts(ws.median, ws.max, &ws.mode, ws.target);
+    if norm.is_none() {
+        warn!(
+            "词库 {} 的 [dictionaries.weight_spec] 参数不自洽（median={} max={} target={}），\
+             归一化未生效。要求 0 < median < max 且 0 < target < 10000。",
+            spec.path, ws.median, ws.max, ws.target
+        );
+    }
+    norm
+}
+
 /// overlay 方案注册表的一条（见 [`EngineManager::overlay_modes`]）。
 ///
 /// **实例身份 = 方案 id**。此前这是 `config.schema.special_modes` 的一个数组条目，
@@ -2563,11 +2598,12 @@ impl EngineManager {
                     schema_id,
                 )));
             }
-            for (name, dict, enabled, base_order, default_weight) in layers {
+            for l in layers {
                 dm.register_layer(Box::new(
-                    wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)
-                        .with_base_order(base_order)
-                        .with_default_weight(default_weight),
+                    wind_dict::SystemDictLayer::with_enabled(l.dict, l.name, l.enabled)
+                        .with_base_order(l.base_order)
+                        .with_default_weight(l.default_weight)
+                        .with_weight_norm(l.weight_norm),
                 ));
             }
             // 英文最大码长取词库最长词的安全上界（前缀匹配用，不触发顶码/自动上屏）。
@@ -2720,12 +2756,14 @@ impl EngineManager {
                 )));
             }
             // 主库优先注册（在 load_codetable_layers 中已置首），扩展库其后。
-            // base_order 决定等权/natural 排序的库间档位；default_weight 覆盖无权重库的权重档。
-            for (name, dict, enabled, base_order, default_weight) in layers {
+            // base_order 决定等权/natural 排序的库间档位；default_weight 覆盖无权重库的权重档；
+            // weight_norm 把偏离约定值域的权重压回 0~10000（见 dict-weight-normalization.md）。
+            for l in layers {
                 dm.register_layer(Box::new(
-                    wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)
-                        .with_base_order(base_order)
-                        .with_default_weight(default_weight),
+                    wind_dict::SystemDictLayer::with_enabled(l.dict, l.name, l.enabled)
+                        .with_base_order(l.base_order)
+                        .with_default_weight(l.default_weight)
+                        .with_weight_norm(l.weight_norm),
                 ));
             }
             // 码元字符集与上屏行为同源于 `eff`（全局基线 + 方案 [engine.codetable] 折叠），
@@ -2813,10 +2851,7 @@ impl EngineManager {
         sys
     }
 
-    fn load_codetable_layers(
-        schema: &Schema,
-        schemas_dir: &Path,
-    ) -> Vec<(String, CachedDict, bool, i32, Option<i32>)> {
+    fn load_codetable_layers(schema: &Schema, schemas_dir: &Path) -> Vec<CodetableLayer> {
         let resolve =
             |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
         let is_english =
@@ -2844,7 +2879,7 @@ impl EngineManager {
             }
         };
 
-        let mut out: Vec<(String, CachedDict, bool, i32, Option<i32>)> = Vec::new();
+        let mut out: Vec<CodetableLayer> = Vec::new();
         // 主库优先注册。加载失败 → 无系统层可用，放弃整方案（避免无候选）。
         match load_one(usable[main_idx]) {
             Some(d) => {
@@ -2853,13 +2888,14 @@ impl EngineManager {
                     usable[main_idx].path,
                     d.len()
                 );
-                out.push((
-                    "codetable-system".to_string(),
-                    d,
-                    true,
-                    usable[main_idx].base_order,
-                    usable[main_idx].default_weight,
-                ));
+                out.push(CodetableLayer {
+                    name: "codetable-system".to_string(),
+                    dict: d,
+                    enabled: true,
+                    base_order: usable[main_idx].base_order,
+                    default_weight: usable[main_idx].default_weight,
+                    weight_norm: weight_norm_of(usable[main_idx]),
+                });
             }
             None => return Vec::new(),
         }
@@ -2877,13 +2913,14 @@ impl EngineManager {
                     enabled,
                     d.len()
                 );
-                out.push((
-                    format!("codetable-extra-{}", e.id),
-                    d,
+                out.push(CodetableLayer {
+                    name: format!("codetable-extra-{}", e.id),
+                    dict: d,
                     enabled,
-                    e.base_order,
-                    e.default_weight,
-                ));
+                    base_order: e.base_order,
+                    default_weight: e.default_weight,
+                    weight_norm: weight_norm_of(e),
+                });
             }
         }
         out

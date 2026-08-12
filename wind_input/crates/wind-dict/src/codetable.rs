@@ -3,6 +3,7 @@
 //! 格式：YAML 头部 + TSV 正文（code\ttext\tweight）
 //! 与 Go 版 `wind_input/internal/dict/codetable/` 对齐。
 
+use crate::WEIGHT_RANGE_MAX;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -471,6 +472,12 @@ pub(crate) struct ParseStats {
     pub empty_field: usize,
     /// 权重列存在但解析失败（如 Rime 的 `50%` 相对权重，本项目未实现预设词库故无基准）。
     pub bad_weight: usize,
+    /// 带非零权重的条目数（值域诊断的分母）。
+    pub weighted: usize,
+    /// 权重**超出约定值域 `0~10000`** 的条目数。见 [`WEIGHT_RANGE_MAX`]。
+    pub over_range: usize,
+    /// 实测最大权重（诊断用；变换用的是方案声明值，见 `dict-weight-normalization.md` §4.3）。
+    pub max_weight: i32,
 }
 
 impl ParseStats {
@@ -478,6 +485,9 @@ impl ParseStats {
         self.short += o.short;
         self.empty_field += o.empty_field;
         self.bad_weight += o.bad_weight;
+        self.weighted += o.weighted;
+        self.over_range += o.over_range;
+        self.max_weight = self.max_weight.max(o.max_weight);
     }
 
     fn is_clean(&self) -> bool {
@@ -486,6 +496,7 @@ impl ParseStats {
 
     /// 有异常才出日志——干净的词库不该刷屏。
     fn log_if_dirty(&self, path: &Path) {
+        self.log_weight_range(path);
         if self.is_clean() {
             return;
         }
@@ -495,6 +506,33 @@ impl ParseStats {
             self.short,
             self.empty_field,
             self.bad_weight
+        );
+    }
+
+    /// **权重值域诊断**：约定是 `0~10000`（与短语权重同轴，见
+    /// `docs/design/dict-weight-normalization.md`），但这条约定此前只写在注释里、
+    /// 没有任何环节在执行。超范围的词库会让「短语 vs 码表」的权重比较失真——
+    /// 短语上限 10000，对手若是 1e7 量级的原始语料词频，用户把短语权重拉满也压不过。
+    ///
+    /// 只告警、不改值。变换是**按库 opt-in** 的（`[dictionaries.weight_spec]`），
+    /// 理由见设计文档 §3.2：强制归一会把守约词库的分布也一起改掉。
+    fn log_weight_range(&self, path: &Path) {
+        if self.over_range == 0 {
+            return;
+        }
+        let pct = 100.0 * self.over_range as f64 / self.weighted.max(1) as f64;
+        warn!(
+            "词库 {} 的权重超出约定值域 0~{}：{}/{} 条（{:.1}%）超范围，实测最大 {}。\
+             跨来源排序（短语 vs 码表）会因此失真——短语权重上限 {}，压不过更大的对手。\
+             请在方案的 `[[dictionaries]]` 下配 `[dictionaries.weight_spec]`（median/max/mode=\"log\"）\
+             开启归一化，或先把词库权重规范到该值域。",
+            path.display(),
+            WEIGHT_RANGE_MAX,
+            self.over_range,
+            self.weighted,
+            pct,
+            self.max_weight,
+            WEIGHT_RANGE_MAX
         );
     }
 }
@@ -883,6 +921,15 @@ fn parse_rime_line(
             }
         },
     };
+    // 值域诊断的取数点（只统计不改值，见 `ParseStats::log_weight_range`）。
+    // 权重 0 = 无权重列/空列，不构成「超范围」，故不计入分母。
+    if weight > 0 {
+        stats.weighted += 1;
+        stats.max_weight = stats.max_weight.max(weight);
+        if weight > WEIGHT_RANGE_MAX {
+            stats.over_range += 1;
+        }
+    }
     Some(RimeLine {
         code,
         abbrev,
@@ -1056,6 +1103,43 @@ pub fn parse_rime_entries_parallel(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 权重值域诊断的取数：超出 `WEIGHT_RANGE_MAX` 的条目被计入 `over_range`，
+    /// 权重 0（无权重列/空列）**不计入分母**——那是「未定义」不是「超范围」。
+    ///
+    /// 这条锁的是诊断的**准确性**：`over_range/weighted` 这个比例会出现在告警里，
+    /// 把 0 权重算进分母会让百分比虚低，方案作者据此低估问题。
+    #[test]
+    fn weight_range_diagnostic_counts_only_real_weights() {
+        let spec = ColumnSpec::from_layout(ColumnLayout::CodeFirst, false);
+        let mut st = ParseStats::default();
+        // 守约、超范围、恰好在边界、空权重、零权重
+        for line in [
+            "a	工	9999",
+            "b	的	10359470",
+            "c	一	10000",
+            "d	是	",
+            "e	不	0",
+        ] {
+            parse_rime_line(line, true, false, spec, &mut st);
+        }
+        assert_eq!(st.weighted, 3, "只有 9999/10359470/10000 三条算「有权重」");
+        assert_eq!(st.over_range, 1, "只有 10359470 超范围；10000 是边界内");
+        assert_eq!(st.max_weight, 10_359_470);
+    }
+
+    /// 反向锁：全部守约时诊断**一声不吭**（`over_range == 0`）。
+    /// 干净的词库不该刷屏——这是 `log_if_dirty` 一贯的约定。
+    #[test]
+    fn well_behaved_dict_triggers_no_weight_warning() {
+        let spec = ColumnSpec::from_layout(ColumnLayout::CodeFirst, false);
+        let mut st = ParseStats::default();
+        for line in ["a	工	120", "aa	弗	9950", "aaa	工	9000"] {
+            parse_rime_line(line, true, false, spec, &mut st);
+        }
+        assert_eq!(st.weighted, 3);
+        assert_eq!(st.over_range, 0, "五笔量级的权重不得触发告警");
+    }
 
     #[test]
     fn syllable_boundary_mask_basics() {
