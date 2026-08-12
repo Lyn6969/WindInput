@@ -86,6 +86,33 @@ public enum KeyHandler {
         case 0x1E: return 0xDD // VK_OEM_6   ]}
         case 0x27: return 0xDE // VK_OEM_7   '"
 
+        // 小键盘 (kVK_ANSI_Keypad*)。**必须映射成 VK_NUMPAD* 而不是主键盘数字**:
+        // 「数字小键盘功能」(input.numpad_behavior) 的归一化在服务端做 —— `numpad_to_main`
+        // 只认 0x60..0x69 这些码, 在这里就地折算成主键盘数字等于把那个开关架空成恒 follow_main。
+        //
+        // 这些键此前一个都没映射, `toWindowsVK` 返回 0 → 整个键不上报 → IMKit 透传。
+        // 后果不止是那个开关无效: 小键盘也无法选候选、无法参与热键。
+        // macOS 没有 NumLock (小键盘恒出数字), 故不像 Windows 那样还要分 VK_HOME/VK_END 一路。
+        case 0x52: return 0x60 // VK_NUMPAD0
+        case 0x53: return 0x61 // VK_NUMPAD1
+        case 0x54: return 0x62 // VK_NUMPAD2
+        case 0x55: return 0x63 // VK_NUMPAD3
+        case 0x56: return 0x64 // VK_NUMPAD4
+        case 0x57: return 0x65 // VK_NUMPAD5
+        case 0x58: return 0x66 // VK_NUMPAD6
+        case 0x59: return 0x67 // VK_NUMPAD7
+        case 0x5B: return 0x68 // VK_NUMPAD8 (注: 0x5A 是 F20, 不是小键盘)
+        case 0x5C: return 0x69 // VK_NUMPAD9
+        case 0x43: return 0x6A // VK_MULTIPLY *
+        case 0x45: return 0x6B // VK_ADD      +
+        case 0x4E: return 0x6D // VK_SUBTRACT -
+        case 0x41: return 0x6E // VK_DECIMAL  .
+        case 0x4B: return 0x6F // VK_DIVIDE   /
+        case 0x4C: return 0x0D // 小键盘 Enter → VK_RETURN (与 Windows 同, 那边也不单列)
+        // 刻意不映射的两个: kVK_ANSI_KeypadClear(0x47) 在 Windows 对位 NumLock，而 macOS
+        // 没有 NumLock 语义; kVK_ANSI_KeypadEquals(0x51) 在 Windows 小键盘上根本没有对应键。
+        // 两者保持 VK=0 透传, 好过映射到一个语义不同的键上。
+
         default:
             return 0
         }
