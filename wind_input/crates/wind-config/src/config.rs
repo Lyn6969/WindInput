@@ -3531,10 +3531,15 @@ impl Config {
                 continue;
             }
             if self.keys.key_actions.contains_key(&key) {
-                info!("配置迁移：{key:?} 已在 keys.key_actions 显式配置，保留用户设置");
+                debug!("配置迁移：{key:?} 已在 keys.key_actions 显式配置，保留用户设置");
                 continue;
             }
-            info!("配置迁移：引导键 {key:?} → keys.key_actions = {action:?}");
+            // debug 而非 info：本函数是**每次 `Config::load` 都跑的内存内归一化**（折算结果
+            // 不写回磁盘），故只要用户配置里还留着 trigger_keys，这两行就会在每一次读配置时
+            // 原样重复。按 info 打印会让日志看起来像「同一件事被反复做了 N 遍」——2026-08-12
+            // 就因此把「设置保存时 4 次配置全量重载」误判成服务端有冗余（实测每个 RPC 各加载
+            // 一次，本就如此）。真正异常的两种情况（键名解析不了 / 多处争用同一键）仍是 warn。
+            debug!("配置迁移：引导键 {key:?} → keys.key_actions = {action:?}");
             self.keys.key_actions.insert(key, action);
         }
     }
