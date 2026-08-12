@@ -5711,7 +5711,7 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 // Commit text atomically: end composition + insert text in a single EditSession.
 // This avoids race conditions in browsers where async EndComposition could clear
 // text that was inserted by a subsequent synchronous InsertText.
-BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer, BOOL replacingHeld)
+BOOL CTextService::CommitText(const std::wstring& text, BOOL nonKeyContext, BOOL replacingHeld)
 {
     // hold 预览态活跃时（智能符号已把中文符号放进组合、等 press2），本次提交必须交代
     // 那个符号的去向——下面提交走的是**组合 range 的 SetText**，range 里此刻显示的正是
@@ -5724,8 +5724,8 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer, BOOL
     // 独占模式出字……），把安全的一侧设为默认，新增路径自动正确。曾经默认丢弃，表现为
     // 全角下「。」+空格 → 符号消失、只剩全角空格。
     //
-    // fromHoldTimer 时计时器已在 OnHoldTimerExpired 里清零、文本也已 move 进 text 参数，
-    // 两个分支在那条路上都是无副作用的 no-op。
+    // 智能符号超时收口那条路上，计时器已在 OnHoldTimerExpired 里清零、文本也已 move
+    // 进 text 参数，两个分支在那条路上都是无副作用的 no-op。
     if (replacingHeld)
         CancelHoldTimer();
     else
@@ -5777,19 +5777,28 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer, BOOL
         CCommitTextEditSession* pEditSession = new CCommitTextEditSession(this, pContext, pCompToEnd, full);
         // pCompToEnd ownership transferred to pEditSession
 
-        if (fromHoldTimer)
+        if (nonKeyContext)
         {
-            // 智能符号 HoldComposition 超时收口跑在裸 WM_TIMER 回调里，不在按键/编辑
-            // 上下文中。Word 对此校验严格，会拒发同步会话（hrSession=TS_E_SYNCHRONOUS
-            // 0x80040208），DoEditSession 根本不执行 → 组合被当孤儿 Release（Word 默认把
-            // 组合里已显示的符号 finalize 落进文档）→ 旧逻辑再见 GetSuccess()==FALSE 就走
-            // SendInput 兜底又打一遍，造成"符号 500ms 后重复上屏"（d5d5815 只治了"谎报
-            // 失败"，治不了这里的"真拒绝同步"）。
+            // 非按键上下文（裸 WM_TIMER 回调 / 窗口消息回调 / COM 回调）。MSDN 限定
+            // TF_ES_SYNC 只在处理按键时合法，Word 严格照此校验，会拒发同步会话
+            // （hrSession=TS_E_SYNCHRONOUS 0x80040208），DoEditSession 根本不执行 →
+            // pCompToEnd 被当孤儿 Release（Word 默认把组合里已显示的内容 finalize 落进
+            // 文档）→ 旧逻辑再见 GetSuccess()==FALSE 就走 SendInput 兜底又打一遍。
+            // 两条已实锤的受害路径：
+            //   · 智能符号 HoldComposition 超时收口 → "符号 500ms 后重复上屏"
+            //     （d5d5815 只治了"谎报失败"，治不了这里的"真拒绝同步"）
+            //   · 鼠标点候选（WM_COMMIT_TEXT）→ Word 里打 sfge 点候选得到 "Sfge杜甫"：
+            //     组合里的原码被 Word finalize 成正文（还吃了 autocorrect 首字母大写），
+            //     正文"杜甫"再由 SendInput 追加在后面。
             //
-            // 改用异步会话：超时时最终文字已在组合态里显示，交给 TSF 在能拿到锁时原地
-            // SetText+EndComposition 落定即可，绝不 SendInput。TF_ES_ASYNCDONTCARE 在能立即
-            // 给锁的宿主（如 Tabby）会同步执行、行为不变；Word 则延后到可授予锁时执行。
-            // 异步下 pEditSession 由 TSF 保活至 DoEditSession 运行，pCompToEnd 随之正确收尾。
+            // 改用异步会话：交给 TSF 在能拿到锁时原地 SetText+EndComposition 落定即可，
+            // 绝不 SendInput。TF_ES_ASYNCDONTCARE 在能立即给锁的宿主（如 Tabby）会同步
+            // 执行、行为不变；Word 则延后到可授予锁时执行。异步下 pEditSession 由 TSF
+            // 保活至 DoEditSession 运行，pCompToEnd 随之正确收尾。
+            //
+            // 两条路的组合区内容不同，但都由 DoEditSession 的 SetText(full) 统一覆盖：
+            // 超时收口时组合里已经是最终文字（覆盖=原样重写）；鼠标上屏时组合里还是
+            // 原码（覆盖=换成上屏文字）。后者在拿到锁之前，用户会多看到原码若干毫秒。
             HRESULT hrSession = S_OK;
             hr = pContext->RequestEditSession(_tfClientId, pEditSession,
                                               TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hrSession);
@@ -5798,11 +5807,11 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer, BOOL
 
             if (SUCCEEDED(hr))
             {
-                WIND_LOG_DEBUG_FMT(L"CommitText(holdTimer): async commit requested, hrSession=0x%08X\n", hrSession);
+                WIND_LOG_DEBUG_FMT(L"CommitText(async): commit requested, hrSession=0x%08X\n", hrSession);
                 return TRUE;
             }
             // 极少数：异步请求本身就被拒（组合已随会话析构释放）。落到 SendInput 末路兜底。
-            WIND_LOG_DEBUG_FMT(L"CommitText(holdTimer): async request rejected hr=0x%08X, falling back to SendInput\n", hr);
+            WIND_LOG_DEBUG_FMT(L"CommitText(async): request rejected hr=0x%08X, falling back to SendInput\n", hr);
         }
         else
         {
@@ -5820,7 +5829,7 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer, BOOL
             // 执行完毕后才置 TRUE，是文档是否已被修改的唯一可信信号。外层 hr/hrSession 在
             // 部分宿主里会出现"编辑其实已经执行、但外层返回码不达标"的情况；若仍要求三者
             // 同时成功，会误判为失败并接着走 SendInput 兜底，在已经正确写入的文字后面再打
-            // 一遍。（Word 超时路径的"真拒绝同步"另见上面 fromHoldTimer 分支。）
+            // 一遍。（Word 在非按键上下文"真拒绝同步"另见上面 nonKeyContext 分支。）
             if (success)
             {
                 WIND_LOG_DEBUG_FMT(L"CommitText: TSF atomic commit succeeded, duration=%dms\n", durationMs);
@@ -5958,7 +5967,7 @@ void CTextService::_ReportEditContextLost()
 // NOTE: This method is now ASYNC - it returns immediately without waiting for
 // the composition to actually end. The _pComposition pointer is cleared immediately
 // so that HasActiveComposition() returns FALSE and new compositions can start.
-void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
+void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint, BOOL nonKeyContext)
 {
     // direct_commit 顶码：失焦/强制收口前，先把待重开的余码组合落定，语义与下方
     // HoldComposition flush 一致——收口时不能让余码组合悬空未开。
@@ -5970,7 +5979,7 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
     if (_hHoldTimer != 0 && _pComposition != nullptr)
     {
         WIND_LOG_DEBUG(L"EndComposition: flushing held smart symbol as commit\n");
-        FlushHoldCompositionIfActive();
+        FlushHoldCompositionIfActive(nonKeyContext);
         return;
     }
 
@@ -5981,7 +5990,7 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
     if (!_pendingCommitPrefix.empty() && _pComposition != nullptr)
     {
         WIND_LOG_DEBUG(L"EndComposition: flushing pending top-code prefix as commit\n");
-        CommitText(L"");
+        CommitText(L"", nonKeyContext);
         return;
     }
 
@@ -6201,10 +6210,10 @@ BOOL CTextService::HoldComposition(const std::wstring& text, UINT timeoutMs)
     return TRUE;
 }
 
-void CTextService::FlushHoldCompositionIfActive()
+void CTextService::FlushHoldCompositionIfActive(BOOL nonKeyContext)
 {
     if (_hHoldTimer != 0)
-        OnHoldTimerExpired();
+        OnHoldTimerExpired(nonKeyContext);
 }
 
 // 把当前 held 的智能符号定格并入 _pendingCommitPrefix（不 commit、不动文档）。
@@ -6252,10 +6261,10 @@ VOID CALLBACK CTextService::HoldTimerProc(HWND /*hwnd*/, UINT /*uMsg*/,
     }
 }
 
-void CTextService::OnHoldTimerExpired(BOOL fromTimerCallback)
+void CTextService::OnHoldTimerExpired(BOOL nonKeyContext)
 {
-    WIND_LOG_DEBUG_FMT(L"OnHoldTimerExpired: committing chinese text, fromTimerCallback=%d\n",
-                       fromTimerCallback);
+    WIND_LOG_DEBUG_FMT(L"OnHoldTimerExpired: committing chinese text, nonKeyContext=%d\n",
+                       nonKeyContext);
 
     UINT_PTR timerId = _hHoldTimer;
     std::wstring textToCommit = std::move(_heldCompositionText);
@@ -6263,9 +6272,10 @@ void CTextService::OnHoldTimerExpired(BOOL fromTimerCallback)
     g_holdTimerInstance = nullptr;
     KillTimer(NULL, timerId);
 
-    // 仅 WM_TIMER 回调路径走异步会话收口（不走 SendInput 兜底，见 CommitText 内注释）；
-    // Flush 路径（PassThrough/失焦）在按键同步上下文，保持同步以确保收口先于后续字符。
-    CommitText(textToCommit, fromTimerCallback);
+    // 判据原样透传给 CommitText：WM_TIMER 回调、以及经 EndComposition 从窗口消息/COM
+    // 回调进来的 Flush 都走异步会话收口（不走 SendInput 兜底，见 CommitText 内注释）；
+    // 按键上下文里的 Flush 保持同步，以确保收口先于后续透传字符。
+    CommitText(textToCommit, nonKeyContext);
 }
 
 // ─── DeferredComposition（direct_commit 顶码，延迟到 keyup 才开新组合）───────────

@@ -142,15 +142,21 @@ public:
     BOOL UpdateComposition(const std::wstring& text, int caretPos, BOOL noUnderline = FALSE);
 
     // Commit text atomically (end composition + insert text in one EditSession)
-    // fromHoldTimer=TRUE：来自智能符号 HoldComposition 超时收口（裸 WM_TIMER 回调）——
-    // 改用异步编辑会话（TF_ES_ASYNCDONTCARE）且不走 SendInput 兜底，规避 Word 在
-    // 计时器上下文拒发同步会话（TS_E_SYNCHRONOUS）导致的重复上屏。见 .cpp 注释。
+    // nonKeyContext=TRUE：调用点**不在按键上下文**中（裸 WM_TIMER 回调、窗口消息回调、
+    // COM 回调……）——改用异步编辑会话（TF_ES_ASYNCDONTCARE）且不走 SendInput 兜底，
+    // 规避 Word 在这类上下文拒发同步会话（TS_E_SYNCHRONOUS）导致的编码泄漏 + 重复上屏。
+    // MSDN 限定 TF_ES_SYNC 只在处理按键时合法，Word 严格照此校验。见 .cpp 注释。
+    //
+    // ★判据是「有没有按键上下文」，不是「谁调的」。曾写成 fromHoldTimer（只认智能符号
+    // 超时那一个调用点），于是同样非按键上下文的 WM_COMMIT_TEXT（鼠标点候选）漏网，
+    // 在 Word 里表现为「Sfge杜甫」——组合被孤儿 finalize + 正文 SendInput 重打。
+    // 新增调用点时先问：我在 OnKeyDown 的调用栈里吗？不在就传 TRUE。
     //
     // replacingHeld=TRUE：本次提交要**替换**掉 hold 预览态里那个待定的中文符号
     // （智能符号 press2：「。」→「.」）。默认 FALSE = 追加语义，held 符号并入 prefix
     // 与本次文本一起上屏——因为提交用的是组合 range 的 SetText，不并入就会被覆盖掉。
     // 由服务端在 CommitText 响应的 flags bit3 显式声明，见 COMMIT_FLAG_REPLACING_HELD。
-    BOOL CommitText(const std::wstring& text, BOOL fromHoldTimer = FALSE,
+    BOOL CommitText(const std::wstring& text, BOOL nonKeyContext = FALSE,
                     BOOL replacingHeld = FALSE);
 
     // 把光标前 count 个已上屏字符替换为 text（智能符号纠错替换）。
@@ -169,7 +175,11 @@ public:
     // 不给则回落 GetFocus()（其余调用点都在焦点未变时触发）。
     // 清空 composition 范围后再 EndComposition，否则 Excel/WPS 等表格类宿主会把残留
     // composition 文本提交到目标 doc。
-    void EndComposition(ITfDocumentMgr* pDocMgrHint = nullptr);
+    //
+    // nonKeyContext: 语义同 CommitText 的同名参数。本方法自身用的就是异步会话（不受
+    // 影响），但顶码聚合中它会转调 CommitText 收口前缀——那一步默认走同步会话，在非
+    // 按键上下文里会被 Word 拒。判据传不进去就等于把同一个坑留在这条支路上。
+    void EndComposition(ITfDocumentMgr* pDocMgrHint = nullptr, BOOL nonKeyContext = FALSE);
 
     // Reset KeyEventSink composing state (called after push pipe commit/clear)
     // keepPairState=TRUE 时保留自动配对状态，语义见 CKeyEventSink::ResetComposingState。
@@ -325,7 +335,8 @@ public:
     void CancelHoldTimer();
 
     // 若 HoldComposition 计时器活跃，立即提交中文符号（宿主中断组合时调用，如 PassThrough 键）。
-    void FlushHoldCompositionIfActive();
+    // nonKeyContext: 语义同 CommitText 的同名参数，透传给收口用的 OnHoldTimerExpired。
+    void FlushHoldCompositionIfActive(BOOL nonKeyContext = FALSE);
 
     // HoldComposition 计时器是否活跃 ⇔ 组合内只有待定的中文符号（外加已承诺提交的 prefix），
     // 不含任何编码——「智能符号预览态」的精确判据。
@@ -585,11 +596,11 @@ private:
     // HoldComposition 计时器状态（智能符号 HoldComposition 方案）
     UINT_PTR       _hHoldTimer = 0;           // SetTimer 返回的计时器 ID；0 表示无活跃计时器
     std::wstring   _heldCompositionText;      // press1 进入组合态的中文文本
-    // 提交 held 中文符号收口。fromTimerCallback=TRUE 仅用于真正的 WM_TIMER 回调
-    // （HoldTimerProc）——此上下文拿不到同步编辑会话，须走异步收口；Flush 路径
-    // （PassThrough 透传、失焦 EndComposition）在按键同步上下文里调用，保持同步以
-    // 确保与后续透传字符的先后顺序正确。
-    void           OnHoldTimerExpired(BOOL fromTimerCallback = FALSE);
+    // 提交 held 中文符号收口。nonKeyContext=TRUE 表示调用点拿不到同步编辑会话，须走
+    // 异步收口：真正的 WM_TIMER 回调（HoldTimerProc）、以及经 EndComposition 从窗口
+    // 消息/COM 回调进来的 Flush。按键上下文里的 Flush 路径（PassThrough 透传）保持
+    // 同步，以确保与后续透传字符的先后顺序正确。语义同 CommitText 的同名参数。
+    void           OnHoldTimerExpired(BOOL nonKeyContext = FALSE);
     static VOID CALLBACK HoldTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime);
 
     // direct_commit 顶码：真提交后，余码新组合延迟到触发键 keyup（或兜底定时器）才开。

@@ -318,6 +318,41 @@ STDAPI CLangBarItemButton::OnClick(TfLBIClick click, POINT pt, const RECT* prcAr
             ServiceResponse response;
             if (pIPCClient->SendToggleMode(response))
             {
+                // 服务端 CMD_TOGGLE_MODE 的应答二选一（server.rs）：有待提交文本时回
+                // CommitText，否则回 StatusUpdate。而**两种应答都意味着这段输入结束了**
+                // ——服务端在 handle_toggle_mode 里已经清了自己的输入态。DLL 侧的组合是
+                // 我们自己维护的，两条路都必须显式收口，否则组合残留在宿主里。
+                //
+                // 旧代码只在 CommitText 分支动组合，StatusUpdate 分支纯刷 UI，于是
+                // keys.commit_on_switch=false（切英文不上屏原码）时编码留在原地不走，
+                // 直到焦点回来才被别的清理路径收掉。
+                const BOOL hasCommitText =
+                    (response.type == ResponseType::CommitText && !response.text.empty());
+
+                if (hasCommitText)
+                {
+                    // CommitOnSwitch 边路: 先把 pending 输入 commit，状态由随后到达的 push pipe 同步
+                    // nonKeyContext=TRUE：OnClick 是 TSF 的 COM 回调（鼠标点语言栏图标），
+                    // 不在按键上下文；且此路径之前没有 EndComposition，组合仍在，
+                    // 走同步会话被 Word 拒时会漏编码（同 WM_COMMIT_TEXT 的病理）。
+                    _pTextService->CommitText(response.text, TRUE);
+                    _pTextService->SetInputMode(response.IsChineseMode());
+                }
+                else
+                {
+                    // 无待提交文本 = 服务端已丢弃这段输入：终止组合、丢弃编码。
+                    // EndComposition 本身走异步会话且无组合时是 no-op，故这里无条件调用
+                    // 安全；nonKeyContext 仍要传，因为它的顶码/智能符号支路会转调 CommitText。
+                    WIND_LOG_DEBUG(L"OnClick: no commit text, discarding composition\n");
+                    _pTextService->EndComposition(nullptr, TRUE);
+                }
+
+                // 与 compartment 模式切换路径（TextService.cpp 的 CONVERSION/OPENCLOSE）
+                // 对齐：切换即一段输入结束，KeyEventSink 的组合态标志必须跟着清，否则
+                // 后续快捷键仍被会话门控挡下。keepPairState=TRUE 的理由见那两处注释
+                // （切换既不移光标也不消除已插入的右符号）。
+                _pTextService->ResetComposingState(TRUE);
+
                 if (response.type == ResponseType::StatusUpdate)
                 {
                     _pTextService->UpdateFullStatus(
@@ -328,12 +363,6 @@ STDAPI CLangBarItemButton::OnClick(TfLBIClick click, POINT pt, const RECT* prcAr
                         response.IsCapsLock(),
                         response.iconLabel.empty() ? nullptr : response.iconLabel.c_str()
                     );
-                }
-                else if (response.type == ResponseType::CommitText && !response.text.empty())
-                {
-                    // CommitOnSwitch 边路: 先把 pending 输入 commit，状态由随后到达的 push pipe 同步
-                    _pTextService->CommitText(response.text);
-                    _pTextService->SetInputMode(response.IsChineseMode());
                 }
             }
             // If IPC fails, don't toggle locally - keep state consistent with Go
@@ -763,11 +792,15 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
             WIND_LOG_DEBUG_FMT(L"MsgWndProc: Processing WM_COMMIT_TEXT, textLen=%zu\n", pData->text.length());
 
             // Use atomic CommitText which ends composition + inserts text in a single
-            // TF_ES_SYNC EditSession. The previous separate EndComposition(async) +
+            // EditSession. The previous separate EndComposition(async) +
             // InsertText(sync) approach caused a race condition where the async
             // EndComposition could clear the just-inserted text, especially in apps
             // like VSCode and browsers when InlinePreedit is disabled.
-            pThis->_pTextService->CommitText(pData->text);
+            //
+            // nonKeyContext=TRUE：这里是裸窗口消息回调（鼠标点候选经 push 通道过来），
+            // 不在按键上下文里，Word 会拒发同步会话。传 FALSE 的表现是 Word 里打 sfge
+            // 点候选得到 "Sfge杜甫"（组合原码被 finalize + 正文 SendInput 追加）。
+            pThis->_pTextService->CommitText(pData->text, TRUE);
             // Reset KeyEventSink state so shortcut keys work again.
             // 保留配对状态：上屏只是在光标处插入文本，已配对的右符号仍在光标右侧
             // （`（你好|）`）。此前一并清零 _pairPendingDepth，导致中文模式下
