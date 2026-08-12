@@ -40,6 +40,14 @@
 # 全局选项:
 #   --data <dir>      指定词库数据源目录 (覆盖 build_mac/data 自动解析)。
 #
+# 环境变量:
+#   WIND_MAC_UNIVERSAL=1   产通用二进制 (arm64 + x86_64)。app / service / 设置 app 三者
+#                          统一由它控制, 打包 (8) 时还会在 pkgbuild 前硬校验架构齐全。
+#                          **分发包必须开**; 本地开发默认关 (单架构, 快一倍)。
+#                          需 rustup 装好 x86_64-apple-darwin target (homebrew 版 rust 无 rustup)。
+#   SIGN_IDENTITY="…"      指定签名身份; 显式设为空串则走 ad-hoc (CI 无证书时用)。
+#                          不设则自动挑: 优先 Apple 签发的带 Team ID 证书, 回落自签 "WindInput Dev"。
+#
 # 变体身份 (跨 Rust/Swift 对齐, 错了 dev 变体就连不通):
 #   release: app=WindInput.app  bundleID=to.feng.inputmethod.WindInput
 #            数据目录=~/Library/Application Support/WindInput  LaunchAgent=to.feng.windinput.service
@@ -66,6 +74,7 @@ SETTING_DIR="$REPO_DIR/../wind-setting"   # 设置程序 (独立项目, 不存�
 # 变体派生 (由 apply_variant 按 release/dev 设置)。
 VARIANT="release"
 CARGO_BUILD_ARGS=(--release)      # release → --release; dev → --profile dev-variant
+PROFILE_SUBDIR="release"          # cargo target/ 下的 profile 目录名 (release / dev-variant)
 APP_VARIANT_FLAG=()               # release → (); dev → (--dev)
 APP_SUPPORT="$HOME/Library/Application Support/WindInput"
 LABEL="to.feng.windinput.service"
@@ -110,12 +119,14 @@ apply_variant() {
     if [[ "$p" == dev ]]; then
         VARIANT="dev"
         CARGO_BUILD_ARGS=(--profile dev-variant)   # 对齐 Windows Build-Core 的 dev-variant profile
+        PROFILE_SUBDIR="dev-variant"
         APP_VARIANT_FLAG=(--dev)
         APP_SUPPORT="$HOME/Library/Application Support/WindInputDev"
         LABEL="to.feng.windinput.service.dev"
     else
         VARIANT="release"
         CARGO_BUILD_ARGS=(--release)
+        PROFILE_SUBDIR="release"
         APP_VARIANT_FLAG=()
         APP_SUPPORT="$HOME/Library/Application Support/WindInput"
         LABEL="to.feng.windinput.service"
@@ -149,9 +160,63 @@ kick_ime_app() {
 
 # ───────────────────────── 子步骤: 编译 ─────────────────────────
 
+# 通用二进制 (arm64 + x86_64) 总开关。**分发包必须开**, 本地开发默认关 (单架构快一倍)。
+# app_build 自己读同一个环境变量, 故这里的全局只服务 Rust 侧 (service / wind_setting);
+# 三处读同一个 WIND_MAC_UNIVERSAL, CI 在 job 级设一次即可全线贯通。
+UNIVERSAL="${WIND_MAC_UNIVERSAL:-0}"
+
+# Rust 通用二进制的落点: <项目>/target/universal/<profile>/<bin>。
+#
+# 为什么不 lipo 回 target/<profile>/ —— 那是原生构建的地盘。写进去以后, 「这个二进制是上次
+# 原生构建的还是上次 lipo 的」就无从分辨, 而两者外观完全一样, 错拿只会在装到 Intel Mac 上
+# 才暴露。'universal' 不是合法 target triple, 与 cargo 自己的 target/<triple>/ 不会撞名。
+UNIVERSAL_SUBDIR="universal"
+
+# 两个 target 各编一遍再 lipo 成通用二进制。
+#   用法: cargo_build_universal <项目目录> <profile子目录> <二进制名> [cargo 参数...]
+# 失败一律返回非零 —— 见文件末 run_tokens 处说明, 本脚本的 errexit 不可依赖, 调用方须显式判。
+cargo_build_universal() {
+    local proj="$1" sub="$2" bin="$3"; shift 3
+    local out="$proj/target/$UNIVERSAL_SUBDIR/$sub/$bin"
+    local t parts=()
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+        bold "==> cargo build --target $t ($bin)"
+        if ! ( cd "$proj" && cargo build --target "$t" "$@" ); then
+            err "通用二进制构建失败: $bin @ $t"
+            err "若报「找不到 target」: rustup target add $t"
+            err "(本机若是 homebrew 装的 rust 则没有 rustup, 加不了 target —— 通用构建请走 CI)"
+            return 1
+        fi
+        parts+=("$proj/target/$t/$sub/$bin")
+    done
+    mkdir -p "$(dirname "$out")"
+    if ! lipo -create -output "$out" "${parts[@]}"; then
+        err "lipo 合并失败: $bin"
+        return 1
+    fi
+    info "universal: $out [$(lipo -archs "$out")]"
+    return 0
+}
+
 build_service() {
-    bold "==> 编译 Rust service ($VARIANT)"
-    ( cd "$RUST_DIR" && cargo build "${CARGO_BUILD_ARGS[@]}" -p wind_service )
+    if [[ $UNIVERSAL -eq 1 ]]; then
+        bold "==> 编译 Rust service ($VARIANT, universal)"
+        cargo_build_universal "$RUST_DIR" "$PROFILE_SUBDIR" wind_input \
+            "${CARGO_BUILD_ARGS[@]}" -p wind_service || return 1
+    else
+        bold "==> 编译 Rust service ($VARIANT)"
+        ( cd "$RUST_DIR" && cargo build "${CARGO_BUILD_ARGS[@]}" -p wind_service ) || return 1
+    fi
+    return 0
+}
+
+# 服务二进制的路径 (随 universal 开关变)。pkg 打包与安装都从这里取, 避免两处各拼一遍。
+service_bin_path() {
+    if [[ $UNIVERSAL -eq 1 ]]; then
+        echo "$RUST_DIR/target/$UNIVERSAL_SUBDIR/$PROFILE_SUBDIR/wind_input"
+    else
+        echo "$RUST_DIR/target/$PROFILE_SUBDIR/wind_input"
+    fi
 }
 
 # ───────────── app_build (拼装 WindInput[Dev].app bundle) ─────────────
@@ -414,12 +479,22 @@ build_setting() {
     fi
     local APP_BUNDLE="$MACOS_DIR/build/$disp.app"
 
-    # 1. 原生 cargo build (wind_setting package → target/<sub>/wind_setting)。
-    bold "==> 编译 wind_setting ($VARIANT, native)"
-    ( cd "$SETTING_DIR" && cargo build ${cargo_flags[@]+"${cargo_flags[@]}"} ) || {
-        err "wind_setting 构建失败 (见上; 非致命, 设置 app 将缺失)"; return 1
-    }
-    local BIN_PATH="$SETTING_DIR/target/$cargo_sub/wind_setting"
+    # 1. cargo build (wind_setting package → target/[universal/]<sub>/wind_setting)。
+    local BIN_PATH
+    if [[ $UNIVERSAL -eq 1 ]]; then
+        bold "==> 编译 wind_setting ($VARIANT, universal)"
+        cargo_build_universal "$SETTING_DIR" "$cargo_sub" wind_setting \
+            ${cargo_flags[@]+"${cargo_flags[@]}"} || {
+            err "wind_setting 通用构建失败 (见上; 非致命, 设置 app 将缺失)"; return 1
+        }
+        BIN_PATH="$SETTING_DIR/target/$UNIVERSAL_SUBDIR/$cargo_sub/wind_setting"
+    else
+        bold "==> 编译 wind_setting ($VARIANT, native)"
+        ( cd "$SETTING_DIR" && cargo build ${cargo_flags[@]+"${cargo_flags[@]}"} ) || {
+            err "wind_setting 构建失败 (见上; 非致命, 设置 app 将缺失)"; return 1
+        }
+        BIN_PATH="$SETTING_DIR/target/$cargo_sub/wind_setting"
+    fi
     [[ -x "$BIN_PATH" ]] || { err "未找到 wind_setting 二进制: $BIN_PATH"; return 1; }
     info "binary: $BIN_PATH ($(stat -f%z "$BIN_PATH") bytes)"
 
@@ -1192,11 +1267,15 @@ service_install() {
     fi
 
     # -------- 解析源目录 --------
+    # WIND_MAC_UNIVERSAL=1 时 build_service 的产物落在 target/universal/<profile>/,
+    # 原生路径下留着的是上一次单架构构建的**旧**二进制 —— 不认这个开关就会装错一个,
+    # 且两者外观一致, 只有跑起来才发现不是刚编的那个。
     if [[ -z "$SRC_DIR" ]]; then
-        if [[ $DEV_VARIANT -eq 1 ]]; then
-            SRC_DIR="$RUST_TARGET/dev-variant"
+        local prof="release"; [[ $DEV_VARIANT -eq 1 ]] && prof="dev-variant"
+        if [[ "${WIND_MAC_UNIVERSAL:-0}" == 1 ]]; then
+            SRC_DIR="$RUST_TARGET/$UNIVERSAL_SUBDIR/$prof"
         else
-            SRC_DIR="$RUST_TARGET/release"
+            SRC_DIR="$RUST_TARGET/$prof"
         fi
     fi
     local SRC_EXE="$SRC_DIR/$EXE_NAME"
@@ -1647,6 +1726,9 @@ EOF
 #   pkg_build [release|dev]            # 用现有构建产物打包 (缺 .app 自动转构建)
 #   pkg_build [release|dev] --build    # 先构建 (cargo + gen-data + app_build) 再打包
 #
+# 通用二进制: WIND_MAC_UNIVERSAL=1 → 三个二进制都按 arm64+x86_64 构建, hostArchitectures
+# 一并放开, 且在 pkgbuild 前逐个 lipo -archs 校验 (缺架构即拒绝出包)。
+#
 # 公证 (预留): 配齐则 productbuild 后自动 productsign + notarytool + staple:
 #   MACOS_DEVELOPER_ID_INSTALLER / MACOS_NOTARY_APPLE_ID / MACOS_NOTARY_PASSWORD / MACOS_NOTARY_TEAM_ID
 pkg_build() {
@@ -1658,11 +1740,11 @@ pkg_build() {
     local SUFFIX=""; [[ "$PROFILE" == dev ]] && SUFFIX="Dev"
     local APP_NAME="WindInput$SUFFIX"
     local APP_BUNDLE="$MACOS_DIR/build/$APP_NAME.app"
-    local SVC_SUBDIR="release"; [[ "$PROFILE" == dev ]] && SVC_SUBDIR="dev-variant"
-    local SERVICE_BIN="$RUST_DIR/target/$SVC_SUBDIR/wind_input"
+    local SERVICE_BIN; SERVICE_BIN="$(service_bin_path)"                    # 随 universal 开关变
     local SERVICE_DATA="$DATA_SNAPSHOT"                                     # gd 产物 (变体无关)
     # 设置 app: build_setting 组装的壳 (变体名不同); 可选 (设置仓缺失则跳过)。
     local SETTING_DISP="清风输入法设置"; [[ "$PROFILE" == dev ]] && SETTING_DISP="清风输入法设置开发版"
+    local SETTING_EXE="wind_setting"; [[ "$PROFILE" == dev ]] && SETTING_EXE="wind_setting_dev"
     local SETTING_APP="$MACOS_DIR/build/$SETTING_DISP.app"
 
     local DIST_DIR="$MACOS_DIR/dist"
@@ -1692,8 +1774,9 @@ pkg_build() {
 
     # -------- (可选) 构建 --------
     if [[ $DO_BUILD -eq 1 ]]; then
-        bold "==> 构建 IME + 服务 + 词库 + 设置 ($PROFILE)"
-        ( cd "$RUST_DIR" && cargo build "${CARGO_BUILD_ARGS[@]}" -p wind_service )
+        bold "==> 构建 IME + 服务 + 词库 + 设置 ($PROFILE$([[ $UNIVERSAL -eq 1 ]] && echo ', universal'))"
+        # 走 build_service 而非内联 cargo —— 内联会绕过 universal 分支, 打出个"名义通用"的包。
+        build_service || { err "服务构建失败, 中止打包"; exit 1; }
         do_gendata                             # 组装 data/ → build_mac/data
         app_build ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}   # IME .app
         build_setting || warn "wind_setting 构建跳过/失败 (非致命, .pkg 将不含设置 app)"   # 设置 .app (可选)
@@ -1754,6 +1837,25 @@ WRAP
     chmod +x "$DEST"/*.sh "$DEST/service/wind_input"
     info "payload: $APP_NAME.app + service(wind_input+data)$([[ $HAVE_SETTING -eq 1 ]] && echo ' + wind_setting.app') + 安装脚本"
 
+    # -------- universal 硬校验 --------
+    # 要了通用二进制却少一个架构 = "名义通用、实则单架构"。这种包在 Intel Mac 上**装得上**
+    # (pkg 只是拷文件), 只在真正拉起进程时才失败, 且失败面是"输入法装了但没反应"这类难查的
+    # 表现。宁可在这里出不了包, 也不能把它发出去。
+    if [[ $UNIVERSAL -eq 1 ]]; then
+        local to_check=("$DEST/service/wind_input" "$DEST/$APP_NAME.app/Contents/MacOS/WindInput")
+        [[ $HAVE_SETTING -eq 1 ]] && to_check+=("$DEST/$SETTING_DISP.app/Contents/MacOS/$SETTING_EXE")
+        local b archs
+        for b in "${to_check[@]}"; do
+            archs="$(lipo -archs "$b" 2>/dev/null || echo '<读不出>')"
+            if [[ "$archs" != *arm64* || "$archs" != *x86_64* ]]; then
+                err "架构不全 [$archs]: $b"
+                err "已指定通用二进制 (WIND_MAC_UNIVERSAL=1) 却缺架构, 拒绝出包。"
+                exit 1
+            fi
+            info "  ✓ [$archs] $(basename "$b")"
+        done
+    fi
+
     # -------- postinstall --------
     cp "$SCRIPT_DIR/pkg_resources/postinstall" "$SCRIPTS/postinstall"
     chmod +x "$SCRIPTS/postinstall"
@@ -1777,7 +1879,9 @@ PY
     bold "==> pkgbuild + productbuild"
     mkdir -p "$DIST_DIR"
     rm -f "$PKG_PATH"
-    local HOST_ARCHS="arm64"   # 本机单架构; universal 分发需自行扩展为 arm64,x86_64
+    # hostArchitectures 必须与 payload 的真实架构一致: 写宽了 (声明 x86_64 但二进制没有)
+    # 会让 Intel Mac 装完发现跑不起来; 写窄了则 Intel Mac 上安装器直接拒装。
+    local HOST_ARCHS="arm64"; [[ $UNIVERSAL -eq 1 ]] && HOST_ARCHS="arm64,x86_64"
     info "hostArchitectures: $HOST_ARCHS"
 
     local COMPONENT_PKG="$SCRIPTS/$APP_NAME-component.pkg"
