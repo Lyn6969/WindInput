@@ -917,6 +917,13 @@ pub struct Coordinator {
     /// 显示授权：handle_caret_update / 兜底 timer 在调 notify_ui_update 前置位以放行首帧显示；
     /// 按键路径不置位，首帧改为 arm 延迟。notify_ui_update 内 swap 消费。
     show_authorized: std::sync::atomic::AtomicBool,
+    /// 候选窗当前是否正在**反转排列**候选项（`ui.candidate.flip_when_above` 真正生效）。
+    ///
+    /// 由 UI 侧 `UiEvent::CandidateFlipped` 单向写入：判据要窗口尺寸 + 屏幕工作区才算得出
+    /// （还叠加模式级强制横/竖排），协调器读配置推不出来，故只镜像不推导。
+    /// 消费点唯一：[`Coordinator::apply_session_action`] 用它把 `highlight_up`/`highlight_down`
+    /// 的走向翻过来，见那里的说明。
+    candidate_flipped: std::sync::atomic::AtomicBool,
     /// 本轮组合的首显是否用了**非权威**坐标（fast 的试探采样 / instant 沿用的旧坐标）。
     /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
     /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
@@ -1760,6 +1767,7 @@ impl Coordinator {
             pending_first_show_token: Mutex::new(0),
             candidate_shown: Mutex::new(false),
             show_authorized: std::sync::atomic::AtomicBool::new(false),
+            candidate_flipped: std::sync::atomic::AtomicBool::new(false),
             composition_start: Mutex::new((0, 0, false)),
             last_authoritative_caret: Mutex::new((0, 0, false)),
             last_key_at: Mutex::new(None),
@@ -2809,6 +2817,14 @@ impl Coordinator {
         (s.current_page, s.selected_index, self.total_pages(&s))
     }
 
+    /// 注入「候选窗当前是否反转排列」（测试/诊断用）。
+    ///
+    /// 刻意走 [`Coordinator::handle_ui_event`] 而非直接写字段——正式路径是 UI 线程发
+    /// `UiEvent::CandidateFlipped`，测试入口跳过分发就测不到那条接线（同 `debug_candidate_op`）。
+    pub fn debug_set_candidate_flipped(&self, flipped: bool) {
+        self.handle_ui_event(UiEvent::CandidateFlipped(flipped));
+    }
+
     /// 将统计采集器内存数据落库（测试/诊断用；生产由后台线程定时 flush）。
     pub fn debug_flush_stats(&self) {
         if let Some(c) = self.stat_collector.as_ref() {
@@ -3063,7 +3079,21 @@ impl Coordinator {
             // 表里只存启用项（`ConfigBundle::build` 过滤过），None 到不了这里。
             wind_config::SessionAction::None => return None,
         };
+        // 候选被反转排列时，高亮移动按**屏幕上看到的方向**走：竖排 + 上翻 + flip_when_above
+        // 三者同时成立时，屏幕从上到下是候选 n..1，此时 ↑ 对应的是候选序的「下一个」。
+        // 不区分按键（↑/↓ 与 Shift+Tab/Tab 一并翻转）——这两组都绑在同一对
+        // `highlight_up`/`highlight_down` 上，行为分叉会让「同一个动作两种走向」。
+        //
+        // **翻页键不在此列**：页与页之间没有空间关系（新页在原处整体替换），反转只发生在页内。
+        //
+        // 回卷语义无需另写：反转后视觉最下方是页内第 0 项，按 ↓ 越界 == `move_up` 的
+        // 「页首回卷到上一页末项」，两者本就是同一件事。
+        let flipped = self
+            .candidate_flipped
+            .load(std::sync::atomic::Ordering::Relaxed);
         let changed = match nav {
+            keymap::NavAction::HighlightUp if flipped => self.move_down(state),
+            keymap::NavAction::HighlightDown if flipped => self.move_up(state),
             keymap::NavAction::HighlightUp => self.move_up(state),
             keymap::NavAction::HighlightDown => self.move_down(state),
             keymap::NavAction::PagePrev => self.page_prev(state),
@@ -4265,6 +4295,9 @@ impl Coordinator {
             UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
             UiEvent::RequestInputDiagMenu { x, y } => self.show_input_diag_menu(x, y),
             UiEvent::SystemThemeChanged => self.on_system_theme_changed(),
+            UiEvent::CandidateFlipped(v) => self
+                .candidate_flipped
+                .store(v, std::sync::atomic::Ordering::Relaxed),
         }
     }
 

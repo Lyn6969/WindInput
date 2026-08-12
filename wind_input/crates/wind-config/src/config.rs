@@ -2736,6 +2736,9 @@ pub struct UiCandidateConfig {
     pub index_labels: String,
     /// 候选窗在光标上方时反转候选排列顺序。**仅竖排生效**：横排候选左右并列，
     /// 反转与窗口在上在下无关，只会把读序倒过来，故对横排一律忽略。
+    ///
+    /// 反转生效期间 `highlight_up` / `highlight_down`（出厂的 ↑↓ 与 Shift+Tab/Tab）
+    /// 按**屏幕上看到的方向**走，与排列一致；翻页键不受影响（页与页之间无空间关系）。
     #[serde(default)]
     pub flip_when_above: bool,
     /// 候选窗在光标上方时交换编码栏与候选栏位置（编码区沉底贴光标）。与 flip_when_above 正交，可叠加。

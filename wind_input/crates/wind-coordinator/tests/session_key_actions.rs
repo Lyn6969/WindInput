@@ -598,3 +598,89 @@ fn shift_tab_and_tab_bind_independently() {
     coord.handle_key_event(&key(VK_TAB, MOD_SHIFT, EVENT_KEY_DOWN));
     assert_eq!(coord.debug_page_info().0, 0, "Shift+Tab 应翻回第 1 页");
 }
+
+// ———————————————— 候选反转时的高亮走向 ————————————————
+
+const VK_UP: u32 = 0x26;
+const VK_DOWN: u32 = 0x28;
+const VK_NEXT: u32 = 0x22; // PageDown
+
+/// 候选被反转排列时（竖排 + 上翻 + `ui.candidate.flip_when_above`），高亮按**屏幕方向**走。
+///
+/// 反转后屏幕从上到下是候选 n..1，此时 ↑ 指向的是候选序的「下一个」。判据本身只有 UI 侧
+/// 算得出（要窗口尺寸 + 屏幕工作区），协调器只镜像 `UiEvent::CandidateFlipped`，故这里
+/// 用 `debug_set_candidate_flipped` 走同一条分发。
+#[test]
+fn highlight_follows_visual_direction_when_flipped() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    type_until_multipage(&coord);
+
+    // 基线：未反转时 ↓ = 候选序下一个，↑ 退回。
+    coord.handle_key_event(&key(VK_DOWN, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().1, 1, "未反转时 ↓ 应前进到候选 2");
+    coord.handle_key_event(&key(VK_UP, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().1, 0, "未反转时 ↑ 应退回候选 1");
+
+    // 反转后两个方向对调。
+    coord.debug_set_candidate_flipped(true);
+    coord.handle_key_event(&key(VK_UP, 0, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_page_info().1,
+        1,
+        "反转后候选 2 显示在候选 1 上方，↑ 应走向候选 2"
+    );
+    coord.handle_key_event(&key(VK_DOWN, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().1, 0, "反转后 ↓ 应走回候选 1");
+
+    // 上报回落后必须恢复原走向——否则窗口翻回下方时方向会一直反着。
+    coord.debug_set_candidate_flipped(false);
+    coord.handle_key_event(&key(VK_DOWN, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().1, 1, "回落为未反转后 ↓ 应重新前进");
+}
+
+/// Tab / Shift+Tab 与 ↑↓ 同属 `highlight_up`/`highlight_down`，反转时**一并翻转**。
+///
+/// 这是刻意选定的行为：两组键绑在同一对动作上，只翻其中一组会让同一个动作出现两种走向。
+#[test]
+fn flip_also_applies_to_tab_bound_highlight() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    type_until_multipage(&coord);
+
+    // 出厂默认 tab = highlight_down / shift+tab = highlight_up。
+    coord.debug_set_candidate_flipped(true);
+    coord.handle_key_event(&key(VK_TAB, MOD_SHIFT, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_page_info().1,
+        1,
+        "反转后 Shift+Tab（highlight_up）应走向候选 2"
+    );
+    coord.handle_key_event(&key(VK_TAB, 0, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().1, 0, "反转后 Tab 应走回候选 1");
+}
+
+/// 反向对照：**翻页键不受反转影响**。
+///
+/// 缺了这条，「一律把四个 NavAction 全部对调」的实现也能让上面两条通过。页与页之间没有
+/// 空间关系（新页在原处整体替换），反转只发生在页内。
+#[test]
+fn paging_direction_unaffected_by_flip() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(cfg_with(&[]), Some(&data_dir()));
+    type_until_multipage(&coord);
+    coord.debug_set_candidate_flipped(true);
+
+    coord.handle_key_event(&key(VK_NEXT, 0, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_page_info().0,
+        1,
+        "反转下 PageDown 仍应翻到下一页"
+    );
+}

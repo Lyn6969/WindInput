@@ -239,6 +239,10 @@ pub struct CandidateWindow {
     flip_when_above: bool,
     /// 当前锚点是否落在光标上方（定位时计算，随锚点锁定保持）。供 flip 判定。
     placed_above: bool,
+    /// 反向事件通道（与 `mouse` / `tooltip` 同源）。窗口自身也要上报状态，见 [`CandidateWindow::report_flip_state`]。
+    events: Sender<UiEvent>,
+    /// 上一次上报给协调器的「候选是否反转」，用于只在变化时发事件（渲染每帧都会走判定）。
+    reported_flip: bool,
     /// 翻页栏显示覆盖（""跟随主题/"hide"/"auto"/"always"）。来自 ui.candidate.pager_bar_display。
     pager_display: String,
     /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
@@ -260,6 +264,7 @@ impl CandidateWindow {
         let window = LayeredWindow::create(None, 400, 200, "WindInputCandidate")?;
         let text_renderer = TextRenderer::new("Microsoft YaHei UI", config.font_size)?;
         let tooltip_events = events.clone();
+        let self_events = events.clone();
         let mouse = Rc::new(RefCell::new(CandidateMouse {
             hit_rects: Vec::new(),
             events,
@@ -305,6 +310,8 @@ impl CandidateWindow {
             font_size_override: 0.0,
             flip_when_above: false,
             placed_above: false,
+            events: self_events,
+            reported_flip: false,
             pager_display: String::new(),
             page_number_display: String::new(),
             swap_preedit_when_above: false,
@@ -371,6 +378,29 @@ impl CandidateWindow {
             self.swap_preedit_when_above,
         );
         flip || swap
+    }
+
+    /// 把「候选项当前是否被反转」上报给协调器（仅在取值变化时发事件）。
+    ///
+    /// ★ **判据的真相源只能在这一侧**：`placed_above` 要窗口尺寸 + 屏幕工作区才算得出，
+    /// `vertical` 还会被模式级强制横/竖排改写 —— 协调器读配置推不出来。故复用
+    /// [`CandidateWindow::above_layout`] 这个既有的单一真相源，把它第一个返回值送过去，
+    /// 由协调器把 `highlight_up` / `highlight_down` 的走向翻转（视觉方向优先于候选序）。
+    ///
+    /// 调用点＝每处「`placed_above` 刚刚定完」之后，以及 [`CandidateWindow::hide`]
+    /// 清除上翻粘滞时 —— 后者关掉的是「组合结束后状态残留为 true，下一轮首帧渲染前
+    /// 用户就按了方向键」的窗口期。
+    fn report_flip_state(&mut self) {
+        let (flip, _) = Self::above_layout(
+            self.placed_above,
+            self.vertical,
+            self.flip_when_above,
+            self.swap_preedit_when_above,
+        );
+        if flip != self.reported_flip {
+            self.reported_flip = flip;
+            let _ = self.events.send(UiEvent::CandidateFlipped(flip));
+        }
     }
 
     /// 设置"翻页栏并入编码栏行"。来自 ui.candidate.pager_in_preedit。
@@ -635,6 +665,7 @@ impl CandidateWindow {
         };
         self.last_content_pos = Some((px, py));
         // 上方显示且有开关真正生效 → 按上方布局重建候选树（项数/尺寸/位置不变，仅排列翻转）
+        self.report_flip_state();
         if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
@@ -812,6 +843,7 @@ impl CandidateWindow {
                 (px, py, false)
             }
         };
+        self.report_flip_state();
         if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
@@ -976,6 +1008,7 @@ impl CandidateWindow {
             self.last_content_pos = Some((px, py));
             screen_xy = Some((px - ml as i32, py - mt as i32));
         }
+        self.report_flip_state();
         if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
@@ -2211,6 +2244,7 @@ impl CandidateWindow {
         self.visible = false;
         self.last_content_pos = None; // 组合结束，下次显示重新落位
         self.placed_above = false; // 清除上方粘滞，下次组合按下方默认重新判定
+        self.report_flip_state(); // 粘滞一清，反转随之失效，须立刻让协调器跟上
         {
             let mut m = self.mouse.borrow_mut();
             m.reset_hover();

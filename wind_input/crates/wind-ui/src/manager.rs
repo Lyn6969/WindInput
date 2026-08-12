@@ -609,6 +609,10 @@ pub enum UiEvent {
     /// 系统「浅色/深色模式」已切换（Win32 `WM_SETTINGCHANGE`/`ImmersiveColorSet`）。
     /// 协调器仅在 `ui.theme.style = "system"` 时据此重解析主题，其余明暗为用户显式指定。
     SystemThemeChanged,
+    /// 候选项排列当前是否被反转（`flip_when_above` 真正生效，见 `CandidateWindow::above_layout`）。
+    /// 仅在取值变化时发送。协调器据此把 `highlight_up` / `highlight_down` 的走向翻过来 ——
+    /// 判据只有 UI 侧算得出（要窗口尺寸 + 屏幕工作区才知道有没有上翻），协调器不能自行推导。
+    CandidateFlipped(bool),
 }
 
 /// UI 管理器（在独立线程中运行）
