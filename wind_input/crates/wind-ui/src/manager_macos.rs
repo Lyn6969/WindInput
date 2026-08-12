@@ -44,6 +44,59 @@ fn node_colors(
     (hex(bg), hex(fg))
 }
 
+/// 把截图的慢活扔到后台线程。
+///
+/// **forwarder 线程绝不能在这里阻塞**：它按序处理**全部** `UiCommand`（候选更新、主题、
+/// 工具栏…），卡住多久，输入法就有多久不响应。而截图这条路上的三件事都不快：
+///   · PNG 编码（候选窗 Retina 下上千像素宽）；
+///   · 写临时文件；
+///   · `copy_bgra_to_clipboard` 在 macOS 要 **spawn 一个 `osascript` 进程**（几十到
+///     几百毫秒）——服务进程不链接 AppKit，拿不到 NSPasteboard，只能走这条外部路。
+/// 三者叠起来实测能让候选窗肉眼可见地冻住。
+///
+/// 每次截图起一个线程（而不是常驻工作线程）是刻意的：截图是用户偶发动作，频率以分钟计，
+/// 一个线程的创建成本完全淹没在上面那几十毫秒里，不值得为它引入一条队列和它的生命周期。
+fn spawn_screenshot_work(tag: &'static str, work: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("windinput-screenshot-{tag}"))
+        .spawn(work)
+    {
+        // 起不了线程（资源耗尽）→ 本次截图丢弃。**不能退回同步执行**：`Builder::spawn`
+        // 已经把闭包吃掉了，这里拿不回来；何况系统连线程都起不出来时，更不该由 forwarder
+        // 线程去扛一个几百毫秒的 osascript。记一条 warn，用户会发现"截了没反应"时有据可查。
+        tracing::warn!("截图线程创建失败({tag}): {e}，本次截图已放弃");
+    }
+}
+
+/// 编码一帧 Toast。**自由函数而非方法**：截图那条路要在后台线程发 Toast（见
+/// `TakeScreenshot` 分支），那边只拿得到 `sink` 与两个配色串的克隆，碰不到 `&self`。
+#[allow(clippy::too_many_arguments)]
+fn toast_frame(
+    bg: &str,
+    fg: &str,
+    text: &str,
+    position: ToastPosition,
+    kind: ToastKind,
+    duration_ms: i32,
+) -> Vec<u8> {
+    let pos = match position {
+        ToastPosition::Center => "center",
+        ToastPosition::TopCenter => "top_center",
+        ToastPosition::BottomCenter => "bottom_center",
+        ToastPosition::TopLeft => "top_left",
+        ToastPosition::TopRight => "top_right",
+        ToastPosition::BottomLeft => "bottom_left",
+        ToastPosition::BottomRight => "bottom_right",
+    };
+    // accent 取 ToastKind 对应强调色（与 toast.rs ToastKind::accent 一致）。
+    let accent = match kind {
+        ToastKind::Info => "#409EFF",
+        ToastKind::Success => "#52C46E",
+        ToastKind::Error => "#F56C6C",
+    };
+    encode_toast_show("", text, bg, fg, accent, pos, duration_ms, 0)
+}
+
 /// macOS 侧提示类窗口的配色快照。.app 原生渲染 tooltip / 状态气泡 / Toast，
 /// 拿不到 `Resolved`，故在此把主题求值成 hex 串随帧下发；空串 = .app 用内置默认。
 #[derive(Default, Clone)]
@@ -312,59 +365,84 @@ impl Forwarder {
             UiCommand::TakeScreenshot { dir } => {
                 let dir = std::path::PathBuf::from(&dir);
                 let ts = crate::screenshot::timestamp();
-                // 本进程能截的那部分先做完，结果随请求一起带下去，由 `.app` 原样回传，
-                // 好让协调器把两边的数量合成**一条** Toast（而不是各弹各的）。
-                let (mut saved, mut clipboard) = (0usize, false);
-                if let Some((buf, w, h)) = self.capture_candidate() {
-                    let path = dir.join(format!("candidate_{ts}.png"));
-                    match crate::screenshot::save_bgra_to_png(&buf, w, h, &path) {
-                        Ok(()) => {
-                            tracing::info!("Screenshot saved: {:?}", path);
-                            saved += 1;
-                            // 存盘同时进剪贴板（对齐 Windows）：截完直接能粘贴，省去翻目录。
-                            // 剪贴板失败不影响"已存盘"这个既成事实，只在文案里说明。
-                            match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
-                                Ok(()) => clipboard = true,
-                                Err(e) => tracing::warn!("截图进剪贴板失败: {e}"),
+                // 取像素要 `&self`（读候选窗当前帧），必须在本线程；**其余全部挪走**，
+                // 理由见 `spawn_screenshot_work`。
+                let shot = self.capture_candidate();
+                let sink = Arc::clone(&self.sink);
+                spawn_screenshot_work("take", move || {
+                    // 本进程能截的那部分先做完，结果随请求一起带下去，由 `.app` 原样回传，
+                    // 好让协调器把两边的数量合成**一条** Toast（而不是各弹各的）。
+                    let (mut saved, mut clipboard) = (0usize, false);
+                    if let Some((buf, w, h)) = shot {
+                        let path = dir.join(format!("candidate_{ts}.png"));
+                        match crate::screenshot::save_bgra_to_png(&buf, w, h, &path) {
+                            Ok(()) => {
+                                tracing::info!("Screenshot saved: {:?}", path);
+                                saved += 1;
+                                // 存盘同时进剪贴板（对齐 Windows）：截完直接能粘贴，省去翻目录。
+                                // 剪贴板失败不影响"已存盘"这个既成事实，只在文案里说明。
+                                match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
+                                    Ok(()) => clipboard = true,
+                                    Err(e) => tracing::warn!("截图进剪贴板失败: {e}"),
+                                }
                             }
+                            Err(e) => tracing::warn!("截图存盘失败: {e}"),
                         }
-                        Err(e) => tracing::warn!("截图存盘失败: {e}"),
                     }
-                }
-                let items: Vec<serde_json::Value> = ["status_tip", "tooltip", "toast"]
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "target": t,
-                            "path": dir.join(format!("{t}_{ts}.png")).to_string_lossy(),
+                    let items: Vec<serde_json::Value> = ["status_tip", "tooltip", "toast"]
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "target": t,
+                                "path": dir.join(format!("{t}_{ts}.png")).to_string_lossy(),
+                            })
                         })
-                    })
-                    .collect();
-                self.send_shot_request(serde_json::json!({
-                    "mode": "all",
-                    "dir": dir.to_string_lossy(),
-                    "already": saved,
-                    "already_clipboard": clipboard,
-                    "items": items,
-                }));
+                        .collect();
+                    // 请求在本线程发出（而不是先发再算）：`already*` 要带上真实结果，
+                    // 而 `.app` 那侧本就是异步的，晚几十毫秒不可见。
+                    sink.push_frame(&encode_ext(
+                        ext_kind::SHOT_PANEL,
+                        serde_json::json!({
+                            "mode": "all",
+                            "dir": dir.to_string_lossy(),
+                            "already": saved,
+                            "already_clipboard": clipboard,
+                            "items": items,
+                        })
+                        .to_string()
+                        .as_bytes(),
+                    ));
+                });
             }
             UiCommand::ScreenshotCandidateToClipboard => {
-                let (msg, kind) = match self.capture_candidate() {
-                    Some((buf, w, h)) => {
-                        match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
-                            Ok(()) => {
-                                tracing::info!("Candidate screenshot copied to clipboard");
-                                ("候选窗口已截图到剪贴板".to_string(), ToastKind::Success)
-                            }
-                            Err(e) => {
-                                tracing::warn!("Screenshot to clipboard failed: {e}");
-                                (format!("截图到剪贴板失败：{e}"), ToastKind::Error)
+                let shot = self.capture_candidate();
+                let sink = Arc::clone(&self.sink);
+                let (bg, fg) = (self.tips.toast_bg.clone(), self.tips.toast_fg.clone());
+                spawn_screenshot_work("clip", move || {
+                    let (msg, kind) = match shot {
+                        Some((buf, w, h)) => {
+                            match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
+                                Ok(()) => {
+                                    tracing::info!("Candidate screenshot copied to clipboard");
+                                    ("候选窗口已截图到剪贴板".to_string(), ToastKind::Success)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Screenshot to clipboard failed: {e}");
+                                    (format!("截图到剪贴板失败：{e}"), ToastKind::Error)
+                                }
                             }
                         }
-                    }
-                    None => ("候选窗口未显示，无法截图".to_string(), ToastKind::Info),
-                };
-                self.push_result_toast(&msg, kind);
+                        None => ("候选窗口未显示，无法截图".to_string(), ToastKind::Info),
+                    };
+                    sink.push_frame(&toast_frame(
+                        &bg,
+                        &fg,
+                        &msg,
+                        ToastPosition::BottomRight,
+                        kind,
+                        3000,
+                    ));
+                });
             }
             UiCommand::CopyTooltipText => {
                 // 提示气泡由 .app 渲染，但文本是本进程随帧下发的，故复制无需 .app 参与。
@@ -411,30 +489,13 @@ impl Forwarder {
 
     /// 推一条 toast 给 `.app`（原生渲染）。
     fn push_toast(&self, text: &str, position: ToastPosition, kind: ToastKind, duration_ms: i32) {
-        let pos = match position {
-            ToastPosition::Center => "center",
-            ToastPosition::TopCenter => "top_center",
-            ToastPosition::BottomCenter => "bottom_center",
-            ToastPosition::TopLeft => "top_left",
-            ToastPosition::TopRight => "top_right",
-            ToastPosition::BottomLeft => "bottom_left",
-            ToastPosition::BottomRight => "bottom_right",
-        };
-        // accent 取 ToastKind 对应强调色（与 toast.rs ToastKind::accent 一致）。
-        let accent = match kind {
-            ToastKind::Info => "#409EFF",
-            ToastKind::Success => "#52C46E",
-            ToastKind::Error => "#F56C6C",
-        };
-        self.sink.push_frame(&encode_toast_show(
-            "",
-            text,
+        self.sink.push_frame(&toast_frame(
             &self.tips.toast_bg,
             &self.tips.toast_fg,
-            accent,
-            pos,
+            text,
+            position,
+            kind,
             duration_ms,
-            0,
         ));
     }
 
@@ -833,6 +894,20 @@ mod tests {
             .collect()
     }
 
+    /// 等扩展信封到达（截图请求由后台线程发出）。最多等 5 秒。
+    fn wait_for_ext(cap: &Arc<Mutex<Vec<Vec<u8>>>>) -> Option<(String, serde_json::Value)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(v) = last_ext(cap) {
+                return Some(v);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// 取最后一个扩展信封的 (kind, body-json)。
     fn last_ext(cap: &Arc<Mutex<Vec<Vec<u8>>>>) -> Option<(String, serde_json::Value)> {
         let v = cap.lock().unwrap();
@@ -852,12 +927,13 @@ mod tests {
             dir: dir.display().to_string(),
         });
 
+        // 请求由后台线程发出，等它到达。
+        let (kind, body) = wait_for_ext(&cap).expect("应下发截图请求");
         assert!(!dir.exists(), "不该建目录/落文件");
         assert!(
             toast_texts(&cap.lock().unwrap()).is_empty(),
             "不该就地弹 Toast：数量要与 .app 侧合并后只弹一条"
         );
-        let (kind, body) = last_ext(&cap).expect("应下发截图请求");
         assert_eq!(kind, ext_kind::SHOT_PANEL);
         assert_eq!(body["mode"], "all");
         assert_eq!(body["already"], 0, "候选窗没截到");
@@ -871,6 +947,20 @@ mod tests {
         assert_eq!(targets, ["status_tip", "tooltip", "toast"]);
     }
 
+    /// 等目录里出现 `want` 个文件（截图已改为后台线程完成）。最多等 5 秒。
+    fn wait_for_files(dir: &std::path::Path, want: usize) -> Vec<std::ffi::OsString> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let files: Vec<_> = std::fs::read_dir(dir)
+                .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+                .unwrap_or_default();
+            if files.len() >= want || std::time::Instant::now() >= deadline {
+                return files;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn screenshot_saves_png_when_visible() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -882,9 +972,9 @@ mod tests {
             dir: dir.display().to_string(),
         });
 
-        let files: Vec<_> = std::fs::read_dir(&dir)
-            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
-            .unwrap_or_default();
+        // 存盘已挪到后台线程（forwarder 线程不能被 PNG 编码 + osascript 卡住），
+        // 故等它落盘；超时即判失败，不放过"永远不落盘"这种回归。
+        let files = wait_for_files(&dir, 1);
         assert_eq!(files.len(), 1, "应存出一张 PNG，实际 {files:?}");
         let name = files[0].to_string_lossy().to_string();
         assert!(
