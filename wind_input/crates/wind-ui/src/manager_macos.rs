@@ -367,6 +367,11 @@ impl Forwarder {
                 };
                 self.push_result_toast(&msg, kind);
             }
+            // 状态气泡 / 悬停提示的截图：**像素不在本进程**（这两者是 `.app` 侧的原生
+            // NSPanel，服务端只下发文本与配色），故转成一次下行请求由那边动手。
+            // 文件名与随后的 Toast 文案仍留在服务端决定，与 Windows 逐字一致。
+            UiCommand::ScreenshotStatusTip { dir } => self.request_panel_shot("status_tip", &dir),
+            UiCommand::ScreenshotTooltip { dir } => self.request_panel_shot("tooltip", &dir),
             // 协调器把定位方式切到 fixed 时问「你现在在哪」，好把当前位置落盘成 custom_x/y
             // ——否则窗口会跳到上次保存（往往是 0,0）的坐标。
             //
@@ -439,6 +444,17 @@ impl Forwarder {
         }
         let f = self.win.render_frame()?;
         Some((f.buf, f.width as u32, f.height as u32))
+    }
+
+    /// 请 `.app` 截某个原生浮窗存盘。文件名在此定（与 Windows 侧同一格式），
+    /// 结果经上行 `shot.result` 回来由协调器弹 Toast（见 `Coordinator::handle_ext`）。
+    fn request_panel_shot(&self, target: &str, dir: &std::path::Path) {
+        let path = dir.join(format!("{target}_{}.png", crate::screenshot::timestamp()));
+        let body = serde_json::json!({ "target": target, "path": path.to_string_lossy() });
+        self.sink.push_frame(&encode_ext(
+            ext_kind::SHOT_PANEL,
+            body.to_string().as_bytes(),
+        ));
     }
 
     /// 按 `win` 的当前状态渲染一帧并推给 `.app`（像素走 SHM，元数据走 push 管道）。

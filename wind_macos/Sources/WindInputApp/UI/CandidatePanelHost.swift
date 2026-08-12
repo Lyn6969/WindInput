@@ -94,6 +94,33 @@ public final class CandidatePanelHost {
         sendFrame(BinaryCodec.encodeExtFrame(kind: kind, body: body))
     }
 
+    /// 截自家浮窗存盘 + 复制剪贴板, 结果回上行。主线程调用 (要渲染视图层级)。
+    ///
+    /// 未知 target **不静默丢弃**: 回一条失败, 免得服务端那边永远等不到答复而毫无线索。
+    private func capturePanel(_ target: String, to path: String) {
+        let panel: NSPanel? = switch target {
+        case "status_tip": statusBubble
+        case "tooltip": tooltip
+        default: nil
+        }
+        var body: [String: Any] = ["target": target, "path": path]
+        if let panel = panel {
+            do {
+                body["clipboard"] = try PanelCapture.snapshot(panel, toPath: path)
+                body["ok"] = true
+            } catch {
+                body["ok"] = false
+                body["reason"] = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            }
+        } else {
+            body["ok"] = false
+            body["reason"] = "unknown_target"
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        sendFrame(BinaryCodec.encodeExtFrame(kind: ExtKind.shotResult, body: data))
+    }
+
     /// 回发统一菜单项点击 (CmdMenuAction)。三处菜单共用同一发送路径。
     public func sendMenuAction(_ id: Int) {
         sendFrame(BinaryCodec.encodeMenuActionFrame(id: Int32(id)))
@@ -307,6 +334,16 @@ public final class CandidatePanelHost {
                 let args = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
                 let argv = (args?["args"] as? [String]) ?? []
                 ModeStatusController.shared.openSettings(arguments: argv)
+            case ExtKind.shotPanel:
+                // 服务端请我们截自家的浮窗（像素不在它那边）。存盘 + 复制剪贴板都在这里做，
+                // 文件名是它给的；结果回上行, 由它统一弹 Toast——两平台文案因此保持一致。
+                guard let o = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+                      let target = o["target"] as? String,
+                      let path = o["path"] as? String else {
+                    NSLog("WindInput[ext] shot.panel 载荷无法解析")
+                    break
+                }
+                DispatchQueue.main.async { [weak self] in self?.capturePanel(target, to: path) }
             case ExtKind.posCandidateQuery, ExtKind.posStatusTipQuery:
                 // 服务端问「你现在在哪」(用户点了菜单里的「固定位置」)。浮窗不可见时**不答**:
                 // 那种情况下没有"当前位置"可言, 沉默让服务端保留旧值, 好过报一个上次残留的

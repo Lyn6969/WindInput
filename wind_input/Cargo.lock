@@ -2617,6 +2617,7 @@ dependencies = [
  "core-text",
  "image",
  "resvg",
+ "serde_json",
  "thiserror",
  "tiny-skia",
  "tracing",

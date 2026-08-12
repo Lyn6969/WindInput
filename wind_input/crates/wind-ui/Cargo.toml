@@ -37,3 +37,6 @@ core-text = "22.0.0"
 wind-ipc = { path = "../wind-ipc" }
 # 全局热键（global_hotkey_macos）复用 key_inject 的 VK → CGKeyCode 表，禁止另起一份。
 wind-keys = { path = "../wind-keys" }
+# 扩展信封的 JSON body（`shot.panel` 等）。手拼字符串在这里不安全：路径里可能有
+# 引号或反斜杠，转义漏一处就是对端解不出的坏包。
+serde_json = { workspace = true }

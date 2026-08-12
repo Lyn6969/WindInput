@@ -101,6 +101,16 @@ public enum ExtKind {
     public static let posCandidate = "pos.candidate"
     /// 上行：状态提示气泡被拖动到新位置。body 同 `posCandidate`。
     public static let posStatusTip = "pos.status_tip"
+    /// 下行：请 `.app` 把某个原生浮窗截图存盘并复制到剪贴板。
+    /// body = `{"target":"status_tip"|"tooltip","path":"/绝对路径.png"}`。
+    ///
+    /// 状态气泡与悬停提示是 `.app` 侧的 NSPanel，**像素不在服务进程**（候选窗相反，
+    /// 那是服务端光栅化后经 SHM 推下来的）。文件名与随后的 Toast 文案仍由服务端决定，
+    /// 保持两平台措辞一致。
+    public static let shotPanel = "shot.panel"
+    /// 上行：`shotPanel` 的结果。
+    /// body = `{"ok":bool,"path":"…","clipboard":bool,"reason":"…"}`（`reason` 仅失败时）。
+    public static let shotResult = "shot.result"
     /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 `posCandidate`。body 空。
     public static let posCandidateQuery = "pos.candidate.query"
     /// 下行：问 `.app` 状态气泡此刻在哪，答案走上行 `posStatusTip`。body 空。

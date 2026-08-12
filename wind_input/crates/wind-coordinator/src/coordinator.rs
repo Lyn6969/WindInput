@@ -5775,6 +5775,44 @@ impl MessageHandler for Coordinator {
                     self.save_status_tip_pos(x, y);
                 }
             }
+            // 原生浮窗截图的结果（`.app` 动手，服务端只管文案）。文案与 Windows 侧
+            // `manager.rs` 的 ScreenshotStatusTip 分支逐字一致——两平台同一操作
+            // 得到不同措辞是最没必要的分叉。
+            ext_kind::SHOT_RESULT => {
+                let v: serde_json::Value = match serde_json::from_slice(body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("shot.result 载荷无法解析：{e}");
+                        return;
+                    }
+                };
+                let label = match v.get("target").and_then(|t| t.as_str()) {
+                    Some("tooltip") => "悬停提示",
+                    _ => "状态提示气泡",
+                };
+                let (msg, kind) = if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let suffix = if v
+                        .get("clipboard")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false)
+                    {
+                        "（已复制到剪贴板）"
+                    } else {
+                        ""
+                    };
+                    (format!("{label}已截图{suffix}\n{path}"), ToastKind::Success)
+                } else {
+                    match v.get("reason").and_then(|r| r.as_str()) {
+                        // 不可见不是错误：用户在气泡消失之后才点的菜单，如实告知即可。
+                        Some("not_visible") | None => {
+                            (format!("{label}未显示，无法截图"), ToastKind::Info)
+                        }
+                        Some(e) => (format!("截图失败：{e}"), ToastKind::Error),
+                    }
+                };
+                self.show_toast(&msg, ToastPosition::BottomRight, kind);
+            }
             _ => tracing::debug!("未处理的扩展消息 kind={kind}"),
         }
     }
