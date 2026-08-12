@@ -966,6 +966,10 @@ impl Coordinator {
             M::leaf("打开用户数据目录", cmd(MenuCmd::OpenConfigDir), true, false),
             M::leaf("打开日志目录", cmd(MenuCmd::OpenLogDir), true, false),
             M::separator(),
+            // 输入诊断 HUD 在 macOS 上整套未实现（`ShowInputDiag` 落在 forwarder 的兜底臂），
+            // 点了没有任何反应。留一个死菜单项比没有更糟，故按平台摘掉。
+            // 要在 macOS 做它得把整个浮层 UI 建在 `.app` 侧，见 wind_macos/AGENTS.md 差距表。
+            #[cfg(not(target_os = "macos"))]
             M::leaf(
                 "输入诊断 HUD",
                 cmd(MenuCmd::ToggleInputDiagnostics),
@@ -1737,6 +1741,34 @@ fn avoid_unset_sentinel(x: i32, y: i32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::avoid_unset_sentinel;
+
+    /// 输入诊断 HUD 整套在 macOS 未实现（`ShowInputDiag` 落在 forwarder 的兜底臂），
+    /// 菜单里不该留一个点了没反应的项。
+    ///
+    /// 这条同时是 `#[cfg]` **确实作用到了 `vec![]` 元素上**的证据——属性写在数组元素前
+    /// 是合法的，但写错位置（比如挂到 `M::leaf` 的某个实参上）照样能编过，只是不生效。
+    #[test]
+    fn input_diag_hud_menu_item_is_platform_gated() {
+        use crate::coordinator::Coordinator;
+        use wind_config::Config;
+
+        let c = Coordinator::new_headless(Config::default(), None);
+        fn contains(items: &[wind_ui::manager::MenuItemSpec], label: &str) -> bool {
+            items
+                .iter()
+                .any(|i| i.label == label || contains(&i.children, label))
+        }
+        assert_eq!(
+            contains(&c.build_main_menu_items(), "输入诊断 HUD"),
+            !cfg!(target_os = "macos"),
+            "HUD 菜单项的平台门控与当前平台不符"
+        );
+        // 同一子菜单里的邻项必须还在——防止 cfg 把整块 vec 或相邻项一起吞掉。
+        assert!(
+            contains(&c.build_main_menu_items(), "密码框强制英文"),
+            "邻项被误伤"
+        );
+    }
 
     /// 只有恰好 (0,0) 被规避，其余坐标（含含 0 分量与负坐标）必须原样落盘。
     #[test]
