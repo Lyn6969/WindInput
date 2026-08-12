@@ -443,6 +443,24 @@ build_setting() {
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <!-- windinput:// 协议(主题/方案/词库一键导入)。Windows 靠注册表把 URL 塞进 argv,
+         macOS 靠这段声明 + windui 的 GURL Apple Event 处理器(platform/macos/url_scheme.rs)
+         —— 两者缺一不可: 只声明不接事件, 点链接毫无反应(URL 不进 argv)。
+         两变体共用同一 scheme, 与 Windows 一样是"谁最后注册谁接管"; 单机同时装两版时
+         链接可能打到非预期变体上(见 wind-setting docs/online-update-plan.md 同一记述)。 -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>$bid</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>windinput</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST_EOF
@@ -1315,6 +1333,51 @@ install_app() {
         rm -rf "$built"
         info "已清理 build/ 重复 .app(防 LS 重复登记导致无法输入)"
     fi
+    check_accessibility_grant
+}
+
+# 辅助功能授权是否仍然有效(cdhash 比对)。
+#
+# 我们用自签证书(无 Team ID / 非 Apple 锚定), TCC 只能把授权钉死在**当次构建的 cdhash**
+# 上——授权记录里的 csreq 就是一条裸 `cdhash H"…"`(对照: 正规签名的 app 存的是
+# `anchor apple generic` + Team ID, 与具体构建无关)。于是每次重新部署 cdhash 一变,
+# 那条授权就再也匹配不上: **系统设置里的开关还亮着, 实际已失效**。
+#
+# 受影响的是命令直通车的按键合成与智能配对的宿主光标回退——它们会**静默不工作**。
+# 故装完主动比对一次, 不一致就明说该怎么办。
+#
+# 读 TCC.db 需要终端有「完全磁盘访问」; 读不到就跳过(不报错, 更不阻断安装)。
+check_accessibility_grant() {
+    # bundleID 从已装 .app 的 plist 直接读，避免在此再复制一份变体派生规则。
+    local appname; appname="$(app_name_for_variant)"
+    local app_path="$HOME/Library/Input Methods/$appname.app"
+    [[ -d "$app_path" ]] || return 0
+    local bid
+    bid="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" \
+        "$app_path/Contents/Info.plist" 2>/dev/null)" || return 0
+    [[ -n "$bid" ]] || return 0
+    command -v sqlite3 >/dev/null || return 0
+
+    local cur; cur="$(codesign -dvvv "$app_path" 2>&1 | sed -n 's/^CDHash=//p')"
+    [[ -n "$cur" ]] || return 0
+    local granted
+    granted="$(sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+        "select lower(hex(csreq)) from access where service='kTCCServiceAccessibility' and client='$bid' and auth_value=2" \
+        2>/dev/null)" || return 0
+    [[ -n "$granted" ]] || return 0   # 从未授权过: 首次用到时系统会自己弹框, 不必在此提示
+
+    # csreq 尾部 20 字节即被钉住的 cdhash(裸 `cdhash H"…"` 形态)。非该形态则跳过判断。
+    local pinned="${granted: -40}"
+    if [[ "$pinned" == "$cur" ]]; then
+        info "辅助功能授权有效 (cdhash 匹配)"
+        return 0
+    fi
+    warn "辅助功能授权已失效: 系统设置里开关仍是开的, 但它被钉在旧构建的 cdhash 上"
+    warn "  已授权: $pinned"
+    warn "  本  次: $cur"
+    warn "  影响: 命令直通车按键合成 / 智能配对的光标回退会静默不工作"
+    warn "  临时解法: tccutil reset Accessibility $bid  然后触发一次相关功能, 重新授权"
+    warn "  根治: 改用带 Team ID 的证书签名(如 Apple Development), TCC 便按身份而非 cdhash 记授权"
 }
 
 install_all() {

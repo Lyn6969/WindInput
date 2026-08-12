@@ -127,6 +127,17 @@ NSLog("WindInputApp boot bundleID=\(bundleID) connection=\(connectionName)")
 let imkServer = IMKServer(name: connectionName, bundleIdentifier: bundleID)
 NSLog("WindInputApp IMKServer ready name=\(connectionName) instance=\(String(describing: imkServer))")
 
+// 辅助功能授权自检 —— 只记一行日志, 不弹框。
+//
+// 需要它的功能: 命令直通车的按键合成 (KeySynthesizer) 与智能配对的宿主光标回退。
+// 未授权时那些功能**静默失效**, 而系统设置里的开关可能显示为"已开启"却仍不生效:
+// 本 .app 用自签证书 (无 Team ID / 非 Apple 锚定), TCC 只能把授权钉死在**当次构建的
+// cdhash** 上 (授权记录里的 csreq 就是一条裸 `cdhash H"…"`), 于是每次重新部署 cdhash
+// 一变, 那条授权就再也匹配不上——开关还亮着, 实际是失效的。
+// 排查时先看这一行, 免得再去翻 TCC.db。
+let axTrusted = AXIsProcessTrusted()
+NSLog("WindInputApp 辅助功能授权: \(axTrusted ? "已获得" : "未获得（按键合成/配对光标回退将静默失效；重新部署后需重新授权）")")
+
 // PR-A.5 Phase 1: 启动候选框 host (订阅 bridge push + mmap SHM)。
 // 失败不致命 — Go 服务可能晚启动, host 内部 lazy retry。
 CandidatePanelHost.shared.start()
