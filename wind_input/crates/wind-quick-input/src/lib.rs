@@ -133,7 +133,7 @@ fn parse_date_parts(s: &str) -> Option<(i32, u32, u32)> {
 /// 日期来源：完整日期优先，否则试年月。输入尾部的点号被容忍
 /// （`"2026.3."` 仍出「2026年3月」，此前会因第三段为空而候选全空）。
 ///
-/// 格式集（按序）：中文 → ISO 扩展 → ISO 基本 → 斜杠。
+/// 格式集（按序）：中文 → 全汉字 → ISO 扩展 → ISO 基本 → 斜杠。
 /// **不产出**中文补零写法（`2025年03月05日`）——GB/T 15835 的中文日期不加前导零，
 /// 它与不补零的那条只在月/日 <10 时不同，属纯冗余。
 pub fn generate_date_candidates(input: &str) -> Vec<String> {
@@ -143,6 +143,33 @@ pub fn generate_date_candidates(input: &str) -> Vec<String> {
         return ymd;
     }
     generate_year_month_candidates(input)
+}
+
+/// 年份的全汉字写法：逐位改写，`2025` → 「二〇二五」（GB/T 15835）。
+///
+/// 与短语层的 `${YC}` 共用同一份实现——同一个写法在两处取值不同，用户无从分辨。
+pub fn year_to_chinese(year: i32) -> String {
+    digits_to_chinese_chars(&year.to_string())
+}
+
+/// 0–99 的中文位值读法（月 / 日 / 时分用）：`6`→六，`10`→十，`12`→十二，
+/// `20`→二十，`25`→二十五。短语层的 `${MC}`/`${DC}` 同用此函数。
+///
+/// 十位不写「一」——中文日期是「十二月」不是「一十二月」，故不复用
+/// [`number_to_chinese`]（它按通用位值制输出「一十二」）。
+/// 超出 0–99 回退逐位改写：调用点（月/日/时分）都在范围内，但公开 API 不该 panic。
+pub fn small_int_to_chinese(n: u32) -> String {
+    if n > 99 {
+        return digits_to_chinese_chars(&n.to_string());
+    }
+    let d = |x: u32| CHAR_DIGITS[x as usize];
+    match n {
+        0..=9 => d(n).to_string(),
+        10..=19 if n.is_multiple_of(10) => "十".to_string(),
+        10..=19 => format!("十{}", d(n % 10)),
+        _ if n.is_multiple_of(10) => format!("{}十", d(n / 10)),
+        _ => format!("{}十{}", d(n / 10), d(n % 10)),
+    }
 }
 
 /// 完整日期（y.m.d 或 m.d，后者补当前年）。
@@ -156,6 +183,12 @@ fn generate_full_date_candidates(input: &str) -> Vec<String> {
     }
     vec![
         format!("{}年{}月{}日", year, month, day),
+        format!(
+            "{}年{}月{}日",
+            year_to_chinese(year),
+            small_int_to_chinese(month),
+            small_int_to_chinese(day)
+        ),
         format!("{:04}-{:02}-{:02}", year, month, day),
         format!("{:04}{:02}{:02}", year, month, day),
         format!("{:04}/{:02}/{:02}", year, month, day),
@@ -165,7 +198,7 @@ fn generate_full_date_candidates(input: &str) -> Vec<String> {
 /// 年月表达式（首段>31，第二段 1-12）。
 ///
 /// 首段 >31 是与「月.日」的分界：`12.25` 只可能是 12 月 25 日，`2025.12` 只可能是年月。
-/// 同样不产出中文补零写法（`2025年06月`）。
+/// 同样不产出中文补零写法（`2025年06月`）。格式集与完整日期同构：中文 → 全汉字 → ISO → 斜杠。
 pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
     let input = trim_pending_tail(input);
     let parts: Vec<&str> = input.split('.').collect();
@@ -185,6 +218,7 @@ pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
     }
     vec![
         format!("{}年{}月", y, m),
+        format!("{}年{}月", year_to_chinese(y), small_int_to_chinese(m)),
         format!("{:04}-{:02}", y, m),
         format!("{:04}/{:02}", y, m),
     ]
@@ -406,6 +440,13 @@ pub fn format_calc_result_prec(val: f64, decimal_places: i32) -> String {
 // ───────────────────────── 数字 / 金额 / 中文数字 ─────────────────────────
 
 const LOWER_DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+/// 逐位改写专用数字表。
+///
+/// 与 [`LOWER_DIGITS`] 只差首项：阿拉伯数字**逐位**改写为汉字时，0 写「〇」
+/// （GB/T 15835，如「二〇二六年」）；而位值读法里表示数位空缺的是「零」
+/// （「一万零一」「二百零五」），财务大写同理（「壹仟零贰拾元」）。
+/// 两者不是一个字，故不能共用一份表。
+const CHAR_DIGITS: [&str; 10] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
 const UPPER_DIGITS: [&str; 10] = ["零", "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖"];
 const LOWER_UNITS: [&str; 4] = ["", "十", "百", "千"];
 const UPPER_UNITS: [&str; 4] = ["", "拾", "佰", "仟"];
@@ -569,18 +610,20 @@ fn decimal_to_chinese_text(int_part: &str, dec_part: &str, upper: bool) -> Strin
     b
 }
 
-/// 逐位中文（含小数点）："123" → "一二三"
+/// 逐位中文（含小数点）："123" → "一二三"，"2026" → "二〇二六"
+///
+/// 用 [`CHAR_DIGITS`]：这里是逐位改写，0 是「〇」而非位值读法的「零」。
 fn digits_to_chinese_chars(num: &str) -> String {
     let mut b = String::new();
     for ch in num.chars() {
         if ch.is_ascii_digit() {
-            b.push_str(LOWER_DIGITS[(ch as u8 - b'0') as usize]);
+            b.push_str(CHAR_DIGITS[(ch as u8 - b'0') as usize]);
         } else if ch == '.' {
             b.push('点');
         }
     }
     if b.is_empty() {
-        LOWER_DIGITS[0].to_string()
+        CHAR_DIGITS[0].to_string()
     } else {
         b
     }
@@ -793,8 +836,46 @@ mod tests {
         let c = generate_date_candidates("2025.12.25");
         assert_eq!(
             c,
-            vec!["2025年12月25日", "2025-12-25", "20251225", "2025/12/25"],
-            "中文优先，且不含补零的中文写法"
+            vec![
+                "2025年12月25日",
+                "二〇二五年十二月二十五日",
+                "2025-12-25",
+                "20251225",
+                "2025/12/25"
+            ],
+            "中文优先，全汉字次之，且不含补零的中文写法"
+        );
+    }
+
+    #[test]
+    fn test_small_int_to_chinese() {
+        // 短语层 ${MC}/${DC} 迁来的用例：口径必须与迁移前逐字一致
+        assert_eq!(small_int_to_chinese(6), "六");
+        assert_eq!(small_int_to_chinese(10), "十");
+        assert_eq!(small_int_to_chinese(12), "十二");
+        assert_eq!(small_int_to_chinese(20), "二十");
+        assert_eq!(small_int_to_chinese(25), "二十五");
+        assert_eq!(small_int_to_chinese(31), "三十一");
+        assert_eq!(small_int_to_chinese(0), "〇");
+        // 越界不 panic，回退逐位
+        assert_eq!(small_int_to_chinese(100), "一〇〇");
+        assert_eq!(year_to_chinese(2026), "二〇二六");
+    }
+
+    #[test]
+    fn test_date_all_chinese_form() {
+        // 年份逐位（0 → 〇），月日位值读法且十位不写「一」
+        let c = generate_date_candidates("2005.10.1");
+        assert!(
+            c.contains(&"二〇〇五年十月一日".to_string()),
+            "实际: {:?}",
+            c
+        );
+        assert!(!c.iter().any(|s| s.contains("二零")), "年份不得用「零」");
+        assert!(
+            !c.iter().any(|s| s.contains("一十")),
+            "月日十位不写「一」，实际: {:?}",
+            c
         );
     }
 
@@ -824,14 +905,14 @@ mod tests {
     #[test]
     fn test_year_month() {
         let c = generate_year_month_candidates("2025.6");
-        assert_eq!(c, vec!["2025年6月", "2025-06", "2025/06"]);
+        assert_eq!(c, vec!["2025年6月", "二〇二五年六月", "2025-06", "2025/06"]);
     }
 
     #[test]
     fn test_year_month_survives_trailing_dot() {
         // 「2026.3.」输入到一半：此前第三段为空导致候选全空，现应维持年月候选
         let c = generate_date_candidates("2026.3.");
-        assert_eq!(c, vec!["2026年3月", "2026-03", "2026/03"]);
+        assert_eq!(c, vec!["2026年3月", "二〇二六年三月", "2026-03", "2026/03"]);
         assert_eq!(c, generate_date_candidates("2026.3"), "尾点不改变候选");
         // 完整日期同理
         assert_eq!(
@@ -931,6 +1012,24 @@ mod tests {
             number_to_chinese("100", &LOWER_DIGITS, &LOWER_UNITS),
             "一百"
         );
+    }
+
+    #[test]
+    fn test_zero_char_only_in_per_digit_reading() {
+        // 逐位改写用「〇」（GB/T 15835）
+        assert_eq!(digits_to_chinese_chars("2026"), "二〇二六");
+        assert_eq!(digits_to_chinese_chars("100"), "一〇〇");
+        assert_eq!(digits_to_chinese_chars("0"), "〇");
+
+        // ★ 反向对照：位值读法与财务大写仍必须是「零」，两者不可混用
+        let c = generate_number_candidates("10001", 6);
+        assert!(c.contains(&"一万零一".to_string()), "实际: {:?}", c);
+        assert!(c.contains(&"壹万零壹元整".to_string()), "实际: {:?}", c);
+        assert!(c.contains(&"一〇〇〇一".to_string()), "实际: {:?}", c);
+        // 小数读法的 0 同属位值语义（「一点零五」），不受影响
+        let d = generate_number_candidates("1.05", 6);
+        assert!(d.contains(&"一点零五".to_string()), "实际: {:?}", d);
+        assert!(d.contains(&"壹元零伍分".to_string()), "实际: {:?}", d);
     }
 
     // ── 合并入口 ──

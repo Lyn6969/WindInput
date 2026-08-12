@@ -692,7 +692,6 @@ fn utf8_len(lead: u8) -> usize {
     }
 }
 
-const CN_DIGITS: [&str; 10] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
 const WEEKDAY_CN: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
 
 /// 展开单个变量；不支持的返回 None。
@@ -707,9 +706,11 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
         "mm" => format!("{:02}", now.minute()),
         "ss" => format!("{:02}", now.second()),
         "WC" => WEEKDAY_CN[now.weekday().num_days_from_sunday() as usize].to_string(),
-        "YC" => year_chinese(now.year()),
-        "MC" => small_int_chinese(now.month()),
-        "DC" => small_int_chinese(now.day()),
+        // 中文数字读法与快捷输入的日期候选共用一份实现（`wind-quick-input`）：
+        // 同一个「二〇二六年六月十四日」在两处取值不同，用户无从分辨谁对。
+        "YC" => wind_quick_input::year_to_chinese(now.year()),
+        "MC" => wind_quick_input::small_int_to_chinese(now.month()),
+        "DC" => wind_quick_input::small_int_to_chinese(now.day()),
         "ts" => now.timestamp().to_string(),
         "tsms" => now.timestamp_millis().to_string(),
         // 随机 UUID：与命令栏 `{uuid()}` 共用同一份生成逻辑（同 dir_var 的理由——
@@ -719,43 +720,6 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
         // 若只在 $CC 里生效、直接写就不生效，用户无从分辨是语法错还是没支持。
         _ => return wind_config::dir_var_str(name),
     })
-}
-
-/// 年份逐位中文："2026" → "二〇二六"
-fn year_chinese(year: i32) -> String {
-    year.to_string()
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| CN_DIGITS[(b - b'0') as usize])
-        .collect()
-}
-
-/// 1~99 的中文读法（月/日用）：6→六，12→十二，25→二十五，20→二十
-fn small_int_chinese(n: u32) -> String {
-    if n < 10 {
-        return CN_DIGITS[n as usize].to_string();
-    }
-    if n < 20 {
-        return format!(
-            "十{}",
-            if n.is_multiple_of(10) {
-                ""
-            } else {
-                CN_DIGITS[(n % 10) as usize]
-            }
-        );
-    }
-    let tens = n / 10;
-    let ones = n % 10;
-    format!(
-        "{}十{}",
-        CN_DIGITS[tens as usize],
-        if ones == 0 {
-            ""
-        } else {
-            CN_DIGITS[ones as usize]
-        }
-    )
 }
 
 #[cfg(test)]
@@ -1180,15 +1144,8 @@ mod tests {
         assert_eq!(hits[1].text, "北京市");
     }
 
-    #[test]
-    fn test_small_int_chinese() {
-        assert_eq!(small_int_chinese(6), "六");
-        assert_eq!(small_int_chinese(10), "十");
-        assert_eq!(small_int_chinese(12), "十二");
-        assert_eq!(small_int_chinese(20), "二十");
-        assert_eq!(small_int_chinese(25), "二十五");
-        assert_eq!(small_int_chinese(31), "三十一");
-    }
+    // 中文数字读法本身的用例已随实现迁往 wind-quick-input
+    // （`test_small_int_to_chinese`）；此处保留 `test_expand_chinese` 覆盖模板端到端。
 
     /// 回归：`${VAR}` 旧式模板变量不得被 cmdbar 语法探测劫走。
     ///

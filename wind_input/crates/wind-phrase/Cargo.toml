@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 wind-cmdbar = { path = "../wind-cmdbar" }
+# 中文数字读法（${YC}/${MC}/${DC}）：与快捷输入的日期候选共用一份实现
+wind-quick-input = { path = "../wind-quick-input" }
 # `${APP_DIR}` 等内部目录变量：与命令栏字符串同源，见 wind_config::dir_var
 wind-config = { path = "../wind-config" }
 tracing = { workspace = true }

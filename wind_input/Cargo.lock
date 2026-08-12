@@ -2497,6 +2497,7 @@ dependencies = [
  "tracing",
  "wind-cmdbar",
  "wind-config",
+ "wind-quick-input",
 ]
 
 [[package]]

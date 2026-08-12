@@ -2492,12 +2492,17 @@ fn test_quick_input_date_space_commits() {
         "日期候选应含 2025年12月25日，实际: {:?}",
         texts
     );
-    // 中文日期是首选（中文输入法场景下最常用），且不产出补零的中文写法
+    // 中文日期是首选（中文输入法场景下最常用），全汉字写法次之，且不产出补零的中文写法
     assert_eq!(texts[0], "2025年12月25日", "实际: {:?}", texts);
+    let cn: Vec<&str> = texts
+        .iter()
+        .filter(|t| t.contains('年'))
+        .map(|s| s.as_str())
+        .collect();
     assert_eq!(
-        texts.iter().filter(|t| t.contains('年')).count(),
-        1,
-        "中文日期只应有不补零的一条（补零写法不合 GB/T 15835），实际: {:?}",
+        cn,
+        vec!["2025年12月25日", "二〇二五年十二月二十五日"],
+        "中文日期恰两条：阿拉伯数字式与全汉字式，均不补零（补零写法不合 GB/T 15835），实际: {:?}",
         texts
     );
     // 空格上屏高亮（首选）
