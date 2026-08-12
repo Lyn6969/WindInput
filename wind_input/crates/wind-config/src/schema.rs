@@ -17,6 +17,34 @@ pub struct Schema {
     pub engine: EngineSpec,
     #[serde(default)]
     pub dictionaries: Vec<DictSpec>,
+    /// **方案级词库权重归一化**（`[weight_spec]`）。`None` = 不归一化（默认）。
+    ///
+    /// ## 为什么是方案级而不是按词库
+    ///
+    /// 一个方案的子词库是**同一套规则下的分组**（主库/扩展/地名/emoji），分库是为了
+    /// 分组与分级，不是各自独立的权重体系。故全方案共用一个映射函数——单调映射天然保序，
+    /// **库间相对关系原样保留**。
+    ///
+    /// ⚠️ 按词库配过一版，实测有反转：给扩展库单独配归一化后，`aaah` 下「欧莱雅」
+    /// （扩展库 1170→3328）反超「葡萄牙」（主库 1485），而作者写的 `base_order = 1`
+    /// 救不回来（`better()` 是 `weight 降 → base_order 升`，weight 在前）。
+    /// 根因就是**两个不同的映射函数之间没有保序保证**。
+    ///
+    /// ## 用途：Rime 生态导入的适配层
+    ///
+    /// 主要场景是从 Rime 生态导入的方案——其权重常是**未归一化的原始语料词频**
+    /// （虎码「的」= 10,359,470），与本仓约定的 `0~10000` 差三个数量级，
+    /// 于是「短语 vs 码表」的权重比较失真。本仓自产方案（五笔等）守约，**不配**。
+    ///
+    /// ⚠️ **拼音方案不要配**：拼音权重刻意在另一条轴（max 1537 万），且
+    /// `pinyin/mod.rs` 的 `COMPLETION_FAR_WEIGHT_FLOOR`(100) /
+    /// `SENTENCE_YIELD_WEIGHT_FLOOR`(50) 是**按原始权重分布标定的绝对阈值**
+    /// （该处代码注释亦有明示）。归一化后拼音 p50 从 20 抬到 target，两道闸门会
+    /// **静默失效**——人人过线，等于没有。
+    ///
+    /// 参数建议由 `wind_input dict weight-check` 按方案实测算出，不必手填。
+    #[serde(default)]
+    pub weight_spec: Option<WeightSpec>,
     #[serde(default)]
     pub encoder: Option<EncoderSpec>,
     /// **方案级按键功能表**（`[key_actions]`）：按键名 → 动词。
@@ -298,13 +326,6 @@ pub struct DictSpec {
     /// 用户覆盖启用（tri-state，nil=继承 default_enabled）
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// 权重归一化参数（[dictionaries.weight_spec]）。
-    ///
-    /// **当前未接线**：仅作为词库权重分布的事实记录供设计者查阅（如 pinyin 方案记 median=200，
-    /// 是 `pinyin/mod.rs` COMPLETION_FAR_WEIGHT_FLOOR 取值的依据）。跨库权重归一化尚未实现——
-    /// 现阶段用 `default_weight`（整库定档）+ `base_order`（硬分档）手工校准。
-    #[serde(default)]
-    pub weight_spec: Option<WeightSpec>,
     /// 该词库的**层级基序档位**（小整数）：排序时作为独立层级（weight 之后、natural_order 之前）。
     /// 等权/`base_sort=natural` 时决定库间先后——设计者配 0/1/2…（如给扩展库配 1 排到主库 0 之后），
     /// 与词库条目数无关。默认 0。系统词库建议取 `>=0`（负值会与用户/临时词层的默认档交错）。
@@ -316,18 +337,23 @@ pub struct DictSpec {
     pub default_weight: Option<i32>,
 }
 
-/// 权重归一化（[dictionaries.weight_spec]）
+/// 方案级词库权重归一化（`[weight_spec]`）。语义与取舍见 [`Schema::weight_spec`]。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WeightSpec {
+    /// 本方案全部词库合并后的权重**中位数**（声明值）。归一化后落到 `target`。
     #[serde(default)]
     pub median: i64,
+    /// 归一化的**上锚点**。建议取 **p99 而非 max**：离群值会吃掉整个量程——虎码方案级
+    /// max=1e11（12 条脏数据）而 p99=343,880，相差 30 万倍。超过本值者 clamp 到上界。
     #[serde(default)]
     pub max: i64,
+    /// 保留字段（暂未消费）。
     #[serde(default)]
     pub min: i64,
-    /// "linear" / "log"
+    /// `"log"`（默认，推荐）/ `"linear"`。长尾分布必须用 log——线性压缩会把低段整除归零。
     #[serde(default)]
     pub mode: String,
+    /// `median` 归一化后的落点。0 = 取默认 1000（与短语默认权重同量级）。
     #[serde(default)]
     pub target: i64,
 }

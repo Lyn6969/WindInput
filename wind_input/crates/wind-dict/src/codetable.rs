@@ -1012,6 +1012,9 @@ pub struct WeightScan {
     pub zero: usize,
     pub min: i32,
     pub median: i32,
+    /// 99 分位。**归一化的上锚点建议取它而非 `max`**：离群值会吃掉整个量程——
+    /// 虎码方案级 max=1e11（12 条脏数据）而 p99=343,880，相差 30 万倍。
+    pub p99: i32,
     pub max: i32,
     /// 超出 [`WEIGHT_RANGE_MAX`] 的条目数。
     pub over_range: usize,
@@ -1027,6 +1030,58 @@ impl WeightScan {
     /// 超范围占比（0.0~100.0）。
     pub fn over_pct(&self) -> f64 {
         100.0 * self.over_range as f64 / self.weighted.max(1) as f64
+    }
+}
+
+/// 读取一个 `.dict.yaml` 的全部非零权重（未排序）与零权重条目数。
+///
+/// 供**跨词库聚合**：方案级归一化的参数取自全方案合并后的分布，而中位数/分位数
+/// 无法由各库的摘要合并得出，必须并原始值再算。
+pub fn scan_weight_values(path: impl AsRef<Path>) -> anyhow::Result<(Vec<i32>, usize)> {
+    let path = path.as_ref();
+    let content = fs::read_to_string(path)?;
+    let Some(off) = rime_body_offset(&content) else {
+        anyhow::bail!("{}: 缺少 YAML 正文分隔行 `...`", path.display());
+    };
+    let body = &content[off..];
+    let cutoff = find_no_comment_directive(body);
+    let Some(spec) = resolve_columns(&content, body, path, cutoff) else {
+        anyhow::bail!("{}: 列声明残缺，无法判定权重列", path.display());
+    };
+    let mut stats = ParseStats::default();
+    let mut ws: Vec<i32> = Vec::new();
+    let mut zero = 0usize;
+    for (line, comments_on) in body_lines(body, 0, cutoff) {
+        if let Some(r) = parse_rime_line(line, comments_on, false, spec, &mut stats) {
+            if r.weight > 0 {
+                ws.push(r.weight);
+            } else {
+                zero += 1;
+            }
+        }
+    }
+    Ok((ws, zero))
+}
+
+/// 由一组权重（**将被就地排序**）与零权重条目数生成画像。
+pub fn weight_scan_of(ws: &mut [i32], zero: usize) -> WeightScan {
+    if ws.is_empty() {
+        return WeightScan {
+            zero,
+            ..Default::default()
+        };
+    }
+    ws.sort_unstable();
+    let n = ws.len();
+    WeightScan {
+        weighted: n,
+        zero,
+        min: ws[0],
+        median: ws[n / 2],
+        // 向下取整的 99 分位；不足百条时退化为最大值。
+        p99: ws[(n * 99 / 100).min(n - 1)],
+        max: ws[n - 1],
+        over_range: ws.iter().filter(|&&w| w > WEIGHT_RANGE_MAX).count(),
     }
 }
 
@@ -1058,21 +1113,7 @@ pub fn scan_weight_stats(path: impl AsRef<Path>) -> anyhow::Result<WeightScan> {
             }
         }
     }
-    if ws.is_empty() {
-        return Ok(WeightScan {
-            zero,
-            ..Default::default()
-        });
-    }
-    ws.sort_unstable();
-    Ok(WeightScan {
-        weighted: ws.len(),
-        zero,
-        min: ws[0],
-        median: ws[ws.len() / 2],
-        max: ws[ws.len() - 1],
-        over_range: ws.iter().filter(|&&w| w > WEIGHT_RANGE_MAX).count(),
-    })
+    Ok(weight_scan_of(&mut ws, zero))
 }
 
 pub fn parse_rime_entries_parallel(

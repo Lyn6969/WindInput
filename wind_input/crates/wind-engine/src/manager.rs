@@ -134,8 +134,8 @@ struct MixPinyinOpts {
 
 /// 一个待注册的码表词库层（[`EngineManager::load_codetable_layers`] 的产出）。
 ///
-/// 此前是个 5 元组。加 `weight_norm` 后到 6 项，且末三项同为「权重相关的可选值」，
-/// 位置错配编译器不报——具名后消费点 `l.default_weight` / `l.weight_norm` 自证。
+/// 此前是个 5 元组。具名后消费点 `l.default_weight` / `l.base_order` 自证，
+/// 不再靠位置对齐。
 struct CodetableLayer {
     name: String,
     dict: CachedDict,
@@ -144,24 +144,29 @@ struct CodetableLayer {
     base_order: i32,
     /// `[[dictionaries]].default_weight`：抹平整库权重。
     default_weight: Option<i32>,
-    /// `[dictionaries.weight_spec]`：保序压缩回约定值域。见 [`weight_norm_of`]。
-    weight_norm: Option<wind_dict::WeightNorm>,
 }
 
-/// `[dictionaries.weight_spec]` → [`wind_dict::WeightNorm`]。
+/// 方案级 `[weight_spec]` → [`wind_dict::WeightNorm`]，施加到本方案**全部**词库层。
 ///
-/// 未配置 → `None`（守约词库的常态，不做任何换算）。
+/// 未配置 → `None`（守约方案的常态，不做任何换算）。
+///
+/// ## ⚠️ 必须是方案级、不可退回按库
+///
+/// 全方案共用一个映射函数，单调映射天然保序 ⇒ **库间相对关系原样保留**。
+/// 按库配过一版，实测有反转：扩展库单独归一化后其条目反超主库，而作者写的
+/// `base_order` 救不回来（`better()` 里 weight 在 base_order 之前）。
+/// 根因是**两个不同的映射函数之间没有保序保证**。见 `Schema::weight_spec`。
 ///
 /// ⚠️ **配了但参数不自洽时告警而非静默跳过**：那会让方案作者以为「配了就生效了」，
 /// 而实际什么也没发生——本仓「配置就位、消费点不可达」那一类静默失效的同款形态。
-fn weight_norm_of(spec: &DictSpec) -> Option<wind_dict::WeightNorm> {
-    let ws = spec.weight_spec.as_ref()?;
+fn weight_norm_of(schema: &Schema) -> Option<wind_dict::WeightNorm> {
+    let ws = schema.weight_spec.as_ref()?;
     let norm = wind_dict::WeightNorm::from_parts(ws.median, ws.max, &ws.mode, ws.target);
     if norm.is_none() {
         warn!(
-            "词库 {} 的 [dictionaries.weight_spec] 参数不自洽（median={} max={} target={}），\
-             归一化未生效。要求 0 < median < max 且 0 < target < 10000。",
-            spec.path, ws.median, ws.max, ws.target
+            "方案 {} 的 [weight_spec] 参数不自洽（median={} max={} target={}），归一化未生效。\
+             要求 0 < median < max 且 0 < target < 10000。",
+            schema.schema.id, ws.median, ws.max, ws.target
         );
     }
     norm
@@ -2598,12 +2603,15 @@ impl EngineManager {
                     schema_id,
                 )));
             }
+            // 方案级归一化：构造一次、施加到全部词库层——同一个映射函数才保序，
+            // 库间相对关系因此原样保留（见 `weight_norm_of`）。
+            let wnorm = weight_norm_of(&schema);
             for l in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(l.dict, l.name, l.enabled)
                         .with_base_order(l.base_order)
                         .with_default_weight(l.default_weight)
-                        .with_weight_norm(l.weight_norm),
+                        .with_weight_norm(wnorm),
                 ));
             }
             // 英文最大码长取词库最长词的安全上界（前缀匹配用，不触发顶码/自动上屏）。
@@ -2756,14 +2764,16 @@ impl EngineManager {
                 )));
             }
             // 主库优先注册（在 load_codetable_layers 中已置首），扩展库其后。
-            // base_order 决定等权/natural 排序的库间档位；default_weight 覆盖无权重库的权重档；
-            // weight_norm 把偏离约定值域的权重压回 0~10000（见 dict-weight-normalization.md）。
+            // base_order 决定等权/natural 排序的库间档位；default_weight 覆盖无权重库的权重档。
+            // 方案级归一化：构造一次、施加到全部词库层——同一个映射函数才保序，
+            // 库间相对关系因此原样保留（见 `weight_norm_of`）。
+            let wnorm = weight_norm_of(&schema);
             for l in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(l.dict, l.name, l.enabled)
                         .with_base_order(l.base_order)
                         .with_default_weight(l.default_weight)
-                        .with_weight_norm(l.weight_norm),
+                        .with_weight_norm(wnorm),
                 ));
             }
             // 码元字符集与上屏行为同源于 `eff`（全局基线 + 方案 [engine.codetable] 折叠），
@@ -2894,7 +2904,6 @@ impl EngineManager {
                     enabled: true,
                     base_order: usable[main_idx].base_order,
                     default_weight: usable[main_idx].default_weight,
-                    weight_norm: weight_norm_of(usable[main_idx]),
                 });
             }
             None => return Vec::new(),
@@ -2919,7 +2928,6 @@ impl EngineManager {
                     enabled,
                     base_order: e.base_order,
                     default_weight: e.default_weight,
-                    weight_norm: weight_norm_of(e),
                 });
             }
         }

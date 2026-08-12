@@ -19,8 +19,11 @@ type = "rime_pinyin"
 default = true
 base_order = 0
 
-[dictionaries.weight_spec]
-median = 200
-max = 19260817
-mode = "log"
+# 权重不归一化——这是刻意的，勿加 [weight_spec]：
+#   1. 拼音权重刻意在与码表不同的轴上（max 1537 万），其与码表的先后由协调器
+#      source_tier 的档位隔离决定，不靠比 weight；
+#   2. pinyin/mod.rs 的 COMPLETION_FAR_WEIGHT_FLOOR(100) 与
+#      SENTENCE_YIELD_WEIGHT_FLOOR(50) 是**按原始权重分布标定的绝对阈值**（该处
+#      代码注释亦有明示）。拼音 p50 仅 20，归一化后人人过线，两道闸门会静默失效。
+# 本库分布（供设计者查阅）：median≈200 max≈1926 万 —— 亦是上述 FLOOR 取值的依据。
 

@@ -181,6 +181,26 @@ mod tests {
         assert!(WeightNorm::from_parts(397, 10_000, "log", 0).is_some());
     }
 
+    /// ★★ **同一映射施加于多个词库时，库间相对关系不变**——这是「方案级而非按库」的全部理由。
+    ///
+    /// 按库配过一版，实测反转：`aaah` 下主库「葡萄牙」(1485) 本压过扩展库「欧莱雅」(1170)，
+    /// 给扩展库单独配归一化后欧莱雅升到 3328、反超；而作者写的 `base_order = 1` 救不回来
+    /// （`better()` 是 `weight 降 → base_order 升`，weight 在前）。
+    /// 根因是**两个不同的映射函数之间没有保序保证**，不是参数没调好。
+    #[test]
+    fn one_map_across_dicts_preserves_cross_dict_order() {
+        let n = WeightNorm::from_parts(397, 343_880, "log", DEFAULT_TARGET).unwrap();
+        // (主库权重, 扩展库权重) —— 每一对里主库都更高
+        let pairs = [(1485, 1170), (9999, 2125), (500, 499), (10_359_470, 18_526)];
+        for (main, extra) in pairs {
+            let (m, e) = (n.apply(main), n.apply(extra));
+            assert!(
+                m >= e,
+                "库间序反转：主库 {main}→{m} 不应低于扩展库 {extra}→{e}"
+            );
+        }
+    }
+
     /// 超出声明 max 的条目被 clamp 到上界，不会溢出成更大的数。
     #[test]
     fn beyond_declared_max_clamps() {

@@ -54,7 +54,7 @@ fn print_usage() {
          import <方案id> <文件> [--replace] [--sections a,b]\n                                            \
          从文件导入（缺省合并；格式自动识别 WindDict/Rime/TSV）\n\
          \n\
-         weight-check [--data <目录>]              体检各方案词库的权重值域（离线，无需服务）\n\
+         weight-check [--data <目录>]              按方案体检词库权重值域（离线，无需服务）\n\
          \n\
          段类型: userWords(用户词库) tempWords(临时词库) freq(词频) shadow(候选调整)"
     );
@@ -177,7 +177,7 @@ fn print_import_report(v: &Value) {
     }
 }
 
-/// `dict weight-check`：离线体检各方案词库的**权重值域**。
+/// `dict weight-check`：离线体检各**方案**的词库权重值域。
 ///
 /// ## 为什么必须是离线的独立命令，而不是启动时告警
 ///
@@ -188,8 +188,14 @@ fn print_import_report(v: &Value) {
 /// 本命令直接读源文件、无视缓存，是权威的那条路径。且受众是**方案作者**（终端用户看到
 /// 告警也改不了词库），他们需要的是「打包前随手查一次」。
 ///
-/// 输出对不守约的库直接给出**可粘贴的 `[dictionaries.weight_spec]` 配置块**——
-/// 参数由实测分布算出，比让作者自己去统计中位数靠谱。
+/// ## ⚠️ 统计按**方案**聚合，不按词库
+///
+/// 归一化是方案级的（一个映射函数施加到全部词库，保序 ⇒ 库间关系不变，见
+/// `Schema::weight_spec`），故参数必须取**全方案合并后**的分布。中位数/分位数无法由各库
+/// 的摘要合并得出，必须并原始值再算——这正是 `scan_weight_values` 存在的理由。
+///
+/// 上锚点建议 **p99 而非 max**：虎码方案级 max=1e11（12 条脏数据）而 p99=343,880，
+/// 相差 30 万倍，用 max 会让量程被那 12 条吃掉。
 fn cmd_weight_check(args: &[String]) -> anyhow::Result<i32> {
     let data_dir = match args.iter().position(|a| a == "--data") {
         Some(i) => std::path::PathBuf::from(
@@ -232,61 +238,81 @@ fn cmd_weight_check(args: &[String]) -> anyhow::Result<i32> {
         if dicts.is_empty() {
             continue;
         }
-        println!("方案 {sid}");
-        for d in dicts {
+
+        // 全方案合并取值——参数必须按方案算，见函数文档。
+        let mut all: Vec<i32> = Vec::new();
+        let mut zero = 0usize;
+        let mut files_n = 0usize;
+        let mut missing: Vec<&str> = Vec::new();
+        for d in &dicts {
             let path = schemas_dir.join(&d.path);
             if !path.is_file() {
-                println!("  ?  {} （文件不存在）", d.path);
+                missing.push(&d.path);
                 continue;
             }
-            match wind_dict::codetable::scan_weight_stats(&path) {
+            match wind_dict::codetable::scan_weight_values(&path) {
+                Ok((mut ws, z)) => {
+                    all.append(&mut ws);
+                    zero += z;
+                    files_n += 1;
+                }
                 Err(e) => println!("  ?  {} （{e}）", d.path),
-                Ok(sc) if sc.weighted == 0 => {
-                    // 整库无权重是**有意设计**（退化为文件顺序），不算问题，但要说清
-                    // 它在跨来源比较里会恒沉底——除非配了 default_weight。
-                    let hint = if d.default_weight.is_some() {
-                        "已配 default_weight"
-                    } else {
-                        "跨来源比较时恒沉底；如需参与请配 default_weight"
-                    };
-                    println!("  -  {}   无权重列（{} 条，{hint}）", d.path, sc.zero);
-                }
-                Ok(sc) if sc.is_compliant() => {
-                    println!(
-                        "  ok {}   {} 条  中位={} 最大={}",
-                        d.path, sc.weighted, sc.median, sc.max
-                    );
-                }
-                Ok(sc) => {
-                    bad += 1;
-                    let configured = d.weight_spec.is_some();
-                    println!(
-                        "  !! {}   {} 条  中位={} 最大={}  超范围 {} 条（{:.1}%）",
-                        d.path,
-                        sc.weighted,
-                        sc.median,
-                        sc.max,
-                        sc.over_range,
-                        sc.over_pct()
-                    );
-                    if configured {
-                        println!("       已配 weight_spec —— 归一化生效，此处仅报源数据分布");
-                    } else {
-                        println!("       建议在该 [[dictionaries]] 下追加：");
-                        println!("         [dictionaries.weight_spec]");
-                        println!("         median = {}", sc.median);
-                        println!("         max = {}", sc.max);
-                        println!("         mode = \"log\"");
-                    }
-                }
+            }
+        }
+        let sc = wind_dict::codetable::weight_scan_of(&mut all, zero);
+        let configured = schema.weight_spec.is_some();
+
+        print!("方案 {sid}  （{files_n} 个词库");
+        if !missing.is_empty() {
+            print!("，{} 个文件缺失", missing.len());
+        }
+        println!("）");
+
+        if sc.weighted == 0 {
+            // 整库无权重是**有意设计**（退化为文件顺序），不算问题。
+            println!(
+                "  -  全部词库无权重列（{} 条）：按文件顺序排，无需归一化",
+                sc.zero
+            );
+        } else if sc.is_compliant() {
+            println!(
+                "  ok {} 条带权重  中位={} p99={} 最大={}",
+                sc.weighted, sc.median, sc.p99, sc.max
+            );
+            if configured {
+                println!("     ⚠ 已配 [weight_spec] 但本方案权重本就守约——通常不必配");
+            }
+        } else {
+            bad += 1;
+            println!(
+                "  !! {} 条带权重  中位={} p99={} 最大={}  超范围 {} 条（{:.1}%）",
+                sc.weighted,
+                sc.median,
+                sc.p99,
+                sc.max,
+                sc.over_range,
+                sc.over_pct()
+            );
+            if configured {
+                println!("     已配 [weight_spec] —— 归一化生效，此处仅报源数据分布");
+            } else {
+                println!("     建议在方案文件顶层追加（上锚点取 p99，离群值 clamp）：");
+                println!("       [weight_spec]");
+                println!("       median = {}", sc.median);
+                println!("       max = {}", sc.p99);
+                println!("       mode = \"log\"");
             }
         }
         println!();
     }
     if bad == 0 {
-        println!("全部词库权重均在约定值域内。");
+        println!("全部方案的词库权重均在约定值域内。");
     } else {
-        println!("{bad} 个词库超出约定值域，跨来源排序（短语 vs 码表）会失真。");
+        println!("{bad} 个方案超出约定值域，跨来源排序（短语 vs 码表）会失真。");
+        println!("⚠️ 拼音方案即使超范围通常也不该配——其权重刻意在另一条轴，且引擎侧有按");
+        println!(
+            "   原始权重标定的绝对阈值（COMPLETION_FAR_WEIGHT_FLOOR 等），归一化会让它们失效。"
+        );
     }
     Ok(0)
 }
