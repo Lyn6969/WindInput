@@ -5089,8 +5089,14 @@ fn top_code_direct_commit_returns_commit_then_defer() {
     }
 }
 
-// 顶码前缓冲 skce 注入短语/命令作首选（短语高权重 PHRASE_WEIGHT_BASE 保证排首），
-// 用于验证顶码上屏对短语(cmdbar)类型生效。
+// 顶码前缓冲 skce 注入短语/命令作首选，用于验证顶码上屏对短语(cmdbar)类型生效。
+//
+// ⚠️ 短语权重 3000 是**必需的**，不是随手写的大数：五笔 `skce` 是「可能」(w=2301) 的全码，
+// 二者同属精确档（`is_exact_code` 均为 true），先后由权重裁决。此处曾写 100，靠
+// `PHRASE_WEIGHT_BASE`(40M) 兜着才排首；该常量删除后短语立刻输给「可能」，本 helper 的
+// 三个测试同时失败——这正是删 40M 的预期效果，故是**调权重**而非改断言。
+//
+// 取 3000 不取 2302：留出余量，词库下次按词频重排后 2301 会变。仍在约定值域 0~10000 内。
 fn coord_with_skce_phrase(
     phrase_text: &str,
     mode: wind_config::TopCommitMode,
@@ -5100,12 +5106,50 @@ fn coord_with_skce_phrase(
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     // build() 构造期读 enabled_phrases_for_input()，故须在建 coordinator 前入库。
-    store.add_phrase("skce", phrase_text, 0, 100).unwrap();
+    store.add_phrase("skce", phrase_text, 0, 3000).unwrap();
     let mut cfg = config_with("wubi86");
     cfg.schema.codetable.punct_commit = true;
     cfg.schema.codetable.top_code_commit = true;
     cfg.input.top_commit_mode = mode;
     Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+/// 精确码短语与码表精确候选**同属精确档、先后完全由权重裁决**——`PHRASE_WEIGHT_BASE`(40M)
+/// 删除后这一步比较才第一次真正生效。
+///
+/// 现场：五笔 `skce` 既是系统词「可能」(w=2301) 的全码，也可作短语码。40M 在时短语恒赢，
+/// 这个比较等于从未执行过（本仓混输六个权重加成也是这样，拆掉后一批从未跑过的比较第一次
+/// 生效，而当时全套测试一条没红）。
+///
+/// ⚠️ **两个方向都测**。只断言「高权重短语排首」证明不了裁决者是权重——40M 时代同样是那个
+/// 结果，测试会一路绿到底。低权重方向失败才说明比较真的发生了。
+///
+/// 层次上刻意放在用户入口（打 s-k-c-e 看候选），而非排序函数的单元测试：引擎/排序全绿
+/// 不等于打得出，二者要各有一份。
+#[test]
+fn phrase_and_codetable_exact_compete_by_weight() {
+    if !has_schemas() {
+        return;
+    }
+    // 「可能」的词频会随词库重排变动，故断言只比「谁在前」，不写死 2301。
+    for (weight, want_first) in [(100, "可能"), (3000, "短语文本")] {
+        let store_path = std::env::temp_dir().join(format!("wind_phrase_vs_exact_{weight}.redb"));
+        let _ = std::fs::remove_file(&store_path);
+        let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+        store.add_phrase("skce", "短语文本", 0, weight).unwrap();
+        let coord =
+            Coordinator::new_headless_with_store(config_with("wubi86"), Some(&data_dir()), store);
+        for ch in ['s', 'k', 'c', 'e'] {
+            press_letter(&coord, ch);
+        }
+        let texts = coord.debug_all_candidate_texts();
+        assert_eq!(
+            texts.first().map(String::as_str),
+            Some(want_first),
+            "短语权重 {weight} vs 五笔「可能」：首选应为 {want_first}，实际 {texts:?}"
+        );
+        let _ = std::fs::remove_file(&store_path);
+    }
 }
 
 #[test]
@@ -7152,7 +7196,7 @@ fn test_codetable_auto_phrase_single_char_is_not_a_word() {
 /// 降到拼音精确候选之下。**不按语法类型区分**（`$CC`/`$SS`/静态同规则），也不再靠 40M 类别硬顶。
 ///
 /// 回归：marker 来自 `lookup_prefix`（前缀枚举、码严格更长＝非完全匹配），曾被标 `is_exact_code=true`
-/// + `PHRASE_WEIGHT_BASE`(40M) 抬进精确档并整体上浮，压过普通候选（用户报「系统/用户短语前缀
+/// + `PHRASE_WEIGHT_BASE`(40M，该常量后已整体删除) 抬进精确档并整体上浮，压过普通候选（用户报「系统/用户短语前缀
 /// 匹配时优先级偏高、压普通编码/候选」）。现改为 `is_exact_code=false` + `is_prefix=!codetable` +
 /// `weight=hit.weight`。低权重（1）确保 marker 可靠沉到码表候选之下，隔离出「避让」这一单一断言。
 /// 构造组短语码 `nia`（严格长于输入 `ni` → 前缀枚举命中）。

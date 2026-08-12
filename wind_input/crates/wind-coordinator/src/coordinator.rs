@@ -1151,9 +1151,6 @@ pub(crate) struct ChaiziAssets {
     pub(crate) font: Option<(String, String)>,
 }
 
-/// 短语候选权重基准（高于普通候选，使短语展开排在前列）
-pub(crate) const PHRASE_WEIGHT_BASE: i32 = 40_000_000;
-
 /// 一次候选刷新后的输入结局（码表全码/空码策略，仅正向输入字母时消费）。
 pub(crate) enum InputOutcome {
     /// 正常更新候选，继续组合。

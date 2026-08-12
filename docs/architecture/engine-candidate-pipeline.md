@@ -488,7 +488,8 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
 ① engine convert（初始 limit 按引擎类型/码长阶梯，:160-171：码表 100/300/1000，拼音/混输 300）
 ② 短语注入（wind-phrase lookup + lookup_prefix）：
      静态/模板短语、$CC 命令（is_command）、$SS/$AA 组（is_group 二级展开）
-     weight = PHRASE_WEIGHT_BASE + hit.weight
+     weight = hit.weight（精确码/前缀枚举同口径；曾有的 PHRASE_WEIGHT_BASE=40M 类别硬顶已删除，
+     短语按自身权重与码表精确候选竞争，见 candidate-sorting-rules.md §5.1）
 ③ 层级排序：is_fuzzy asc → **is_partial asc** → is_prefix asc → weight desc → natural_order asc
      （Fuzzy＜子短语＜前缀补全＜完整匹配：与 PinyinEngine 内部排序一致。缺 `is_partial` 时，
      高权重子串单字会靠 weight 反超低权重精确词组——如 `pingtan` 下

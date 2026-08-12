@@ -79,13 +79,21 @@
 
 **① 权重量纲不可比——跨类别比 `weight`，比的其实是类别。**
 词组权重取自词频、单字取自字频，两套量纲不可比（`codetable/engine.rs` 自认）。更有甚者，多套系统往
-`weight` 上叠**巨大常量**来表达「类别」：协调器 `PHRASE_WEIGHT_BASE=40M`、拼音
-`BARE_INITIAL_SINGLE_CHAR_BOOST=10M`。这些数字**没有物理意义**，只是排序占位符。
+`weight` 上叠**巨大常量**来表达「类别」：拼音 `BARE_INITIAL_SINGLE_CHAR_BOOST=10M`、
+（已删的）协调器 `PHRASE_WEIGHT_BASE=40M`。这些数字**没有物理意义**，只是排序占位符。
 **任何「跨来源比权重」的想法都要先想到这一点。**
 
-> 混输引擎曾是这条红线最重的一处（六个加成常量），已整体拆除，改为显式的
-> **截断优先级档**（§4.3）。拆除记录见 `docs/design/mixed-source-tier-quota.md`——那份文档
-> 也记着拆的过程中发现的两处「加成掩盖了未定义行为」的账。
+> 三处最重的欠账都已还清：混输引擎的六个加成常量整体拆除、改为显式的**截断优先级档**（§4.3，
+> 记录见 `docs/design/mixed-source-tier-quota.md`）；词库权重有了方案级归一化
+> （`docs/design/dict-weight-normalization.md`）；`PHRASE_WEIGHT_BASE` 随之删除，短语改按
+> 自身权重与码表精确候选竞争（§5）。
+>
+> ⚠️ **红线①并未因此作废**，它换了形态：现在「同轴」是一条**数据契约**（自产权重一律落在
+> `0~WEIGHT_RANGE_MAX`=10000：短语默认 1000、五笔主库 median 941、`LEARN_ADD_WEIGHT` 800、
+> `PROMOTED_WEIGHT` 1000），而契约靠数据守、不靠类型系统。Rime 生态导入的方案（虎码
+> p99=343,880）不配 `[weight_spec]` 就会破坏它，且**失效时毫无报错**。护栏有两道：
+> `SystemDictLayer::effective_weight` 的查询期越界告警，以及守门测试
+> `tests/builtin_phrase_reachability.rs`。
 
 **② 匹配层/精确档先于权重——胜负常在比权重前就被结构标志定死。**
 `candidate_display_order` 与 `freq_tier` 都把「层级/档位」作为**首要键**，`weight` 只在同层同档内才起作用。
@@ -225,13 +233,37 @@
 
 | 匹配方式 | 来源 | `is_exact_code` | `is_prefix` | `weight` |
 |---|---|---|---|---|
-| **精确码**（`lookup`，`code==输入`，HashMap 精确键） | 完全匹配 | **true** | false | `PHRASE_WEIGHT_BASE(40M) + hit.weight` |
-| **前缀枚举**（`lookup_prefix`，码严格更长） | 前缀匹配 | false | **`!codetable_mode`** | `hit.weight`（**不加 40M**） |
+| **精确码**（`lookup`，`code==输入`，HashMap 精确键） | 完全匹配 | **true** | false | `hit.weight` |
+| **前缀枚举**（`lookup_prefix`，码严格更长） | 前缀匹配 | false | **`!codetable_mode`** | `hit.weight` |
 
-- **精确码短语**（打全 `date`）→ 进精确档、靠 40M 抬升，与码表精确候选同层竞争（对应「完全匹配才提前」，
-  也是 `skce` 短语曾输给五笔「可能」那个 bug 的修复点）。
+两条通路的 `weight` 现已同口径。精确码短语此前是 `PHRASE_WEIGHT_BASE(40M) + hit.weight`，
+该常量已删除——短语按自身权重与码表精确候选竞争，「谁排前面」交回给权重配置。
+
+- **精确码短语**（打全 `date`）→ 进精确档，与码表精确候选**同层比权重**（对应「完全匹配才提前」；
+  `is_exact_code` 漏标会让它掉到精确档之下，那是 `skce` 短语曾输给五笔「可能」那个 bug 的修复点）。
 - **前缀短语**（打 `da`）→ 不进精确档；`is_prefix=!codetable_mode` 使其在拼音/混输降到拼音精确候选之下、
-  码表下与更长编码补全同档；按 `hit.weight` 排，**不靠 40M 硬顶**（对应「前缀避让、按权重」）。
+  码表下与更长编码补全同档（对应「前缀避让、按权重」）。
+
+### 5.1 ⚠️ 删掉 40M 只改变了纯码表
+
+沿本文 §6 的比较链倒推「精确码短语 vs 码表精确候选」在每种模式下的**实际**裁决者：
+
+| 模式 | `mixed` | 裁决者 | 删 40M 的影响 |
+|---|---|---|---|
+| **纯码表** | false | 两者 `is_exact_code` 同为 true ⇒ `cmp_exact_first` 平局 ⇒ 落到 `weight` | ✅ **变了**：真比权重 |
+| 混输 | true | `source_tier` 档 0（码表精确）< 档 1（精确码短语），档位在 weight 之前 | ⭕ 不变，40M 早被覆盖 |
+| 纯拼音 | false | 拼音候选 `is_exact_code` 恒 false ⇒ `cmp_exact_first` 已让短语居前 | ⭕ 不变，与 40M 无关 |
+
+**一个「恒赢的偏置」往往只在你没检查的那一条路径上恒赢。** 40M 存在时纯码表下的那次比较从未真正
+执行过，删除后才第一次生效——与混输六个加成拆除时暴露的是同一类账。
+
+因此「删 `PHRASE_WEIGHT_BASE`」与「档位 6→4 合并」是**两件事**：前者只动纯码表，后者只动混输，
+应分开做、分开验证（后者见 `dict-weight-normalization.md` §6）。
+
+**内置数据的隐式契约**：系统短语权重必须高于同码码表词条，否则打那个码时首选不是短语。
+全仓 54 个系统短语码里 `datm`（对手五笔「万花筒」w=1080）和 `tmts`（「身条」w=536）与五笔碰撞，
+前者曾因短语权重 1000 更低而失效。守门测试 `tests/builtin_phrase_reachability.rs` 固化了这次扫描
+——词库按词频重排后权重会整体变动，靠人是守不住的。
 - **方案内词库 `$CC` 词条**（挂在五笔等方案里，走 `finalize_candidates`）**不是**全局短语：它 `is_phrase=false`、
   `source=CodeTable`，按方案权重排、`is_command` 只影响选中行为——**天然按方案处理，不经本节**。
 
@@ -420,7 +452,7 @@
 
 | 常量 | 值 | 位置 | 作用 |
 |---|---|---|---|
-| `PHRASE_WEIGHT_BASE` | 40,000,000 | `coordinator.rs` | 协调器**精确码短语**权重基（前缀短语已不用，改按 `hit.weight`） |
+| ~~`PHRASE_WEIGHT_BASE`~~ | ~~40,000,000~~ | ~~`coordinator.rs`~~ | **已删除**。曾是精确码短语的权重基，现按 `hit.weight` 与码表精确候选竞争（§5.1） |
 | `PINYIN_QUOTA_DIVISOR` | 5 | `mixed/engine.rs` | 截断时拼音**保底配额**分母（`max/5`，300 ⇒ 60 席） |
 | `BARE_INITIAL_SINGLE_CHAR_BOOST` | 10,000,000 | `pinyin/mod.rs` | 裸声母单字提权 |
 | `COMPLETION_WEIGHT_DISCOUNT` | 0.5 | `pinyin/mod.rs` | 前缀补全**每个未输入音节**的权重折扣（`w × 0.5^extra`） |

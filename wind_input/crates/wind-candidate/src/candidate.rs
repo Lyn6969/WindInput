@@ -196,9 +196,10 @@ pub struct Candidate {
     ///   纯拼音模式全体为 `false`，本键退化为无操作。
     ///
     /// **为何不复用 `is_prefix`**：该字段已被自定义短语借作「非精确层」标记（协调器
-    /// `build_candidates` 中短语恒 `is_prefix=true` 且带 `PHRASE_WEIGHT_BASE`=40M）。若给码表
-    /// 前缀候选也标 `is_prefix`，短语会与码表词组落进同层，靠 40M 权重整体浮到词组之上——
-    /// 一个字段承担两种含义，复用即耦合两件无关的事。
+    /// `build_candidates` 中前缀短语恒 `is_prefix=true`）。若给码表前缀候选也标 `is_prefix`，
+    /// 短语会与码表词组落进同层——一个字段承担两种含义，复用即耦合两件无关的事。
+    /// （当时短语还带 `PHRASE_WEIGHT_BASE`=40M，落进同层就会整体浮到词组之上；那个常量已删除，
+    /// 但「一个字段两种含义」这条理由与权重无关，依然成立。）
     ///
     /// **为何需要独立层级而非靠权重**：词组权重来自词频、单字权重来自字频，两套量纲不可比。
     /// 「新的」(usrq, 47487) 纯按权重会压过简码「新」(usr, 11777)，把简码字挤到第三位——
@@ -541,9 +542,13 @@ pub fn source_tier(c: &Candidate, input: &str) -> u8 {
         //
         // ⚠️ 前缀短语此前与码表前缀补全**同档**（都是 3），靠 weight 分先后。那从来不是一次
         // 真正的比较：混输引擎给码表前缀补全 `+PARTIAL_MATCH_BOOST`(500K)，而前缀短语拿的是
-        // 原始权重（`PHRASE_WEIGHT_BASE`=40M 只加给精确码短语），于是码表恒赢。加成拆除后
+        // 原始权重（当时的 `PHRASE_WEIGHT_BASE`=40M 只加给精确码短语），于是码表恒赢。加成拆除后
         // 两者变成「码表词频 vs 用户设定的短语权重」——两个不同量纲的数硬比，正是本档位
         // 要消灭的那种比较。故就地拆成两档，把既有次序写成规则。
+        //
+        // 归一化落地（方案级 `[weight_spec]`）后两边可以同轴了，档 2/4 有望合回一档——那是
+        // `docs/design/dict-weight-normalization.md` §6 的下一步，**与本次删 40M 是两件事**：
+        // 删 40M 只改变纯码表（见 `handle_candidate.rs` 的 `lookup` 分支），合档只改变混输。
         return if c.is_exact_code { 1 } else { 4 };
     }
     if is_pinyin_exact_tier(c, input.len()) {

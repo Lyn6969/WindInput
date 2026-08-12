@@ -3,8 +3,8 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
 use crate::coordinator::{
-    Coordinator, DEFERRED_COMPOSITION_FALLBACK_MS, InputOutcome, LEARN_ADD_WEIGHT,
-    PHRASE_WEIGHT_BASE, State, now_unix_secs, punct_char,
+    Coordinator, DEFERRED_COMPOSITION_FALLBACK_MS, InputOutcome, LEARN_ADD_WEIGHT, State,
+    now_unix_secs, punct_char,
 };
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
@@ -48,7 +48,8 @@ pub(crate) struct CandidateOpScope {
 /// - `is_exact_code` 不可少：码表引擎已把「精确匹配优先」排好，但本函数会**无条件重排全部候选**，
 ///   若不复刻该键，引擎结果会在这里被按纯权重推翻——码表词组权重取自词频、单字取自字频，量纲
 ///   不可比，「新的」(usrq, 47487) 会压过简码「新」(usr, 11777)。须置于 `cmp_match_layers` 之后：
-///   精确优先只在同匹配层内生效，短语（`is_prefix=true` + 40M 权重）仍留在其下层不受提拔。
+///   精确优先只在同匹配层内生效，前缀短语（`is_prefix=true`）仍留在其下层不受提拔——
+///   哪怕它权重更高。
 ///
 /// - `is_partial` 不可少：混输 ÷100 压缩权重后，高权重子串单字（平 w=58 is_partial=true）会靠
 ///   weight 反超低权重精确词组（平摊 w=4 is_partial=false）；且须在 `is_prefix` 之后（对齐 PinyinEngine）。
@@ -673,7 +674,34 @@ impl Coordinator {
                     //
                     // ★ 一行化是**显示层关注点**，放在数据层就必然殃及上屏。
                     text: hit.text,
-                    weight: PHRASE_WEIGHT_BASE + hit.weight,
+                    // 短语自身权重，**不加类别硬顶**。此处曾是 `PHRASE_WEIGHT_BASE(40M) + w`，
+                    // 于是精确码短语在纯码表下恒赢每一条码表精确候选（混输/纯拼音见下）。
+                    //
+                    // ## 为什么现在可以直接比
+                    //
+                    // 全仓自产权重早已在同一条轴上，只是被 40M 遮住从未真正比较过：
+                    // 短语默认 1000（`wind_phrase` 的 `unwrap_or(1000)`）、系统短语实测 800~2000、
+                    // 五笔主库 median 941 / p99 9000 / max 9999、`LEARN_ADD_WEIGHT` 800、
+                    // `PROMOTED_WEIGHT` 1000、约定上界 `WEIGHT_RANGE_MAX` 10000。
+                    // 短语 w=1000 击败 54% 的五笔条目，w=2000 击败 92%——这是一次有意义的比较。
+                    //
+                    // ## ⚠️ 前提：码表权重必须守约
+                    //
+                    // Rime 生态导入的方案常是未归一的原始词频（虎码 p99=343,880），不配方案级
+                    // `[weight_spec]` 就会让短语全线沉底，且**没有任何报错**——用户只看到「短语没了」。
+                    // 护栏在 `wind_dict::SystemDictLayer::effective_weight`（查询期越界告警），
+                    // 体检走 `wind_input dict weight-check`。
+                    //
+                    // ## 删掉 40M 只改变纯码表
+                    //
+                    // 沿 `candidate_display_order` 倒推「精确码短语 vs 码表精确候选」的裁决者：
+                    // - **纯码表**（mixed=false）：两者 `is_exact_code` 同为 true ⇒ `cmp_exact_first`
+                    //   平局 ⇒ 落到 `by_weight`。40M 在此恒赢，**本次改的就是这里**；
+                    // - 混输（mixed=true）：`source_tier` 档 0（码表精确）< 档 1（精确码短语），
+                    //   档位在 `by_weight` 之前 ⇒ 40M 早已被覆盖、不起作用；
+                    // - 纯拼音：拼音候选 `is_exact_code` 恒 false ⇒ `cmp_exact_first` 已让短语居前，
+                    //   同样与 40M 无关。
+                    weight: hit.weight,
                     is_phrase: true,
                     // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；
                     // 选中时由 commit_selected 拦截，执行动作而非上屏 display 标签。
@@ -681,7 +709,7 @@ impl Coordinator {
                     // 供右键「禁用短语」按 (code, 原文) 定位 store 记录（对齐 Go PhraseTemplate）。
                     is_command,
                     // `lookup` 查的是**精确码短语**（短语编码与输入完全相等），按定义即精确匹配，
-                    // 须与码表精确候选同层竞争（其内靠 PHRASE_WEIGHT_BASE 居前）。漏标会被
+                    // 须与码表精确候选同层竞争（同层内按权重定先后，见上方 `weight`）。漏标会被
                     // `cmp_exact_first` 压到码表精确候选之下——如短语 skce 会输给五笔「可能」(skce)。
                     // 下面 `lookup_prefix` 的前缀枚举则不标，留在精确层之下。
                     is_exact_code: true,
@@ -736,7 +764,8 @@ impl Coordinator {
             // - `is_exact_code=false`：前缀非完全匹配，不进精确档（完全匹配走上面的 `lookup`，仍抬升）；
             // - `is_prefix=!codetable_mode`：码表下与更长编码补全同档、按权重竞争；拼音/混输下降到
             //   拼音精确候选（is_prefix=false）之下；
-            // - `weight=hit.weight`：**不加** `PHRASE_WEIGHT_BASE`——按短语自身权重排，不靠 40M 类别硬顶。
+            // - `weight=hit.weight`：按短语自身权重排。与上方 `lookup` 分支同口径——类别硬顶
+            //   `PHRASE_WEIGHT_BASE`(40M) 已整体删除，两条通路不再有量级差异。
             let phrase_prefix_is_prefix = !codetable_mode;
             let mut built: Vec<Candidate> = Vec::new();
             for hit in prefix_hits {
@@ -3623,8 +3652,18 @@ mod finalize_candidates_tests {
     ///
     /// 复刻 usr 现场（古精86五笔）：简码「新」(usr, 11777) vs 前缀词组「新的」(usrq, 47487)。
     /// 引擎已排好序，但本函数会无条件重排全部候选——若不复刻 `is_exact_code` 键，引擎结果
-    /// 会在这里被按纯权重推翻（原始 bug）。同时验证短语（`is_prefix=true` + 40M 权重）仍留在
+    /// 会在这里被按纯权重推翻（原始 bug）。同时验证前缀枚举短语（`is_prefix=true`）仍留在
     /// 精确层之下，不因本键而上浮。
+    ///
+    /// ## ⚠️ 精确档**内部**的先后已改由权重裁决
+    ///
+    /// 引导键组短语（`$SS`/`$AA`）此前带 `PHRASE_WEIGHT_BASE`(40M)，在精确档内**恒**居首；
+    /// 那个常量已整体删除（见 `lookup` 分支的 `weight` 注释）。现在它与码表精确候选真比权重，
+    /// 于是先后**取决于配置**：系统组短语实测 1230，会输给 11777 的简码；调到简码之上就赢。
+    ///
+    /// 下方两个方向都断言。**只测一个方向证明不了裁决者是权重**——若某个更靠前的键碰巧
+    /// 也给出同样次序，单向断言会一路绿到底（本仓踩过：混输六个加成里有恒赢的偏置，
+    /// 拆掉后一批从未执行过的比较才第一次生效，而全套测试当时一条没红）。
     #[test]
     fn exact_code_outranks_prefix_but_stays_within_match_layer() {
         let exact = Candidate {
@@ -3644,39 +3683,57 @@ mod finalize_candidates_tests {
             natural_order: 20,
             ..Default::default()
         };
-        // 前缀枚举短语：is_prefix=true 使其落在更低匹配层，40M 权重也不应把它拉到精确候选之上。
+        // 前缀枚举短语：is_prefix=true 使其落在更低匹配层。权重取真实量级（系统短语 800~2000），
+        // 高于「新」也不该把它拉到精确候选之上——`cmp_match_layers` 在权重之前。
         let prefix_phrase = Candidate {
             text: "短语".into(),
-            weight: PHRASE_WEIGHT_BASE,
+            weight: 2000,
             is_phrase: true,
             is_prefix: true,
             ..Default::default()
         };
-        // 引导键导航候选（$SS/$AA 组）：三个匹配层标志均为 false，改动前靠 40M 权重隐式居首。
-        // 须显式属精确档，否则会被每一条码表精确候选压下去——用户按引导键时首选会变成五笔单字。
-        let guide_group = Candidate {
+        // 引导键导航候选（$SS/$AA 组）：三个匹配层标志均为 false，须显式属精确档，
+        // 否则会被每一条码表精确候选压下去——用户按引导键时首选会变成五笔单字。
+        let guide_group = |weight: i32| Candidate {
             text: "组名".into(),
-            weight: PHRASE_WEIGHT_BASE,
+            weight,
             is_phrase: true,
             is_group: true,
             is_exact_code: true,
             ..Default::default()
         };
-        for ignore_weight in [false, true] {
-            // 故意以「最不利」的顺序放入，确保结果由排序而非原序决定。
+        // 故意以「最不利」的顺序放入，确保结果由排序而非原序决定。
+        let order_of = |group: Candidate, ignore_weight: bool| -> Vec<String> {
             let mut cands = vec![
                 prefix_phrase.clone(),
                 prefix_word.clone(),
                 exact.clone(),
-                guide_group.clone(),
+                group,
             ];
             cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false, XU_LEN));
-            let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+            cands.into_iter().map(|c| c.text).collect()
+        };
+
+        // ① 系统组短语的真实权重（1230）低于该简码 → 组名落到简码之后，但仍在精确档内、
+        //    整体先于前缀词组。这是删掉 40M 后的**新行为**。
+        assert_eq!(
+            order_of(guide_group(1230), false),
+            vec!["新", "组名", "新的", "短语"],
+            "精确档内按权重：组短语 1230 < 简码 11777 ⇒ 排其后；两者仍先于前缀词组"
+        );
+        // ② 反向对照：把组短语权重调到简码之上，它就回到首位。证明裁决者确实是 weight。
+        assert_eq!(
+            order_of(guide_group(20000), false),
+            vec!["组名", "新", "新的", "短语"],
+            "精确档内按权重：组短语 20000 > 简码 11777 ⇒ 回到首位"
+        );
+        // ③ natural 模式忽略权重 ⇒ 精确档内退化为 base_order/natural_order（组名 0 < 新 10），
+        //    两个权重取值结果相同——这一档的次序与权重无关。
+        for w in [1230, 20000] {
             assert_eq!(
-                order,
+                order_of(guide_group(w), true),
                 vec!["组名", "新", "新的", "短语"],
-                "引导键候选与精确匹配同档(其内 40M 权重居前)、前缀词组次之、\
-                 低匹配层短语垫底（ignore_weight={ignore_weight}）"
+                "natural 模式下精确档按 natural_order，与权重 {w} 无关"
             );
         }
     }

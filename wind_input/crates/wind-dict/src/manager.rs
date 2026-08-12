@@ -78,12 +78,14 @@ pub struct SystemDictLayer {
     /// 用于**无权重的附加库**——与带权重主库合并、按权重排序时，让其条目落在设计者选定的权重档，
     /// 而非因 weight=0 全部沉底。None = 用词库自身权重。
     default_weight: Option<i32>,
-    /// 权重归一化（`[dictionaries.weight_spec]`）：Some 时把本库权重映射回约定值域
-    /// `0~WEIGHT_RANGE_MAX`，使其与短语权重同轴可比。None = 不归一化（守约词库的常态）。
+    /// 权重归一化（方案级 `[weight_spec]`，施加到本方案全部词库层）：Some 时把权重映射回
+    /// 约定值域 `0~WEIGHT_RANGE_MAX`，使其与短语权重同轴可比。None = 不归一化（守约词库的常态）。
     ///
     /// 与 `default_weight` 的分工：后者**抹平**整库权重（退化为文件顺序），前者**保序压缩**。
     /// 两者同时配时 `default_weight` 优先——它是更强的声明（「本库不参与权重排序」）。
     weight_norm: Option<crate::WeightNorm>,
+    /// 越界告警的一次性闸门。见 [`SystemDictLayer::warn_out_of_range`]。
+    over_range_warned: std::sync::atomic::AtomicBool,
 }
 
 impl SystemDictLayer {
@@ -101,6 +103,7 @@ impl SystemDictLayer {
             base_order: 0,
             default_weight: None,
             weight_norm: None,
+            over_range_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -134,8 +137,52 @@ impl SystemDictLayer {
             Some(w) => w,
             None => match &self.weight_norm {
                 Some(n) => n.apply(raw),
-                None => raw,
+                None => {
+                    if raw > crate::WEIGHT_RANGE_MAX {
+                        self.warn_out_of_range(raw);
+                    }
+                    raw
+                }
             },
+        }
+    }
+
+    /// 「权重越界且未配归一化」的一次性告警。
+    ///
+    /// ## 为什么在**查询期**而不是加载期
+    ///
+    /// 加载期已有一份诊断（`ParseStats::log_weight_range`），但它只在**解析 yaml** 时触发，
+    /// 而词库一旦建了 `.wdat` 缓存就直接 mmap、不再解析。于是「老词库 + 新版本」这个最需要
+    /// 报警的组合**一次也不会响**（实测：首次加载报一次，删掉缓存才会再报）。
+    /// 查询期看到的是真实流过的权重，绕开了缓存这一层。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 协调器已删除 `PHRASE_WEIGHT_BASE`(40M)，短语改按自身权重与码表候选同场竞争。
+    /// 那个比较成立的前提是双方同轴：短语在 `0~10000`（默认 1000），本仓自产词库亦然
+    /// （五笔主库 median 941 / max 9999）。而 Rime 生态导入的方案常是未归一的原始词频
+    /// （虎码 p99=343,880），不配方案级 `[weight_spec]` 就会让短语全线沉底——**且没有任何
+    /// 报错**，用户只看到「我的短语突然没了」。本告警是这条静默失效路径上唯一的提示。
+    ///
+    /// 只报一次：热路径上，且同一库的越界条目往往成千上万。
+    /// 不打候选文本，只打词库名与权重数值（日志隐私红线）。
+    #[cold]
+    fn warn_out_of_range(&self, raw: i32) {
+        use std::sync::atomic::Ordering;
+        if self
+            .over_range_warned
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                "词库 {} 出现越界权重 {}（约定值域 0~{}），且所属方案未配 [weight_spec]。\
+                 短语权重在 0~{} 轴上，与之同场比较会被压到底。\
+                 请跑 `wind_input dict weight-check` 体检并按建议配置方案级 [weight_spec]。",
+                self.name,
+                raw,
+                crate::WEIGHT_RANGE_MAX,
+                crate::WEIGHT_RANGE_MAX,
+            );
         }
     }
 

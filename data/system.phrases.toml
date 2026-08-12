@@ -55,22 +55,26 @@ text = '$HH时$mm分$ss秒'
 weight = 800
 position = 3
 
+# ⚠️ datm 组权重高于同组默认的 1000/800：五笔 `datm` 是「万花筒」(w=1080) 的全码。
+# 协调器删除 PHRASE_WEIGHT_BASE(40M) 后短语与码表精确候选真比权重，1000 会输给 1080，
+# 打 datm 首选变成「万花筒」。54 个系统短语码里只有 datm 和 tmts 与五笔碰撞，
+# tmts 对手「身条」w=536 无需调整。
 [[phrases]]
 code = 'datm'
 text = '$Y年$M月$D日 $HH:$mm:$ss'
-weight = 1000
+weight = 2000
 position = 1
 
 [[phrases]]
 code = 'datm'
 text = '$Y-$MM-$DD $HH:$mm:$ss'
-weight = 800
+weight = 1800
 position = 2
 
 [[phrases]]
 code = 'datm'
 text = '${YC}年${MC}月${DC}日 $HH:$mm:$ss'
-weight = 800
+weight = 1800
 position = 3
 
 [[phrases]]
