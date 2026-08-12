@@ -27,11 +27,16 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 
 | UiCommand | 影响 | 备注 |
 |---|---|---|
-| `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md` |
-| `ScreenshotStatusTip` / `ScreenshotTooltip` | 状态气泡 / 悬停提示的截图缺失 | **像素不在本进程**：这两者是 `.app` 侧原生 NSPanel，服务只下发文本与配色。要做得由 `.app` 截图，经扩展信封回传二进制块（`body` 是不透明字节，正为此设计） |
-| `ShowCandidateMenu` / `HideMenu` / `MenuKey` | 候选右键菜单的键盘导航缺失 | 菜单树本身已走 `CmdMenuShow` + `UnifiedMenuBuilder` |
+| `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md`。**菜单入口已按平台摘掉**（`build_main_menu_items` 的 `advanced_children`）——留一个点了没反应的项比没有更糟 |
+| `ShowCandidateMenu` / `HideMenu` / `MenuKey` | N/A（**不是缺失**） | macOS 弹的是原生 NSMenu，方向键/回车/Esc 由 AppKit 自己消费。协调器**刻意不转发**菜单键（见 `handle_key_event` 里那段 `cfg(not(target_os = "macos"))`）：一旦吞键而 `menu_open` 没复位就会永久卡死输入 |
 | `SetToolbarPos` / `SetToolbarAutoHide` / `SetToolbarVertical` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
+
+非 `UiCommand` 的一项差距，同样待补：
+
+| 能力 | 影响 | 备注 |
+|---|---|---|
+| `CMD_INPUT_STATS`（英文输入统计） | 英文模式下的输入不计入统计 | Win 侧由 TSF DLL 在英文模式下上报，`.app` 未采集。**已知并暂缓**（2026-08-12 决定：当前 macOS 用户量少，优先级低）。对应设置项 `stats.track_english` 已按平台隐藏，故当前不表现为「开关无效」，只表现为统计数字偏低 |
 
 ### 已按平台屏蔽的设置项
 
@@ -60,7 +65,25 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 已接：`RegisterGlobalHotkeys`（见下）、`OpenPath` / `OpenApp`（`/usr/bin/open`，
 `.app` 包走 `open -a … --args`）、`TakeScreenshot` / `ScreenshotCandidateToClipboard` /
 `CopyTooltipText`（见下）、`ReportCandidatePos` / `ReportStatusTipPos`（见下「浮窗拖动
-与位置固定」）。
+与位置固定」）、`ScreenshotStatusTip` / `ScreenshotTooltip`（见下「原生浮窗截图」）。
+
+### 原生浮窗截图（状态气泡 / 悬停提示）
+
+候选窗的像素在服务进程（本进程光栅化后经 SHM 推下去），直接截自己的 buffer 即可；
+**这两者相反**——是 `.app` 侧的原生 NSPanel，服务端只下发文本与配色，只能请那边动手：
+
+下行扩展信封 `shot.panel`（body 带 `target` 与服务端定好的 `path`）→ `.app` 截图存盘 +
+复制剪贴板 → 上行 `shot.result` 回报 → 协调器据此弹 Toast。**文件名与文案留在服务端**，
+与 Windows 侧 `manager.rs` 的对应分支逐字一致，两平台同一操作不该有不同措辞。
+
+两个实现细节：
+
+- **不用 `CGWindowListCreateImage`**：那条路自 macOS 14 起要「屏幕录制」授权，而本输入法
+  申请的是「辅助功能」。为一个截图菜单项再要一项更敏感的授权不成比例，且用户拒授权后
+  只会得到一张黑图——比功能不存在更糟。自己的视图自己渲染不需要任何授权。
+- **走 `layer.render(in:)` 而非 `cacheDisplay(in:to:)`**：这两个浮窗的背景是**图层属性**
+  （`layer.backgroundColor` + `cornerRadius`）而不是 `draw(_:)` 画出来的，而 `cacheDisplay`
+  只走视图绘制路径——对这种视图会截出一张只有文字、没有底色和圆角的透明图。
 
 未接的变体落在 `Forwarder::handle` 的 `other =>` 兜底臂，只打一条 debug 日志。
 **新接一个变体时同步更新本表**。
@@ -142,8 +165,11 @@ vk_to_cgkeycode`（与按键注入同源，禁止另起一张表）。该表已�
   mac 的 `.app` 未采集，故英文输入不计入统计。
 
 （此处曾记有「`CMD_CANDIDATE_SCROLL` 滚轮翻页 macOS 用不了」——那是 0x0211 码位被
-`CMD_FRONT_CONTEXT` 同方向复用所致。macOS 尚未发布，该复用已直接消除：`FRONT_CONTEXT`
-迁到 0x0215，两平台码位含义此后完全一致，滚轮翻页只差 `.app` 侧采集 `scrollWheel`。）
+`CMD_FRONT_CONTEXT` 同方向复用所致，该复用已消除，`FRONT_CONTEXT` 迁到 0x0215。
+但**滚轮翻页本身两个平台都还没实现**：`MessageHandler::handle_candidate_scroll` 是个
+带文档的空实现（“默认不做任何动作，统一接入点便于后续按配置实现”），协调器没有覆写。
+Windows 的 host-render DLL 会发这个帧，服务端收下后什么也不做。要做是**跨平台功能**，
+不是 macOS 补齐——且默认行为需要一个配置项，见该 handler 的注释。）
 
 ## 安装与 TIS 注册
 
