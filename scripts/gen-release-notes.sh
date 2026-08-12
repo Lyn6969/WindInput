@@ -102,7 +102,10 @@ if [ -z "$changelog" ]; then changelog="首个版本。"$'\n'; fi
 # ---- 组装 -----------------------------------------------------------------
 REPO="${GITHUB_REPOSITORY:-huanfeng/WindInput}"
 if [ -n "$PREV" ]; then
-  summary="变更记录（$count 个提交，$PREV → $TAG）"
+  # ⚠️ $TAG 必须写成 ${TAG}: 紧跟其后的「）」是多字节字符, 而 macOS 自带的 bash 3.2 在扫描
+  # 变量名时不认 UTF-8, 会把该字符的首字节吞进名字里 → set -u 下报 "TAG?: unbound variable"。
+  # CI 跑在 bash 5 上看不出来, 只有在 mac 本地预览时才炸。
+  summary="变更记录（$count 个提交，$PREV → ${TAG}）"
   compare="[完整对比](https://github.com/$REPO/compare/$PREV...$TAG)"
 else
   summary="变更记录（$count 个提交）"
