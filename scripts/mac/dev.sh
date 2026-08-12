@@ -72,10 +72,31 @@ LABEL="to.feng.windinput.service"
 INSTALLED_DATA="$APP_SUPPORT/service/data"
 DATA_OVERRIDE=""
 
-# 固定自签证书签名: macOS 26 的 IME 必须真 Authority (纯 ad-hoc 装上能切但 IMK 不拉起
-# 控制器→无法输入); 且证书签名 cdhash 稳定, 重装不掉 TIS 注册, 不用每次去系统设置重加。
-# 证书由 `scripts/mac/dev.sh sign-setup` 创建。可用环境变量覆盖 (SIGN_IDENTITY= 空则回退 ad-hoc)。
-export SIGN_IDENTITY="${SIGN_IDENTITY-WindInput Dev}"
+# 证书签名 (非 ad-hoc) 是必须的: macOS 26 的 IME 必须有真 Authority, 纯 ad-hoc 装上能切
+# 但 IMK 不拉起控制器 → 无法输入。
+#
+# **优先选带 Team ID 的 Apple 签发证书 (Apple Development / Developer ID Application),
+# 没有才回落自签的 "WindInput Dev"。** 差别不在能不能签, 而在 TCC 怎么记「辅助功能」授权:
+#
+#   带 Team ID  → TCC 存 `anchor apple generic` + subject.OU=<TeamID> 的要求, **与具体
+#                 构建无关**, 重新部署后授权继续有效。
+#   自签/无 OU  → TCC 只能存一条裸 `cdhash H"…"`, 钉死在当次构建上。每次重新部署 cdhash
+#                 一变授权就作废 —— 而系统设置里的开关**仍显示为开**, 表现是命令直通车的
+#                 按键合成、智能配对的光标回退静默不工作 (2026-08-12 实测确认)。
+#
+# 自签证书由 `scripts/mac/dev.sh sign-setup` 创建。可用环境变量覆盖:
+#   SIGN_IDENTITY="…" 指定身份; SIGN_IDENTITY= (空) 回退 ad-hoc。
+pick_sign_identity() {
+    local line
+    line="$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -E '"(Apple Development|Developer ID Application):' | head -1)"
+    if [[ -n "$line" ]]; then
+        printf '%s' "$line" | sed -n 's/.*"\(.*\)".*/\1/p'
+        return 0
+    fi
+    printf 'WindInput Dev'
+}
+export SIGN_IDENTITY="${SIGN_IDENTITY-$(pick_sign_identity)}"
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 info() { printf "  %s\n" "$*"; }

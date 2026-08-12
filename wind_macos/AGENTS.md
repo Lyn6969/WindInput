@@ -194,6 +194,22 @@ host-render DLL 一直在发这个帧、服务端收下什么也不做——两�
 本机自签路径（`sign-setup` + `p1`/`pm1`）可以端到端跑起来，无需 Apple Developer
 Program 公证——已多次实测。
 
+**但签名身份的选择另有一层与 TCC（辅助功能授权）相关的讲究**，`dev.sh` 因此默认
+**优先挑带 Team ID 的 Apple 签发证书**（Apple Development / Developer ID Application），
+没有才回落自签的 `WindInput Dev`：
+
+| 签名身份 | TCC 存的授权要求 | 重新部署后 |
+|---|---|---|
+| 带 Team ID | `anchor apple generic` + `subject.OU=<TeamID>`，与具体构建无关 | **继续有效** |
+| 自签 / 无 OU | 一条裸 `cdhash H"…"`，钉死在当次构建 | **失效**，但系统设置里开关仍显示为开 |
+
+后者的表现是：命令直通车的按键合成、智能配对的宿主光标回退**静默不工作**，而用户在
+系统设置里看到的是「已授权」。2026-08-12 实测确认（TCC.db 里我们的 csreq 就是裸 cdhash，
+与当时安装的 .app cdhash 已对不上）。
+
+`install_app` 装完会自动比对一次并在失配时给出解法；`.app` 启动也会记一行授权状态。
+临时解法是 `tccutil reset Accessibility <bundleID>` 后重新授权一次。
+
 **重装后偶发不稳定**：重新部署 `.app` 后有时切不过去 / 系统设置里状态不对。
 **注销重登**（Log Out）即恢复——TIS 数据库与输入源列表是登录会话级的缓存，
 `lsregister -f` 与重注册刷不动它。碰到这种情况先注销，不要往「代码坏了」方向排查。
