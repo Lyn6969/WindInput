@@ -403,6 +403,27 @@ impl CandidateWindow {
         }
     }
 
+    /// 标记窗口进入可见态；**不可见 → 可见**的转换处重采鼠标防抖基线。
+    ///
+    /// # ★★★ 基线必须在「窗口即将出现」时采样，不能沿用 `hide()` 那次
+    ///
+    /// 防抖的门控是「物理光标坐标与基线相同 ⇒ 是内容刷新引起的伪移动 ⇒ 忽略」。基线一旦
+    /// 陈旧，判据就整个反转：窗口出现在**新**光标位下方时，Windows 投来的进入消息坐标与
+    /// 陈旧基线不同 → 被判成「用户真实移动了鼠标」→ 闸门放行 → 60ms 后自动高亮并弹 tooltip，
+    /// 而用户根本没动过鼠标。这正是本防抖要挡的那件事。
+    ///
+    /// 此前基线只在 [`CandidateWindow::hide`] 里采，于是两种情况必然失效：
+    /// - **进程内第一次显示**：此前没有任何 `hide()`，基线是构造初值 `i32::MIN`，必不相等；
+    /// - **两次显示之间用户移动过鼠标**：`hide()` 采的是上一次组合结束时的光标位，已经过时。
+    ///
+    /// 采样点挪到显示转换处后，两者一并消失——「窗口出现瞬间鼠标在哪」才是这个判据要的基准。
+    fn mark_visible(&mut self) {
+        if !self.visible {
+            self.mouse.borrow_mut().reset_hover();
+        }
+        self.visible = true;
+    }
+
     /// 设置"翻页栏并入编码栏行"。来自 ui.candidate.pager_in_preedit。
     pub fn set_pager_in_preedit(&mut self, on: bool) {
         self.pager_in_preedit = on;
@@ -732,8 +753,10 @@ impl CandidateWindow {
 
         // 位置 (px, py) 已在 paint 前计算并锚定（组合期锁定后复用，避免漂移）。
         // 窗口实际左上 = 内容锚点 − 左/上 margin，使内容仍落在锚点处，阴影向四周溢出。
+        // 基线采样刻意排在 `show` **之前**：窗口出现不会移动鼠标，两处取值物理上相同，
+        // 但排在前面就完全不依赖「`show` 内部不会泵到 WM_MOUSEMOVE」这个前提。
+        self.mark_visible();
         self.window.show(px - ml as i32, py - mt as i32);
-        self.visible = true;
         let t_tip0 = Instant::now();
         // 命中矩形是窗口缓冲坐标（内容起点在 (ml,mt)）；tooltip 定位须用窗口屏幕原点。
         self.update_tooltip(px - ml as i32, py - mt as i32);
@@ -881,7 +904,7 @@ impl CandidateWindow {
         }
         root.paint(&mut buf, width, height, &self.text_renderer);
 
-        self.visible = true;
+        self.mark_visible();
         // 关键单位换算：ml/mt/blur 都是 device px（含 scale），而 screen_x/y 是 .app 使用的【逻辑点】
         // （图像按 scale 显示）。故补偿前必须 /scale 换回逻辑点，否则 Retina(×2) 下会多减一截 →
         // 候选窗偏左、偏上盖住 caret（正是截图现象）。no-shadow(margin=0)→0，无变化。
@@ -1044,7 +1067,7 @@ impl CandidateWindow {
         }
         root.paint(&mut buf, width, height, &self.text_renderer);
 
-        self.visible = true;
+        self.mark_visible();
         // 上方三级定位分支穷尽，此处必为 Some；debug 下断言，release 兜底到光标处而非
         // (0,0)——真出现逻辑漏洞时窗口至少还在光标附近，不会莫名飞到屏幕左上角。
         debug_assert!(screen_xy.is_some(), "定位三分支必有其一赋值 screen_xy");
@@ -2355,8 +2378,13 @@ impl CandidateMouse {
         }
     }
 
-    /// 重置悬停状态（窗口隐藏 / 新组合）。
-    /// 以当前物理光标位作基线，使内容刷新引起的伪移动被门控，仅真实移动才激活。
+    /// 重置悬停状态：清空闸门与去重值，并**以当前物理光标位重建基线**。
+    ///
+    /// 两个调用点，职责不同，缺一不可：
+    /// - [`CandidateWindow::mark_visible`]（不可见 → 可见）：**基线在这里才有意义**。判据问的是
+    ///   「窗口出现之后鼠标动没动」，基准就必须取自窗口出现那一刻，见该函数的说明。
+    /// - [`CandidateWindow::hide`]：清掉闸门与残留悬停，使下一轮从未激活态起步。它顺带采的
+    ///   那次基线到下次显示时多半已经过时（用户在这期间移动了鼠标），**不能当作基线的来源**。
     fn reset_hover(&mut self) {
         self.last_hover = -1;
         self.engaged = false;
