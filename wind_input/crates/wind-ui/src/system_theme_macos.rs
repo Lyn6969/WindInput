@@ -28,21 +28,29 @@ use core_foundation_sys::notification_center::{
 };
 use core_foundation_sys::string::{CFStringCreateWithBytes, kCFStringEncodingUTF8};
 use std::ffi::c_void;
-use std::sync::OnceLock;
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 
-/// 观察者回调里要用的事件通道。只装一次（观察者也只注册一次）。
-static EV_TX: OnceLock<Sender<UiEvent>> = OnceLock::new();
+/// 观察者回调里要用的事件通道。**每次 `ensure_installed` 都刷新**，不是只认第一个。
+///
+/// 与 `INSTALLED` 的区别是刻意的：观察者只能注册一次（重复注册会收到重复通知），而
+/// sender 该跟着最新的来。此前这里也是 `OnceLock`，只认首个 sender —— 今天无害（UI 事件
+/// 通道每进程只建一次），但调用方 `global_hotkey_macos::drain_pending` 是**每次 apply 都
+/// 传一个新 clone** 的，两处对同一件事的假设不一致：热键跟最新、主题认最早。真有一天通道
+/// 被重建，主题变更就会静默投进一个死 sender，而热键照常工作——那种不对称最难查。
+static EV_TX: Mutex<Option<Sender<UiEvent>>> = Mutex::new(None);
+/// 观察者是否已注册（只注册一次）。
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
 const NOTIFICATION: &[u8] = b"AppleInterfaceThemeChangedNotification";
 
 /// 注册系统明暗变更观察者（幂等）。**必须在主线程调用**（见模块头「线程」）。
 pub fn ensure_installed(ev_tx: Sender<UiEvent>) {
+    // 先刷新 sender：早退分支也要刷，否则「已注册」之后的调用就更新不了通道了。
+    *EV_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(ev_tx);
     if INSTALLED.get().is_some() {
         return;
     }
-    let _ = EV_TX.set(ev_tx);
     unsafe {
         let name = CFStringCreateWithBytes(
             kCFAllocatorDefault,
@@ -84,7 +92,8 @@ extern "C" fn on_theme_changed(
     _info: CFDictionaryRef,
 ) {
     tracing::debug!("系统明暗设置变更 → 通知协调器");
-    if let Some(tx) = EV_TX.get() {
+    // 回调在主线程执行，主题变更是低频事件，取锁的开销可忽略。
+    if let Some(tx) = EV_TX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         let _ = tx.send(UiEvent::SystemThemeChanged);
     }
 }
