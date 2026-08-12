@@ -30,8 +30,32 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 | `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md` |
 | `ScreenshotStatusTip` / `ScreenshotTooltip` | 状态气泡 / 悬停提示的截图缺失 | **像素不在本进程**：这两者是 `.app` 侧原生 NSPanel，服务只下发文本与配色。要做得由 `.app` 截图，经扩展信封回传二进制块（`body` 是不透明字节，正为此设计） |
 | `ShowCandidateMenu` / `HideMenu` / `MenuKey` | 候选右键菜单的键盘导航缺失 | 菜单树本身已走 `CmdMenuShow` + `UnifiedMenuBuilder` |
-| `SetToolbarPos` / `SetToolbarAutoHide` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
+| `SetToolbarPos` / `SetToolbarAutoHide` / `SetToolbarVertical` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
+
+### 已按平台屏蔽的设置项
+
+无落点的配置**在设置清单里门控掉**（`platform = "windows"`，见 `wind-setting`
+`settings_manifest.toml`），而不是留着让用户配一个不生效的开关：
+
+| 配置项 | macOS 上为何无落点 |
+|---|---|
+| `ui.toolbar.hide_in_fullscreen` / `auto_hide` / `auto_hide_delay` / `vertical` | 菜单栏指示器不是浮动窗口，无从隐藏 / 排列 / 自动淡出。`ui.toolbar.visible` **不在此列**——它在 mac 上控制指示器显隐，是有落点的 |
+| `input.capslock.cancel_on_mode_switch` | 实现手段是合成一次 CapsLock 敲击（`key_inject::tap_caps_lock`），而 macOS 的大写锁定态由 HID 层维护，CGEvent 改不动它（要走 `IOHIDSetModifierLockState` 那条完全不同的路）。补 VK→CGKeyCode 映射也没用 |
+| `stats.track_english` | 英文模式下的输入由 Windows 侧 TSF DLL 经 `CMD_INPUT_STATS` 上报，`.app` 没有对应采集点 |
+
+`keys.session_actions` 里的 **CapsLock** 同理无落点（`capslock_hook` 在非 Windows 是
+`bail!` 的空壳），但它是对话框内的一个**取值**而非独立配置项，清单门控管不到，故在
+`wind-setting` 的 `session_actions.rs::key_options` 里按平台剔除。已有配置（从 Windows
+同步过来的）不丢——词表外的键会被当「当前值」保留，并显示「本平台不支持」。
+
+**仍然保留的两个容易被误判为「该屏蔽」的**：
+
+- **「候选窗首显」**（应用独立配置菜单）：`fast` 档的加速判据依赖 `CMD_CARET_PROBE`，
+  那只有 Windows DLL 发；但三档在 mac 上仍有可观测差别（`wait` 兜底 150ms、`fast` 25ms、
+  `instant` 不等），故保留。只是菜单文案描述的 TSF reflow 背景在 mac 上不成立。
+- **`ui.toolbar.visible`**：形态不同（浮动条 vs 菜单栏指示器）但语义一致，文案已改写成
+  平台中立的「常驻显示输入法当前状态」。
 
 已接：`RegisterGlobalHotkeys`（见下）、`OpenPath` / `OpenApp`（`/usr/bin/open`，
 `.app` 包走 `open -a … --args`）、`TakeScreenshot` / `ScreenshotCandidateToClipboard` /
