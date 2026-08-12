@@ -2910,9 +2910,22 @@ impl Coordinator {
             } else {
                 gc
             };
+            // 与键盘路径（`commit_command`）同样先复位组合再执行。
+            //
+            // 此前这里只清了 `state.active`，缓冲与候选列表原封不动，于是：
+            //   1. 候选窗被 `notify_ui_hide` 藏起来，但下一次 `notify_ui_update`
+            //      （光标上报、模式变化…任何一处）又把那批陈旧候选推回屏幕；
+            //   2. 宿主里已输入的命令码（如 "coen"）没人收回——键盘路径靠返回
+            //      `ClearComposition` 清掉，而鼠标点击不在按键应答里，没有那个出口。
+            // `spawn_command_action` 的文档早写明「不做任何状态重置，调用方须先退出」，
+            // 这条鼠标通路是唯一漏做的。
+            self.reset_pinyin_composition(&mut state);
             state.active = None;
             drop(state);
             self.notify_ui_hide();
+            // 补上键盘路径由 KeyAction 承担的那一半：让宿主结束 composition。
+            self.push_server
+                .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
             self.spawn_command(src, input);
             return None;
         }
