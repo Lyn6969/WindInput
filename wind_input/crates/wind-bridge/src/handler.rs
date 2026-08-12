@@ -329,8 +329,9 @@ pub trait MessageHandler: Send + Sync {
     fn handle_candidate_select(&self, _page_local_index: i32) {}
 
     /// host 候选框鼠标滚轮（delta 为 WHEEL_DELTA 倍数，正=上滚）。
-    /// 对齐 Go HandleCandidateScroll：默认不做任何动作（本地候选窗无滚轮翻页），
-    /// 统一接入点便于后续按配置实现滚轮行为。默认空。
+    ///
+    /// 协调器把它实现为「上下键调整高亮项」（到页边界翻到相邻页），两平台同一实现，
+    /// 见 `Coordinator::handle_candidate_scroll`。此处的空实现只服务于测试夹具。
     fn handle_candidate_scroll(&self, _delta: i32) {}
 
     /// darwin: .app 鼠标 hover 候选（页内下标，-1=无）。默认空。

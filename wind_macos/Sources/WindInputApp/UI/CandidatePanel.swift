@@ -26,6 +26,7 @@ final class CandidateContentView: NSView {
     var onSelect: ((Int) -> Void)?
     var onHover: ((Int) -> Void)?
     var onContextAction: ((Int, String) -> Void)? // (pageLocalIndex, action)
+    var onScroll: ((Int32) -> Void)?              // 滚轮 (delta, WHEEL_DELTA 倍数, 正=上滚)
     var onDragMoved: (() -> Void)?                // 拖动进行中 (每次位移后)
     var onDragEnded: (() -> Void)?                // 空白区拖动松手 (整窗已移到新位置)
     /// 拖动起点：光标屏幕位置 + 窗口起始左下角。nil = 未在拖动。
@@ -167,6 +168,34 @@ final class CandidateContentView: NSView {
         if report != lastHover { lastHover = report; onHover?(report) }
     }
 
+    /// 滚轮 → 上报 delta，服务端解释成「上下键调整高亮项」(到页边界翻到相邻页)。
+    ///
+    /// **必须攒够一格再发**：触控板的一次轻扫会来几十个 `scrollingDeltaY` 极小的事件
+    /// (`hasPreciseScrollingDeltas`)，逐个上报等于让高亮一口气飞过整页。鼠标滚轮一格
+    /// 通常是 ±1 行，直接够阈值。
+    ///
+    /// wire 单位沿用 Win32 的 `WHEEL_DELTA`(120)、正=上滚：那是既有约定，服务端只有一份实现。
+    override func scrollWheel(with event: NSEvent) {
+        let dy = event.scrollingDeltaY
+        guard dy != 0 else { return }
+        if event.phase == .began || event.momentumPhase == .began {
+            scrollAccum = 0   // 新一次滑动重新起算，别把上次的余量算进来
+        }
+        scrollAccum += dy
+        let step = event.hasPreciseScrollingDeltas ? Self.preciseStep : 1
+        let notches = (scrollAccum / step).rounded(.towardZero)
+        guard notches != 0 else { return }
+        scrollAccum -= notches * step
+        // macOS 的 scrollingDeltaY 正值 = 内容向下走 = 视觉上向**上**滚，与 wire 的
+        // 「正=上滚」同向，直接乘 120。natural scrolling 关闭时系统已替我们翻好符号。
+        onScroll?(Int32(notches) * 120)
+    }
+
+    /// 触控板的累积量，攒够 `preciseStep` 记一格。
+    private var scrollAccum: CGFloat = 0
+    /// 触控板一格的阈值 (点)。取 10：一次自然轻扫约移动 2~4 项，快扫更多，慢扫能逐项微调。
+    private static let preciseStep: CGFloat = 10
+
     override func mouseExited(with event: NSEvent) {
         let none = CandidateContentView.noHover
         if lastHover != none { lastHover = none; onHover?(none) }
@@ -200,6 +229,11 @@ final class CandidatePanel: NSPanel {
     var onUnifiedAction: ((Int) -> Void)? {
         get { content.onUnifiedAction }
         set { content.onUnifiedAction = newValue }
+    }
+    /// 滚轮回调 (delta, WHEEL_DELTA 倍数, 正=上滚)。服务端解释成高亮上下移。
+    var onScroll: ((Int32) -> Void)? {
+        get { content.onScroll }
+        set { content.onScroll = newValue }
     }
     /// 拖动落定回调, 参数为 wire 坐标 (top-left) 下的窗口左上角。
     /// 服务端据当前定位方式决定落不落盘: 固定位置=重新摆放并写配置; 跟随光标=只是临时挪开。

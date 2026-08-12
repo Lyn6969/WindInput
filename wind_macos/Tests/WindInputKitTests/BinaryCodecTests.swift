@@ -143,6 +143,17 @@ final class BinaryCodecTests: XCTestCase {
         XCTAssertEqual(decoded.prevChar, 0)
     }
 
+    /// 滚轮帧：负 delta 必须按 i32 位模式落盘，不能被 UInt32 转换截成正数——
+    /// 服务端靠符号区分上滚/下滚，符号丢了就只会往一个方向走。
+    func testCandidateScrollFrame_NegativeDeltaKeepsSign() throws {
+        let f = BinaryCodec.encodeCandidateScrollFrame(delta: -240)
+        let (cmd, len, _) = try BinaryCodec.decodeHeader(f)
+        XCTAssertEqual(cmd, UpstreamCmd.candidateScroll)
+        XCTAssertEqual(len, 4)
+        let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
+        XCTAssertEqual(Int32(bitPattern: payload.readUInt32LE(at: 0)), -240)
+    }
+
     // MARK: - 扩展信封 (0x0E01)
 
     func testExtEnvelope_Roundtrip() throws {

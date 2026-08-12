@@ -32,7 +32,9 @@ constexpr uint16_t CMD_MENU_COMMAND     = 0x0208; // Menu command (toggle_mode, 
 constexpr uint16_t CMD_SHOW_CONTEXT_MENU     = 0x020A; // Request to show context menu (sends screen coordinates)
 constexpr uint16_t CMD_CANDIDATE_SELECT      = 0x020D; // Host render: mouse click hit a candidate (payload: pageLocalIndex i32; <0 = page button -1 up / -2 down)
 constexpr uint16_t CMD_CANDIDATE_HOVER       = 0x020E; // Host render: mouse hover (payload: index i32 + anchorX i32 + belowY i32 + aboveY i32). index: >=0 candidate, -1 nothing, -2 page-up button, -3 page-down button (differs from select/rect -1/-2 convention: hover needs a distinct "nothing")
-constexpr uint16_t CMD_CANDIDATE_SCROLL      = 0x0211; // Host render: mouse wheel over candidate box (payload: delta i32, WHEEL_DELTA multiple, >0 = up); Go decides (no paging by default)
+constexpr uint16_t CMD_CANDIDATE_SCROLL      = 0x0211; // Host render: mouse wheel over candidate box (payload: delta i32, WHEEL_DELTA multiple, >0 = up).
+// The service maps this to "move the highlight up/down" (crossing to the adjacent page at a
+// page boundary) — same handler on both platforms, see Coordinator::handle_candidate_scroll.
 constexpr uint16_t CMD_HOST_RENDER_FAILED    = 0x0212; // Host render: band window creation failed in DLL (async, payload: reason u32). Go logs + notifies user the candidate fell back to its local window
 constexpr uint32_t HOST_RENDER_FAIL_WINDOW_CREATE = 1; // CreateWindowInBand failed at target band and band=0
 // Input state report (C++ -> Go, async): compartment-driven disabled/reason change outside

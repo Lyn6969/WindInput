@@ -106,7 +106,7 @@ pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex i32 LE�
 pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无；Windows 另带 anchorX/belowY/aboveY 三个 i32，当前仅取 index)
 pub const CMD_CANDIDATE_CONTEXT_MENU: u16 = 0x020F; // 上行：候选右键动作 (payload: index i32 + actionLen u32 + action UTF-8)
 pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (payload: 菜单 id i32 LE)
-pub const CMD_CANDIDATE_SCROLL: u16 = 0x0211; // 上行：host 候选框滚轮 (payload: delta i32，WHEEL_DELTA 倍数，正=上滚)；服务端统一决策（默认不翻页，对齐 Go）
+pub const CMD_CANDIDATE_SCROLL: u16 = 0x0211; // 上行：host 候选框滚轮 (payload: delta i32，WHEEL_DELTA 倍数，正=上滚)；服务端解释成「上下键调整高亮项」（到页边界翻到相邻页），见 Coordinator::handle_candidate_scroll
 /// 上报前台上下文（命令直通车 `app()`/`title()`/`sel()` 取值，目前仅 darwin `.app` 发）：
 /// payload = appLen u32 + app(UTF-8) + titleLen u32 + title + selLen u32 + sel，均 LE 长度前缀。
 ///

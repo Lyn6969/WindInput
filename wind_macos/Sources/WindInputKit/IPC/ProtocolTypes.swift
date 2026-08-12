@@ -28,6 +28,9 @@ public enum UpstreamCmd {
     public static let systemModeSwitch: UInt16 = 0x020B
     public static let candidateSelect: UInt16  = 0x020D   // NSPanel 鼠标点击命中候选 (payload: pageLocalIndex u32)
     public static let candidateHover: UInt16   = 0x020E   // NSPanel 鼠标悬停候选 (payload: pageLocalIndex i32, -1=无)
+    /// NSPanel 候选框滚轮 (payload: delta i32, WHEEL_DELTA=120 的倍数, 正=上滚)。
+    /// 服务端把它解释成「上下键调整高亮项」(到页边界翻到相邻页)，两平台同一实现。
+    public static let candidateScroll: UInt16  = 0x0211
     public static let candidateContextMenu: UInt16 = 0x020F // NSPanel 右键菜单动作 (payload: index i32 + actionLen u32 + action UTF-8)
     public static let menuAction: UInt16       = 0x0210   // 统一菜单项被选中 (payload: id i32)
     public static let frontContext: UInt16     = 0x0215   // 前台上下文快照 (payload: appLen+app + titleLen+title + selLen+sel)

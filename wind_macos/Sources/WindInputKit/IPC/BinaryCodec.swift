@@ -381,6 +381,19 @@ public enum BinaryCodec {
         return out
     }
 
+    /// 编码 CmdCandidateScroll (0x0211 upstream): payload = delta i32 LE。
+    ///
+    /// `delta` 用 Win32 的 `WHEEL_DELTA`(120) 倍数、正=上滚 —— 这是既有的 wire 约定
+    /// (Windows 的 host-render DLL 原样转发系统滚轮消息)，macOS 侧折算成同一单位，
+    /// 服务端因此只需一份实现。
+    public static func encodeCandidateScrollFrame(delta: Int32) -> Data {
+        var payload = Data(count: 4)
+        payload.writeUInt32LE(UInt32(bitPattern: delta), at: 0)
+        var out = encodeHeader(cmd: UpstreamCmd.candidateScroll, payloadLen: 4)
+        out.append(payload)
+        return out
+    }
+
     /// 编码 CmdCandidateHover (0x020E upstream): payload = pageLocalIndex i32 LE (-1=无)。
     public static func encodeCandidateHoverFrame(index: Int) -> Data {
         var payload = Data(count: 4)
