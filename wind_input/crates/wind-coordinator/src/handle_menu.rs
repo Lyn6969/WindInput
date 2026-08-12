@@ -18,6 +18,20 @@ use wind_ui::toolbar::ToolbarState;
 /// 「点开菜单 → 切走窗口」的最短间隔（看清菜单内容至少几百毫秒）。
 pub(crate) const MENU_FOCUS_GUARD: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// `MenuCmd::ToggleToolbar` 的菜单文案。两平台**同一个命令、不同的 UI 实体**，故文案分平台：
+/// Windows 下它显隐的是跟随光标的悬浮工具栏窗口；macOS 下 `UpdateToolbar` 被
+/// `manager_macos` 编码成 mode_status 帧，最终落到 `ModeStatusController` 的
+/// `NSStatusItem.isVisible` —— 显隐的是菜单栏里那个中/英状态图标，压根没有悬浮工具栏。
+/// 照搬「显示工具栏」会让 mac 用户去找一个不存在的东西。
+///
+/// 常量而非各处字面量：三处菜单（IMK 输入源 / 候选框右键 / 状态指示器下拉）必须字字一致，
+/// 这正是本次统一要解决的问题，散成字面量迟早再次跑偏。
+pub(crate) const TOOLBAR_MENU_LABEL: &str = if cfg!(target_os = "macos") {
+    "显示状态图标"
+} else {
+    "显示工具栏"
+};
+
 /// 把 (键, 值) 列表拼成设置程序的附加参数串（`--k=v`，空格分隔）。值为空的项跳过
 /// ——设置端把"传了空串"和"没传"当同一回事，少一个参数更省事。
 ///
@@ -836,15 +850,27 @@ impl Coordinator {
     /// 相比 Windows 完整菜单，只保留必要项、且【无子菜单】（IMK 输入源菜单无法可靠处理嵌套子菜单）：
     ///   组1 输入方案（展开）：英文 + 各方案单选
     ///   组2 中文标点 / 全角 / 简入繁出
-    ///   组3 重启服务
+    ///   组3 显示状态图标
+    ///   组4 重启服务
     ///   设置…
-    /// 主题/工具栏/检索范围/重载配置/高级/词库/关于 移除（配置类交由设置应用）。
+    /// 主题/检索范围/重载配置/高级/词库/关于 移除（配置类交由设置应用）。
+    ///
+    /// 状态图标开关是**唯一从精简树里保留的显示类开关**，理由是入口自锁：它关掉的正是
+    /// 菜单栏状态指示器，而那个指示器的下拉菜单是完整树的两个入口之一；只留在完整树里
+    /// 的话，用户一旦关掉图标就把开关本身也藏了（只剩候选框右键这个得先打字才碰得到的
+    /// 入口）。IMK 输入源菜单不依赖任何 UI 可见性，是恒定可达的那个。
     #[cfg(target_os = "macos")]
     pub(crate) fn build_menu_items_macos(&self) -> Vec<wind_ui::manager::MenuItemSpec> {
         use wind_ui::manager::MenuItemSpec as M;
-        let (chinese, punct, full, s2t) = {
+        let (chinese, punct, full, s2t, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (s.chinese_mode, s.chinese_punct, s.full_width, s.s2t_enabled)
+            (
+                s.chinese_mode,
+                s.chinese_punct,
+                s.full_width,
+                s.s2t_enabled,
+                s.toolbar_visible,
+            )
         };
         let cmd = |c: MenuCmd| MenuKind::Command(c);
         let active = self.engine_mgr.active_schema_id();
@@ -863,6 +889,13 @@ impl Coordinator {
         items.push(M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct));
         items.push(M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full));
         items.push(M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t));
+        items.push(M::separator());
+        items.push(M::leaf(
+            TOOLBAR_MENU_LABEL,
+            cmd(MenuCmd::ToggleToolbar),
+            true,
+            toolbar_vis,
+        ));
         items.push(M::separator());
         items.push(M::leaf(
             "重启服务",
@@ -1099,7 +1132,12 @@ impl Coordinator {
             M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t),
             M::submenu("检索范围", filter_children),
             M::separator(),
-            M::leaf("显示工具栏", cmd(MenuCmd::ToggleToolbar), true, toolbar_vis),
+            M::leaf(
+                TOOLBAR_MENU_LABEL,
+                cmd(MenuCmd::ToggleToolbar),
+                true,
+                toolbar_vis,
+            ),
             M::submenu("主题", theme_children),
             M::separator(),
             M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
@@ -1768,6 +1806,60 @@ mod tests {
             contains(&c.build_main_menu_items(), "密码框强制英文"),
             "邻项被误伤"
         );
+    }
+
+    /// 状态图标开关必须同时出现在 macOS 的**两棵**菜单树里，且文案一致。
+    ///
+    /// 回归背景：IMK 输入源菜单走精简树 `build_menu_items_macos()`、候选框右键与状态指示器
+    /// 走完整树 `build_main_menu_items()`，两棵树各自维护 → 精简树当初把这项砍了，同一个
+    /// 输入法在两处菜单里表现不一。这条测试同时钉住「都在」和「同名」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn toolbar_toggle_present_in_both_macos_menu_trees() {
+        use super::TOOLBAR_MENU_LABEL;
+        use crate::coordinator::Coordinator;
+        use wind_config::Config;
+
+        let c = Coordinator::new_headless(Config::default(), None);
+        fn contains(items: &[wind_ui::manager::MenuItemSpec], label: &str) -> bool {
+            items
+                .iter()
+                .any(|i| i.label == label || contains(&i.children, label))
+        }
+        assert!(
+            contains(&c.build_menu_items_macos(), TOOLBAR_MENU_LABEL),
+            "IMK 精简菜单缺状态图标开关——关掉图标后开关本身也没了（入口自锁）"
+        );
+        assert!(
+            contains(&c.build_main_menu_items(), TOOLBAR_MENU_LABEL),
+            "完整菜单缺状态图标开关"
+        );
+        // 文案必须是 macOS 语义：这里显隐的是 NSStatusItem，不是 Windows 的悬浮工具栏。
+        assert_eq!(TOOLBAR_MENU_LABEL, "显示状态图标");
+    }
+
+    /// 勾选态必须跟随 `toolbar_visible`，否则菜单上是个永远不打勾的死开关。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn toolbar_toggle_reflects_visibility_in_imk_menu() {
+        use super::TOOLBAR_MENU_LABEL;
+        use crate::coordinator::Coordinator;
+        use wind_config::Config;
+
+        let c = Coordinator::new_headless(Config::default(), None);
+        let checked = |c: &Coordinator| {
+            c.build_menu_items_macos()
+                .into_iter()
+                .find(|i| i.label == TOOLBAR_MENU_LABEL)
+                .expect("菜单项不存在")
+                .checked
+        };
+        let before = checked(&c);
+        c.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .toolbar_visible = !before;
+        assert_eq!(checked(&c), !before, "勾选态没跟随 toolbar_visible");
     }
 
     /// 只有恰好 (0,0) 被规避，其余坐标（含含 0 分量与负坐标）必须原样落盘。
