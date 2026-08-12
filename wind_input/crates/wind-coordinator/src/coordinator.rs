@@ -1243,7 +1243,22 @@ impl Coordinator {
             let c = Arc::clone(&coordinator);
             std::thread::spawn(move || {
                 let active = c.engine_mgr.active_schema_id();
-                for id in c.engine_mgr.available_schemas() {
+                // available_schemas 只含「可切换的方案」。临时拼音 / 临时英文的目标引擎
+                // **不在其中**（它们是模式的实现，不是可切换方案），此前因此漏出预热范围：
+                // 实测首次按引导键进临拼时才同步加载 52 万词条的拼音库 + 英文库，用户感到
+                // 顿一下。两者都只在启用时才预热，不给没开这些功能的用户白付内存。
+                let mut targets: Vec<String> = c.engine_mgr.available_schemas().to_vec();
+                // ⚠ `temp_pinyin_target()` **自身就会 `ensure_loaded`**（它的语义是「可用才
+                // 返回」），故这一行本身即完成了临拼引擎的加载，下面循环里那次只是复查跳过。
+                // 看着绕，但比在此复制一份「开关 + 方案适用性 + 目标解析」的判据强——那套判据
+                // 是所有临拼入口的公共门卫，抄一份必然漂移。
+                if let Some(t) = c.engine_mgr.temp_pinyin_target() {
+                    targets.push(t);
+                }
+                if c.rt().config.input.temp_english.show_candidates {
+                    targets.push("english".to_string());
+                }
+                for id in targets {
                     if id == active || c.engine_mgr.is_loaded(&id) {
                         continue;
                     }
