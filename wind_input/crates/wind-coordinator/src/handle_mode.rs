@@ -1238,8 +1238,7 @@ impl Coordinator {
     /// **成员顺序即候选优先级**——把 `quick_input.calc` 排在最前即得「计算结果作首选」。
     pub(crate) fn update_mix_candidates(&self, state: &mut State) {
         state.candidates.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
         state.mix_repeat = false;
         // 组合区 = 显示态前缀 + 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
         state.preedit = format!(

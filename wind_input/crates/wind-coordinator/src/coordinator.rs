@@ -480,9 +480,6 @@ pub(crate) struct State {
     pub(crate) candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     pub(crate) selected_index: usize,
-    /// 鼠标悬停目标（原始 tag）：-1 无，0..N 候选页内下标，或翻页器 tag。
-    /// 与 selected_index 相互独立：悬停只是视觉提示，不改变空格上屏的目标。
-    pub(crate) hover_index: i32,
     /// 当前页码（0-based）
     pub(crate) current_page: usize,
     /// 动态分级加载：当前候选对应的输入码
@@ -924,6 +921,22 @@ pub struct Coordinator {
     /// 消费点唯一：[`Coordinator::apply_session_action`] 用它把 `highlight_up`/`highlight_down`
     /// 的走向翻过来，见那里的说明。
     candidate_flipped: std::sync::atomic::AtomicBool,
+    /// 鼠标悬停目标（原始 tag）：-1 无，0..N 候选页内下标，或翻页器 tag。
+    /// 与 `State::selected_index` 相互独立：悬停只是视觉提示，不改变空格上屏的目标。
+    ///
+    /// # ★★ 为什么不放在 `State` 里
+    ///
+    /// 它的生命周期是**候选窗会话**（窗口一隐藏就该归零），不是输入状态。放在 `State` 里时，
+    /// 清空只能由每个候选装填点手工执行——主路径 `update_candidates` 做了，
+    /// 特殊模式 / 临拼 / 混输 / 快捷输入的 8 个装填点全部漏了，于是悬停高亮与 tooltip 跨组合、
+    /// 跨模式存活（用户 2026-08-12 反馈「再次弹出时悬停被记忆」）。普通输入下每敲一键都重走
+    /// 主路径，残留被持续覆盖掉，**故该缺陷在主路径上物理不可观测**。
+    ///
+    /// 移出为原子量后，[`Coordinator::clear_hover`] **不需要 state 锁**，才能安放进
+    /// [`Coordinator::notify_ui_hide`]——那里有 40+ 个调用点，无法逐一确认是否已持锁，
+    /// 加锁即埋死锁。「窗口隐藏即清空悬停」这句话至此才在真相源上成立，而不只在 UI 侧的
+    /// 防抖状态（`CandidateMouse::reset_hover`）上成立。
+    hover_index: std::sync::atomic::AtomicI32,
     /// 本轮组合的首显是否用了**非权威**坐标（fast 的试探采样 / instant 沿用的旧坐标）。
     /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
     /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
@@ -1691,7 +1704,6 @@ impl Coordinator {
                 shadow_code: String::new(),
                 candidates: Vec::new(),
                 selected_index: 0,
-                hover_index: -1,
                 current_page: 0,
                 candidate_input: String::new(),
                 candidate_limit: 0,
@@ -1768,6 +1780,7 @@ impl Coordinator {
             candidate_shown: Mutex::new(false),
             show_authorized: std::sync::atomic::AtomicBool::new(false),
             candidate_flipped: std::sync::atomic::AtomicBool::new(false),
+            hover_index: std::sync::atomic::AtomicI32::new(-1),
             composition_start: Mutex::new((0, 0, false)),
             last_authoritative_caret: Mutex::new((0, 0, false)),
             last_key_at: Mutex::new(None),
@@ -2696,6 +2709,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = hidden;
         if hidden {
+            self.clear_hover();
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
         // 候选字号覆盖（ui.candidate.font_size，0=跟随主题）；font_size_follow_theme=true 时强制跟随。
@@ -2870,9 +2884,40 @@ impl Coordinator {
         state.candidates.len().div_ceil(pp).max(1)
     }
 
+    /// 清除鼠标悬停目标（无需 state 锁，见 [`Coordinator::hover_index`] 的说明）。
+    ///
+    /// 调用点＝一切「悬停不再对应屏幕上任何东西」的时刻：候选窗隐藏、候选列表重新装填、
+    /// 键盘移动高亮/翻页。少接一处的后果是**静默的**——悬停高亮与 tooltip 会在下一次候选窗
+    /// 出现时凭空复现，且鼠标从未移动过。
+    pub(crate) fn clear_hover(&self) {
+        self.hover_index
+            .store(-1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 当前鼠标悬停目标（原始 tag；-1 = 无）。
+    pub(crate) fn hover_target(&self) -> i32 {
+        self.hover_index.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 候选列表重新装填 / 组合清空后的**视图复位**：翻页归零、键盘高亮归零、鼠标悬停清除。
+    ///
+    /// # ★★ 三件事必须一起做
+    ///
+    /// 此前只有主路径 `update_candidates` 三件齐全，特殊模式 / 临拼 / 混输 / 快捷输入的
+    /// 8 个装填点都只做了前两件——漏掉的第三件让悬停高亮与 tooltip 跨按键、跨组合、跨模式
+    /// 存活（2026-08-12 用户反馈）。而普通输入每敲一键都重走主路径把残留覆盖掉，
+    /// **该缺陷在主路径上物理不可观测**，只有 overlay 模式才露馅。
+    ///
+    /// 收进一处后，新增候选来源时能漏的只剩「忘了调用本函数」——比在三行里少写一行显眼得多。
+    pub(crate) fn reset_candidate_view(&self, state: &mut State) {
+        state.current_page = 0;
+        state.selected_index = 0;
+        self.clear_hover();
+    }
+
     /// 上移高亮（页首回卷到上一页末项）；返回是否变化
     fn move_up(&self, state: &mut State) -> bool {
-        state.hover_index = -1;
+        self.clear_hover();
         if state.candidates.is_empty() {
             return false;
         }
@@ -2890,7 +2935,7 @@ impl Coordinator {
 
     /// 下移高亮（页尾回卷到下一页首项）；返回是否变化
     fn move_down(&self, state: &mut State) -> bool {
-        state.hover_index = -1;
+        self.clear_hover();
         if state.candidates.is_empty() {
             return false;
         }
@@ -2913,7 +2958,7 @@ impl Coordinator {
 
     /// 上一页（高亮归零）；返回是否变化
     fn page_prev(&self, state: &mut State) -> bool {
-        state.hover_index = -1;
+        self.clear_hover();
         if state.current_page > 0 {
             state.current_page -= 1;
             state.selected_index = 0;
@@ -2925,7 +2970,7 @@ impl Coordinator {
 
     /// 下一页（高亮归零）；返回是否变化
     fn page_next(&self, state: &mut State) -> bool {
-        state.hover_index = -1;
+        self.clear_hover();
         // 接近末页且有更多 → 先动态扩展加载，使新页可达
         if state.has_more && state.current_page + 2 >= self.total_pages(state) {
             self.expand_candidates(state);
@@ -3548,8 +3593,7 @@ impl Coordinator {
         state.preedit_fp_body.clear();
         state.shadow_code.clear();
         state.candidates.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
     }
 
     /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持
@@ -3647,6 +3691,7 @@ impl Coordinator {
             *h
         };
         if hidden {
+            self.clear_hover();
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
         self.show_tip(if hidden {
@@ -3724,6 +3769,7 @@ impl Coordinator {
             String::new()
         };
         if state.candidates.is_empty() && state.input_buffer.is_empty() && mode_label.is_empty() {
+            self.clear_hover(); // 组合结束的最常见隐藏出口（不经 notify_ui_hide），须自行归零
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
             self.reset_first_show();
             return;
@@ -3734,6 +3780,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
+            self.clear_hover();
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
             self.reset_first_show();
             return;
@@ -3949,7 +3996,7 @@ impl Coordinator {
         let total_pages = self.total_pages(state);
         let selected = state.selected_index.min(items.len().saturating_sub(1));
         // 悬停目标独立于选中项：候选越界视为无悬停，翻页器 tag 原样透传
-        let hover = match state.hover_index {
+        let hover = match self.hover_target() {
             h if (0..wind_ui::manager::HOVER_PAGE_PREV).contains(&h) => {
                 if (h as usize) < items.len() { h } else { -1 }
             }
@@ -4096,6 +4143,10 @@ impl Coordinator {
         // 「CapsLock 绑定这一次没生效」，多吃却是「用户在别的应用里 CapsLock 按不动」。
         // 凡拿不准就归零。
         wind_keys::capslock_hook::set_should_eat(false);
+        // 悬停归零同理：窗口没了，悬停目标不可能还有意义。UI 侧 `CandidateMouse::reset_hover`
+        // 清的只是防抖闸门（决定何时**发**事件），高亮与 tooltip 读的是本值——不清这一句，
+        // 特殊模式下窗口再次弹出时会带着上次的悬停高亮，鼠标却从未移动过。
+        self.clear_hover();
         let _ = self.ui_tx.send(UiCommand::HideCandidates);
         self.reset_first_show();
     }
@@ -4422,8 +4473,12 @@ impl Coordinator {
     /// 悬停高亮：设置独立的悬停目标（候选或翻页器），不改键盘选中项，重绘。
     /// target<0 表示离开。空格上屏仍以 selected_index 为准。
     fn mouse_hover(&self, target: i32) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
+            // 候选已清空 → 悬停不再对应屏幕上任何东西，归零后返回（无候选时窗口本就不显示，
+            // 不必重绘）。★ 必须**归零而非早退**：早退会让「鼠标移出候选窗」发出的那条
+            // `Hover(-1)` 在候选恰好清空时被整个吞掉，旧值一路残留到下一次候选窗显示。
+            self.clear_hover();
             return;
         }
         let new_hover = if target == wind_ui::manager::HOVER_PAGE_PREV
@@ -4440,8 +4495,11 @@ impl Coordinator {
         } else {
             -1
         };
-        if state.hover_index != new_hover {
-            state.hover_index = new_hover;
+        if self
+            .hover_index
+            .swap(new_hover, std::sync::atomic::Ordering::Relaxed)
+            != new_hover
+        {
             self.notify_ui_update(&state);
         }
     }
@@ -11022,5 +11080,124 @@ mod ext_envelope_tests {
         ] {
             assert_eq!(decode_ext_point(bad), None, "body={:?} 应被拒", bad);
         }
+    }
+}
+
+#[cfg(test)]
+mod hover_reset_tests {
+    //! 鼠标悬停目标（`Coordinator::hover_index`）的**清空覆盖面**。
+    //!
+    //! 本组测试锁的是一个曾经静默存在的缺陷：悬停目标此前是 `State` 的字段，清空只能由每个
+    //! 候选装填点手工执行。主路径 `update_candidates` 做了，overlay 各路径（特殊模式 / 临拼 /
+    //! 临英 / 混输·快捷输入 / 拼音组合复位）全部漏了——悬停高亮与 tooltip 于是跨按键、跨组合、
+    //! 跨模式存活，用户看到的是「候选窗再次弹出时，鼠标没动却已经有一项被高亮并弹出了 tooltip」。
+    //!
+    //! ★ 该缺陷在主路径上**物理不可观测**：普通输入每敲一键都重走 `update_candidates`，
+    //! 残留被持续覆盖掉。所以只测普通输入路径等于什么都没测——下面必须逐个 overlay 入口点名。
+    use super::*;
+
+    fn coord() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
+
+    /// 造一页候选，好让 `mouse_hover` 有合法落点（它对空候选另有分支，见下面的专项测试）。
+    fn seed_candidates(c: &Coordinator, n: usize) {
+        let mut st = c.state.lock().unwrap();
+        st.candidates = (0..n)
+            .map(|i| wind_candidate::Candidate {
+                text: i.to_string(),
+                ..Default::default()
+            })
+            .collect();
+    }
+
+    /// **反向对照**：悬停确实设得上。
+    ///
+    /// 少了本条，下面所有「××之后归零」都可能因为悬停压根没设上而全部假绿——本仓
+    /// 「测了个恒为真的断言」已经栽过不止一次。
+    #[test]
+    fn mouse_hover_sets_target() {
+        let c = coord();
+        seed_candidates(&c, 5);
+        c.mouse_hover(2);
+        assert_eq!(c.hover_target(), 2, "有候选时悬停应设得上");
+    }
+
+    /// 候选窗隐藏 = 会话终结，悬停必须归零。
+    ///
+    /// 这是根治点：`notify_ui_hide` 有 40+ 个调用点，把清空放在这里，任何一条隐藏通路都覆盖到。
+    /// （UI 侧 `CandidateMouse::reset_hover` 清的是防抖闸门，决定何时**发**事件；
+    /// 高亮与 tooltip 读的是本值，两者不是一回事。）
+    #[test]
+    fn notify_ui_hide_clears_hover() {
+        let c = coord();
+        seed_candidates(&c, 5);
+        c.mouse_hover(2);
+        c.notify_ui_hide();
+        assert_eq!(c.hover_target(), -1, "候选窗隐藏后悬停必须归零");
+    }
+
+    /// 每一个 overlay 候选装填入口，装填后都必须已清除悬停。
+    ///
+    /// 逐个点名而不是抽样：它们是**平行的独立落点**，历史上正是「主路径做了、其余全漏」。
+    /// 新增候选来源时若忘了 `reset_candidate_view`，本测试不会自动覆盖到——但把入口逐个
+    /// 列在这里，至少让「又多了一个装填点」这件事在评审时看得见。
+    #[test]
+    fn every_overlay_refill_clears_hover() {
+        // (入口名, 调用) —— 名字进断言消息，失败时直接指出是哪条路径漏了。
+        let cases: Vec<(&str, fn(&Coordinator, &mut State))> = vec![
+            ("特殊模式 update_special_candidates", |c, st| {
+                let _ = c.update_special_candidates(st);
+            }),
+            ("临时拼音 update_temp_pinyin_candidates", |c, st| {
+                c.update_temp_pinyin_candidates(st)
+            }),
+            ("临时英文 update_temp_english_candidates", |c, st| {
+                c.update_temp_english_candidates(st)
+            }),
+            ("混输·快捷输入 update_mix_candidates", |c, st| {
+                c.update_mix_candidates(st)
+            }),
+            ("拼音组合复位 reset_pinyin_composition", |c, st| {
+                c.reset_pinyin_composition(st)
+            }),
+        ];
+        for (name, refill) in cases {
+            let c = coord();
+            seed_candidates(&c, 5);
+            c.mouse_hover(2);
+            assert_eq!(c.hover_target(), 2, "{name}：前置条件——悬停应已设上");
+
+            let mut st = c.state.lock().unwrap();
+            refill(&c, &mut st);
+            assert_eq!(c.hover_target(), -1, "{name}：候选重新装填后悬停必须清除");
+        }
+    }
+
+    /// 「鼠标移出候选窗」这条 `Hover(-1)` 在候选恰好已清空时**不能被吞掉**。
+    ///
+    /// 旧实现在 `mouse_hover` 开头对空候选直接 early-return，于是离开事件丢失、旧值残留。
+    /// 「候选没了」正是最该归零的时刻，拿它当早退条件恰好搞反了。
+    #[test]
+    fn leaving_clears_hover_even_when_candidates_already_empty() {
+        let c = coord();
+        seed_candidates(&c, 5);
+        c.mouse_hover(2);
+        c.state.lock().unwrap().candidates.clear();
+
+        c.mouse_hover(-1);
+        assert_eq!(c.hover_target(), -1, "候选已空时的离开事件不能被吞掉");
+    }
+
+    /// 键盘操作（移动高亮 / 翻页）同样取消悬停：两种高亮并存时视觉上会有两个「选中项」。
+    /// 此前这四处是仅有的清空点之一，改造成 `clear_hover` 后需确认语义没丢。
+    #[test]
+    fn keyboard_navigation_clears_hover() {
+        let c = coord();
+        seed_candidates(&c, 5);
+        c.mouse_hover(2);
+        let mut st = c.state.lock().unwrap();
+        assert!(c.move_down(&mut st), "前置条件——应能下移");
+        assert_eq!(c.hover_target(), -1, "键盘移动高亮后悬停应取消");
     }
 }

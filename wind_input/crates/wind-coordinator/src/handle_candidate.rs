@@ -1245,9 +1245,7 @@ impl Coordinator {
         // 引擎返回数达到上限 → 可能还有更多未加载
         state.has_more = engine_count >= limit;
         // 候选变化：复位翻页与高亮（含清除鼠标悬停）
-        state.current_page = 0;
-        state.selected_index = 0;
-        state.hover_index = -1;
+        self.reset_candidate_view(state);
         // 简繁 1对多变体展开（须在自动上屏判定之后——outcome 已定型，见函数文档）。
         self.expand_s2t_variants(state);
         // 组合区按高亮候选类型重算（混输高亮跟随；含已转换前缀拼接）。
@@ -1820,8 +1818,7 @@ impl Coordinator {
         state.input_buffer.clear();
         state.preedit.clear();
         state.candidates.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
         out
     }
 

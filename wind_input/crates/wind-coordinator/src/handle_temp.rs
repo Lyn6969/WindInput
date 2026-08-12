@@ -276,8 +276,7 @@ impl Coordinator {
         state.committed_segs.clear();
         state.candidates.clear();
         state.preedit.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
     }
 
     /// 临拼向引擎取数的上限：目标方案是拼音类才取全量。
@@ -298,8 +297,7 @@ impl Coordinator {
     /// 用临时拼音目标方案转换缓冲，刷新候选与组合区（前缀 + 已转换汉字 + 剩余拼音）
     pub(crate) fn update_temp_pinyin_candidates(&self, state: &mut State) {
         state.candidates.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
         let prefix = format!("{}{}", state.temp_pinyin_prefix, state.committed_text);
         if state.temp_pinyin_buffer.is_empty() {
             state.preedit = prefix;
@@ -748,8 +746,7 @@ impl Coordinator {
     /// （如缓冲 `Hello` 时词库的 `hello` 被变形候选先占位挡下）。
     pub(crate) fn update_temp_english_candidates(&self, state: &mut State) {
         state.candidates.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
         let buf = state.temp_english_buffer.clone();
         state.preedit = format!("{}{}", state.temp_english_prefix, buf);
         if buf.is_empty() {

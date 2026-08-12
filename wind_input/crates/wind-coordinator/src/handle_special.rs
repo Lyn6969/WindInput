@@ -150,8 +150,7 @@ impl Coordinator {
     /// 走命令执行路径，普通候选上屏其文本）。
     pub(crate) fn update_special_candidates(&self, state: &mut State) -> Option<Candidate> {
         state.candidates.clear();
-        state.current_page = 0;
-        state.selected_index = 0;
+        self.reset_candidate_view(state);
         // 组合区 = 显示态前缀 + 编码缓冲（前缀只显示不参与查询）。
         state.preedit = format!("{}{}", state.special_prefix, state.special_buffer);
         if state.special_buffer.is_empty() {
