@@ -1593,7 +1593,17 @@ impl Coordinator {
     fn web_phrase_add(&self, params: &Value) -> anyhow::Result<Value> {
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let position = i32_param(params, "position");
-        let weight = params.get("weight").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+        // 缺省 1800：短语与码表精确候选**按权重竞争**（`PHRASE_WEIGHT_BASE`(40M) 类别硬顶
+        // 已删除，见 candidate-sorting-rules.md §5.1），所以这个默认值直接决定「新建的短语
+        // 打不打得出」。此处曾是 1 —— 那会输给几乎每一条码表词条（五笔主库 min=120），
+        // 在 40M 时代无所谓，现在是让新短语默认沉底。
+        //
+        // 取 1800 的依据：五笔主库 median=941、p99=9000，1800 越过约 90% 的条目，
+        // 又留足余量给用户手动上调（约定值域 0~10000）。与系统短语常用档 800~2000 同轴。
+        let weight = params
+            .get("weight")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1800) as i32;
         let store = self
             .store
             .as_ref()

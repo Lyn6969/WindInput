@@ -59,22 +59,25 @@ position = 3
 # 协调器删除 PHRASE_WEIGHT_BASE(40M) 后短语与码表精确候选真比权重，1000 会输给 1080，
 # 打 datm 首选变成「万花筒」。54 个系统短语码里只有 datm 和 tmts 与五笔碰撞，
 # tmts 对手「身条」w=536 无需调整。
+#
+# 变体取 1100 而非沿用 800：三条都要越过 1080，否则「万花筒」会插进本组中间。
+# 组内次序由 weight 降序 → position 升序保证，1200 > 1100 已足够分出主条。
 [[phrases]]
 code = 'datm'
 text = '$Y年$M月$D日 $HH:$mm:$ss'
-weight = 2000
+weight = 1200
 position = 1
 
 [[phrases]]
 code = 'datm'
 text = '$Y-$MM-$DD $HH:$mm:$ss'
-weight = 1800
+weight = 1100
 position = 2
 
 [[phrases]]
 code = 'datm'
 text = '${YC}年${MC}月${DC}日 $HH:$mm:$ss'
-weight = 1800
+weight = 1100
 position = 3
 
 [[phrases]]
