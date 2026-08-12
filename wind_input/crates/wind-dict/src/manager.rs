@@ -9,7 +9,7 @@
 use crate::cached::CachedDict;
 use crate::composite::CompositeDict;
 use crate::layer::{DictLayer, LayerType};
-use wind_candidate::{Candidate, CandidateSource, better};
+use wind_candidate::{Candidate, CandidateMeta, CandidateSource, better};
 
 /// 词典管理器：持有一个方案的多层复合词典。
 #[derive(Default)]
@@ -182,6 +182,12 @@ impl DictLayer for SystemDictLayer {
                 text: hit.text,
                 code: code.to_string(),
                 weight: self.effective_weight(hit.weight),
+                // 归一化会改写 `weight`，原值留在这里——否则排查问题时看到的数与词库里
+                // 的数对不上，而「候选权重为什么是这个」正是最常问的问题。
+                meta: CandidateMeta {
+                    raw_weight: hit.weight,
+                    ..Default::default()
+                },
                 natural_order: hit.order,
                 boundary: hit.boundary,
                 source: CandidateSource::None,
@@ -204,6 +210,12 @@ impl DictLayer for SystemDictLayer {
                 text: hit.text,
                 code: hit.code,
                 weight: self.effective_weight(hit.weight),
+                // 归一化会改写 `weight`，原值留在这里——否则排查问题时看到的数与词库里
+                // 的数对不上，而「候选权重为什么是这个」正是最常问的问题。
+                meta: CandidateMeta {
+                    raw_weight: hit.weight,
+                    ..Default::default()
+                },
                 natural_order: hit.order,
                 boundary: hit.boundary,
                 source: CandidateSource::None,

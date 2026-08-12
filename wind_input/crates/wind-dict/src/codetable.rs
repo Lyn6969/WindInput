@@ -999,6 +999,82 @@ fn rime_body_offset(content: &str) -> Option<usize> {
 /// 边界随主表条目一起拿到。
 type RimeEntries = (Vec<(String, String, i32, u64)>, Vec<(String, String, i32)>);
 
+/// 一个词库的**权重值域画像**（`wind_input dict weight-check` 的产出）。
+///
+/// 只统计不建库：走与正式加载**完全相同**的列序判定与行解析（`resolve_columns` +
+/// `parse_rime_line`），故画像与真实加载所见一致——另抄一份按 TSV 切列的扫描器，
+/// 会在列序声明残缺、`# no comment` 指令等边角上与真实行为分叉。
+#[derive(Debug, Default, Clone)]
+pub struct WeightScan {
+    /// 带非零权重的条目数（0 = 无权重列/空列，不计入）。
+    pub weighted: usize,
+    /// 权重为 0 的条目数（诊断「整库无权重」用）。
+    pub zero: usize,
+    pub min: i32,
+    pub median: i32,
+    pub max: i32,
+    /// 超出 [`WEIGHT_RANGE_MAX`] 的条目数。
+    pub over_range: usize,
+}
+
+impl WeightScan {
+    /// 是否守约（全部权重在 `0..=WEIGHT_RANGE_MAX`）。整库无权重也算守约——那是
+    /// 「退化为文件顺序」的有意设计，由 `default_weight` 另行处置。
+    pub fn is_compliant(&self) -> bool {
+        self.over_range == 0
+    }
+
+    /// 超范围占比（0.0~100.0）。
+    pub fn over_pct(&self) -> f64 {
+        100.0 * self.over_range as f64 / self.weighted.max(1) as f64
+    }
+}
+
+/// 扫描一个 `.dict.yaml` 的权重分布，供离线体检使用。
+///
+/// ⚠️ 与运行时诊断（[`ParseStats::log_weight_range`]）的关系：后者只在**解析 yaml** 时触发，
+/// 而词库一旦建了 `.wdat` 缓存就不再解析 —— 于是「老词库 + 新版本」这个最需要报警的组合
+/// 反而一声不吭。本函数无视缓存、直接读源文件，是**权威**的那条路径。
+pub fn scan_weight_stats(path: impl AsRef<Path>) -> anyhow::Result<WeightScan> {
+    let path = path.as_ref();
+    let content = fs::read_to_string(path)?;
+    let Some(off) = rime_body_offset(&content) else {
+        anyhow::bail!("{}: 缺少 YAML 正文分隔行 `...`", path.display());
+    };
+    let body = &content[off..];
+    let cutoff = find_no_comment_directive(body);
+    let Some(spec) = resolve_columns(&content, body, path, cutoff) else {
+        anyhow::bail!("{}: 列声明残缺，无法判定权重列", path.display());
+    };
+    let mut stats = ParseStats::default();
+    let mut ws: Vec<i32> = Vec::new();
+    let mut zero = 0usize;
+    for (line, comments_on) in body_lines(body, 0, cutoff) {
+        if let Some(r) = parse_rime_line(line, comments_on, false, spec, &mut stats) {
+            if r.weight > 0 {
+                ws.push(r.weight);
+            } else {
+                zero += 1;
+            }
+        }
+    }
+    if ws.is_empty() {
+        return Ok(WeightScan {
+            zero,
+            ..Default::default()
+        });
+    }
+    ws.sort_unstable();
+    Ok(WeightScan {
+        weighted: ws.len(),
+        zero,
+        min: ws[0],
+        median: ws[ws.len() / 2],
+        max: ws[ws.len() - 1],
+        over_range: ws.iter().filter(|&&w| w > WEIGHT_RANGE_MAX).count(),
+    })
+}
+
 pub fn parse_rime_entries_parallel(
     path: impl AsRef<Path>,
     lowercase_code: bool,
@@ -1103,6 +1179,102 @@ pub fn parse_rime_entries_parallel(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// `scan_weight_stats` 的画像：分位数、超范围计数、无权重条目分离统计。
+    ///
+    /// 这是 `dict weight-check` 的**全部实质**——CLI 只是把它排版打印。
+    #[test]
+    fn scan_weight_stats_profiles_a_dict() {
+        let path = std::env::temp_dir().join("wind_wscan_demo.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "---
+name: x
+columns:
+  - code
+  - text
+  - weight
+..."
+            )
+            .unwrap();
+            for (c, t, w) in [
+                ("a", "甲", "1000"),
+                ("b", "乙", "5000"),
+                ("c", "丙", "50000"),
+                ("d", "丁", "500000"),
+                ("e", "戊", "1000000"),
+                ("f", "己", ""), // 空权重列：不计入分母
+            ] {
+                writeln!(f, "{c}	{t}	{w}").unwrap();
+            }
+        }
+        let sc = scan_weight_stats(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(sc.weighted, 5, "空权重列不计入分母");
+        assert_eq!(sc.zero, 1);
+        assert_eq!(sc.min, 1000);
+        assert_eq!(sc.median, 50000, "5 条取中间那条");
+        assert_eq!(sc.max, 1_000_000);
+        assert_eq!(sc.over_range, 3, "50000/500000/1000000 超 10000");
+        assert!(!sc.is_compliant());
+        assert!((sc.over_pct() - 60.0).abs() < 0.01);
+    }
+
+    /// 守约词库：`is_compliant` 为真，CLI 据此不给建议。
+    #[test]
+    fn scan_weight_stats_marks_compliant_dict() {
+        let path = std::env::temp_dir().join("wind_wscan_ok.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "---
+name: x
+columns:
+  - code
+  - text
+  - weight
+..."
+            )
+            .unwrap();
+            writeln!(f, "a	工	120").unwrap();
+            writeln!(f, "b	弗	9950").unwrap();
+            writeln!(f, "c	王	10000").unwrap();
+        }
+        let sc = scan_weight_stats(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(sc.is_compliant(), "10000 是边界内，不算超范围");
+        assert_eq!(sc.over_range, 0);
+        assert_eq!(sc.median, 9950);
+    }
+
+    /// 整库无权重列：`weighted == 0`，算守约（那是「退化为文件顺序」的有意设计）。
+    #[test]
+    fn scan_weight_stats_handles_dict_without_weights() {
+        let path = std::env::temp_dir().join("wind_wscan_nw.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "---
+name: x
+columns:
+  - code
+  - text
+..."
+            )
+            .unwrap();
+            writeln!(f, "a	甲").unwrap();
+            writeln!(f, "b	乙").unwrap();
+        }
+        let sc = scan_weight_stats(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(sc.weighted, 0);
+        assert_eq!(sc.zero, 2);
+        assert!(sc.is_compliant(), "无权重不是「超范围」");
+    }
 
     /// 权重值域诊断的取数：超出 `WEIGHT_RANGE_MAX` 的条目被计入 `over_range`，
     /// 权重 0（无权重列/空列）**不计入分母**——那是「未定义」不是「超范围」。

@@ -23,6 +23,9 @@ pub fn run(args: &[String]) -> i32 {
             (Some(id), Some(file)) => cmd_import(id, file, &args[3..]),
             _ => return usage_err("import <方案id> <文件> [--replace] [--sections a,b,...]"),
         },
+        // 离线子命令：读数据目录的源文件，**不经 RPC、不要求服务在线**。
+        // 受众是打包方案的作者，他们跑这条命令时通常没在跑输入法。
+        Some("weight-check") => cmd_weight_check(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             return 0;
@@ -50,6 +53,8 @@ fn print_usage() {
          export <方案id> <文件> [--sections a,b]   导出词库数据到文件（缺省按引擎默认段）\n  \
          import <方案id> <文件> [--replace] [--sections a,b]\n                                            \
          从文件导入（缺省合并；格式自动识别 WindDict/Rime/TSV）\n\
+         \n\
+         weight-check [--data <目录>]              体检各方案词库的权重值域（离线，无需服务）\n\
          \n\
          段类型: userWords(用户词库) tempWords(临时词库) freq(词频) shadow(候选调整)"
     );
@@ -170,4 +175,118 @@ fn print_import_report(v: &Value) {
         }
         println!("✓ {}: {}", label(key), parts.join(" · "));
     }
+}
+
+/// `dict weight-check`：离线体检各方案词库的**权重值域**。
+///
+/// ## 为什么必须是离线的独立命令，而不是启动时告警
+///
+/// 解析期告警（`ParseStats::log_weight_range`）只在**解析 yaml** 时触发，而词库一旦建了
+/// `.wdat` 缓存就直接 mmap、不再解析。于是「老词库 + 新版本」这个最需要报警的组合
+/// **一次也不会响** —— 实测：首次加载报一次，删掉缓存才会再报。
+///
+/// 本命令直接读源文件、无视缓存，是权威的那条路径。且受众是**方案作者**（终端用户看到
+/// 告警也改不了词库），他们需要的是「打包前随手查一次」。
+///
+/// 输出对不守约的库直接给出**可粘贴的 `[dictionaries.weight_spec]` 配置块**——
+/// 参数由实测分布算出，比让作者自己去统计中位数靠谱。
+fn cmd_weight_check(args: &[String]) -> anyhow::Result<i32> {
+    let data_dir = match args.iter().position(|a| a == "--data") {
+        Some(i) => std::path::PathBuf::from(
+            args.get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--data 后缺少目录"))?,
+        ),
+        None => wind_config::Config::data_dir()
+            .ok_or_else(|| anyhow::anyhow!("找不到数据目录，请用 --data <目录> 指定"))?,
+    };
+    let schemas_dir = data_dir.join("schemas");
+    if !schemas_dir.is_dir() {
+        anyhow::bail!("{} 不是有效的数据目录（缺 schemas/）", data_dir.display());
+    }
+    println!("数据目录: {}", data_dir.display());
+    println!("约定值域: 0 ~ {}\n", wind_dict::WEIGHT_RANGE_MAX);
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&schemas_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".schema.toml"))
+        .collect();
+    files.sort();
+
+    let mut bad = 0usize;
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let Ok(schema) = toml::from_str::<wind_config::Schema>(&text) else {
+            continue;
+        };
+        let sid = f
+            .file_name()
+            .map(|n| n.to_string_lossy().replace(".schema.toml", ""))
+            .unwrap_or_default();
+        let dicts: Vec<_> = schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.path.is_empty())
+            .collect();
+        if dicts.is_empty() {
+            continue;
+        }
+        println!("方案 {sid}");
+        for d in dicts {
+            let path = schemas_dir.join(&d.path);
+            if !path.is_file() {
+                println!("  ?  {} （文件不存在）", d.path);
+                continue;
+            }
+            match wind_dict::codetable::scan_weight_stats(&path) {
+                Err(e) => println!("  ?  {} （{e}）", d.path),
+                Ok(sc) if sc.weighted == 0 => {
+                    // 整库无权重是**有意设计**（退化为文件顺序），不算问题，但要说清
+                    // 它在跨来源比较里会恒沉底——除非配了 default_weight。
+                    let hint = if d.default_weight.is_some() {
+                        "已配 default_weight"
+                    } else {
+                        "跨来源比较时恒沉底；如需参与请配 default_weight"
+                    };
+                    println!("  -  {}   无权重列（{} 条，{hint}）", d.path, sc.zero);
+                }
+                Ok(sc) if sc.is_compliant() => {
+                    println!(
+                        "  ok {}   {} 条  中位={} 最大={}",
+                        d.path, sc.weighted, sc.median, sc.max
+                    );
+                }
+                Ok(sc) => {
+                    bad += 1;
+                    let configured = d.weight_spec.is_some();
+                    println!(
+                        "  !! {}   {} 条  中位={} 最大={}  超范围 {} 条（{:.1}%）",
+                        d.path,
+                        sc.weighted,
+                        sc.median,
+                        sc.max,
+                        sc.over_range,
+                        sc.over_pct()
+                    );
+                    if configured {
+                        println!("       已配 weight_spec —— 归一化生效，此处仅报源数据分布");
+                    } else {
+                        println!("       建议在该 [[dictionaries]] 下追加：");
+                        println!("         [dictionaries.weight_spec]");
+                        println!("         median = {}", sc.median);
+                        println!("         max = {}", sc.max);
+                        println!("         mode = \"log\"");
+                    }
+                }
+            }
+        }
+        println!();
+    }
+    if bad == 0 {
+        println!("全部词库权重均在约定值域内。");
+    } else {
+        println!("{bad} 个词库超出约定值域，跨来源排序（短语 vs 码表）会失真。");
+    }
+    Ok(0)
 }
