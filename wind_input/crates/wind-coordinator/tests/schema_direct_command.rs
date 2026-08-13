@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use wind_config::Config;
 use wind_coordinator::Coordinator;
-use wind_ui::manager::UiCommand;
+use wind_ui_types::UiCommand;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")

@@ -2700,7 +2700,7 @@ fn test_quick_format_move_top_applies_to_other_inputs() {
     if !has_schemas() {
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, p) = quick_coord("movetop");
 
     quick_type(&coord, "2026.6.19");
@@ -2736,7 +2736,7 @@ fn test_quick_format_disable_and_reset() {
     if !has_schemas() {
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, p) = quick_coord("disable");
 
     quick_type(&coord, "2026.6.19");
@@ -2766,7 +2766,7 @@ fn test_quick_format_adjust_does_not_leak_across_kinds() {
     if !has_schemas() {
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, p) = quick_coord("kinds");
 
     quick_type(&coord, "123");
@@ -4556,7 +4556,7 @@ fn test_candidate_op_move_top_and_delete() {
     if !has_schemas() {
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     // candidate_op 的置顶/删除经 self.store 持久化 Shadow 规则，故需注入真实 store
     // （new_headless 的 store=None 会让 pin/delete 变空操作）。
     // 用码表方案（非拼音）：拼音普通候选禁调位（见 handle_candidate.rs 的
@@ -4597,7 +4597,7 @@ fn test_candidate_op_delete_single_char_hides() {
     if !has_schemas() {
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     // 单字保护已取消：隐藏候选对单字同样生效（shadow 按 code+word 键控，
     // 仅该编码下隐藏，设置页可恢复）。
     let store_path = std::env::temp_dir().join("wind_candidate_op_single_test.redb");
@@ -7930,7 +7930,7 @@ fn special_mode_candidate_delete_writes_to_own_schema_bucket() {
         eprintln!("跳过：缺少 schema");
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, path, store) = special_op_fixture("delete", false);
     enter_special_mode_via_backslash(&coord);
     press_letter(&coord, 'a');
@@ -7982,7 +7982,7 @@ fn special_mode_candidate_move_top_uses_own_engine_type() {
         eprintln!("跳过：缺少 schema");
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, path, _store) = special_op_fixture("movetop", false);
     enter_special_mode_via_backslash(&coord);
     press_letter(&coord, 'a');
@@ -8016,7 +8016,7 @@ fn special_mode_show_all_browse_state_supports_candidate_op() {
         eprintln!("跳过：缺少 schema");
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, path, store) = special_op_fixture("browse", true);
     enter_special_mode_via_backslash(&coord);
 
@@ -8059,7 +8059,7 @@ fn special_mode_browse_state_shadow_survives_reenter() {
         eprintln!("跳过：缺少 schema");
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let (coord, path, _store) = special_op_fixture("reenter", true);
     enter_special_mode_via_backslash(&coord);
 
@@ -8124,7 +8124,7 @@ fn special_mode_browse_exact_mode_hides_first_shows_next() {
         eprintln!("跳过：缺少 schema");
         return;
     }
-    use wind_ui::manager::CandidateOp;
+    use wind_ui_types::CandidateOp;
     let store_path = std::env::temp_dir().join("wind_special_browse_exact.redb");
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
