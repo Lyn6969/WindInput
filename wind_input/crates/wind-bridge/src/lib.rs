@@ -19,7 +19,9 @@ pub mod shared_render_frame;
 pub mod push_unix;
 #[cfg(unix)]
 pub mod server_unix;
-#[cfg(unix)]
+// Android（bionic）无 POSIX SHM：libc 不导出 shm_open/shm_unlink，整模块排除。
+// 唯一消费者是 wind-ui 的 macOS forwarder，Android 走进程内直调不经此。
+#[cfg(all(unix, not(target_os = "android")))]
 pub mod shared_memory_posix;
 
 // Windows：命名 SHM 写端 + 命名 Event（带 AppContainer SDDL）+ HostRenderManager

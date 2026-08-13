@@ -2447,7 +2447,6 @@ dependencies = [
  "tracing",
  "wind-candidate",
  "wind-store",
- "windows",
 ]
 
 [[package]]
