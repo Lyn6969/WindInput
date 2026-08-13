@@ -9,16 +9,147 @@
 
 use crate::text::dwrite::TextRenderer;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
     PixmapMut, PixmapPaint, Point, RadialGradient, SpreadMode, Transform,
 };
 use wind_theme::schema::Dim;
 
+/// 阴影蒙版缓存键：(盒宽, 盒高, 圆角, 模糊, 亚像素相位 x, 亚像素相位 y)。
+///
+/// 各项量化到 1/4 px：阴影经高斯模糊后，1/4 px 的几何差异不可见，而量化能吸收
+/// 浮点噪音，让几何不变的相邻帧稳定命中——否则 `spread`/`radius` 经 DPI 换算后的
+/// 末位抖动就足以让缓存永不命中，白付一次哈希。
+type ShadowKey = (i32, i32, i32, i32, i32, i32);
+
+/// 蒙版量化因子（1/4 px）。
+const SHADOW_Q: f32 = 4.0;
+
+/// 蒙版缓存条数上限。候选窗的阴影几何种类有限（随候选数/码长变化），超限整体清空即可。
+const SHADOW_CACHE_CAP: usize = 32;
+
+/// 模糊后的阴影 alpha 蒙版 + 尺寸与四周留边（`pad`）。
+struct ShadowMask {
+    alpha: Vec<u8>,
+    w: i32,
+    h: i32,
+    pad: i32,
+}
+
 thread_local! {
     /// 背景图解码/填充缓存（UI 单线程，跨帧复用，避免每帧解码）。
     static IMAGE_CACHE: RefCell<crate::image_cache::ImageCache> =
         RefCell::new(crate::image_cache::ImageCache::new());
+
+    /// 阴影蒙版缓存（UI 单线程，跨帧复用）。
+    ///
+    /// 缓存 **alpha 蒙版而非着色后的像素**：蒙版只由几何决定、与阴影颜色无关，于是
+    /// 主题明暗切换、阴影调色都不会让它失效，内存也只要 1/4（1 字节/像素 vs BGRA）。
+    ///
+    /// 这层缓存省掉的是每帧 3 趟可分离方框模糊——400×120 的窗口配 blur=8，临时缓冲
+    /// 约 460×180，三轮双向模糊就是 ~50 万像素的 6 遍扫描，而候选窗在一次输入过程中
+    /// 尺寸高度重复（同码长、同候选数），几乎帧帧都在重算同一张图。
+    static SHADOW_CACHE: RefCell<HashMap<ShadowKey, ShadowMask>> = RefCell::new(HashMap::new());
+}
+
+/// 以模糊阴影蒙版调用 `f`（命中缓存则复用，否则构建并入缓存）。
+///
+/// 传闭包而非返回蒙版，是为了避开一次 Vec 克隆——蒙版有几十上百 KB，克隆的 memcpy
+/// 虽比重算模糊便宜，但既然只在闭包内读一次，就没有拷贝的理由。
+fn with_shadow_mask<R>(
+    bw: f32,
+    bh: f32,
+    radius: f32,
+    blur: f32,
+    phase_x: f32,
+    phase_y: f32,
+    f: impl FnOnce(&ShadowMask) -> R,
+) -> Option<R> {
+    let q = |v: f32| (v * SHADOW_Q).round() as i32;
+    let key = (q(bw), q(bh), q(radius), q(blur), q(phase_x), q(phase_y));
+    SHADOW_CACHE.with(|c| {
+        if let Some(m) = c.borrow().get(&key) {
+            return Some(f(m));
+        }
+        let mask = build_shadow_mask(bw, bh, radius, blur, phase_x, phase_y)?;
+        let mut cache = c.borrow_mut();
+        if cache.len() >= SHADOW_CACHE_CAP {
+            cache.clear();
+        }
+        Some(f(cache.entry(key).or_insert(mask)))
+    })
+}
+
+/// 仅测试可见：当前阴影蒙版缓存条目数。
+#[cfg(test)]
+fn shadow_cache_len() -> usize {
+    SHADOW_CACHE.with(|c| c.borrow().len())
+}
+
+/// 仅测试可见：清空阴影蒙版缓存，让用例从确定状态起步。
+#[cfg(test)]
+fn shadow_cache_clear() {
+    SHADOW_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// 构建模糊阴影蒙版：画 alpha=255 的圆角矩形 → 抽 alpha 通道 → 3 次方框模糊逼近高斯。
+///
+/// `phase_*` 为亚像素相位（`bx - bx.floor()`）：蒙版按相位构建才能保住边缘 AA，
+/// 故相位也是缓存键的一部分。候选窗坐标恒为整数，实际相位恒 0。
+fn build_shadow_mask(
+    bw: f32,
+    bh: f32,
+    radius: f32,
+    blur: f32,
+    phase_x: f32,
+    phase_y: f32,
+) -> Option<ShadowMask> {
+    // 3 次方框模糊级联 sigma ≈ sqrt(blur*(blur+2))，3-sigma 需约 3×sigma px 衰减到透明。
+    let sigma = (blur * (blur + 2.0)).max(0.0).sqrt();
+    let pad = (3.0 * sigma).ceil() as i32 + 2;
+    let tmp_w = bw.ceil() as i32 + 2 * pad;
+    let tmp_h = bh.ceil() as i32 + 2 * pad;
+    if tmp_w < 1 || tmp_h < 1 {
+        return None;
+    }
+    // 临时盒内阴影左上（保留亚像素偏移维持 AA）
+    let local_x = pad as f32 + phase_x;
+    let local_y = pad as f32 + phase_y;
+
+    let mut tmp = vec![0u8; (tmp_w * tmp_h * 4) as usize];
+    {
+        let mut pm = PixmapMut::from_bytes(&mut tmp, tmp_w as u32, tmp_h as u32)?;
+        let path = round_rect_path(local_x, local_y, bw, bh, radius.max(0.0))?;
+        // 蒙版只取 alpha 通道，填充色任意；用全黑与原实现保持一致。
+        let paint = aa_paint([0, 0, 0, 255]);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+
+    // 提取 alpha 通道 → 3× 方框模糊
+    let n = (tmp_w * tmp_h) as usize;
+    let mut alpha = vec![0u8; n];
+    for (i, a) in alpha.iter_mut().enumerate() {
+        *a = tmp[i * 4 + 3];
+    }
+    let r = blur.round() as i32;
+    if r > 0 {
+        for _ in 0..3 {
+            box_blur_alpha(&mut alpha, tmp_w, tmp_h, r);
+        }
+    }
+    Some(ShadowMask {
+        alpha,
+        w: tmp_w,
+        h: tmp_h,
+        pad,
+    })
 }
 
 /// 背景填充图（已解析路径 + 模式）。slice 为源图四边切片像素 [上,右,下,左]。
@@ -1069,84 +1200,48 @@ pub fn paint_blur_shadow(
     if bw <= 0.0 || bh <= 0.0 {
         return;
     }
-    // 3 次方框模糊级联 sigma ≈ sqrt(blur*(blur+2))，3-sigma 需约 3×sigma px 衰减到透明。
-    let sigma = (blur * (blur + 2.0)).max(0.0).sqrt();
-    let pad = (3.0 * sigma).ceil() as i32 + 2;
-    let tmp_w = bw.ceil() as i32 + 2 * pad;
-    let tmp_h = bh.ceil() as i32 + 2 * pad;
-    if tmp_w < 1 || tmp_h < 1 {
-        return;
-    }
-    // 临时盒内阴影左上（保留亚像素偏移维持 AA）
-    let local_x = pad as f32 + (bx - bx.floor());
-    let local_y = pad as f32 + (by - by.floor());
-
-    let mut tmp = vec![0u8; (tmp_w * tmp_h * 4) as usize];
-    {
-        let Some(mut pm) = PixmapMut::from_bytes(&mut tmp, tmp_w as u32, tmp_h as u32) else {
-            return;
-        };
-        let Some(path) = round_rect_path(local_x, local_y, bw, bh, radius.max(0.0)) else {
-            return;
-        };
-        let paint = aa_paint([0, 0, 0, 255]);
-        pm.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
-    }
-
-    // 提取 alpha 通道 → 3× 方框模糊
-    let n = (tmp_w * tmp_h) as usize;
-    let mut alpha = vec![0u8; n];
-    for (i, a) in alpha.iter_mut().enumerate() {
-        *a = tmp[i * 4 + 3];
-    }
-    let r = blur.round() as i32;
-    if r > 0 {
-        for _ in 0..3 {
-            box_blur_alpha(&mut alpha, tmp_w, tmp_h, r);
-        }
-    }
+    // 亚像素相位：蒙版按相位构建才能保住边缘 AA，故它也是缓存键的一部分。
+    // 候选窗的阴影盒坐标恒为整数，实际相位恒 0 → 同几何必命中。
+    let phase_x = bx - bx.floor();
+    let phase_y = by - by.floor();
 
     // 着色 + 预乘 src-over 合成到主缓冲（主缓冲为 BGRA：0=B,1=G,2=R,3=A；color 为 [R,G,B,A]）
-    let dst_x0 = bx.floor() as i32 - pad;
-    let dst_y0 = by.floor() as i32 - pad;
     let (cr, cg, cb, ca) = (
         color[0] as u32,
         color[1] as u32,
         color[2] as u32,
         color[3] as u32,
     );
-    for ty in 0..tmp_h {
-        for tx in 0..tmp_w {
-            let ma = alpha[(ty * tmp_w + tx) as usize] as u32;
-            if ma == 0 {
-                continue;
+    with_shadow_mask(bw, bh, radius, blur, phase_x, phase_y, |mask| {
+        let dst_x0 = bx.floor() as i32 - mask.pad;
+        let dst_y0 = by.floor() as i32 - mask.pad;
+        for ty in 0..mask.h {
+            for tx in 0..mask.w {
+                let ma = mask.alpha[(ty * mask.w + tx) as usize] as u32;
+                if ma == 0 {
+                    continue;
+                }
+                let fa = ma * ca / 255; // 最终 alpha
+                if fa == 0 {
+                    continue;
+                }
+                let dx = dst_x0 + tx;
+                let dy = dst_y0 + ty;
+                if dx < 0 || dx >= buf_w as i32 || dy < 0 || dy >= buf_h as i32 {
+                    continue;
+                }
+                let off = ((dy * buf_w as i32 + dx) * 4) as usize;
+                let inv = 255 - fa;
+                let sb = cb * fa / 255;
+                let sg = cg * fa / 255;
+                let sr = cr * fa / 255;
+                buf[off] = ((sb * 255 + buf[off] as u32 * inv) / 255) as u8;
+                buf[off + 1] = ((sg * 255 + buf[off + 1] as u32 * inv) / 255) as u8;
+                buf[off + 2] = ((sr * 255 + buf[off + 2] as u32 * inv) / 255) as u8;
+                buf[off + 3] = ((fa * 255 + buf[off + 3] as u32 * inv) / 255) as u8;
             }
-            let fa = ma * ca / 255; // 最终 alpha
-            if fa == 0 {
-                continue;
-            }
-            let dx = dst_x0 + tx;
-            let dy = dst_y0 + ty;
-            if dx < 0 || dx >= buf_w as i32 || dy < 0 || dy >= buf_h as i32 {
-                continue;
-            }
-            let off = ((dy * buf_w as i32 + dx) * 4) as usize;
-            let inv = 255 - fa;
-            let sb = cb * fa / 255;
-            let sg = cg * fa / 255;
-            let sr = cr * fa / 255;
-            buf[off] = ((sb * 255 + buf[off] as u32 * inv) / 255) as u8;
-            buf[off + 1] = ((sg * 255 + buf[off + 1] as u32 * inv) / 255) as u8;
-            buf[off + 2] = ((sr * 255 + buf[off + 2] as u32 * inv) / 255) as u8;
-            buf[off + 3] = ((fa * 255 + buf[off + 3] as u32 * inv) / 255) as u8;
         }
-    }
+    });
 }
 
 /// 窗口软投影参数（设备像素，已 ×scale）。模糊扩散层总偏移 = 基础 offset + 扩散额外偏移。
@@ -1570,6 +1665,119 @@ mod geom_tests {
     fn left_bar_tiny_ratio_clamped_to_min_height() {
         let tiny = paint_left_bar(0.001, 0.0, 4.0);
         assert!(alpha_at(&tiny, 1, 20) > 0, "极小比例仍应保底 2px 可见");
+    }
+}
+
+/// 阴影蒙版缓存：缓存不得改变渲染结果（跨平台真实——纯 tiny-skia 光栅化，不涉文本）。
+///
+/// 这些用例的重心是**反向对照**：只断言"同参数两次结果一致"是抓不到缓存 bug 的——
+/// 键漏了某一项时，两次调用都会取到同一张错蒙版，结果照样一致、测试照样绿。真正能
+/// 抓住漏键的是"只改一项，输出必须变"。
+#[cfg(test)]
+mod shadow_cache_tests {
+    use super::*;
+
+    /// 在 64×64 透明缓冲上画一次阴影，返回缓冲。内容盒固定落在 (16,16)。
+    fn shadow_buf(bw: f32, bh: f32, radius: f32, blur: f32, color: [u8; 4]) -> Vec<u8> {
+        const W: u32 = 64;
+        const H: u32 = 64;
+        let mut buf = vec![0u8; (W * H * 4) as usize];
+        paint_blur_shadow(
+            &mut buf, W, H, 16.0, 16.0, bw, bh, radius, blur, 0.0, 0.0, 0.0, color,
+        );
+        buf
+    }
+
+    /// 基准形状：够小以完整落在 64×64 内，blur 够大以真正触发模糊路径。
+    fn base(color: [u8; 4]) -> Vec<u8> {
+        shadow_buf(20.0, 20.0, 4.0, 3.0, color)
+    }
+
+    const BLACK: [u8; 4] = [0, 0, 0, 200];
+
+    /// 缓存**确实在工作**：同几何重绘不新增条目，不同几何才新增。
+    ///
+    /// 这条是本模块其余用例的地基。没有它，那些"结果一致 / 结果不同"的断言在缓存
+    /// 完全失效（每帧照旧重算模糊）时也会全绿——而消除"每帧重算"正是这次改动的
+    /// 全部目的，测不出来就等于没测。
+    ///
+    /// 换色不新增条目这一条同时正面验证了键的设计：蒙版与颜色无关。
+    #[test]
+    fn cache_stores_and_reuses_masks() {
+        shadow_cache_clear();
+        assert_eq!(shadow_cache_len(), 0, "起手应为空");
+        let _ = base(BLACK);
+        assert_eq!(shadow_cache_len(), 1, "首次绘制应入缓存一条");
+        let _ = base(BLACK);
+        assert_eq!(shadow_cache_len(), 1, "同几何重绘应命中，不得新增");
+        let _ = base([255, 0, 0, 200]);
+        assert_eq!(shadow_cache_len(), 1, "仅换色应命中（蒙版与颜色无关）");
+        let _ = shadow_buf(28.0, 20.0, 4.0, 3.0, BLACK);
+        assert_eq!(shadow_cache_len(), 2, "不同几何应新增条目");
+    }
+
+    /// 同参数重复绘制结果逐字节一致——缓存命中路径与首次构建路径必须等价。
+    #[test]
+    fn cache_hit_reproduces_first_render() {
+        let first = base(BLACK);
+        let second = base(BLACK);
+        assert_eq!(first, second, "缓存命中不得改变渲染结果");
+    }
+
+    /// 阴影颜色**不在缓存键里**（缓存的是 alpha 蒙版），输出却必须随颜色变。
+    ///
+    /// 这是"缓存蒙版而非着色像素"这一设计的判据：一旦有人把着色也塞进缓存，
+    /// 换了颜色仍会取到上一色的像素——而因为几何没变，缓存必命中，错误 100% 复现。
+    #[test]
+    fn color_is_not_cached_though_absent_from_key() {
+        let black = base(BLACK);
+        let red = base([255, 0, 0, 200]);
+        assert_ne!(black, red, "换色必须改变输出（着色不得被缓存）");
+    }
+
+    /// 主题明暗切换只改颜色、不改几何——此时蒙版应复用而输出仍正确。
+    /// 与上一用例同源，但特意走"先浅后深"的顺序，覆盖缓存已被填充后再换色的路径。
+    #[test]
+    fn alpha_only_change_still_affects_output() {
+        let opaque = base([0, 0, 0, 255]);
+        let faint = base([0, 0, 0, 64]);
+        assert_ne!(opaque, faint, "仅改阴影透明度也必须改变输出");
+    }
+
+    /// 盒尺寸进键：只改宽度，输出必须变。
+    #[test]
+    fn box_size_changes_output() {
+        let a = shadow_buf(20.0, 20.0, 4.0, 3.0, BLACK);
+        let b = shadow_buf(28.0, 20.0, 4.0, 3.0, BLACK);
+        assert_ne!(a, b, "盒宽变化必须改变输出");
+    }
+
+    /// 圆角进键：直角与圆角的蒙版不同。
+    #[test]
+    fn radius_changes_output() {
+        let sharp = shadow_buf(20.0, 20.0, 0.0, 3.0, BLACK);
+        let round = shadow_buf(20.0, 20.0, 9.0, 3.0, BLACK);
+        assert_ne!(sharp, round, "圆角变化必须改变输出");
+    }
+
+    /// 模糊半径进键：它同时决定蒙版尺寸（pad）与衰减，漏掉它错得最明显。
+    #[test]
+    fn blur_changes_output() {
+        let tight = shadow_buf(20.0, 20.0, 4.0, 1.0, BLACK);
+        let wide = shadow_buf(20.0, 20.0, 4.0, 6.0, BLACK);
+        assert_ne!(tight, wide, "模糊半径变化必须改变输出");
+    }
+
+    /// 缓存超限后整体清空，不得影响正确性——清空前后同参数结果须一致。
+    /// 用 33 组不同几何（> `SHADOW_CACHE_CAP`）挤掉基准条目，再重画基准比对。
+    #[test]
+    fn eviction_preserves_correctness() {
+        let before = base(BLACK);
+        for i in 0..=SHADOW_CACHE_CAP {
+            let _ = shadow_buf(10.0 + i as f32, 12.0, 2.0, 2.0, BLACK);
+        }
+        let after = base(BLACK);
+        assert_eq!(before, after, "缓存清空后重建的蒙版须与首次一致");
     }
 }
 
