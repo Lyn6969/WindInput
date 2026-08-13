@@ -19,6 +19,33 @@ pub struct TextMetrics {
     pub height: f32,
 }
 
+/// 测量缓存容量上限；超过即整体清空。
+///
+/// 不做 LRU：候选窗每帧的文本集合高度重复（同一批候选、序号、注释反复测量），
+/// 命中率本就极高，淘汰策略的簿记开销换不回收益。整体清空的最坏情况是一帧全 miss，
+/// 等价于没有缓存时的行为。
+#[cfg_attr(not(windows), allow(dead_code))]
+const MEASURE_CACHE_CAP: usize = 4096;
+
+/// 测量缓存键：`(文本, 字号, 字重, 字体族)` 的 64 位哈希。
+///
+/// 存哈希而非完整键，是为了免掉每次查询都克隆 `String`——测量在热路径上，一帧数十次。
+/// 64 位下 4096 条目的碰撞概率约 4.5e-13，可忽略；真碰撞的后果是某段文本用了另一段的
+/// 宽度（布局错位），故键必须**覆盖所有影响测量的输入**，漏一项就是系统性错位而非偶发。
+///
+/// 字号用 `to_bits()` 而非 `as u32`：字号是 DPI 缩放后的浮点（如 14.4/16.8），
+/// 取整会让相邻字号撞进同一个键。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn measure_key(text: &str, size: f32, weight: i32, family: Option<&str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    size.to_bits().hash(&mut h);
+    weight.hash(&mut h);
+    family.hash(&mut h);
+    h.finish()
+}
+
 /// 扫描 UTF-16 序列，返回私用区（PUA）字符的连续段 `[(起始下标, 码元长度)]`，
 /// 下标/长度均以 **UTF-16 码元** 计，可直接用作 `DWRITE_TEXT_RANGE`。
 ///
@@ -82,7 +109,7 @@ pub use imp::TextRenderer;
 /// Windows 实现（DirectWrite）。非 Windows 平台见文件末尾的 mock。
 #[cfg(windows)]
 mod imp {
-    use super::TextMetrics;
+    use super::{MEASURE_CACHE_CAP, TextMetrics, measure_key};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -124,6 +151,12 @@ mod imp {
         params: IDWriteRenderingParams,
         /// 文本格式缓存：按字号（取整 px）keyed，避免每帧重建 COM 对象。
         formats: RefCell<HashMap<u32, IDWriteTextFormat>>,
+        /// 文本测量缓存（键见 `measure_key`）：避免每帧重建 `IDWriteTextLayout`。
+        ///
+        /// 盒模型对同一段文本会测两到三次（measure 阶段一次、paint 阶段为算对齐再一次、
+        /// 有 caret 时再测前半段），上翻布局生效时整棵树还会重建重测。没有这层缓存时，
+        /// 每一次都是一个新的 COM 对象 + 一次完整排版。
+        measure_cache: RefCell<HashMap<u64, TextMetrics>>,
         /// 当前位图渲染表面（按需重建）
         surface: RefCell<Option<Surface>>,
         /// 拆字字根字体（可选）：设置后对 PUA 码位字符级联回退到该字体渲染。
@@ -161,6 +194,7 @@ mod imp {
                     gdi_interop,
                     params,
                     formats: RefCell::new(HashMap::new()),
+                    measure_cache: RefCell::new(HashMap::new()),
                     surface: RefCell::new(None),
                     chaizi: None,
                 })
@@ -204,6 +238,9 @@ mod imp {
                     .chain(std::iter::once(0))
                     .collect();
                 self.chaizi = Some(ChaiziFont { collection, family });
+                // 字根字体改变了 PUA 字符的字形来源 → 其测量宽度随之改变。不清缓存的话，
+                // 切换拆字方案后字根仍按旧字体的宽度布局（表现为字根格错位/重叠）。
+                self.measure_cache.borrow_mut().clear();
                 Ok(())
             }
         }
@@ -213,6 +250,12 @@ mod imp {
             self.font_size
         }
 
+        /// 仅测试可见：当前测量缓存条目数。
+        #[cfg(test)]
+        pub fn measure_cache_len(&self) -> usize {
+            self.measure_cache.borrow().len()
+        }
+
         /// 更新基准字号（DPI 动态变化时调用）。格式按 px 缓存，无需重建 COM 对象，
         /// 仅改变未显式指定字号的叶子的回退字号。
         pub fn set_base_size(&mut self, size: f32) {
@@ -220,12 +263,16 @@ mod imp {
         }
 
         /// 切换字体族（ui.font.family 变更时调用）。清空按字号缓存的 TextFormat，使新字体生效。
+        ///
+        /// 测量缓存同样要清：其键里的字体族为 `None` 时表示"用全局 family"，全局一换，
+        /// 这些条目记录的就是旧字体的宽度。
         pub fn set_font_family(&mut self, font_family: &str) {
             self.family = font_family
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
             self.formats.borrow_mut().clear();
+            self.measure_cache.borrow_mut().clear();
         }
 
         /// 取得（或创建）给定字号的文本格式（按取整 px 缓存）。
@@ -309,7 +356,7 @@ mod imp {
             self.measure_text_styled(text, size, 0, None)
         }
 
-        /// 测量文本尺寸（指定字号 + 字重 + 字体族覆盖）。
+        /// 测量文本尺寸（指定字号 + 字重 + 字体族覆盖）。结果按 `measure_key` 缓存。
         pub fn measure_text_styled(
             &self,
             text: &str,
@@ -323,35 +370,47 @@ mod imp {
                     height: size * 1.2,
                 };
             }
-            let layout = match self.create_layout(
-                text,
-                size,
-                weight,
-                family,
-                f32::MAX / 2.0,
-                f32::MAX / 2.0,
-            ) {
-                Ok(l) => l,
-                Err(_) => {
-                    return TextMetrics {
-                        width: text.chars().count() as f32 * size * 0.6,
-                        height: size * 1.2,
-                    };
-                }
+            let key = measure_key(text, size, weight, family);
+            if let Some(m) = self.measure_cache.borrow().get(&key) {
+                return m.clone();
+            }
+            // 排版失败走等宽近似回退，且**不入缓存**：失败多是暂时性的（资源紧张、
+            // 字体集正在切换），一旦把回退值固化，这段文本就会一直按错误宽度布局
+            // 直到下次整体清空——而清空只在换字体/换字根时发生，可能永远等不到。
+            let Some(m) = self.measure_layout(text, size, weight, family) else {
+                return TextMetrics {
+                    width: text.chars().count() as f32 * size * 0.6,
+                    height: size * 1.2,
+                };
             };
+            let mut c = self.measure_cache.borrow_mut();
+            if c.len() >= MEASURE_CACHE_CAP {
+                c.clear();
+            }
+            c.insert(key, m.clone());
+            m
+        }
+
+        /// 走一次 DirectWrite 排版取度量。任一 COM 环节失败返回 `None`
+        /// （由 [`TextRenderer::measure_text_styled`] 决定回退值，并跳过缓存）。
+        fn measure_layout(
+            &self,
+            text: &str,
+            size: f32,
+            weight: i32,
+            family: Option<&str>,
+        ) -> Option<TextMetrics> {
+            let layout = self
+                .create_layout(text, size, weight, family, f32::MAX / 2.0, f32::MAX / 2.0)
+                .ok()?;
             unsafe {
                 let mut m = DWRITE_TEXT_METRICS::default();
-                if layout.GetMetrics(&mut m).is_err() {
-                    return TextMetrics {
-                        width: text.chars().count() as f32 * size * 0.6,
-                        height: size * 1.2,
-                    };
-                }
+                layout.GetMetrics(&mut m).ok()?;
                 let height = if m.height > 0.0 { m.height } else { size * 1.2 };
-                TextMetrics {
+                Some(TextMetrics {
                     width: m.widthIncludingTrailingWhitespace,
                     height,
-                }
+                })
             }
         }
 
@@ -398,7 +457,8 @@ mod imp {
         /// - `buf`: 目标 BGRA 缓冲区（已含背景，预乘 alpha）
         /// - `buf_width`/`buf_height`: 缓冲区尺寸
         /// - `x`/`y`: 文本左上角（像素坐标）
-        /// - `color`: 文本颜色 [B, G, R, A]
+        /// - `color`: 文本颜色 [R, G, B, A]（`A` 为文字自身不透明度，见
+        ///   [`TextRenderer::draw_text_styled`] 步骤 3 的二次混合）
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text(
             &self,
@@ -537,6 +597,18 @@ mod imp {
                     .map_err(|e| format!("TextLayout::Draw: {e}"))?;
 
                 // 3) 选择性预乘回写：RGB 变动的像素视为文字，按窗口原 alpha 预乘（仅包围盒）。
+                //
+                // 文字自身的 alpha（`color[3]`）在这一步才混进来，而非交给 DirectWrite：
+                // `BitmapRenderTarget::DrawGlyphRun` 只接受不含 alpha 的 COLORREF，半透明
+                // 文字色根本传不进去。DirectWrite 已把**字形覆盖率**（含抗锯齿/ClearType）
+                // 算进 (nr,ng,nb)——那是"文字色完全不透明"时的合成结果；此处再按 fa 与原
+                // 背景混一次，等效于把 fa 乘进有效覆盖率。
+                //
+                // fa=255 时 mix 退化为 n 本身，逐像素等同旧逻辑 → 不透明文字零回归。
+                let fa = color[3] as u32;
+                // 背景侧取 buf 的现有预乘值当直通用——与步骤 1 拷进 DIB 的口径一致，
+                // 两处必须同源，否则半透明背景上的文字会与 DirectWrite 的混合基准错位。
+                let mix = |n: u8, b: u8| ((n as u32 * fa + b as u32 * (255 - fa)) / 255) as u8;
                 for row in cy0..cy1 {
                     let sbase = row * w * 4;
                     let dbase = row * stride;
@@ -550,9 +622,14 @@ mod imp {
                             continue; // 背景未变
                         }
                         let a = buf[s + 3] as u32;
-                        buf[s] = (nb as u32 * a / 255) as u8;
-                        buf[s + 1] = (ng as u32 * a / 255) as u8;
-                        buf[s + 2] = (nr as u32 * a / 255) as u8;
+                        // 先按 fa 混合（读原 buf 值），再按窗口 alpha 预乘写回——顺序承重：
+                        // mix 的背景侧必须是尚未被本像素写覆盖的原值。
+                        let fb = mix(nb, buf[s]);
+                        let fg = mix(ng, buf[s + 1]);
+                        let fr = mix(nr, buf[s + 2]);
+                        buf[s] = (fb as u32 * a / 255) as u8;
+                        buf[s + 1] = (fg as u32 * a / 255) as u8;
+                        buf[s + 2] = (fr as u32 * a / 255) as u8;
                         // alpha 保持窗口原值
                     }
                 }
@@ -845,6 +922,139 @@ mod imp {
         ) -> Result<(), String> {
             Ok(())
         }
+    }
+}
+
+// 测量缓存的**接线**测试：键函数再正确，没接进 `measure_text_styled` 也是白搭，
+// 而 `measure_key_tests` 直接调键函数，接线断了它照样全绿。这里从公开的测量入口进，
+// 用缓存条目数确认它真的被查过、被写过。
+//
+// 需要真实 DirectWrite（`TextRenderer::new` 建 COM 工厂），故 gate 到 Windows；
+// 键本身的正确性由跨平台的 `measure_key_tests` 在 Linux CI 上守。
+#[cfg(all(test, windows))]
+mod measure_cache_tests {
+    use super::imp::TextRenderer;
+
+    fn tr() -> TextRenderer {
+        TextRenderer::new("微软雅黑", 14.0).expect("建 DirectWrite TextRenderer")
+    }
+
+    /// 测量结果入缓存，重复测量命中而不新增条目。
+    #[test]
+    fn repeated_measure_hits_cache() {
+        let r = tr();
+        assert_eq!(r.measure_cache_len(), 0, "起手应为空");
+        let a = r.measure_text_styled("你好", 14.0, 400, None);
+        assert_eq!(r.measure_cache_len(), 1, "首次测量应入缓存");
+        let b = r.measure_text_styled("你好", 14.0, 400, None);
+        assert_eq!(r.measure_cache_len(), 1, "重复测量应命中，不得新增");
+        assert_eq!(a.width, b.width, "命中值须与首次一致");
+        assert_eq!(a.height, b.height);
+    }
+
+    /// 空串走的是提前返回，不该占用缓存条目。
+    #[test]
+    fn empty_text_does_not_populate_cache() {
+        let r = tr();
+        let _ = r.measure_text_styled("", 14.0, 400, None);
+        assert_eq!(r.measure_cache_len(), 0);
+    }
+
+    /// 换字体族清空缓存——键里 `None` 表示"用全局 family"，全局一换这些条目就失效了。
+    #[test]
+    fn set_font_family_clears_cache() {
+        let mut r = tr();
+        let _ = r.measure_text_styled("你好", 14.0, 400, None);
+        assert_eq!(r.measure_cache_len(), 1);
+        r.set_font_family("宋体");
+        assert_eq!(r.measure_cache_len(), 0, "换字体族须清空测量缓存");
+    }
+
+    /// 不同字号各占一条（键含字号），且两者宽度确有差异——顺带证明缓存没把它们混为一谈。
+    #[test]
+    fn distinct_sizes_are_cached_separately() {
+        let r = tr();
+        let small = r.measure_text_styled("你好", 12.0, 400, None);
+        let large = r.measure_text_styled("你好", 24.0, 400, None);
+        assert_eq!(r.measure_cache_len(), 2, "两种字号应各占一条");
+        assert!(
+            large.width > small.width,
+            "24px 应宽于 12px（得 {} vs {}）",
+            large.width,
+            small.width
+        );
+    }
+}
+
+// 测量缓存键的跨平台测试（`measure_key` 不依赖 DirectWrite，与 `pua_runs` 同样不限平台）。
+//
+// 这里测的是**键的区分度**而非缓存命中：键漏掉任何一项影响测量的输入，后果都是某段文本
+// 静默套用另一段的宽度——布局错位，且因为是缓存命中路径，重现条件依赖于测量顺序，极难定位。
+#[cfg(test)]
+mod measure_key_tests {
+    use super::measure_key;
+
+    /// 同一组输入恒得同一个键（缓存能命中的前提）。
+    #[test]
+    fn same_inputs_yield_same_key() {
+        let a = measure_key("你好", 14.0, 400, Some("微软雅黑"));
+        let b = measure_key("你好", 14.0, 400, Some("微软雅黑"));
+        assert_eq!(a, b);
+    }
+
+    /// 四项输入各自独立参与键——逐项只改一个，键都必须变。
+    #[test]
+    fn each_input_affects_key() {
+        let base = measure_key("你好", 14.0, 400, Some("微软雅黑"));
+        assert_ne!(
+            base,
+            measure_key("你好啊", 14.0, 400, Some("微软雅黑")),
+            "文本"
+        );
+        assert_ne!(
+            base,
+            measure_key("你好", 16.0, 400, Some("微软雅黑")),
+            "字号"
+        );
+        assert_ne!(
+            base,
+            measure_key("你好", 14.0, 700, Some("微软雅黑")),
+            "字重"
+        );
+        assert_ne!(base, measure_key("你好", 14.0, 400, Some("宋体")), "字体族");
+    }
+
+    /// 字号必须按 `to_bits()` 精确入键，不能取整。
+    ///
+    /// 字号是 DPI 缩放后的浮点：125% 下 12px→15.0、13px→16.25，150% 下 14px→21.0。
+    /// 若按 `as u32`/`round()` 入键，16.25 与 16.8 会撞进同一条缓存——注释与正文只差
+    /// 一两个像素时恰好落进这个区间，表现为某一档 DPI 下注释宽度突然用了正文的值。
+    #[test]
+    fn fractional_sizes_do_not_collide() {
+        let a = measure_key("你好", 16.25, 400, None);
+        let b = measure_key("你好", 16.8, 400, None);
+        assert_ne!(a, b, "同一整数区间内的两个字号不得共用缓存键");
+    }
+
+    /// `None`（用全局字体族）与显式指定不是一回事：`set_font_family` 只会让前者失效。
+    /// 两者若共用键，换字体后显式指定的条目会被连带清掉（性能损失，无正确性问题），
+    /// 更糟的是反过来——全局族的条目被显式族的值命中，直接就是错误宽度。
+    #[test]
+    fn none_family_differs_from_explicit() {
+        assert_ne!(
+            measure_key("你好", 14.0, 400, None),
+            measure_key("你好", 14.0, 400, Some("微软雅黑")),
+        );
+    }
+
+    /// 空串字体族与 `None` 也要分开——调用方 `View::font_family` 会把空串过滤成 `None`，
+    /// 但本函数不该依赖上游的这个约定。
+    #[test]
+    fn empty_family_differs_from_none() {
+        assert_ne!(
+            measure_key("你好", 14.0, 400, None),
+            measure_key("你好", 14.0, 400, Some("")),
+        );
     }
 }
 
