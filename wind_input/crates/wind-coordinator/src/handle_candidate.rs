@@ -72,12 +72,12 @@ pub(crate) struct CandidateOpScope {
 ///   ⚠️ 「消费整串」不可省成 `!is_partial`：Viterbi 整句只解释部分输入时 `is_partial` 仍是
 ///   false（`aaw` → 「啊啊」只消费 2/3 键），会被误提档并抢走首位。
 /// - `mixed`：当前是混输引擎时，在 `is_exact_code` 之后、权重之前插入**跨来源档位**
-///   （[`wind_candidate::source_tier`]），档序为「码表精确 → 精确码短语 → 拼音精确 →
-///   码表前缀补全/前缀短语 → 拼音其余/英文」。解决混输打 `xu` 时拼音「需」被码表 `xu*` 的
+///   （[`wind_candidate::source_tier`]），档序为「码表精确/精确码短语 → 拼音精确 →
+///   码表前缀补全 → 前缀短语 → 拼音其余/英文」。解决混输打 `xu` 时拼音「需」被码表 `xu*` 的
 ///   124 条前缀补全压到第 125 位。
 ///   ⚠️ **必须由调用方按引擎语境传入、不可恒 true**：纯拼音下全体候选同为 `Pinyin` 来源，档位会
-///   退化成「`is_common` 优先」（档 2 vs 档 4），把含生僻字的多字词硬降到全部常用单字之后。
-///   依赖 `mark_common` 已在排序前跑过（`is_common` 是档 2 的准入条件）。
+///   退化成「`is_common` 优先」（拼音精确档 vs 拼音其余档），把含生僻字的多字词硬降到全部
+///   常用单字之后。依赖 `mark_common` 已在排序前跑过（`is_common` 是拼音精确档的准入条件）。
 ///
 /// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
 pub(crate) fn candidate_display_order(
@@ -97,12 +97,12 @@ pub(crate) fn candidate_display_order(
     // 混输专属层级：**跨来源档位**（`source_tier`，跨来源先后的唯一真相源）。
     //
     // 此前这里只用 `cmp_pinyin_exact_first`，即整个档位体系里只承认「是不是拼音精确档」
-    // 一个二分。其余档次（码表精确 / 精确码短语 / 码表前缀 / 拼音其余）当时由混输引擎的
-    // 权重加成表达（`PHRASE_WEIGHT_BOOST` 等），于是同一语义分散在两处、且已经不一致
-    // （混输加成给短语一律 +1M 不分精确/前缀，`source_tier` 把前缀短语降到档 3）。
+    // 一个二分。其余档次（码表精确 / 码表前缀 / 拼音其余）当时由混输引擎的权重加成表达
+    // （`PHRASE_WEIGHT_BOOST` 等），于是同一语义分散在两处、且已经不一致
+    // （混输加成给短语一律 +1M 不分精确/前缀，`source_tier` 把前缀短语单独降档）。
     //
     // 纯拼音/纯码表下必须为空操作——纯拼音时全体候选同源，档位会退化成「is_common 优先」
-    // （档 2 vs 档 4），把含生僻字的多字词硬降到全部常用单字之后。
+    // （拼音精确档 vs 拼音其余档），把含生僻字的多字词硬降到全部常用单字之后。
     let by_source_tier = if mixed {
         wind_candidate::source_tier(a, input).cmp(&wind_candidate::source_tier(b, input))
     } else {
@@ -694,15 +694,19 @@ impl Coordinator {
                     // 护栏在 `wind_dict::SystemDictLayer::effective_weight`（查询期越界告警），
                     // 体检走 `wind_input dict weight-check`。
                     //
-                    // ## 删掉 40M 只改变纯码表
+                    // ## 「精确码短语 vs 码表精确候选」现在处处由权重裁决
                     //
-                    // 沿 `candidate_display_order` 倒推「精确码短语 vs 码表精确候选」的裁决者：
+                    // 沿 `candidate_display_order` 倒推每种模式的实际裁决者：
                     // - **纯码表**（mixed=false）：两者 `is_exact_code` 同为 true ⇒ `cmp_exact_first`
-                    //   平局 ⇒ 落到 `by_weight`。40M 在此恒赢，**本次改的就是这里**；
-                    // - 混输（mixed=true）：`source_tier` 档 0（码表精确）< 档 1（精确码短语），
-                    //   档位在 `by_weight` 之前 ⇒ 40M 早已被覆盖、不起作用；
+                    //   平局 ⇒ 落到 `by_weight`。40M 在此恒赢，删除它改的就是这条；
+                    // - 混输（mixed=true）：`source_tier` 曾把二者分作档 0/档 1（码表恒先），40M
+                    //   因此被档位覆盖、不起作用。该档已合并（同为档 0）⇒ 现在同样落到 `by_weight`；
                     // - 纯拼音：拼音候选 `is_exact_code` 恒 false ⇒ `cmp_exact_first` 已让短语居前，
-                    //   同样与 40M 无关。
+                    //   与权重无关。
+                    //
+                    // 合档的动因不在这里，而在 `freq_rerank::freq_tier`——它复用 `source_tier` 且是
+                    // 调频重排的首要键，二者分档会造成「开调频码表恒赢、关调频按权重比」的
+                    // 开关依赖不一致。见 `wind_candidate::source_tier` 函数文档。
                     weight: hit.weight,
                     is_phrase: true,
                     // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；

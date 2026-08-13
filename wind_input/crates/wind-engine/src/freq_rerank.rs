@@ -77,17 +77,22 @@ impl ProtectPolicy {
 ///
 /// ⚠️ 这里**不必**像协调器那样区分「是否混输」：本函数只服务
 /// `rerank_codetable_usedfirst`（码表 / 混输），纯拼音走 `rerank_pinyin_positional` 不经过此处；
-/// 而纯码表下没有 `Pinyin` 来源候选，档 2 天然是空操作。
+/// 而纯码表下没有 `Pinyin` 来源候选，拼音精确档天然是空操作。
 fn freq_tier(c: &Candidate, input: &str) -> u8 {
     wind_candidate::source_tier(c, input)
 }
 
 /// 码表/混输词频重排（§3）：档位感知的**永久** used-first（五笔优先）。
-/// 先按来源档位（码表精确 < 精确码短语 < **拼音精确** < 码表前缀补全 < 前缀短语 < 拼音其余），
+/// 先按来源档位（**码表精确 = 精确码短语** < 拼音精确 < 码表前缀补全 < 前缀短语 < 拼音其余），
 /// 档内再 used-first + 策略排序。前缀短语排在码表前缀补全**之后**＝短语不因 is_phrase 抬到
 /// 补全之上。（二者曾同档、由 weight 分先后，但那一步从未真正裁决过——混输给码表前缀补全
 /// +500K 而前缀短语拿原始权重，码表恒赢；加成拆除后已就地拆成两档，见 `source_tier`。）
 /// 稳定排序保证同档无记录者维持引擎权重序，绝不把拼音浮到五笔精确全码之上。
+///
+/// ⚠️ 精确码短语与码表精确**同档**（都是 0），故本函数不再让码表精确恒赢短语——它们在档内
+/// 按 used-first/权重竞争。这条合并的动因正在本函数：`source_tier` 是这里的**首要键**、
+/// 整体压过协调器显示序，短语与码表精确若在此分档，就会出现「开调频码表恒赢、关调频按权重比」
+/// 的开关依赖不一致（`PHRASE_WEIGHT_BASE` 删除后暴露）。见 `source_tier` 函数文档。
 ///
 /// 策略：`Step`（默认/逐次提升）count 降序、last_used 降序 tiebreak（抗误选）；
 /// `Top`（一次到顶/MRU）last_used 降序、count 降序 tiebreak（最近选的置该档之首）。
@@ -119,7 +124,7 @@ pub fn rerank_codetable_usedfirst(
     use std::cmp::Ordering;
     if strategy == FreqStrategy::Position {
         // 位次减半：与拼音共用 `rerank_positional`，只把层级判据换成来源档位。
-        // 档位仍是硬约束——前缀补全（tier 3）再怎么提升也跨不到精确全码（tier 0）之前，
+        // 档位仍是硬约束——前缀补全（tier 2）再怎么提升也跨不到精确全码（tier 0）之前，
         // 「五笔优先」不受影响；提升只在**档内**发生，这正是前缀匹配为主的方案要的。
         rerank_positional(
             candidates,
@@ -892,7 +897,7 @@ mod tests {
     #[test]
     fn mixed_tier_keeps_codetable_exact_above_pinyin() {
         let mut cands = vec![ct("aaaa", "工", 100), pin("啊", 5000)];
-        // 拼音「啊」高频近用，但档位 3 低于码表精确全码档位 0
+        // 拼音「啊」高频近用，但其档位低于码表精确全码档位 0
         let r = recs(&[("啊", 50, NOW)]);
         rerank_codetable_usedfirst(
             &mut cands,
@@ -1113,29 +1118,29 @@ mod tests {
         assert_eq!(cands[0].text, "戈", "NONE 策略下词频照常生效");
     }
 
-    /// freq_tier 短语再分档：精确码短语（is_exact_code）tier 1 紧随码表精确；前缀短语
+    /// freq_tier 短语再分档：精确码短语（is_exact_code）与码表精确**同档**（tier 0）；前缀短语
     /// （!is_exact_code）排在码表前缀补全**之后**，**不因 is_phrase 抬到补全之上**。
     ///
-    /// 回归 `da`→`date` 现场：混输下 `date` 前缀短语曾只因 is_phrase 拿 tier 1、压过码表
+    /// 回归 `da`→`date` 现场：混输下 `date` 前缀短语曾只因 is_phrase 拿高档、压过码表
     /// 前缀补全（如 矼/509000）。入参按 `candidate_display_order` 的输出序喂入（精确码 →
     /// 精确码短语 → 码表前缀补全 → 前缀短语），验证 rerank 维持该档位结构而非把短语顶起。
-    /// 旧码（`is_phrase => 1`）下前缀短语会跳到 tier 1、排到 矼 之前 → 本用例会红。
+    /// 旧码（`is_phrase` 一刀切进高档）下前缀短语会排到 矼 之前 → 本用例会红。
     #[test]
     fn codetable_tier_prefix_phrase_stays_with_completion() {
         let exact_code = ct("da", "左", 3000); // 码表精确全码 tier 0
         let exact_phrase = {
-            let mut c = ct("", "精确短语", 10); // lookup 精确码短语 tier 1
+            let mut c = ct("", "精确短语", 10); // lookup 精确码短语，与上者同 tier 0
             c.is_phrase = true;
             c.is_exact_code = true;
             c
         };
-        let completion = ct("dax", "矼", 9000); // 码表前缀补全 tier 3（真实词频，加成已拆除）
+        let completion = ct("dax", "矼", 9000); // 码表前缀补全 tier 2（真实词频，加成已拆除）
         let prefix_phrase = {
             let mut c = ct("", "date短语", 10);
             c.is_phrase = true;
             c.is_prefix = true; // is_exact_code 默认 false
             c
-        }; // lookup_prefix 前缀短语 tier 4
+        }; // lookup_prefix 前缀短语 tier 3
         let mut cands = vec![exact_code, exact_phrase, completion, prefix_phrase];
         let r = recs(&[]); // 无词频记录 → 纯按档位 + 稳定序（维持入参显示序）
         rerank_codetable_usedfirst(
@@ -1152,7 +1157,58 @@ mod tests {
         assert_eq!(
             order,
             vec!["左", "精确短语", "矼", "date短语"],
-            "精确码短语 tier1 紧随码表精确；前缀短语 tier4 排在码表前缀补全(tier3)之后"
+            "精确码短语与码表精确同 tier 0（维持入参序）；前缀短语 tier3 排在码表前缀补全 tier2 之后"
+        );
+    }
+
+    /// **开调频不得推翻协调器按权重排出的「短语 vs 码表精确」次序。**
+    ///
+    /// 这是把精确码短语并入 tier 0 的**唯一动因**，也是这条合并要偿还的账：
+    /// `PHRASE_WEIGHT_BASE`(40M) 删除后，协调器在纯码表下已按权重比二者；而本模块的
+    /// `freq_tier` 是 `rerank_codetable_usedfirst` 的**首要键**、整体压过协调器显示序。
+    /// 二者若分档，同一个输入就会「开调频码表精确恒赢、关调频按权重比」——一处**开关依赖
+    /// 的不一致**，且开关（`[schema.codetable.frequency] enabled`）默认关，用户一旦打开
+    /// 就会发现短语行为变了，却完全看不出关联。
+    ///
+    /// ⚠️ **两个方向都测**：只测「短语在前」证明不了档位已合并——若断言方向恰好与
+    /// 「码表恒赢」一致，旧码同样会绿。真正能证伪的是第 ① 条。
+    ///
+    /// 无词频记录 ⇒ 档内落到稳定排序 ⇒ 维持入参序。这正是设计意图：调频重排的比较链
+    /// 不含 weight（见 frequency.md §8），权重次序由协调器负责，本模块只做 used-first。
+    #[test]
+    fn codetable_tier_exact_phrase_keeps_coordinator_weight_order() {
+        let phrase = |w: i32| {
+            let mut c = ct("", "短语", w);
+            c.is_phrase = true;
+            c.is_exact_code = true;
+            c
+        };
+        let exact = |w: i32| ct("skce", "可能", w);
+        let run = |mut cands: Vec<Candidate>| -> Vec<String> {
+            rerank_codetable_usedfirst(
+                &mut cands,
+                &recs(&[]),
+                "skce",
+                FreqStrategy::Step,
+                ProtectPolicy::NONE,
+                NOW,
+                FreqProfile::default(),
+                PromotePrefix::All,
+            );
+            cands.into_iter().map(|c| c.text).collect()
+        };
+        // ① 短语权重更高 → 协调器把它排在前，本模块须维持。
+        //    旧码（精确码短语独占 tier 1）会把「可能」提到最前 ⇒ 本断言变红。
+        assert_eq!(
+            run(vec![phrase(1800), exact(500)]),
+            vec!["短语", "可能"],
+            "短语 1800 > 码表 500：开调频不得把码表精确提到短语之前"
+        );
+        // ② 反向对照：码表权重更高时次序同样维持，证明不是「短语恒前」。
+        assert_eq!(
+            run(vec![exact(3000), phrase(1800)]),
+            vec!["可能", "短语"],
+            "码表 3000 > 短语 1800：次序同样由入参（协调器权重序）决定"
         );
     }
 
@@ -1527,8 +1583,8 @@ mod tests {
     fn codetable_position_respects_source_tiers() {
         let mut c = vec![
             ct("a", "工", 9999),   // tier 0：精确全码
-            ct("ab", "式", 5000),  // tier 3：前缀补全
-            ct("abc", "戒", 3000), // tier 3
+            ct("ab", "式", 5000),  // tier 2：前缀补全
+            ct("abc", "戒", 3000), // tier 2
         ];
         rerank_codetable_usedfirst(
             &mut c,

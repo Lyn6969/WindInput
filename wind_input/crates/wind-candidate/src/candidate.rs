@@ -493,20 +493,34 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 /// 候选**来源档位**（数字越小越靠前）——跨来源先后的**唯一真相源**。
 ///
 /// ```text
-/// 0  码表精确全码（code == input）
-/// 1  精确码短语（is_phrase && is_exact_code）
-/// 2  拼音精确档（is_pinyin_exact_tier：精确音节 + 常用字）  ← 先于码表前缀补全
-/// 3  码表前缀补全
-/// 4  前缀短语 + 其余来源
-/// 5  拼音其余（前缀补全/子短语/简拼/模糊/生僻） + 英文
+/// 0  码表精确全码（code == input）+ 精确码短语（is_phrase && is_exact_code）
+/// 1  拼音精确档（is_pinyin_exact_tier：精确音节 + 常用字）  ← 先于码表前缀补全
+/// 2  码表前缀补全
+/// 3  前缀短语 + 其余来源
+/// 4  拼音其余（前缀补全/子短语/简拼/模糊/生僻） + 英文
 /// ```
 ///
 /// 五笔优先的硬约束：码表精确全码恒在拼音之上，词频重排只在同档内调整。
 /// 纯拼音 / 纯码表模式下同源候选档位相同，退化为按词频排序。
 ///
-/// ★ 档 2 是「五笔优先」的一处**有意松动**：码表**精确**仍恒先于拼音（档 0 < 档 2），但码表
+/// ★ 档 1 是「五笔优先」的一处**有意松动**：码表**精确**仍恒先于拼音（档 0 < 档 1），但码表
 /// **前缀补全**要让位于拼音精确匹配。理由是短输入下二者置信度恰好反相关——`xu` 的 124 条码表
 /// 前缀补全全都要打满 4 码才精确，而拼音 `xu` 已是完整音节。
+///
+/// ## 档 0 内「码表精确 vs 精确码短语」由权重裁决
+///
+/// 二者曾分居档 0/档 1（短语恒在后）。合并的直接动因是**消除一处开关依赖的不一致**：
+/// `PHRASE_WEIGHT_BASE`(40M) 删除后，纯码表下协调器已按权重比二者，而本函数（经
+/// `freq_rerank::freq_tier`）在**开启码表自动调频**时是首要键、整体压过协调器显示序——
+/// 于是同一个输入，开调频码表精确恒赢、关调频按权重比，两种结果。
+///
+/// ⚠️ **只合并了「精确」这一对，前缀那一对刻意不合**（前缀短语仍在档 3、码表前缀补全在档 2）。
+/// 归一化让两边量纲可比了，但**可比 ≠ 该比**：档位表达的不只是量纲，还有置信度。
+/// 精确码短语是「用户打全了码、明确要它」，前缀短语是「只打了前缀、系统猜他可能要」。
+/// 且前缀短语权重（新建默认 1800、系统短语 800~2000）普遍高于码表前缀补全（五笔主库
+/// median 941），合档会让它压过多数补全候选——那正是历史上用户报过的
+/// 「系统/用户短语前缀匹配时优先级偏高、压普通编码/候选」（回归测试见
+/// `input_flow.rs::prefix_group_marker_defers_*`）。
 ///
 /// ## 为什么放在 `wind-candidate`
 ///
@@ -518,12 +532,12 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 /// （`MixedEngine::truncation_tier`，只管「谁活下来」，与本函数的「谁排前面」职责不重叠）。
 ///
 /// ⚠ `c.code == input` 与 [`Candidate::is_exact_code`]（见 [`cmp_exact_first`]）是同一概念的
-/// 两份判据，纯码表路径结论一致。未合并是因为本档位还承载来源语义（`is_phrase` 独占档 1、
+/// 两份判据，纯码表路径结论一致。未合并是因为本档位还承载来源语义（前缀短语单独占档、
 /// 按来源分 Pinyin/English 档）。
 ///
 /// ## ⚠️⚠️ 只能在**协调器侧**调用，引擎内部用不了
 ///
-/// 档 2 的判据 [`is_pinyin_exact_tier`] 要求 `c.is_common`，而 `is_common` **只在协调器
+/// 拼音精确档（档 1）的判据 [`is_pinyin_exact_tier`] 要求 `c.is_common`，而 `is_common` **只在协调器
 /// `mark_common` 置位**（`handle_candidate.rs`），引擎产出的候选该字段恒为 `false`（Default）。
 /// 于是在引擎里调用本函数，拼音精确候选会静默落到档 4 —— **不报错、不 panic，只是档位悄悄错**。
 ///
@@ -535,31 +549,31 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 pub fn source_tier(c: &Candidate, input: &str) -> u8 {
     use CandidateSource::*;
     if c.is_phrase {
-        // 短语按「完全匹配 vs 前缀匹配」再分档，勿因 is_phrase 一刀切抬到码表前缀补全之上：
-        // - 精确码短语（`lookup`，码==输入的完全匹配 → `is_exact_code=true`）留档 1、紧随码表精确；
-        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）降到码表前缀补全**之后**。
+        // 短语按「完全匹配 vs 前缀匹配」分档，勿因 is_phrase 一刀切抬到码表前缀补全之上：
+        // - 精确码短语（`lookup`，码==输入的完全匹配 → `is_exact_code=true`）进档 0，
+        //   与码表精确候选**同档比权重**（理由见函数文档「档 0 内…由权重裁决」）；
+        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）留档 3、在码表前缀补全之后。
         //   否则混输/拼音下打 `da` 会让 `date` 短语只因 is_phrase 就压过码表前缀补全（如 矼）。
         //
-        // ⚠️ 前缀短语此前与码表前缀补全**同档**（都是 3），靠 weight 分先后。那从来不是一次
-        // 真正的比较：混输引擎给码表前缀补全 `+PARTIAL_MATCH_BOOST`(500K)，而前缀短语拿的是
-        // 原始权重（当时的 `PHRASE_WEIGHT_BASE`=40M 只加给精确码短语），于是码表恒赢。加成拆除后
-        // 两者变成「码表词频 vs 用户设定的短语权重」——两个不同量纲的数硬比，正是本档位
-        // 要消灭的那种比较。故就地拆成两档，把既有次序写成规则。
-        //
-        // 归一化落地（方案级 `[weight_spec]`）后两边可以同轴了，档 2/4 有望合回一档——那是
-        // `docs/design/dict-weight-normalization.md` §6 的下一步，**与本次删 40M 是两件事**：
-        // 删 40M 只改变纯码表（见 `handle_candidate.rs` 的 `lookup` 分支），合档只改变混输。
-        return if c.is_exact_code { 1 } else { 4 };
+        // ⚠️ 前缀短语曾与码表前缀补全同档、靠 weight 分先后，那从来不是一次真正的比较：
+        // 混输引擎给码表前缀补全 `+PARTIAL_MATCH_BOOST`(500K)，而前缀短语拿原始权重
+        // （当时的 `PHRASE_WEIGHT_BASE`=40M 只加给精确码短语），于是码表恒赢。加成拆除后
+        // 就地拆成两档，把既有次序写成规则——**这条分档保留**，不随精确那一对合并，
+        // 理由见函数文档（可比 ≠ 该比）。
+        return if c.is_exact_code { 0 } else { 3 };
     }
     if is_pinyin_exact_tier(c, input.len()) {
-        return 2;
+        return 1;
     }
     match c.source {
         CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
-        CodeTable => 3,                    // 码表前缀补全
-        Pinyin => 5,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
-        English => 5,
-        _ => 4,
+        CodeTable => 2,                    // 码表前缀补全
+        Pinyin => 4,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
+        English => 4,
+        // 其余来源（主要是 `CandidateSource::None`，即引擎未标注来源的候选）。
+        // 与前缀短语同档是**沿袭**而非设计——二者都属「说不清置信度」，放在码表补全之后、
+        // 拼音其余之前。若将来有来源需要明确定位，应单独判而不是继续挂在这里。
+        _ => 3,
     }
 }
 
@@ -585,7 +599,7 @@ pub fn source_tier(c: &Candidate, input: &str) -> u8 {
 /// 把含生僻字的多字词（`is_string_common` 要求整串每字都常用）硬降到全部常用单字之后 ——
 /// 那是明显回归。纯码表下没有拼音候选，本键是空操作。
 ///
-/// ⚠️ **`freq_rerank::freq_tier` 是同概念的第二份判据**（同一个 `is_pinyin_exact_tier`，档位 2）。
+/// ⚠️ **`freq_rerank::freq_tier` 是同概念的第二份判据**（同一个 `is_pinyin_exact_tier`，档位 1）。
 /// 开自动调频时它是首要键、整体压过本比较链，两处改一处须核对另一处（红线③）。
 pub fn cmp_pinyin_exact_first(
     a: &Candidate,
