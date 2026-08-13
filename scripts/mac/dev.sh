@@ -172,6 +172,14 @@ UNIVERSAL="${WIND_MAC_UNIVERSAL:-0}"
 # 才暴露。'universal' 不是合法 target triple, 与 cargo 自己的 target/<triple>/ 不会撞名。
 UNIVERSAL_SUBDIR="universal"
 
+# 仓库根 docs/VERSION (CI 由 tag 写入) 的规范化读取: 去 BOM 与空白, 读不到则输出空串。
+# 版本真源只此一处, IME 壳 / 设置壳 / pkg / wind-setting 的 build.rs 都从这里取同一个值。
+repo_version() {
+    local f="$REPO_DIR/docs/VERSION"
+    [[ -f "$f" ]] || return 0
+    tr -d '\xef\xbb\xbf \t\r\n' < "$f"
+}
+
 # 两个 target 各编一遍再 lipo 成通用二进制。
 #   用法: cargo_build_universal <项目目录> <profile子目录> <二进制名> [cargo 参数...]
 # 失败一律返回非零 —— 见文件末 run_tokens 处说明, 本脚本的 errexit 不可依赖, 调用方须显式判。
@@ -467,6 +475,16 @@ build_setting() {
     fi
     command -v codesign >/dev/null || { err "codesign 未安装 (装 Xcode CLT)"; return 1; }
 
+    # 版本注入: docs/VERSION → wind-setting 的 build.rs (对齐 Windows 侧 dev.ps1 的
+    # $env:WIND_APP_VERSION)。缺了这一步, build.rs 会回落到 git_version() —— 而那是在
+    # wind-setting 自己的仓库里 describe, CI 的浅 checkout 无 tag, 结果就是界面上显示
+    # 一串裸短 hash, 与本仓 tag 完全无关。
+    local ver; ver="$(repo_version)"
+    if [[ -n "$ver" ]]; then
+        export WIND_APP_VERSION="$ver"
+        info "version: $ver (注入 wind_setting build.rs)"
+    fi
+
     # 变体派生。
     local disp exe_name bid cargo_sub
     local cargo_flags=()
@@ -505,11 +523,8 @@ build_setting() {
     cp "$BIN_PATH" "$APP_BUNDLE/Contents/MacOS/$exe_name"
     chmod +x "$APP_BUNDLE/Contents/MacOS/$exe_name"
 
-    # 版本: 仓库根 docs/VERSION (无则 0.0.0), 与 IME app / pkg 版本贯通。
-    local ver="0.0.0"
-    if [[ -f "$REPO_DIR/docs/VERSION" ]]; then
-        local v; v=$(tr -d '\xef\xbb\xbf \t\r\n' < "$REPO_DIR/docs/VERSION"); [[ -n "$v" ]] && ver="$v"
-    fi
+    # 版本: 上面读到的 docs/VERSION (无则 0.0.0), 与 IME app / pkg / 界面版本号贯通。
+    [[ -n "$ver" ]] || ver="0.0.0"
 
     # Info.plist (窗口应用: 不设 LSUIElement; NSPrincipalClass=NSApplication)。
     cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST_EOF
