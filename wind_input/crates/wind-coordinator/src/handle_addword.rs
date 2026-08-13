@@ -8,9 +8,9 @@ use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::CandidateSource;
 use wind_ipc::protocol::MOD_CTRL;
 use wind_keys::keymap;
-use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::UiCommand;
-use wind_ui::toast::{ToastKind, ToastPosition};
+use wind_ui_types::CandidateItem;
+use wind_ui_types::UiCommand;
+use wind_ui_types::{ToastKind, ToastPosition};
 
 /// 最小加词长度
 const ADD_WORD_MIN_LEN: usize = 1;

@@ -50,11 +50,10 @@ pub struct InputDiagState {
     pub mask: u64,
 }
 
-/// 窗口 / TSF 上下文诊断快照的**存放位置在 wind-ui**（`input_diag_hud::WindowDiagView`）。
-///
-/// 依赖方向是 coordinator → ui，HUD 视图类型只能定义在 ui 侧；这里 re-export 一次，
-/// 让本模块仍是"输入诊断数据类型"的单一入口。
-pub use wind_ui::manager::WindowDiagView;
+/// 窗口 / TSF 上下文诊断快照定义在 wind-ui-types（表现层协议 crate，
+/// 协调器与渲染端共同的依赖）；这里 re-export 一次，让本模块仍是
+/// "输入诊断数据类型"的单一入口。
+pub use wind_ui_types::WindowDiagView;
 
 #[cfg(test)]
 mod tests {

@@ -23,7 +23,7 @@ use wind_cmdbar::{
     ClipboardService, ConfigService, DictService, EvalContext, ImeController, ProcSpawn,
     ProcessRunner, Services, UrlOpener,
 };
-use wind_ui::toast::{ToastKind, ToastPosition};
+use wind_ui_types::{ToastKind, ToastPosition};
 
 impl Coordinator {
     /// 构造后装配 cmdbar：自身 Weak 引用 + Services。一次性，幂等。

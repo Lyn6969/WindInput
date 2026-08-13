@@ -18,7 +18,7 @@
 use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
 use wind_config::{Config, LayoutIntent, OverlaySpec};
-use wind_ui::manager::UiCommand;
+use wind_ui_types::UiCommand;
 
 /// 「模式 → 布局意图」映射。**唯一一处**把这层对应关系写死的地方——新增模式只加一行。
 ///

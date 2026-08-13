@@ -14,7 +14,7 @@ use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
 use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
-use wind_ui::manager::CandidateOp;
+use wind_ui_types::CandidateOp;
 
 /// 候选词条操作（置顶 / 前移 / 后移 / 删除 / 恢复默认）的作用域快照。
 /// 由 [`Coordinator::candidate_op_scope`] 解析，菜单构建、写端、macOS 禁用位三处共用。

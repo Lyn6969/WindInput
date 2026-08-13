@@ -14,6 +14,9 @@ wind-engine = { path = "../wind-engine" }
 wind-candidate = { path = "../wind-candidate" }
 wind-transform = { path = "../wind-transform" }
 wind-theme = { path = "../wind-theme" }
+# 表现层协议类型（UiCommand/UiEvent 等）；数据类型一律从这里引，wind-ui 只供
+# 桌面构造路径的运行期能力（UiManager/剪贴板/macOS forwarder）。
+wind-ui-types = { path = "../wind-ui-types" }
 wind-ui = { path = "../wind-ui" }
 wind-cmdbar = { path = "../wind-cmdbar" }
 wind-phrase = { path = "../wind-phrase" }

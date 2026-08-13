@@ -2429,6 +2429,7 @@ dependencies = [
  "wind-transfer",
  "wind-transform",
  "wind-ui",
+ "wind-ui-types",
  "windows",
  "winreg",
 ]

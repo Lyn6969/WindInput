@@ -8,8 +8,8 @@ use crate::theme_style::ThemeStyle;
 use wind_bridge::handler::MessageHandler;
 use wind_config::Config;
 use wind_keys::keymap;
-use wind_ui::manager::{CandidateOp, MenuAnchor, MenuCmd, MenuKind, ToolbarAction, UiCommand};
-use wind_ui::toolbar::ToolbarState;
+use wind_ui_types::ToolbarState;
+use wind_ui_types::{CandidateOp, MenuAnchor, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 
 /// 菜单打开后的焦点事件豁免期，见 [`Coordinator::menu_close_on_focus_change`]。
 ///
@@ -350,7 +350,7 @@ impl Coordinator {
     /// 右键状态提示气泡请求的功能菜单：常驻显示 / 焦点切换时显示 / 固定位置（均带勾选）/
     /// 恢复默认位置 / 截图。
     pub(crate) fn show_status_menu(&self, x: i32, y: i32) {
-        use wind_ui::manager::MenuItemSpec as M;
+        use wind_ui_types::MenuItemSpec as M;
         let si_always;
         let si_fixed;
         let si_on_focus;
@@ -399,7 +399,7 @@ impl Coordinator {
     /// 右键弹出菜单后鼠标会移到菜单窗口上，若不抑制 tooltip 会当场消失，菜单就指向一个
     /// 已不存在的窗口，「截图此窗口」会截空。抑制标志在菜单关闭时由 menu_close 统一清除。
     pub(crate) fn show_tooltip_menu(&self, x: i32, y: i32) {
-        use wind_ui::manager::MenuItemSpec as M;
+        use wind_ui_types::MenuItemSpec as M;
         let _ = self.ui_tx.send(UiCommand::SetTooltipMenuOpen(true));
         let cmd = |c: MenuCmd| MenuKind::Command(c);
         let items = vec![
@@ -419,7 +419,7 @@ impl Coordinator {
     /// 勾选态与实际行为不同步，那会让用户反复点同一项。
     pub(crate) fn show_input_diag_menu(&self, x: i32, y: i32) {
         use std::sync::atomic::Ordering::Relaxed;
-        use wind_ui::manager::{DiagSections, MenuItemSpec as M};
+        use wind_ui_types::{DiagSections, MenuItemSpec as M};
         let cmd = |c: MenuCmd| MenuKind::Command(c);
         let sections = *self
             .input_diag_sections
@@ -842,7 +842,7 @@ impl Coordinator {
 
     /// 循环切换到下一个主题，重绘并持久化选择。
     /// 构建并显示功能主菜单（对齐 Go 统一菜单：方案/主题子菜单 + 勾选态）。
-    /// 位置与展开方向全由 `anchor` 描述，见 [`wind_ui::manager::MenuPlacement`]。
+    /// 位置与展开方向全由 `anchor` 描述，见 [`wind_ui_types::MenuPlacement`]。
     pub(crate) fn show_main_menu(&self, anchor: MenuAnchor) {
         let items = self.build_main_menu_items();
         self.mark_menu_open(0, String::new());
@@ -865,8 +865,8 @@ impl Coordinator {
     /// 的话，用户一旦关掉图标就把开关本身也藏了（只剩候选框右键这个得先打字才碰得到的
     /// 入口）。IMK 输入源菜单不依赖任何 UI 可见性，是恒定可达的那个。
     #[cfg(target_os = "macos")]
-    pub(crate) fn build_menu_items_macos(&self) -> Vec<wind_ui::manager::MenuItemSpec> {
-        use wind_ui::manager::MenuItemSpec as M;
+    pub(crate) fn build_menu_items_macos(&self) -> Vec<wind_ui_types::MenuItemSpec> {
+        use wind_ui_types::MenuItemSpec as M;
         let (chinese, punct, full, s2t, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -915,8 +915,8 @@ impl Coordinator {
 
     /// 构建功能主菜单项树（纯构建，不改状态/不弹窗）。
     /// Windows 经 `show_main_menu` 进程内渲染；macOS 经 `query_main_menu_encoded` 序列化下发给 `.app` 原生 NSMenu。
-    pub(crate) fn build_main_menu_items(&self) -> Vec<wind_ui::manager::MenuItemSpec> {
-        use wind_ui::manager::MenuItemSpec as M;
+    pub(crate) fn build_main_menu_items(&self) -> Vec<wind_ui_types::MenuItemSpec> {
+        use wind_ui_types::MenuItemSpec as M;
         let (chinese, punct, full, s2t, filter_mode, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -1175,9 +1175,9 @@ impl Coordinator {
     /// 把 `MenuItemSpec` 树映射为线格式 `MenuNode` 树（id 由 `MenuKind::to_menu_id` 派生）。
     #[cfg(target_os = "macos")]
     pub(crate) fn menu_items_to_nodes(
-        items: &[wind_ui::manager::MenuItemSpec],
+        items: &[wind_ui_types::MenuItemSpec],
     ) -> Vec<wind_ipc::codec::MenuNode> {
-        use wind_ui::manager::MenuKind;
+        use wind_ui_types::MenuKind;
         items
             .iter()
             .map(|it| wind_ipc::codec::MenuNode {
@@ -1315,7 +1315,7 @@ impl Coordinator {
     /// - 特殊模式（快符等）：词条操作**照常提供**，编码取其独立缓冲、归属取其引用方案。
     /// - 无词库落点者（临拼/临英/混输/网址，以及特殊模式的空码浏览态）：仅提供复制。
     pub(crate) fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
-        use wind_ui::manager::MenuItemSpec as M;
+        use wind_ui_types::MenuItemSpec as M;
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
             return;
@@ -1834,7 +1834,7 @@ mod tests {
         use wind_config::Config;
 
         let c = Coordinator::new_headless(Config::default(), None);
-        fn contains(items: &[wind_ui::manager::MenuItemSpec], label: &str) -> bool {
+        fn contains(items: &[wind_ui_types::MenuItemSpec], label: &str) -> bool {
             items
                 .iter()
                 .any(|i| i.label == label || contains(&i.children, label))
@@ -1864,7 +1864,7 @@ mod tests {
         use wind_config::Config;
 
         let c = Coordinator::new_headless(Config::default(), None);
-        fn contains(items: &[wind_ui::manager::MenuItemSpec], label: &str) -> bool {
+        fn contains(items: &[wind_ui_types::MenuItemSpec], label: &str) -> bool {
             items
                 .iter()
                 .any(|i| i.label == label || contains(&i.children, label))

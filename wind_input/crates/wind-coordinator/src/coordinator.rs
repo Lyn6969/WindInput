@@ -35,12 +35,12 @@ use wind_store::stat_collector::{StatCollector, StatEvent};
 use wind_store::stats::CommitSource;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
-use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{GlobalHotkeyEntry, UiCommand, UiEvent};
+use wind_ui_types::CandidateItem;
+use wind_ui_types::{GlobalHotkeyEntry, UiCommand, UiEvent};
 // UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
 #[cfg(not(target_os = "macos"))]
 use wind_ui::manager::UiManager;
-use wind_ui::toast::{ToastKind, ToastPosition};
+use wind_ui_types::{ToastKind, ToastPosition};
 
 /// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素）。微信 reflow 后的
 /// 权威帧通常上报真实行高（~20px，随 DPI 缩放），直接取用；仅退化帧（height=1）落到此下限，
@@ -1145,7 +1145,7 @@ pub struct Coordinator {
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
     pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
     /// HUD 分区显示开关（右键菜单「显示分类」）。会话级，不持久化。
-    pub(crate) input_diag_sections: Mutex<wind_ui::manager::DiagSections>,
+    pub(crate) input_diag_sections: Mutex<wind_ui_types::DiagSections>,
     /// HUD 冻结中（右键菜单「停止刷新」）：新快照不再推给 UI。
     ///
     /// 冻结落在**推送**这一层而不是 UI 渲染层：数据照常进 `last_*_diag`（解冻后立即有
@@ -1374,8 +1374,8 @@ impl Coordinator {
     pub fn set_host_render(&self, mgr: Arc<wind_bridge::host_render_windows::HostRenderManager>) {
         let _ = self.host_render.set(mgr.clone());
         // 把同一 Arc 传给 UI 线程，使其在消息循环中激活 SHM 分流路径（Task 7）。
-        let _ = self.ui_tx.send(wind_ui::manager::UiCommand::SetHostRender(
-            wind_ui::manager::HostRenderArc(mgr),
+        let _ = self.ui_tx.send(wind_ui_types::UiCommand::SetHostRender(
+            wind_ui_types::HostRenderArc(mgr),
         ));
     }
 
@@ -2193,7 +2193,7 @@ impl Coordinator {
             .input_diag_sections
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let view = wind_ui::manager::InputDiagView {
+        let view = wind_ui_types::InputDiagView {
             process_name,
             pid,
             disabled,
@@ -2208,7 +2208,7 @@ impl Coordinator {
         };
         let _ = self
             .ui_tx
-            .send(wind_ui::manager::UiCommand::ShowInputDiag(view));
+            .send(wind_ui_types::UiCommand::ShowInputDiag(view));
     }
 
     /// 查 `compat.toml` 中该进程的初始中英规则；`None` = 未配置（不干预）。
@@ -4028,12 +4028,13 @@ impl Coordinator {
         let total_pages = self.total_pages(state);
         let selected = state.selected_index.min(items.len().saturating_sub(1));
         // 悬停目标独立于选中项：候选越界视为无悬停，翻页器 tag 原样透传
-        let hover = match self.hover_target() {
-            h if (0..wind_ui::manager::HOVER_PAGE_PREV).contains(&h) => {
-                if (h as usize) < items.len() { h } else { -1 }
-            }
-            h => h, // 翻页器 tag / -1
-        };
+        let hover =
+            match self.hover_target() {
+                h if (0..wind_ui_types::HOVER_PAGE_PREV).contains(&h) => {
+                    if (h as usize) < items.len() { h } else { -1 }
+                }
+                h => h, // 翻页器 tag / -1
+            };
         // preedit 是否嵌入宿主（app_inline）：嵌入时编码插入宿主、光标随输入右移，候选窗须锚在
         // 组合起点（缓冲头部）而非跟随光标末尾；非嵌入时 preedit 在候选窗、宿主光标不动，用当前光标。
         // 该标志同时门控下方 preedit 是否下发候选窗渲染（嵌入时候选窗不重复显示 preedit）。
@@ -4513,8 +4514,8 @@ impl Coordinator {
             self.clear_hover();
             return;
         }
-        let new_hover = if target == wind_ui::manager::HOVER_PAGE_PREV
-            || target == wind_ui::manager::HOVER_PAGE_NEXT
+        let new_hover = if target == wind_ui_types::HOVER_PAGE_PREV
+            || target == wind_ui_types::HOVER_PAGE_NEXT
         {
             target // 翻页器悬停
         } else if target >= 0 {
@@ -5897,7 +5898,7 @@ impl MessageHandler for Coordinator {
 
     /// macOS `.app` 回传统一菜单选择：由菜单 id 还原动作并派发。
     fn handle_menu_action_id(&self, id: i32) {
-        if let Some(kind) = wind_ui::manager::MenuKind::from_menu_id(id) {
+        if let Some(kind) = wind_ui_types::MenuKind::from_menu_id(id) {
             self.menu_action(kind);
         } else {
             tracing::debug!("handle_menu_action_id: 未知菜单 id {}", id);
@@ -5973,15 +5974,15 @@ impl MessageHandler for Coordinator {
     fn handle_candidate_hover(&self, page_local_index: i32) {
         #[cfg(windows)]
         let target = match page_local_index {
-            -2 => wind_ui::manager::HOVER_PAGE_PREV,
-            -3 => wind_ui::manager::HOVER_PAGE_NEXT,
+            -2 => wind_ui_types::HOVER_PAGE_PREV,
+            -3 => wind_ui_types::HOVER_PAGE_NEXT,
             v if v >= 0 => v,
             _ => -1,
         };
         #[cfg(not(windows))]
         let target = match page_local_index {
-            -1 => wind_ui::manager::HOVER_PAGE_PREV,
-            -2 => wind_ui::manager::HOVER_PAGE_NEXT,
+            -1 => wind_ui_types::HOVER_PAGE_PREV,
+            -2 => wind_ui_types::HOVER_PAGE_NEXT,
             v if v >= 0 => v,
             _ => -1,
         };
@@ -6020,7 +6021,7 @@ impl MessageHandler for Coordinator {
 
     /// macOS `.app` 候选右键动作：动作串 → 词条操作/复制，作用于页内下标候选。
     fn handle_candidate_context_menu(&self, page_local_index: i32, action: &str) {
-        use wind_ui::manager::{CandidateOp, UiCommand};
+        use wind_ui_types::{CandidateOp, UiCommand};
         if page_local_index < 0 {
             return;
         }
@@ -6063,7 +6064,7 @@ impl MessageHandler for Coordinator {
         // 若在此调 show_main_menu 会把协调器置 menu_open=true 并经 forward_menu_key 吞掉后续
         // 所有按键，而 macOS 无弹窗、永不回 MenuClose → 输入被永久卡死 (打字无响应)。
         #[cfg(not(target_os = "macos"))]
-        self.show_main_menu(wind_ui::manager::MenuAnchor::at_point(x, y));
+        self.show_main_menu(wind_ui_types::MenuAnchor::at_point(x, y));
         #[cfg(target_os = "macos")]
         let _ = (x, y);
     }

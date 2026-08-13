@@ -46,8 +46,8 @@ impl QuickFormatOp {
     /// 两处语义有偏移，菜单标签必须相应改写（在 `show_candidate_menu` 里）：
     /// - `Delete` 对候选是「从词库屏蔽这个词」，对格式是「不再显示这种写法」；
     /// - `Reset` 对候选是「恢复这一条」，对格式是「恢复**整类**」（停用后点不到单条）。
-    pub fn from_candidate_op(op: wind_ui::manager::CandidateOp) -> Self {
-        use wind_ui::manager::CandidateOp as C;
+    pub fn from_candidate_op(op: wind_ui_types::CandidateOp) -> Self {
+        use wind_ui_types::CandidateOp as C;
         match op {
             C::MoveTop => Self::MoveTop,
             C::MoveUp => Self::MoveUp,
@@ -179,7 +179,7 @@ impl Coordinator {
     /// 菜单给了入口而这里落到另一条路径，用户会看到「点了没反应」且日志干净。
     pub(crate) fn candidate_or_quick_format_op(
         &self,
-        op: wind_ui::manager::CandidateOp,
+        op: wind_ui_types::CandidateOp,
         page_local: usize,
     ) {
         let scope = {

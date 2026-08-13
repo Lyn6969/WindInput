@@ -11,7 +11,7 @@ use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_config::BoundAction;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
-use wind_ui::manager::UiCommand;
+use wind_ui_types::UiCommand;
 
 /// 方案级按键功能表对某个键的裁决，见 [`Coordinator::bound_key_decision`]。
 pub(crate) enum BoundKeyDecision {

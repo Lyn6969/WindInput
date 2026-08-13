@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
 use wind_config::BoundAction;
 use wind_config::Config;
-use wind_ui::manager::UiCommand;
+use wind_ui_types::UiCommand;
 
 use crate::coordinator::{numpad_char, printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
