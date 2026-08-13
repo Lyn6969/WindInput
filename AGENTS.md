@@ -17,13 +17,14 @@
 
 ## Crate 索引
 
-> workspace 共 19 个 crate（均在 `wind_input/crates/`）。复杂 crate 已配 crate 级 `AGENTS.md`，改动前先读对应文档；新增/重构 crate 时参照同结构补文档。
+> workspace 共 20 个 crate（均在 `wind_input/crates/`）。复杂 crate 已配 crate 级 `AGENTS.md`，改动前先读对应文档；新增/重构 crate 时参照同结构补文档。
 
 | Crate | 职责 | crate 文档 |
 |---|---|---|
 | `wind-coordinator` | 输入法“大脑”：按键路由、状态机、候选与模式切换的中央协调器 | [AGENTS.md](wind_input/crates/wind-coordinator/AGENTS.md) |
 | `wind-engine` | Schema 驱动的引擎工厂：拼音/码表/混输/英文四类引擎的构建、切换与候选分发 | [AGENTS.md](wind_input/crates/wind-engine/AGENTS.md) |
 | `wind-ui` | 所有浮层窗口（候选窗/工具栏/菜单/状态泡/Toast/Tooltip）的渲染与鼠标交互 | [AGENTS.md](wind_input/crates/wind-ui/AGENTS.md) |
+| `wind-ui-types` | 表现层协议（纯数据）：`UiCommand`/`UiEvent` 及载荷，协调器 ↔ 任意前端（桌面/macOS/Android）共用 | [AGENTS.md](wind_input/crates/wind-ui-types/AGENTS.md) |
 | `wind-cmdbar` | 命令直通车：短语解析 → AST 求值 → 动作执行（纯逻辑） | [AGENTS.md](wind_input/crates/wind-cmdbar/AGENTS.md) |
 | `wind-dict` | 多层复合词典引擎：DictLayer/CompositeDict 查询 + wdat mmap 二进制词库 | [AGENTS.md](wind_input/crates/wind-dict/AGENTS.md) |
 | `wind-store` | 基于 redb 的用户数据持久化：按方案隔离用户词/词频/Shadow，全局存短语 | [AGENTS.md](wind_input/crates/wind-store/AGENTS.md) |
@@ -46,6 +47,29 @@
 核心输入链路（词库 → 五类引擎 → 候选后处理）的**现状架构文档**见
 [docs/architecture/engine-candidate-pipeline.md](docs/architecture/engine-candidate-pipeline.md)
 （含混输拼音否决、顶码/满码一致性、各模式流程对比）；改引擎/候选逻辑时同步更新该文档。
+
+## 平台分层策略——平台/系统依赖放哪
+
+Android 复用（进程内直调 headless coordinator）落地后，「平台代码放哪」是立约级问题。
+新写任何 `cfg(windows)` / `cfg(target_os = …)` / 平台 crate 依赖之前，按下表定归属：
+
+| 你要加的东西 | 归属 | 先例 |
+|---|---|---|
+| 协调器 ↔ 前端之间流转的**数据类型** | `wind-ui-types`（三条红线见其 AGENTS.md：仅纯数据、依赖过 android check、平台载荷走 target-specific + cfg 变体） | `UiCommand`；唯一平台载荷 `SetHostRender` |
+| 引擎/词库/候选/配置等**纯逻辑** | 对应纯逻辑 crate，**零平台依赖**（引入前先问「Android 上编得过吗」） | wind-engine / wind-dict / wind-candidate 等全员 |
+| 协调器逻辑中途要**同步 pull** 的平台能力，且 cfg 兜底值是语义错误 | `HostServices` trait 注入面（coordinator/src/host_services.rs，收录判据三条见模块文档） | 剪贴板三方法 |
+| 平台状态有**事件推送通路**可注入 | 用注入路，**不要**造第二个 pull 真相源 | 宿主进程名走焦点事件喂 `pid_names` |
+| cfg 兜底值在缺失平台**可接受**的探测函数 | 同名函数三平台并列 cfg + 兜底，不进 trait | `theme_style.rs::system_prefers_dark`（三实现范例）、`is_foreground_fullscreen`→false |
+| **整模块**平台专属的功能 | `lib.rs` 处整模块 cfg（聚类，勿散落函数内） | `direct_switch`（windows）、`handle_cmdbar_macos`、wind-bridge 的 `*_unix`/`*_windows` 模块族 |
+| **桌面渲染路径**（窗口/UI 线程/渲染注入） | wind-coordinator 的 `desktop-ui` feature（default 含）；`--no-default-features` 即 headless/Android 形态 | 生产构造器 `new`、`UiManager` |
+
+编译门与防走样（命令即 `wind_input/.cargo/config.toml` 的 alias，CI 强制）：
+`cargo check-headless`（host 无 wind-ui 形态）、`cargo check-android`（依赖闭包过
+aarch64-linux-android；⚠ zstd-sys 等 C 依赖的 build script 需 NDK clang，本机无 NDK 时由
+CI 承接）、CI 另有 `cargo tree` 断言 coordinator 无 wind-ui 依赖边。
+
+已知 Android target 坑：bionic 无 POSIX SHM（`shared_memory_posix` 已 cfg 排除）；
+「check 不链接故无需 NDK」对 `-sys` crate **不成立**（build script 要编 C 源）。
 
 ## 虚拟键码（VK）—— 用常量，禁止裸十六进制
 
@@ -264,8 +288,10 @@ $env:WIND_REMOTE_SLOT = "off"    # 关掉槽位，与主树共用目录（串台
 ### Linux 交叉（MinGW，`scripts/dev.sh`）
 
 - 编译检查：`cargo check --target x86_64-pc-windows-gnu -p <crate>`（`wind_input/` 下）。
-- host 单测仅限 `wind-engine` / `wind-dict` / `wind-config` / `wind-transform` 等无 Windows
-  依赖的 crate；**`wind-coordinator` 传递依赖 `windows` crate，不能在 Linux host 跑测试**。
+- host 单测：`windows` crate 全员是 `cfg(windows)` 依赖，Linux host 上不参与编译——
+  `wind-coordinator` 也可直接 `cargo test -p wind-coordinator`（旧说法「传递依赖 windows
+  不能跑」已随 wind-ui 解耦作废；CI 的 test 正是跑在 ubuntu 上）。注意集成测试的
+  `build_dev/data` 假绿判据（见下方「注意」）。
 - 部署调试版到 Windows：`scripts/dev.sh push debug`（配置见 `scripts/deploy.local`）。
 
 ### macOS 本机（`scripts/mac/dev.sh`）
