@@ -279,7 +279,17 @@ function Build-Portable ([string]$profile = "release", [string]$outdir = $null) 
 
 # ---------- 代码质量 ----------
 function Do-Check  { Say "`n正在运行 cargo check (全工作区)...";  Push-Location $ProjectRoot; try { cargo check --workspace }  finally { Pop-Location } }
-function Do-Clippy { Say "`n正在运行 cargo clippy (全工作区)..."; Push-Location $ProjectRoot; try { cargo clippy --workspace } finally { Pop-Location } }
+# -Deny 把警告升为错误(CI 走这条)。本地 `dev.ps1 l` 不带, 迭代中途的 warning 不该中断。
+# --all-targets 不可省: 不带它连测试代码都不检查, 而测试里同样会长出警告。
+function Do-Clippy {
+    param([switch]$Deny)
+    Say "`n正在运行 cargo clippy (全工作区含测试)..."
+    Push-Location $ProjectRoot
+    try {
+        if ($Deny) { cargo clippy --workspace --all-targets -- -D warnings }
+        else { cargo clippy --workspace --all-targets }
+    } finally { Pop-Location }
+}
 function Do-Test   { Say "`n正在运行 cargo test (全工作区)...";   Push-Location $ProjectRoot; try { cargo test --workspace }   finally { Pop-Location } }
 function Do-Fmt    { Say "`n正在运行 cargo fmt...";                Push-Location $ProjectRoot; try { cargo fmt }                finally { Pop-Location } }
 function Do-FmtCheck { Say "`n正在运行 cargo fmt --check...";      Push-Location $ProjectRoot; try { cargo fmt --all -- --check } finally { Pop-Location } }
@@ -294,7 +304,7 @@ function Do-Ci {
     Push-Location $ProjectRoot
     try {
         Do-FmtCheck; if ($LASTEXITCODE -ne 0) { ErrMsg "fmt 检查失败!"; return $false }
-        Do-Clippy;   if ($LASTEXITCODE -ne 0) { ErrMsg "clippy 失败!"; return $false }
+        Do-Clippy -Deny; if ($LASTEXITCODE -ne 0) { ErrMsg "clippy 失败!"; return $false }
         Do-Test;     if ($LASTEXITCODE -ne 0) { ErrMsg "test 失败!";   return $false }
     } finally { Pop-Location }
     Say "`nCI 全部通过 ✓"; return $true

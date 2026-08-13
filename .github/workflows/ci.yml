@@ -102,9 +102,11 @@ jobs:
         working-directory: wind_macos
         run: swift test
 
+      # 与 Linux job 的 dev.sh ci 同一门禁口径：--all-targets 覆盖测试代码，-D warnings 挂新警告。
+      # darwin 与 windows 走的 cfg 分支不同，本条是 macOS-only 代码的唯一 lint 关卡。
       - name: Clippy wind_input (darwin)
         working-directory: wind_input
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test wind_input (Rust core, darwin)
         working-directory: wind_input

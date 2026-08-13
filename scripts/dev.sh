@@ -199,9 +199,13 @@ do_check() {
 }
 
 do_clippy() {
-    say "\n正在运行 cargo clippy ($TARGET, 全工作区)..."
-    # 注:暂不加 -D warnings(现存 ~36 个 warning 待并发会话稳定后单独清理)
-    cd "$PROJECT_ROOT" && cargo_xwin clippy --target "$TARGET" --workspace
+    # 传 "deny" 时把警告升为错误(CI 走这条)。本地 `dev.sh l` 不传, 迭代中途的 warning
+    # 不该直接中断; 门禁只在 CI 上生效。
+    # --all-targets 不可省: 不带它连测试代码都不检查, 而测试里同样会长出警告。
+    local deny_args=()
+    [ "${1:-}" = "deny" ] && deny_args=(-- -D warnings)
+    say "\n正在运行 cargo clippy ($TARGET, 全工作区含测试)..."
+    cd "$PROJECT_ROOT" && cargo_xwin clippy --target "$TARGET" --workspace --all-targets "${deny_args[@]}"
 }
 
 do_test() {
@@ -233,7 +237,7 @@ do_clean() {
 do_ci() {
     cd "$PROJECT_ROOT" || return 1
     do_fmt_check || { err "fmt 检查失败!"; return 1; }
-    do_clippy    || { err "clippy 失败!"; return 1; }
+    do_clippy deny || { err "clippy 失败!"; return 1; }
     do_test      || { err "test 失败!"; return 1; }
     say "\nCI 全部通过 ✓"
 }
