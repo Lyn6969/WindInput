@@ -582,11 +582,14 @@ mod tests {
     #[test]
     fn commit_and_enter_special_writes_no_guide_prefix() {
         let c = coord_with_overlays("enter_empty", Config::default(), &["zz_rare"]);
+        // 下标必须按 id 现取, 不能硬编码 0——见 `special_mode_idx_locates_by_registry_order`
+        // 的说明: 注册表会一并收进用户目录里真实安装的 overlay 方案, 绝对下标随之平移。
+        let idx = c.special_mode_idx("zz_rare").expect("zz_rare 应在表内");
         let mut st = c.state.lock().unwrap();
         st.chinese_mode = true;
         // 空缓冲进入：无半成品可上屏 → 返回 UpdateComposition，组合区无引导符。
-        let act = c.commit_and_enter_special_mode(&mut st, 0, 0);
-        assert_eq!(st.active, Some(ModeKind::Special(0)));
+        let act = c.commit_and_enter_special_mode(&mut st, idx, 0);
+        assert_eq!(st.active, Some(ModeKind::Special(idx)));
         assert!(
             st.special_prefix.is_empty(),
             "热键进入不应写引导符（special_prefix 应空）"
@@ -597,6 +600,10 @@ mod tests {
     #[test]
     fn commit_and_enter_special_commits_pending_candidate() {
         let c = coord_with_overlays("enter_commit", Config::default(), &["zz_rare"]);
+        // 同上：硬编码 0 会在装了真实 overlay 方案的开发机上落到别人的方案头上。
+        // 本用例尤其致命——真实快符方案 `kf` 配了 `show_all_on_enter = true`，进入即装填
+        // 候选，末尾的「候选应清空」断言必挂，而 CI 因无用户方案目录照常全绿。
+        let idx = c.special_mode_idx("zz_rare").expect("zz_rare 应在表内");
         let mut st = c.state.lock().unwrap();
         st.chinese_mode = true;
         // 模拟普通输入半成品：编码 + 高亮候选。
@@ -607,13 +614,13 @@ mod tests {
         }];
         st.selected_index = 0;
         st.current_page = 0;
-        let act = c.commit_and_enter_special_mode(&mut st, 0, 0);
+        let act = c.commit_and_enter_special_mode(&mut st, idx, 0);
         // 进入前的高亮候选应作为 InsertText 上屏，随后进入目标模式、组合区无引导符。
         match act {
             KeyAction::InsertText { text, .. } => assert_eq!(text, "工"),
             other => panic!("应上屏半成品并进入模式，实际 {other:?}"),
         }
-        assert_eq!(st.active, Some(ModeKind::Special(0)));
+        assert_eq!(st.active, Some(ModeKind::Special(idx)));
         assert!(st.special_prefix.is_empty());
         assert!(st.candidates.is_empty());
     }
