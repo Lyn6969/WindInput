@@ -370,6 +370,16 @@ mod imp {
                     .factory
                     .CreateTextLayout(&wide, &fmt, max_w.max(1.0), max_h.max(1.0))
                     .map_err(|e| format!("CreateTextLayout: {e}"))?;
+                // 关闭自动换行：本 View 引擎是单行盒模型，容不下 DirectWrite 自作主张的折行。
+                //
+                // 测量与绘制传的 max_w 本就不同——测量传 f32::MAX（不换行），绘制传缓冲宽度。
+                // 于是文本一旦宽过缓冲，布局按单行高度排、绘制却折成多行，多出来的行直接画到
+                // 节点框外，盖住相邻候选。竖排的 behavior.vertical_max_width 默认 600，会把
+                // 窗口宽度钳掉，正是触发这条路径的现成入口（约 37 个汉字以上的候选）。
+                //
+                // NO_WRAP 只关**自动**换行，`\n` 硬换行照旧生效（实测：含 \n 的文本仍返回
+                // 2 倍行高）——candidate_window 依赖后者做多行候选，不能一起关掉。
+                let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                 // 节点级字重/字体族覆盖（作用于全文；下方 chaizi PUA 段会再覆盖字体族）。
                 let full = DWRITE_TEXT_RANGE {
                     startPosition: 0,
@@ -973,6 +983,72 @@ mod imp {
         ) -> Result<(), String> {
             Ok(())
         }
+    }
+}
+
+// 换行语义：关自动换行、留硬换行。两条缺一不可——只验前者会让多行候选静默退化成单行，
+// 只验后者则放任溢出继续。需要真实 DirectWrite，gate 到 Windows。
+#[cfg(all(test, windows))]
+mod wrapping_tests {
+    use super::{TextRenderer, TextStyle};
+
+    fn tr() -> TextRenderer {
+        TextRenderer::new("Microsoft YaHei UI", 16.0).expect("建 TextRenderer")
+    }
+
+    /// 自动换行必须关闭：宽过缓冲的文本只画一行（超出部分裁掉），不得折行。
+    ///
+    /// 折行的后果不是「看不全」而是「画到别处」——多出来的行落在节点框外，盖住相邻候选。
+    /// 竖排 `vertical_max_width`（默认 600）会钳窗口宽度，正是触发它的现成入口。
+    #[test]
+    fn long_text_clips_instead_of_wrapping() {
+        let r = tr();
+        let ts = TextStyle::new(16.0);
+        let line_h = r.measure("中", &ts).height;
+
+        const BW: u32 = 60; // 远窄于文本宽度
+        const BH: u32 = 120;
+        let mut buf = vec![255u8; (BW * BH * 4) as usize];
+        r.draw(
+            &mut buf,
+            BW,
+            BH,
+            0.0,
+            0.0,
+            "这是一个很长的候选词条",
+            &ts,
+            [0, 0, 0, 255],
+        )
+        .expect("draw");
+
+        let bottom = (0..BH as i32)
+            .rfind(|&y| (0..BW as i32).any(|x| buf[((y * BW as i32 + x) * 4 + 2) as usize] < 128))
+            .unwrap_or(-1);
+        assert!(
+            bottom >= 0,
+            "字形应当被画出来，否则本用例测的是「什么都没画」"
+        );
+        assert!(
+            (bottom as f32) <= line_h,
+            "宽过缓冲的文本应裁切在单行内（底边 {bottom} ≤ 行高 {line_h:.0}），\
+             实测溢出说明自动换行又被打开了"
+        );
+    }
+
+    /// `\n` 硬换行必须保留——candidate_window 依赖它做多行候选。
+    /// 这是上一条修复的边界：NO_WRAP 只该关自动换行，一起关掉硬换行就是过度修复。
+    #[test]
+    fn hard_newline_still_breaks_lines() {
+        let r = tr();
+        let ts = TextStyle::new(16.0);
+        let one = r.measure("中文", &ts);
+        let two = r.measure("中文\n第二行", &ts);
+        assert!(
+            two.height > one.height * 1.5,
+            "含 \\n 的文本应约为两倍行高（实得 {:.1} vs 单行 {:.1}）",
+            two.height,
+            one.height
+        );
     }
 }
 
