@@ -1512,6 +1512,22 @@ impl Coordinator {
         )
     }
 
+    /// 当前是否有活跃组合（编码缓冲非空）。
+    ///
+    /// 供**无 TSF 前置过滤的宿主**（Android IME）做吃键判定：Windows 侧
+    /// `OnTestKeyDown` 在 IPC 往返前就决定吃不吃键，空缓冲的空格/回车/退格/数字
+    /// 根本不会送进协调器；Android 的 `onKeyDown` 没有这一层，宿主必须自己按
+    /// 「有组合才吃功能键」过滤，否则协调器对这些键返回的 `Consumed`（意为
+    /// 「已在输入法内处理」）会被当成消费，宿主既不上屏也不执行默认行为。
+    pub fn is_composing(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .input_buffer
+            .is_empty()
+    }
+
     /// 无头 + 注入 redb store（测试用）：用于 web_data_rpc 数据域契约测试。
     pub fn new_headless_with_store(
         config: Config,
