@@ -9,7 +9,7 @@
 //!
 //! - **跨平台真实**（Linux 测试 == Windows 行为）：[`view`] 的盒模型布局
 //!   （measure/arrange/collect_hits）与形状绘制（fill_rounded/circle/ring/shadow，
-//!   基于纯 Rust 的 tiny-skia 光栅化）、[`viewbox`]、[`debounce`]、[`image_cache`]。
+//!   基于纯 Rust 的 tiny-skia 光栅化）、[`debounce`]、[`image_cache`]。
 //! - **mock 近似**（Linux 可测但数值是占位）：[`text::dwrite`] 的文本测量在非 Windows
 //!   返回 `字符数 × 字号 × 0.6` 的等宽近似；真实字形宽度需 Windows + DirectWrite。
 //!   含文本的布局测试因此 gate 到 `not(windows)`，以 mock 的确定尺寸做精确断言。
@@ -34,9 +34,7 @@ pub mod manager;
 #[cfg(target_os = "macos")]
 pub mod manager_macos;
 pub mod popup_menu;
-pub mod renderer;
 pub mod screenshot;
-pub mod status;
 pub mod status_tip;
 pub mod sys;
 /// macOS 系统明暗变更监听。对位 Windows 消息泵里的 `WM_SETTINGCHANGE`。
@@ -49,7 +47,6 @@ pub mod toolbar;
 pub mod toolbar_gate;
 pub mod tooltip;
 pub mod view;
-pub mod viewbox;
 pub mod window;
 
 pub use manager::UiManager;
