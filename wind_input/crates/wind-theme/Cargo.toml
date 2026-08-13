@@ -11,3 +11,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }
 resvg = "0.44"
+
+[lints]
+workspace = true

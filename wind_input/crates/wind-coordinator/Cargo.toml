@@ -42,3 +42,6 @@ core-foundation-sys = "0.8"
 wind-config = { path = "../wind-config" }
 wind-bridge = { path = "../wind-bridge" }
 wind-ipc = { path = "../wind-ipc" }
+
+[lints]
+workspace = true

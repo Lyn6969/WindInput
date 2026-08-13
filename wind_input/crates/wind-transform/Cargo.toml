@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 wind-config = { path = "../wind-config" }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

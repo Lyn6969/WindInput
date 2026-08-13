@@ -31,6 +31,20 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+# 全工作区 lint 策略。各成员 crate 以 `[lints] workspace = true` 接入（新建 crate 别忘了加，
+# 否则它不受这里约束）。
+#
+# 这里只放**全工作区一致**的规则；个别函数的例外一律就地 `#[allow(...)]` 并写明理由
+# （如 codec.rs 的线协议编码、view.rs 的绘图基元），不要为了让某一处过关而在此放行整仓。
+#
+# CI 另跑 `clippy --all-targets -- -D warnings`：任何新警告直接挂构建，不再悄悄累积。
+[workspace.lints.clippy]
+# 调试残留与占位实现不得进主干：三者当前全仓为 0 处，设为 deny 即锁住这个状态。
+# `todo!`/`unimplemented!` 尤其隐蔽——它们编译得过、跑到才 panic，是最典型的「假完成」。
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
 # Serialization
 serde = { version = "1", features = ["derive"] }

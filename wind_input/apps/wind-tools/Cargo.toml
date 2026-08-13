@@ -30,3 +30,6 @@ path = "src/bin/gen_emoji_names.rs"
 anyhow = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+
+[lints]
+workspace = true

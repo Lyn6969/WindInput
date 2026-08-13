@@ -17,3 +17,6 @@ toml = { workspace = true }
 
 [dev-dependencies]
 wind-config = { path = "../wind-config" }
+
+[lints]
+workspace = true

@@ -13,3 +13,6 @@ windows = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
+
+[lints]
+workspace = true

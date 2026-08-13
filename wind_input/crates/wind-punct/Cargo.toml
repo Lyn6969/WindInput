@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 wind-config = { path = "../wind-config" }
 wind-transform = { path = "../wind-transform" }
+
+[lints]
+workspace = true

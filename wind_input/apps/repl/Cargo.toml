@@ -15,3 +15,6 @@ wind-engine = { path = "../../crates/wind-engine" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
