@@ -1481,6 +1481,10 @@ impl Coordinator {
     /// 非 Windows 上 `focus_monitor` 恒为 None，故本函数恒为 no-op——位置恢复整体不生效。
     /// 无实际影响：`manager_macos.rs` 的 forwarder 本就把 `SetToolbarPos`/`SetToolbarCorner`
     /// 当留桩丢弃，工具栏在那边由 .app 原生承载。
+    ///
+    /// 桌面构造路径（`new`）专用；headless/Android 入口不经此，故仅在无 desktop-ui 时放行
+    /// dead_code——**不要**整体 feature 门控（同 impl 块的运行期工具栏逻辑配置重载仍要用）。
+    #[cfg_attr(not(feature = "desktop-ui"), allow(dead_code))]
     pub(crate) fn init_toolbar_pos(&self) {
         self.sync_toolbar_monitor();
     }

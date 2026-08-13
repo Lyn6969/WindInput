@@ -1,0 +1,8 @@
+# 别名与验收标准/CI 同一份命令，防命令漂移（见 crates/wind-ui-types/AGENTS.md）。
+[alias]
+# headless 形态（Android/FFI 路径）在 host 上的编译门。
+check-headless = "check -p wind-coordinator --no-default-features"
+# Android target 编译门。check 虽不链接，但 zstd-sys/bzip2-sys（wind-transfer→zip）
+# 的 build script 要编 C 源：需 NDK 交叉 clang（设 CC_aarch64_linux_android/AR_… 指向
+# NDK 的 aarch64-linux-android*-clang / llvm-ar）。本机无 NDK 时此门由 CI 承接。
+check-android = "check -p wind-coordinator --no-default-features --target aarch64-linux-android"

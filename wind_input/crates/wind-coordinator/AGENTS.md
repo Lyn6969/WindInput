@@ -1,5 +1,5 @@
 <!-- Parent: ../../AGENTS.md -->
-<!-- Updated: 2026-06-29 -->
+<!-- Updated: 2026-08-13 -->
 
 # wind-coordinator
 
@@ -26,6 +26,7 @@
 | `src/handle_tooltip.rs` | 候选悬停提示（编码/拆字/拼音反查） |
 | `src/hotkey_match.rs` | key_down 热键匹配 |
 | `src/webdata.rs` | Web 设置数据 RPC（schema/dict/temp/freq/shadow/phrase/stats/theme 命名空间，经 wind-rpc 转发） |
+| `src/host_services.rs` | `HostServices` trait（剪贴板等平台能力注入面）+ 桌面/headless 实现；收录判据见模块文档 |
 | `src/stats.rs` | 输入统计采集 |
 | `src/watchdog.rs` | 看门狗 |
 
@@ -44,14 +45,19 @@
 - **锁与线程**：`State` 由单个 `Mutex` 保护，另有多个细粒度 `Mutex`/`Atomic`（pending_first_show、stat_recorded、fullscreen_cached 等）。cmdbar 动作经独立线程异步执行（`self_weak`），故控制器回调自锁的 coordinator 方法是安全的——切勿在持 `state` 锁时调用会再次取锁的方法。
 - **工具栏显隐**对齐 Go 公式 `ime_active && toolbar_visible`（两者正交，见 `State` 注释），隐藏经 UI 层 50ms 防抖；全屏经 `fullscreen_cached` 后台异步刷新，勿在 bridge handler 线程同步调 `is_foreground_fullscreen`。
 
+### Feature: desktop-ui（headless/Android 形态）
+- `desktop-ui`（默认开）门控桌面渲染路径：生产构造器 `new`、`UiManager`、剪贴板直通、macOS `select_self`。`--no-default-features` 即 headless/Android 形态——入口是 `new_headless_with_ui`（返回 `Receiver<UiCommand>`）+ `inject_ui_event`（反向事件）+ `set_host_services`（剪贴板注入，须在首次使用前）。
+- 编译门（与 CI 同一份命令，alias 见 `wind_input/.cargo/config.toml`）：`cargo check-headless`（host）与 `cargo check-android`（aarch64-linux-android；⚠ zstd-sys 等 C 依赖的 build script 需 NDK clang，本机无 NDK 时由 CI 承接）。数据类型一律从 `wind-ui-types` 引；**headless 路径不得新增对 wind-ui 的引用**（CI 有 `cargo tree` 断言）。
+
 ### Testing Requirements
-- 本 crate **传递依赖 `windows` crate**（自身 `cfg(windows)` + 经 wind-bridge/wind-ui/wind-ipc 等），**不能在 host 跑 `cargo test -p wind-coordinator`**；需 Windows 目标交叉编译 / 设备验证。
-- 纯逻辑函数（`en_case_variants`/`parse_pairs`/`punct_char` 等）逻辑独立，可借设备/CI 上的集成测试或无头构造器（`new_headless`）覆盖。
+- **host 可直接 `cargo test -p wind-coordinator`**（Windows/macOS host 全量；`windows` crate 是 `cfg(windows)` 依赖，非对应平台不参与编译）。历史说法「传递依赖 windows 不能 host 测」已随 wind-ui 解耦作废。
+- ⚠️ 集成测试依赖 `build_dev/data`，缺失时**静默跳过且计数照绿**——以 `--test input_flow` 耗时 ≥1s 为数据在位判据（见根 AGENTS.md）。
+- 纯逻辑函数（`en_case_variants`/`parse_pairs`/`punct_char` 等）逻辑独立，经无头构造器（`new_headless` 族）覆盖。
 
 ## Dependencies
 
 ### Internal
-- `wind-ipc`（协议常量/键 hash）、`wind-bridge`（MessageHandler/KeyEventData/Push）、`wind-config`、`wind-store`（redb 持久化）、`wind-dict`、`wind-engine`、`wind-candidate`、`wind-transform`、`wind-theme`、`wind-ui`、`wind-cmdbar`、`wind-phrase`、`wind-keys`（keymap/VK/NavKeys）、`wind-quick-input`、`wind-reverse`、`wind-punct`
+- `wind-ipc`（协议常量/键 hash）、`wind-bridge`（MessageHandler/KeyEventData/Push）、`wind-config`、`wind-store`（redb 持久化）、`wind-dict`、`wind-engine`、`wind-candidate`、`wind-transform`、`wind-theme`、`wind-ui-types`（UiCommand/UiEvent 等表现层协议）、`wind-ui`（**optional，desktop-ui feature**：UiManager/剪贴板/macOS forwarder）、`wind-cmdbar`、`wind-phrase`、`wind-keys`（keymap/VK/NavKeys）、`wind-quick-input`、`wind-reverse`、`wind-punct`
 
 ### External
 - `tracing`、`anyhow`、`serde`/`serde_json`、`toml`、`chrono`、`fontdb`；`windows`（仅 `cfg(windows)`）。无 tokio（2026-07 移除，全 workspace 同步线程模型）

@@ -35,8 +35,18 @@ pub trait HostServices: Send + Sync {
 
 /// 桌面实现：直通 `wind_ui::popup_menu` 的三平台剪贴板
 /// （Windows CF_UNICODETEXT + 序列号缓存 / macOS pbcopy·pbpaste + Pasteboard 缓存）。
+#[cfg(feature = "desktop-ui")]
 pub struct DesktopHostServices;
 
+/// headless 默认实现：全部落 trait 默认（set/get 报错、cached 空串）。
+/// Android FFI 在首次使用前 `set_host_services` 注入 Kotlin 实现替代它。
+#[cfg(not(feature = "desktop-ui"))]
+pub struct NullHostServices;
+
+#[cfg(not(feature = "desktop-ui"))]
+impl HostServices for NullHostServices {}
+
+#[cfg(feature = "desktop-ui")]
 impl HostServices for DesktopHostServices {
     fn clipboard_set_text(&self, text: &str) -> anyhow::Result<()> {
         // try 版传播失败（OpenClipboard 被占用重试后仍失败等）；

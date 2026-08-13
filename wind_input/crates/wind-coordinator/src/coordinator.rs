@@ -38,7 +38,7 @@ use wind_transform::punctuation::PunctuationConverter;
 use wind_ui_types::CandidateItem;
 use wind_ui_types::{GlobalHotkeyEntry, UiCommand, UiEvent};
 // UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(feature = "desktop-ui", not(target_os = "macos")))]
 use wind_ui::manager::UiManager;
 use wind_ui_types::{ToastKind, ToastPosition};
 
@@ -1181,7 +1181,9 @@ pub(crate) enum InputOutcome {
 }
 
 impl Coordinator {
-    /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程
+    /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程。
+    /// 桌面专属（desktop-ui）：headless/Android 走 `new_headless_with_ui`。
+    #[cfg(feature = "desktop-ui")]
     pub fn new(push_server: Arc<PushServer>) -> Arc<Self> {
         let data_dir = Config::data_dir();
         let config = Config::load(data_dir.as_deref()).unwrap_or_default();
@@ -1381,10 +1383,18 @@ impl Coordinator {
         let _ = self.host_services.set(svc);
     }
 
-    /// 宿主服务访问点；未注入时落默认实现（桌面剪贴板直通）。
+    /// 宿主服务访问点；未注入时落默认实现（桌面剪贴板直通 / headless no-op）。
     pub(crate) fn host_services(&self) -> &Arc<dyn crate::host_services::HostServices> {
-        self.host_services
-            .get_or_init(|| Arc::new(crate::host_services::DesktopHostServices))
+        self.host_services.get_or_init(|| {
+            #[cfg(feature = "desktop-ui")]
+            {
+                Arc::new(crate::host_services::DesktopHostServices)
+            }
+            #[cfg(not(feature = "desktop-ui"))]
+            {
+                Arc::new(crate::host_services::NullHostServices)
+            }
+        })
     }
 
     /// 注入 host-render 管理器（Windows）。服务入口在构造 `BridgeServer` 后调用一次，
@@ -1444,6 +1454,9 @@ impl Coordinator {
         // 无头模式无 UI 消费端：丢弃 rx，notify_ui_* 的 send 会静默失败（已用 `let _ =` 忽略）
         let (ui_tx, _rx) = std::sync::mpsc::channel();
         drop(_rx);
+        // PushServer::new 零副作用（不起线程不开管道，副作用全在 start()，headless
+        // 从不调）；无客户端时 push_* 全是遍历空表的 no-op。勿为 headless 把它
+        // feature 门控——40+ 调用点会跟着裂开，得不偿失。
         let push_server = Arc::new(PushServer::new(PushConfig {
             suffix: String::new(),
             write_timeout_ms: 30_000,
@@ -4373,6 +4386,18 @@ impl Coordinator {
 
     // ———————————————— 鼠标交互（来自 UI 线程的反向事件）————————————————
 
+    /// 注入渲染端反向事件（[`UiEvent`]）——headless/Android FFI 的公开入口。
+    ///
+    /// 桌面路径由 `new` 里 spawn 的事件线程消费 `Receiver<UiEvent>` 后调用同一分发；
+    /// Android 的候选点击/翻页/菜单动作语义上就是 UiEvent，Kotlin 侧经 FFI 直调本方法，
+    /// 不再另设通道（入方向无排队语义，与 `MessageHandler` 的方法直调先例一致）。
+    ///
+    /// 线程契约：可从任意**非协调器回调**线程调用（内部按需自行加锁/推送；
+    /// 与桌面事件线程同款纪律，勿在持 state 锁的回调里重入）。
+    pub fn inject_ui_event(&self, ev: UiEvent) {
+        self.handle_ui_event(ev);
+    }
+
     /// 分发 UI 鼠标事件（在专用线程中执行，可安全加锁/推送）
     fn handle_ui_event(&self, ev: UiEvent) {
         match ev {
@@ -5218,8 +5243,9 @@ impl Coordinator {
                 self.trigger_screenshot();
                 true
             }
-            // macOS 专属：Windows 上该动作由 ctfmon 原生处理，本进程收不到、也不该处理。
-            #[cfg(target_os = "macos")]
+            // macOS 桌面专属：Windows 上该动作由 ctfmon 原生处理，本进程收不到、也不该处理；
+            // headless（无 desktop-ui）落 `_` 臂 debug 忽略。
+            #[cfg(all(feature = "desktop-ui", target_os = "macos"))]
             "activate_ime" => wind_ui::input_source_macos::select_self(),
             _ => {
                 debug!("Unhandled hotkey action: {}", action);

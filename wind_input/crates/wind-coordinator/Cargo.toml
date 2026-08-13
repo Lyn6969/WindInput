@@ -15,9 +15,10 @@ wind-candidate = { path = "../wind-candidate" }
 wind-transform = { path = "../wind-transform" }
 wind-theme = { path = "../wind-theme" }
 # 表现层协议类型（UiCommand/UiEvent 等）；数据类型一律从这里引，wind-ui 只供
-# 桌面构造路径的运行期能力（UiManager/剪贴板/macOS forwarder）。
+# 桌面构造路径的运行期能力（UiManager/剪贴板/macOS forwarder），由 desktop-ui
+# feature 门控——`--no-default-features` 即 headless/Android 形态。
 wind-ui-types = { path = "../wind-ui-types" }
-wind-ui = { path = "../wind-ui" }
+wind-ui = { path = "../wind-ui", optional = true }
 wind-cmdbar = { path = "../wind-cmdbar" }
 wind-phrase = { path = "../wind-phrase" }
 wind-keys = { path = "../wind-keys" }
@@ -40,6 +41,12 @@ winreg = "0.52"
 [target.'cfg(target_os = "macos")'.dependencies]
 # 系统明暗探测（theme_style.rs 读全局偏好 AppleInterfaceStyle）
 core-foundation-sys = "0.8"
+
+[features]
+default = ["desktop-ui"]
+# 桌面渲染路径：UiManager/剪贴板直通/macOS forwarder。关掉即 headless/Android
+# 形态——生产构造器 `new` 不可用，走 `new_headless_with_ui` + 注入 HostServices。
+desktop-ui = ["dep:wind-ui"]
 
 [dev-dependencies]
 wind-config = { path = "../wind-config" }

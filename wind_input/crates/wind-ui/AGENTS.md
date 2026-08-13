@@ -12,16 +12,16 @@
 | File | Description |
 |------|-------------|
 | `src/lib.rs` | 模块导出 + 仅 re-export `UiManager`；顶部注释定义跨平台可测性三层（必读） |
-| `src/manager.rs` | `UiManager` + UI 线程主循环；定义协调器↔UI 协议 `UiCommand`/`UiEvent` 及菜单类型 `MenuItemSpec`/`MenuKind`/`MenuCmd` |
+| `src/manager.rs` | `UiManager` + UI 线程主循环。协议类型（`UiCommand`/`UiEvent`/菜单族）**定义已下沉 wind-ui-types**，此处 `pub use` 再导出保持原路径；加变体时两边同步（见 wind-ui-types/AGENTS.md） |
 | `src/window.rs` | `LayeredWindow`：Win32 `UpdateLayeredWindow` 封装 + `WindowMouse` 鼠标 trait + 非 Windows mock；wnd_proc 鼠标分发 |
 | `src/view.rs` | **实际盒模型引擎**：measure→arrange→paint + 命中矩形提取；圆角/边框/阴影/渐变/九宫格背景图/z 层。各窗口共用 |
-| `src/candidate_window.rs` | 候选窗：从候选构建 View 树、布局、绘制、鼠标命中/悬停防抖、翻页；含 `CandidateItem`/`CandidateWindowConfig` |
+| `src/candidate_window.rs` | 候选窗：从候选构建 View 树、布局、绘制、鼠标命中/悬停防抖、翻页；含 `CandidateWindowConfig`（`CandidateItem` 已下沉 wind-ui-types，原路径再导出） |
 | `src/toolbar.rs` | 常驻工具栏窗口（中英/方案/标点/全半角），可拖动，命中回送 `ToolbarAction`；横/纵朝向见 `bar_layout` |
 | `src/popup_menu.rs` | 级联弹出菜单（右键候选菜单 + 功能主菜单）；多级子菜单、勾选态、键盘导航经协调器 `MenuKey` 转发 |
 | `src/status_tip.rs` | 状态提示气泡（切换中英/标点/全半角/方案时短暂或常驻显示） |
 | `src/toast.rs` | 一次性通知 Toast（按位置/类型配色，定时自动隐藏） |
 | `src/tooltip.rs` | 候选悬停反查气泡（显示编码/拼音） |
-| `src/input_diag_hud.rs` | 输入诊断 HUD：四分区文本浮窗（输入态/窗口链/TSF 实例/HostRender），可拖动、双击复制、右键菜单（复制·显示分类·停止刷新·置顶）。定位三档见 `plan_position`——**已定位时走钳制而非原样沿用**，否则内容变长会被屏幕边缘吞掉；拖动不经此路径，故当次说了算、下次更新钳回。`format_diag_lines` 为纯函数（全部展示语义在此可单测） |
+| `src/input_diag_hud.rs` | 输入诊断 HUD：四分区文本浮窗（输入态/窗口链/TSF 实例/HostRender），可拖动、双击复制、右键菜单（复制·显示分类·停止刷新·置顶）。定位三档见 `plan_position`——**已定位时走钳制而非原样沿用**，否则内容变长会被屏幕边缘吞掉；拖动不经此路径，故当次说了算、下次更新钳回。`format_diag_lines` 与视图类型已下沉 wind-ui-types（纯测试随迁），此处再导出 |
 | `src/text/dwrite.rs` | DirectWrite 文本测量/渲染（预乘 alpha 回写 BGRA）+ 非 Windows mock（0.6×em 等宽近似） |
 | `src/text/backend.rs` | `TextBackend` trait（measure/draw 抽象） |
 | `src/theme_assets.rs` | 把 wind-theme 的 `RvImage` ref 解析为绝对路径并转 `ViewImage`/`ViewLayer` |
