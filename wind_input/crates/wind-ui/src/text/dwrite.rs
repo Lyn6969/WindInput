@@ -925,6 +925,79 @@ mod imp {
     }
 }
 
+// 文字色 alpha 的**像素级**验证：混合公式改的是逐像素算术，只靠逻辑推导不算验过。
+// 需要真实 DirectWrite 出字形，故 gate 到 Windows。
+#[cfg(all(test, windows))]
+mod alpha_text_tests {
+    use super::imp::TextRenderer;
+
+    const W: u32 = 48;
+    const H: u32 = 48;
+
+    /// 不透明白底的 BGRA 预乘缓冲（A=255 时预乘即直通）。
+    fn white_buf() -> Vec<u8> {
+        vec![255u8; (W * H * 4) as usize]
+    }
+
+    /// 缓冲中最暗的 R 通道值。取最暗而非固定坐标——字形的确切落点随字体/hinting 变，
+    /// 但"块体最暗处"这个判据与位置无关。
+    fn darkest_r(buf: &[u8]) -> u8 {
+        buf.chunks_exact(4).map(|p| p[2]).min().unwrap_or(255)
+    }
+
+    /// 在白底画一个全块字符（█ U+2588，覆盖率≈1），返回缓冲。
+    fn draw_block(alpha: u8) -> Vec<u8> {
+        let r = TextRenderer::new("微软雅黑", 32.0).expect("建 TextRenderer");
+        let mut buf = white_buf();
+        r.draw_text_styled(
+            &mut buf,
+            W,
+            H,
+            0.0,
+            0.0,
+            "\u{2588}",
+            32.0,
+            0,
+            None,
+            [0, 0, 0, alpha],
+        )
+        .expect("draw_text_styled");
+        buf
+    }
+
+    /// alpha=255：全块应压到近黑——同时确认字形真的画出来了（否则下一条测了个寂寞）。
+    #[test]
+    fn opaque_text_is_near_black() {
+        let d = darkest_r(&draw_block(255));
+        assert!(d < 64, "不透明黑块中心应近黑，实得 {d}");
+    }
+
+    /// alpha=128：同一个全块应落在中灰，而非近黑。
+    ///
+    /// 这是修复前后的分水岭——旧实现丢弃 `color[3]`，此处会与上一条同样得到近黑。
+    /// 区间放宽到 96..=176 以容纳字体覆盖率与 ClearType 的差异；判据是"明显不是黑"。
+    #[test]
+    fn half_alpha_text_blends_to_midtone() {
+        let d = darkest_r(&draw_block(128));
+        assert!(
+            (96..=176).contains(&d),
+            "50% alpha 黑块应混成中灰（96..=176），实得 {d}——落在近黑说明 alpha 又被丢了"
+        );
+    }
+
+    /// 单调性：alpha 越低，字越淡。比固定区间更稳，不受字体覆盖率影响。
+    #[test]
+    fn lower_alpha_yields_lighter_text() {
+        let opaque = darkest_r(&draw_block(255));
+        let half = darkest_r(&draw_block(128));
+        let faint = darkest_r(&draw_block(48));
+        assert!(
+            opaque < half && half < faint,
+            "alpha 越低字应越淡，实得 255→{opaque} 128→{half} 48→{faint}"
+        );
+    }
+}
+
 // 测量缓存的**接线**测试：键函数再正确，没接进 `measure_text_styled` 也是白搭，
 // 而 `measure_key_tests` 直接调键函数，接线断了它照样全绿。这里从公开的测量入口进，
 // 用缓存条目数确认它真的被查过、被写过。
