@@ -307,10 +307,12 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     }
 
     // Get current modifiers and calculate key hash
-    uint32_t modifiers = CHotkeyManager::GetCurrentModifiers();
-    uint32_t keyHash = CHotkeyManager::CalcKeyHash(modifiers, (uint32_t)wParam);
-
     // For function hotkeys (like Ctrl+`), use normalized modifiers (no left/right distinction)
+    //
+    // 只算归一化这一份：本函数下游的每一处查表都用它。此处原先还并列着一份非归一化的
+    // `keyHash`，自「统一走归一化」之后就无人读了——留着会让排查「热键配了没反应」的人
+    // 以为这里还有第二条匹配路径，而 hash 失配恰恰是那类问题的头号嫌疑。
+    uint32_t modifiers = CHotkeyManager::GetCurrentModifiers();
     uint32_t normalizedMods = CHotkeyManager::NormalizeModifiers(modifiers);
     uint32_t normalizedKeyHash = CHotkeyManager::CalcKeyHash(normalizedMods, (uint32_t)wParam);
 
@@ -825,10 +827,12 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // IPC 断连时的兜底见下方 `ipc_failed_*` 分支：那时不能吐成 pfEaten=FALSE（已经吃了），
     // 否则不补发 WM_KEYDOWN 的宿主直接丢字符。
 
-    uint32_t modifiers = CHotkeyManager::GetCurrentModifiers();
-    uint32_t keyHash = CHotkeyManager::CalcKeyHash(modifiers, (uint32_t)wParam);
-
     // For function hotkeys (like Ctrl+`), use normalized modifiers (no left/right distinction)
+    //
+    // 只算归一化这一份：本函数下游的每一处查表都用它。此处原先还并列着一份非归一化的
+    // `keyHash`，自「统一走归一化」之后就无人读了——留着会让排查「热键配了没反应」的人
+    // 以为这里还有第二条匹配路径，而 hash 失配恰恰是那类问题的头号嫌疑。
+    uint32_t modifiers = CHotkeyManager::GetCurrentModifiers();
     uint32_t normalizedMods = CHotkeyManager::NormalizeModifiers(modifiers);
     uint32_t normalizedKeyHash = CHotkeyManager::CalcKeyHash(normalizedMods, (uint32_t)wParam);
 
@@ -2447,8 +2451,12 @@ BOOL CKeyEventSink::_SendCommitRequest(uint16_t barrierSeq, uint16_t triggerKey,
     }
 
     // Build CommitRequestPayload
-    size_t payloadSize = sizeof(CommitRequestPayload) - sizeof(uint32_t) + 4 + inputBuffer.size();
-    std::vector<uint8_t> payload(12 + inputBuffer.size());
+    //
+    // 尺寸跟着结构体走，不写字面量 12：`sizeof` 有 BinaryProtocol.h 里的 static_assert
+    // 兜底，结构体一旦改动这里自动跟随；写死的 12 只会在改动那天悄悄少写几个字节。
+    // （此前两者并存——算了 payloadSize 却用字面量开 vector，数值恰好相等而已。）
+    size_t payloadSize = sizeof(CommitRequestPayload) + inputBuffer.size();
+    std::vector<uint8_t> payload(payloadSize);
 
     // Header fields
     payload[0] = barrierSeq & 0xFF;

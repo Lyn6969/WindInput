@@ -2371,15 +2371,17 @@ void CIPCClient::_AsyncReaderLoop()
                 // Read completed
                 if (!GetOverlappedResult(_hReadPipe, &overlapped, &bytesRead, FALSE))
                 {
-                    DWORD error = GetLastError();
-                    if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
+                    // 名字不能再叫 error：外层 ReadFile 的错误码还在作用域里，同名会遮蔽它，
+                    // 读日志时分不清报的是哪一步失败。
+                    DWORD ovlError = GetLastError();
+                    if (ovlError == ERROR_BROKEN_PIPE || ovlError == ERROR_PIPE_NOT_CONNECTED)
                     {
                         _LogInfo(L"Async reader: pipe disconnected, will reconnect...");
                         CloseHandle(_hReadPipe);
                         _hReadPipe = INVALID_HANDLE_VALUE;
                         continue;
                     }
-                    _LogError(L"Async reader: GetOverlappedResult failed: %d", error);
+                    _LogError(L"Async reader: GetOverlappedResult failed: %d", ovlError);
                     continue;
                 }
             }

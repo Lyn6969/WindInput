@@ -100,9 +100,14 @@ target_compile_definitions(${TSF_TARGET_NAME} PRIVATE
 )
 
 # 添加编译选项
+#
+# 警告级别与 Makefile(clang 交叉编译)那条路径保持同一口径, 见 wind_tsf/Makefile 的 WARNFLAGS。
+# 两条路径此前不一致: 这里 /W3、那里一个 -W 都没有, 于是 CI 对 C++ 警告实际上是全盲的。
 target_compile_options(${TSF_TARGET_NAME} PRIVATE
-    /utf-8  # 使用 UTF-8 编码
-    /W3     # 警告级别3
+    /utf-8   # 使用 UTF-8 编码
+    /W4      # 警告级别4
+    /wd4100  # 未引用的形参: COM 接口与系统回调(DllMain/ITfKeyEventSink/ITfLangBarItem 等)
+             # 签名由接口定义, 用不到的参数是常态而非漏用。全仓 23 处已逐一核对确认。
 )
 
 # 从模板生成模块定义文件（LIBRARY 名称随 TSF_TARGET_NAME 变化）

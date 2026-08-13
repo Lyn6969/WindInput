@@ -75,10 +75,21 @@ LIBFLAGS := -Xlinker /LIBPATH:$(XWIN_ROOT)/crt/lib/$(LIBARCH) \
             -Xlinker /LIBPATH:$(XWIN_ROOT)/sdk/lib/um/$(LIBARCH) \
             -Xlinker /LIBPATH:$(XWIN_ROOT)/sdk/lib/ucrt/$(LIBARCH)
 
+# ---- 警告选项 ----
+# 与 CMakeLists.txt(本机 MSVC 构建)的 /W4 /wd4100 同一口径。
+#
+# 此前这里一个 -W 都没有 —— clang 默认只报极少数问题，而 CI 的 Linux job 恰好走这条路径，
+# 等于 C++ 侧根本没有编译期检查。两条构建路径的警告级别必须一起改，否则改了一边等于没改。
+#
+# -Wno-unused-parameter 对应 MSVC 的 /wd4100：COM 接口与系统回调签名固定，用不到的参数是
+# 常态。不加 -Werror：本文件走的是 Linux→Windows 交叉编译，clang 与 MSVC 的警告集合并不
+# 重合，先让它把话说出来，确认干净后再考虑升级为错误。
+WARNFLAGS := -Wall -Wextra -Wno-unused-parameter
+
 # ---- 编译 / 链接选项 ----
 # -fms-runtime-lib=static：静态链接 MSVC CRT，DLL 自包含（无需目标机装 VC++ 运行库）。
 # 不带 -g：无调试信息，DLL 本体即已精简（无需再 strip）。
-CXXFLAGS := --target=$(TRIPLE) -fms-runtime-lib=static -std=c++17 -O2 \
+CXXFLAGS := --target=$(TRIPLE) -fms-runtime-lib=static -std=c++17 -O2 $(WARNFLAGS) \
   -DUNICODE -D_UNICODE -D_WINDOWS -D_USRDLL $(VARFLAGS) \
   -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
   -Iinclude -Isrc $(INCFLAGS)
