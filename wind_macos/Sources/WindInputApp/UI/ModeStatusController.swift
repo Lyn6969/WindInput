@@ -118,7 +118,7 @@ public final class ModeStatusController: NSObject, NSMenuDelegate {
     }
 
     /// 打开设置应用 (wind_setting.app, Rust + windui)。经 LaunchServices 按 bundleID 查找并启动,
-    /// 已在运行则激活已有窗口 (macOS .app 天然单实例)。
+    /// 已在运行则激活已有窗口 (无参数时; 带深链参数的路径见 openSettings 注释)。
     @objc private func openSettingsMenuAction() { openSettings(arguments: []) }
 
     /// 打开设置应用, arguments 为原样直通的命令行参数 (深链见
@@ -127,6 +127,10 @@ public final class ModeStatusController: NSObject, NSMenuDelegate {
     ///
     /// ⚠️ 已在运行时 LaunchServices **不重传 arguments**, 只激活窗口 —— 深链要在已开着的
     /// 设置窗口上生效, 靠的是 windui 的单实例转发 (二次实例把 argv 发给首实例)。
+    /// 而转发的前提是**真有一个二次进程**: 默认的 openApplication 对已运行的 app 只做
+    /// activate、不 exec 新进程, 转发那条路一步都走不到 (页不动只是窗口闪一下)。故带参数
+    /// 时显式要求新实例 —— 它 acquire 失败后把 argv 经 socket 送给首实例, 随即自行退出。
+    /// 无参数 (托盘「设置…」) 仍走普通激活, 否则每点一次就多开一个窗口。
     public func openSettings(arguments: [String]) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in self?.openSettings(arguments: arguments) }
@@ -141,15 +145,19 @@ public final class ModeStatusController: NSObject, NSMenuDelegate {
         let ws = NSWorkspace.shared
         if let url = ws.urlForApplication(withBundleIdentifier: bundleID) {
             let cfg = NSWorkspace.OpenConfiguration()
-            if !arguments.isEmpty { cfg.arguments = arguments }
+            if !arguments.isEmpty {
+                cfg.arguments = arguments
+                cfg.createsNewApplicationInstance = true
+            }
             ws.openApplication(at: url, configuration: cfg)
         } else {
             // LaunchServices 尚未登记时的兜底: open -b 触发一次注册+启动。
+            // 带参数时同样要 -n 强起新实例, 理由同上 (不加则已运行时 argv 被丢弃)。
             let p = Process()
             p.launchPath = "/usr/bin/open"
             p.arguments = arguments.isEmpty
                 ? ["-b", bundleID]
-                : ["-b", bundleID, "--args"] + arguments
+                : ["-n", "-b", bundleID, "--args"] + arguments
             try? p.run()
         }
     }
