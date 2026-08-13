@@ -40,13 +40,14 @@ pub(crate) fn run_native(cmd: &str, args: &[String], cwd: &str) -> anyhow::Resul
 /// 更可靠。代价：仅纯文本（⌘V 才能粘富文本/图片并触发目标 app 原生粘贴），但对输入法的
 /// 「粘贴」命令纯文本即所需。等价于 `type(clip())`。
 pub(crate) fn paste_via_ime(weak: &Weak<Coordinator>) {
-    let text = wind_ui::popup_menu::get_clipboard_text();
+    let Some(c) = weak.upgrade() else {
+        return;
+    };
+    let text = c.host_services().clipboard_get_text().unwrap_or_default();
     if text.is_empty() {
         return;
     }
-    if let Some(c) = weak.upgrade() {
-        c.push_commit_text(&text);
-    }
+    c.push_commit_text(&text);
 }
 
 /// 构造 macOS 的按键注入服务（[`CoordKeys`]）。

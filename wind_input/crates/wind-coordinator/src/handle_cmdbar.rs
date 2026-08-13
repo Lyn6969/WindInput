@@ -75,6 +75,7 @@ impl Coordinator {
             front_title,
             front_sel,
             services,
+            host: self.host_services().clone(),
         };
         let reg = wind_cmdbar::default_registry();
         let actions = match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
@@ -164,6 +165,7 @@ impl Coordinator {
             front_title,
             front_sel,
             services,
+            host: self.host_services().clone(),
         };
         let reg = wind_cmdbar::default_registry();
         let actions = match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
@@ -199,6 +201,8 @@ struct CmdbarCtx<'a> {
     front_title: String,
     front_sel: String,
     services: &'a Services,
+    /// 宿主服务（clip() 取剪贴板）；随构造从协调器 clone 注入。
+    host: Arc<dyn crate::host_services::HostServices>,
 }
 
 impl EvalContext for CmdbarCtx<'_> {
@@ -214,14 +218,8 @@ impl EvalContext for CmdbarCtx<'_> {
     fn clip(&self, _n: i64) -> String {
         // 仅当前剪贴板（n>1 历史栈未实现）。macOS 走 pbpaste（与 SysClip::get_text 一致），
         // 让 clip() 取值与 clip.copy 写入对称——此前 macOS 硬编码返回空是 bug。
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            wind_ui::popup_menu::get_clipboard_text()
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            String::new()
-        }
+        // 读取失败（含不支持平台）降级空串：clip() 是求值上下文，报错没有落点。
+        self.host.clipboard_get_text().unwrap_or_default()
     }
     fn sel(&self) -> String {
         self.front_sel.clone()
@@ -568,25 +566,25 @@ impl UrlOpener for CoordOpener {
 
 /// 系统剪贴板服务（clip.copy / clip.get / clip.paste）。
 ///
-/// set/get 复用 `wind_ui::popup_menu`：Windows 走 CF_UNICODETEXT，macOS 走 `pbcopy`/`pbpaste`
-/// 子进程（无需 AppKit/主线程，服务进程即可用）；其它 Unix 暂无统一通道。
+/// set/get 经协调器的 [`crate::host_services::HostServices`] 注入面（桌面实现直通
+/// `wind_ui::popup_menu`：Windows 走 CF_UNICODETEXT，macOS 走 `pbcopy`/`pbpaste`
+/// 子进程；其它 Unix 暂无统一通道）。
 /// paste 经按键注入合成粘贴热键（macOS 推 CmdKeyTap 给 .app，见 [`SysClip::paste`]）。
 struct SysClip(Weak<Coordinator>);
 
 impl ClipboardService for SysClip {
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
-        // try 版传播失败（OpenClipboard 被占用重试后仍失败等），run_actions 记 warn；
-        // 菜单"复制"等 best-effort 路径仍用无返回值的 set_clipboard_text。
-        wind_ui::popup_menu::try_set_clipboard_text(text)
+        // 失败传播（OpenClipboard 被占用重试后仍失败等），run_actions 记 warn；
+        // 菜单"复制"等 best-effort 路径仍走 UiCommand::CopyToClipboard 由 UI 侧执行。
+        match self.0.upgrade() {
+            Some(c) => c.host_services().clipboard_set_text(text),
+            None => anyhow::bail!("clip.copy: coordinator 已释放"),
+        }
     }
     fn get_text(&self) -> anyhow::Result<String> {
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            Ok(wind_ui::popup_menu::get_clipboard_text())
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            anyhow::bail!("clip.get: 当前平台暂未支持")
+        match self.0.upgrade() {
+            Some(c) => c.host_services().clipboard_get_text(),
+            None => anyhow::bail!("clip.get: coordinator 已释放"),
         }
     }
     fn paste(&self) -> anyhow::Result<()> {

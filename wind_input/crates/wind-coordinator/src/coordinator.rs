@@ -1086,6 +1086,10 @@ pub struct Coordinator {
     pub(crate) theme_index_labels: Mutex<Vec<String>>,
     /// 命令栏（cmdbar）服务束（ime/config/dict 等动作后端），构造后由 init_cmdbar 装配。
     pub(crate) cmdbar_services: std::sync::OnceLock<wind_cmdbar::Services>,
+    /// 宿主服务（剪贴板等平台能力）。`OnceLock` 构造后注入惯例（同 `self_weak`）；
+    /// 未注入时首次取用即固化默认实现（桌面 DesktopHostServices），故 Android FFI
+    /// 必须在**首个可能触碰剪贴板的调用之前** `set_host_services`。
+    pub(crate) host_services: std::sync::OnceLock<Arc<dyn crate::host_services::HostServices>>,
     /// 自身 Weak 引用：$CC 命令在独立线程异步执行（避免持 state 锁回调自锁方法致死锁）。
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
     /// 上屏历史环形缓冲（index 0 = 最近）：供命令栏 `last(n)` 取最近上屏文本。
@@ -1366,6 +1370,21 @@ impl Coordinator {
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
         coordinator
+    }
+
+    /// 注入宿主服务（剪贴板等平台能力）。重复注入静默忽略（`OnceLock` 语义）。
+    ///
+    /// Android FFI 必须在首个可能触碰剪贴板的调用之前注入——未注入时首次取用
+    /// 即固化默认实现（见 [`Self::host_services`]），此后本方法不再生效。
+    /// 桌面构造路径不调用：默认实现就是桌面剪贴板。
+    pub fn set_host_services(&self, svc: Arc<dyn crate::host_services::HostServices>) {
+        let _ = self.host_services.set(svc);
+    }
+
+    /// 宿主服务访问点；未注入时落默认实现（桌面剪贴板直通）。
+    pub(crate) fn host_services(&self) -> &Arc<dyn crate::host_services::HostServices> {
+        self.host_services
+            .get_or_init(|| Arc::new(crate::host_services::DesktopHostServices))
     }
 
     /// 注入 host-render 管理器（Windows）。服务入口在构造 `BridgeServer` 后调用一次，
@@ -1839,6 +1858,7 @@ impl Coordinator {
             theme_style: Mutex::new(theme_style_init),
             theme_index_labels: Mutex::new(Vec::new()),
             cmdbar_services: std::sync::OnceLock::new(),
+            host_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
             last_commit_len: std::sync::atomic::AtomicUsize::new(1),

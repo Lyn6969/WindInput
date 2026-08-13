@@ -23,6 +23,7 @@ pub mod handle_special;
 pub mod handle_temp;
 pub mod handle_tooltip;
 pub mod handle_url;
+pub mod host_services;
 pub mod hotkey_match;
 pub mod input_diag;
 pub mod layout;
