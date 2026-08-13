@@ -231,8 +231,10 @@ public final class CandidatePanelHost {
 
     private func openSHMIfNeeded() {
         if reader != nil { return }
-        // SHM 名按变体后缀与 Go host_render_darwin.darwinSHMName 对齐 (release: /WindInput_SHM;
-        // debug: /WindInput_SHM_debug)。否则两变体抢同一段, 开机后候选框渲染坏掉。
+        // SHM 名按变体后缀与 Rust wind_bridge::endpoint::shm_name 对齐
+        // (release: /WindInput_SHM; dev: /WindInput_SHMDev)。否则两变体抢同一段,
+        // 开机后候选框渲染坏掉; 名字与服务端不一致则整个 dev 变体拿不到帧。
+        // 注: 服务端内部传的是管道后缀 "_dev", 由 endpoint.rs 的 variant_suffix 映射成 "Dev"。
         let shmName = "/WindInput_SHM\(BridgeEndpoints.variantSuffix)"
         do {
             reader = try SharedMemoryReader(name: shmName, size: 4 * 1024 * 1024)
