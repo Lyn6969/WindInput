@@ -30,7 +30,7 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 use tracing::info;
 
-const MAGIC: [u8; 4] = [b'W', b'D', b'A', b'T'];
+const MAGIC: [u8; 4] = *b"WDAT";
 // v3：EntryRecord 增加 order u32（全局自然序，10→14B），跨编码等权时按词库出现顺序排序，
 // 不再退化为叶内序号致编码字母序。旧 v2 缓存 mtime/指纹不匹配自动重建。
 // v4：EntryRecord 增加 boundary u64（音节起始位 bitmask，14→22B）。源数据 rime `ni hao` 的
@@ -235,14 +235,20 @@ impl StringPool {
     }
 }
 
+/// LeafTable 一行：`(该码的条目区字节偏移, 条目数)`。
+type DatLeafRow = (u32, u16);
+
+/// EntryTable 一行：`(文本在共享池的偏移, 文本字节长, weight, natural_order, 音节边界位图)`。
+type DatEntryRow = (u32, u16, i32, u32, u64);
+
 /// 从排序后的 (code,entries) 构建一段独立 DAT：返回 (DAT, leaves, entries)，文本入共享池。
 /// 主表与简拼表各调一次（共用同一 StringPool 去重）。
 fn build_section(
     sorted: &[&(String, Vec<WriteEntry>)],
     pool: &mut StringPool,
-) -> (Dat, Vec<(u32, u16)>, Vec<(u32, u16, i32, u32, u64)>) {
-    let mut leaves: Vec<(u32, u16)> = Vec::with_capacity(sorted.len());
-    let mut entries: Vec<(u32, u16, i32, u32, u64)> = Vec::new();
+) -> (Dat, Vec<DatLeafRow>, Vec<DatEntryRow>) {
+    let mut leaves: Vec<DatLeafRow> = Vec::with_capacity(sorted.len());
+    let mut entries: Vec<DatEntryRow> = Vec::new();
     let mut codes: Vec<&str> = Vec::with_capacity(sorted.len());
     let mut entry_byte_off = 0u32;
     for kv in sorted {
@@ -268,11 +274,7 @@ fn build_section(
 /// **实现为两趟而非递归**：DAT 深度等于最长编码长度，用户词库可能出现极长编码，
 /// 递归有栈溢出风险。第一趟前序 DFS 收集访问序（父必先于子出现），第二趟逆序回填
 /// （于是子必先于父被算出），等价于后序遍历且无递归。
-fn compute_maxw(
-    dat: &Dat,
-    leaves: &[(u32, u16)],
-    entries: &[(u32, u16, i32, u32, u64)],
-) -> Vec<i32> {
+fn compute_maxw(dat: &Dat, leaves: &[DatLeafRow], entries: &[DatEntryRow]) -> Vec<i32> {
     let n = dat.base.len();
     let mut maxw = vec![NO_MAXW; n];
     if n == 0 {
@@ -522,8 +524,8 @@ impl WdatWriter {
         let write_dat_section = |f: &mut std::io::BufWriter<std::fs::File>,
                                  dat: &Dat,
                                  maxw: &[i32],
-                                 leaves: &[(u32, u16)],
-                                 entries: &[(u32, u16, i32, u32, u64)]|
+                                 leaves: &[DatLeafRow],
+                                 entries: &[DatEntryRow]|
          -> std::io::Result<()> {
             for v in &dat.base {
                 f.write_all(&v.to_le_bytes())?;
@@ -579,11 +581,11 @@ impl WdatWriter {
         write_charmap(&mut f, &dat)?;
 
         // Meta。
-        if let Some(m) = &self.meta {
-            if !m.is_empty() {
-                f.write_all(&(m.len() as u32).to_le_bytes())?;
-                f.write_all(m)?;
-            }
+        if let Some(m) = &self.meta
+            && !m.is_empty()
+        {
+            f.write_all(&(m.len() as u32).to_le_bytes())?;
+            f.write_all(m)?;
         }
 
         f.flush()?;
@@ -762,13 +764,12 @@ impl WdatReader {
         let read_charmap = |off: usize| -> ([i32; 256], Vec<u8>, i32) {
             let max_code = i32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
             let mut cm = [-1i32; 256];
-            for b in 0..256 {
+            for (b, slot) in cm.iter_mut().enumerate() {
                 let o = off + 4 + b * 4;
-                cm[b] = i32::from_le_bytes(mmap[o..o + 4].try_into().unwrap());
+                *slot = i32::from_le_bytes(mmap[o..o + 4].try_into().unwrap());
             }
             let mut rm = vec![0u8; (max_code.max(0) as usize) + 1];
-            for b in 0..256 {
-                let c = cm[b];
+            for (b, &c) in cm.iter().enumerate() {
                 if c > 0 && (c as usize) < rm.len() {
                     rm[c as usize] = b as u8;
                 }
@@ -899,7 +900,7 @@ impl WdatReader {
         Some((-bt - 1) as u32)
     }
 
-    fn read_leaf(&self, v: &DatView, leaf_idx: u32) -> (u32, u16) {
+    fn read_leaf(&self, v: &DatView, leaf_idx: u32) -> DatLeafRow {
         let o = v.leaf_off + leaf_idx as usize * LEAF_SIZE;
         let eoff = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap());
         let elen = u16::from_le_bytes(self.mmap[o + 4..o + 6].try_into().unwrap());

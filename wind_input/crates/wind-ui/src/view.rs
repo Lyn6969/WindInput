@@ -644,8 +644,27 @@ impl View {
 
 // ———————————————— 像素绘制工具 ————————————————
 
-/// 贝塞尔逼近圆弧的控制点比例（kappa）。
-const KAPPA: f32 = 0.552_284_75;
+/// 贝塞尔逼近圆弧的控制点比例（kappa = 4/3·(√2−1) ≈ 0.552_284_75）。
+/// 字面量按 f32 可表示的最近值书写——多写的位数 f32 存不下，只会误导读者。
+const KAPPA: f32 = 0.552_284_8;
+
+/// 抗锯齿纯色画笔。`color` 为直通 [R,G,B,A]。
+///
+/// **R/B 在此交换**：BGRA 缓冲被当作 tiny-skia 的 RGBA Pixmap 直接渲染（零拷贝），
+/// 故传色时取 [B,G,R,A]，输出即合法的预乘 BGRA。这个约定原先在五处填充函数里各抄一遍，
+/// 抄漏一处就是红蓝互换的显示 bug，收敛到此处只留一个出错点。
+///
+/// `#[inline]`：调用点在逐帧绘制路径上，语义上仍是「就地构造一个 Paint」，不该因为抽函数
+/// 而多一次调用。
+#[inline]
+fn aa_paint(color: [u8; 4]) -> Paint<'static> {
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    paint
+}
 
 /// 在缓冲区子区域填充圆角矩形：tiny-skia 抗锯齿填充 + 源覆盖混合。
 /// `color` 约定为直通 [R,G,B,A]；缓冲区按预乘 BGRA 维护（供 UpdateLayeredWindow）。
@@ -654,6 +673,10 @@ const KAPPA: f32 = 0.552_284_75;
 /// 传色时交换 R/B（Color 取 [B,G,R,A]）。预乘 alpha 合成逐通道对称，故输出即合法 BGRA。
 /// 绘制背景填充图：从线程局部缓存取目标尺寸填充位图（BGRA 预乘），以 Pattern 填到圆角路径内。
 /// 绘制背景渐变：以 tiny-skia 线性/径向着色器填到圆角路径内（叠在底色之上、背景图之下）。
+///
+/// 本文件的绘图基元一律豁免 `too_many_arguments`：参数是「缓冲 + 缓冲尺寸 + 几何 + 颜色」
+/// 这组固定形状，且都在逐帧绘制路径上——包成参数对象只是把同一批标量搬一遍。
+#[allow(clippy::too_many_arguments)]
 fn paint_bg_gradient(
     buf: &mut [u8],
     buf_w: u32,
@@ -853,6 +876,7 @@ fn anchor_pos(anchor: &str, host: Rect, lw: f32, lh: f32) -> (f32, f32) {
     (ax, ay)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fill_rounded(
     buf: &mut [u8],
     buf_w: u32,
@@ -881,10 +905,7 @@ pub fn fill_rounded(
     let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    // BGRA 缓冲被当作 RGBA：换 R/B，输出即正确的预乘 BGRA。
-    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    let paint = aa_paint(color);
     pm.fill_path(
         &path,
         &paint,
@@ -895,6 +916,7 @@ pub fn fill_rounded(
 }
 
 /// 填充实心圆（tiny-skia 抗锯齿）。`color` 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
+#[allow(clippy::too_many_arguments)]
 pub fn fill_circle(
     buf: &mut [u8],
     buf_w: u32,
@@ -915,9 +937,7 @@ pub fn fill_circle(
     let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    let paint = aa_paint(color);
     pm.fill_path(
         &path,
         &paint,
@@ -930,6 +950,7 @@ pub fn fill_circle(
 /// 绘制齿轮图标（工具栏设置按钮）：8 齿平顶 cog 多边形（`color` 齿轮体）+ 中心孔（`hole` 色）。
 /// 纯矢量绘制，不依赖字体度量 → 在单元格内精确居中、与文字格对齐。
 /// `(cx,cy)` 中心，`r` 外径（齿尖半径）。color/hole 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
+#[allow(clippy::too_many_arguments)]
 pub fn fill_gear(
     buf: &mut [u8],
     buf_w: u32,
@@ -968,19 +989,17 @@ pub fn fill_gear(
         }
     }
     pb.close();
-    if let Some(path) = pb.finish() {
-        if let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) {
-            let mut paint = Paint::default();
-            paint.anti_alias = true;
-            paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
-            pm.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
+    if let Some(path) = pb.finish()
+        && let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h)
+    {
+        let paint = aa_paint(color);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
     // 中心孔：在齿轮体上叠画一个小圆（hole 色，通常取工具栏底色 → 视觉镂空）。
     fill_circle(buf, buf_w, buf_h, cx, cy, r * 0.34, hole);
@@ -988,6 +1007,7 @@ pub fn fill_gear(
 
 /// 绘制内联 SVG 图标到 BGRA 缓冲（工具栏图标用）：按 `color` 单色 tint（SVG 仅作 alpha 蒙版），
 /// 栅格化到 `size`×`size` 后以 src-over 合成到 `(dx,dy)`（左上角）。不依赖字体度量 → 位置精确、形状灵活。
+#[allow(clippy::too_many_arguments)]
 pub fn draw_svg_icon(
     buf: &mut [u8],
     buf_w: u32,
@@ -1069,9 +1089,7 @@ pub fn paint_blur_shadow(
         let Some(path) = round_rect_path(local_x, local_y, bw, bh, radius.max(0.0)) else {
             return;
         };
-        let mut paint = Paint::default();
-        paint.anti_alias = true;
-        paint.set_color(Color::from_rgba8(0, 0, 0, 255));
+        let paint = aa_paint([0, 0, 0, 255]);
         pm.fill_path(
             &path,
             &paint,
@@ -1308,6 +1326,7 @@ fn round_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_s
 /// 圆角矩形描边环（外圈 − 内圈，even-odd 单次填充）：粗细恒为 bw、内外各一条干净 AA，
 /// 对齐 Go 的边框画法（避免中心描边 AA 渗色致粗细不均）。透明内部也适用。
 /// color 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
+#[allow(clippy::too_many_arguments)]
 pub fn fill_ring(
     buf: &mut [u8],
     buf_w: u32,
@@ -1347,9 +1366,7 @@ pub fn fill_ring(
     let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    let paint = aa_paint(color);
     pm.fill_path(
         &path,
         &paint,
@@ -1430,8 +1447,8 @@ mod geom_tests {
     fn fill_circle_writes_center_not_corner() {
         let mut buf = vec![0u8; 20 * 20 * 4];
         fill_circle(&mut buf, 20, 20, 10.0, 10.0, 8.0, [0, 255, 0, 255]);
-        assert!(buf[(10 * 20 + 10) * 4 + 3] > 0, "圆心应被填充");
-        assert_eq!(buf[(0 * 20 + 0) * 4 + 3], 0, "角落在圆外，不应被填充");
+        assert!(px_alpha(&buf, 20, 10, 10) > 0, "圆心应被填充");
+        assert_eq!(px_alpha(&buf, 20, 0, 0), 0, "角落在圆外，不应被填充");
     }
 
     #[test]
@@ -1449,7 +1466,7 @@ mod geom_tests {
             h: 16.0,
         };
         paint_bg_gradient(&mut buf, 16, 16, r, 0.0, &g);
-        assert!(buf[(8 * 16 + 8) * 4 + 3] > 0, "渐变中心 alpha 应被写入");
+        assert!(px_alpha(&buf, 16, 8, 8) > 0, "渐变中心 alpha 应被写入");
     }
 
     #[test]
@@ -1467,7 +1484,7 @@ mod geom_tests {
             h: 8.0,
         };
         paint_bg_gradient(&mut buf, 8, 8, r, 0.0, &g);
-        assert!(buf[(4 * 8 + 4) * 4 + 3] > 0, "单停靠点退化为纯色填充");
+        assert!(px_alpha(&buf, 8, 4, 4) > 0, "单停靠点退化为纯色填充");
     }
 
     #[test]
@@ -1486,8 +1503,8 @@ mod geom_tests {
             2.0,
         );
         // 边框环：靠边像素被描边，正中心（挖空）保持透明
-        assert!(buf[(0 * 20 + 10) * 4 + 3] > 0, "上边框应被描边");
-        assert_eq!(buf[(10 * 20 + 10) * 4 + 3], 0, "环中心应镂空透明");
+        assert!(px_alpha(&buf, 20, 10, 0) > 0, "上边框应被描边");
+        assert_eq!(px_alpha(&buf, 20, 10, 10), 0, "环中心应镂空透明");
     }
 
     // ── 左侧强调条：height_ratio / offset ──────────────────────────────────
@@ -1511,9 +1528,16 @@ mod geom_tests {
         buf
     }
 
-    /// (x, y) 处 alpha。
+    /// BGRA 缓冲里 (x, y) 像素的 alpha 分量。`stride` 为缓冲宽度（像素）。
+    /// 写成函数而非手写 `(y * w + x) * 4 + 3`：坐标语义更清楚，也避开 clippy
+    /// 对 `0 * 20 + 0` 这类「保留坐标形状」写法的 erasing_op/identity_op 报错。
+    fn px_alpha(buf: &[u8], stride: usize, x: usize, y: usize) -> u8 {
+        buf[(y * stride + x) * 4 + 3]
+    }
+
+    /// 40×40 缓冲专用的 [`px_alpha`]。
     fn alpha_at(buf: &[u8], x: usize, y: usize) -> u8 {
-        buf[(y * 40 + x) * 4 + 3]
+        px_alpha(buf, 40, x, y)
     }
 
     #[test]

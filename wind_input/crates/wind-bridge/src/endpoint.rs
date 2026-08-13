@@ -32,19 +32,19 @@ fn variant_suffix(pipe_suffix: &str) -> &str {
 /// （与 .app、dev.sh、用户配置目录同名），/tmp 段是无 HOME 时的兜底，
 /// 沿用管道风格的 snake 命名。
 pub fn runtime_dir(suffix: &str) -> PathBuf {
-    if let Ok(env) = std::env::var("WIND_INPUT_RUNTIME_DIR") {
-        if !env.is_empty() {
-            return PathBuf::from(env);
-        }
+    if let Ok(env) = std::env::var("WIND_INPUT_RUNTIME_DIR")
+        && !env.is_empty()
+    {
+        return PathBuf::from(env);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            let dir = variant_suffix(suffix);
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join(format!("WindInput{dir}"));
-        }
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        let dir = variant_suffix(suffix);
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join(format!("WindInput{dir}"));
     }
     PathBuf::from(format!("/tmp/wind_input{suffix}"))
 }

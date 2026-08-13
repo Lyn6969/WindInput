@@ -732,19 +732,16 @@ fn pinyin_eval_report() {
                     });
                 }
             }
-            match rank {
-                Some(r) => {
-                    if r == 0 {
-                        sc.top1 += 1;
-                    }
-                    if r < 5 {
-                        sc.top5 += 1;
-                    }
-                    sc.mrr_sum += 1.0 / (r as f64 + 1.0);
+            if let Some(r) = rank {
+                if r == 0 {
+                    sc.top1 += 1;
                 }
-                None => {}
+                if r < 5 {
+                    sc.top5 += 1;
+                }
+                sc.mrr_sum += 1.0 / (r as f64 + 1.0);
             }
-            if rank.map_or(true, |r| r != 0) {
+            if rank != Some(0) {
                 sc.misses.push(Miss {
                     input: s.input.clone(),
                     expect: s.text.clone(),
@@ -906,21 +903,21 @@ fn pinyin_eval_report() {
     // ---- 5. 机器可读输出
     let mut j = String::new();
     j.push_str("{\n");
-    let _ = write!(
+    let _ = writeln!(
         j,
-        "  \"seed\": {}, \"top_n\": {}, \"n_per_class\": {},\n",
+        "  \"seed\": {}, \"top_n\": {}, \"n_per_class\": {},",
         seed, TOP_N, n_per_class
     );
-    let _ = write!(
+    let _ = writeln!(
         j,
-        "  \"timing_ms\": {{ \"generate\": {}, \"engine_load\": {}, \"score\": {} }},\n",
+        "  \"timing_ms\": {{ \"generate\": {}, \"engine_load\": {}, \"score\": {} }},",
         gen_ms, load_ms, run_ms
     );
     j.push_str("  \"classes\": {\n");
     for (i, (c, sc, ms)) in scores.iter().enumerate() {
-        let _ = write!(
+        let _ = writeln!(
             j,
-            "    \"{}\": {{ \"population\": {}, \"sampled\": {}, \"top1\": {:.6}, \"top5\": {:.6}, \"mrr\": {:.6}, \"seg_ok\": {:.6}, \"top1_hits\": {}, \"top5_hits\": {}, \"score_ms\": {},\n",
+            "    \"{}\": {{ \"population\": {}, \"sampled\": {}, \"top1\": {:.6}, \"top5\": {:.6}, \"mrr\": {:.6}, \"seg_ok\": {:.6}, \"top1_hits\": {}, \"top5_hits\": {}, \"score_ms\": {},",
             c.key(),
             class_totals.get(c.key()).copied().unwrap_or(0),
             sc.total,
@@ -938,9 +935,9 @@ fn pinyin_eval_report() {
         );
         // D 类专有：首词命中率（seg_ok 对它恒为 0，不可用于对账）
         if *c == Class::D {
-            let _ = write!(
+            let _ = writeln!(
                 j,
-                "      \"first_word_top1\": {:.6}, \"first_word_hits\": {}, \"first_word_recall\": {:.6},\n",
+                "      \"first_word_top1\": {:.6}, \"first_word_hits\": {}, \"first_word_recall\": {:.6},",
                 Score::rate(sc.partial_ok, sc.total),
                 sc.partial_ok,
                 Score::rate(sc.partial_recall, sc.total)
@@ -948,9 +945,9 @@ fn pinyin_eval_report() {
         }
         j.push_str("      \"misses\": [\n");
         for (k, m) in sc.misses.iter().take(dump).enumerate() {
-            let _ = write!(
+            let _ = writeln!(
                 j,
-                "        {{ \"input\": \"{}\", \"expect\": \"{}\", \"rank\": {}, \"top1\": \"{}\", \"unigram\": {}, \"true_syls\": \"{}\", \"mm\": \"{}\" }}{}\n",
+                "        {{ \"input\": \"{}\", \"expect\": \"{}\", \"rank\": {}, \"top1\": \"{}\", \"unigram\": {}, \"true_syls\": \"{}\", \"mm\": \"{}\" }}{}",
                 json_escape(&m.input),
                 json_escape(&m.expect),
                 m.rank

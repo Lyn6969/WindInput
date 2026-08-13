@@ -30,6 +30,12 @@ pub struct HotCache {
     max_per_prefix: usize,
 }
 
+impl Default for HotCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HotCache {
     pub fn new() -> Self {
         Self {

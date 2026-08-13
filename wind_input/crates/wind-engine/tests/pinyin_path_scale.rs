@@ -182,7 +182,7 @@ fn pinyin_path_scale_census() {
         }
     }
 
-    worst.sort_by(|a, b| b.0.cmp(&a.0));
+    worst.sort_by_key(|w| std::cmp::Reverse(w.0));
     println!("\n=== 路径数最多的 15 个真实输入 ===");
     for (p, s, m, t, i) in worst.iter().take(15) {
         println!(

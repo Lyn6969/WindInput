@@ -38,6 +38,7 @@ impl Coordinator {
     ///   2. 数字后智能转换（命中则该标点按英文输出，不转中文）
     ///   3. 中文标点转换（引号左右交替状态机）
     ///   4. 全半角转换
+    ///
     /// `prev_char` 为光标前一字符的 UTF-16 单元（0=不可用），用于数字后智能判定。
     pub(crate) fn convert_punct(&self, state: &State, ch: char, prev_char: u16) -> String {
         let mut conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
@@ -82,7 +83,7 @@ impl Coordinator {
         let Some(pairs) = self.active_pairs(state.chinese_punct) else {
             return false;
         };
-        if !pairs.iter().any(|p| *p == (l, r)) {
+        if !pairs.contains(&(l, r)) {
             return false;
         }
         self.punct
@@ -103,6 +104,7 @@ impl Coordinator {
     /// （自定义列 > 中/英转换 > 全半角）。对齐 Go `computePunctStrPure`。
     ///   - `chinese=true`：算中文标点产物（武装/匹配用，引号经 peek 预测不改状态）。
     ///   - `chinese=false`：算英文标点产物（替换用，即该键英文模式下输出）。
+    ///
     /// 引号有状态、键名特殊，此处保守跳过自定义、走标准引号/英文产物。
     pub(crate) fn compute_punct_str_pure(
         &self,

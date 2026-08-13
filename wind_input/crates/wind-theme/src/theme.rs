@@ -193,7 +193,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_typed_dirs(&[dir.clone()], "derived").unwrap_err();
+        let err = load_typed_dirs(std::slice::from_ref(&dir), "derived").unwrap_err();
         assert!(
             err.to_string().contains("no-such-base"),
             "错误信息应指出缺失的 base 主题名: {err}"

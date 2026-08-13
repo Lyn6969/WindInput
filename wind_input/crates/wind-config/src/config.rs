@@ -177,7 +177,7 @@ fn collect_leaf_paths(v: &toml::Value, prefix: &mut Vec<String>, out: &mut Vec<V
 }
 
 /// 完整配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub schema: SchemaConfig,
@@ -1493,10 +1493,10 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
     }]
 }
 
-/// ⛔ `SpecialModeConfig` 已删除。特殊模式的实例集合改由「带 `[overlay]` 段的已安装方案」
-/// 定义（`EngineManager::overlay_modes`）：呈现配置落方案文件的 `[overlay]` 段，引导键与
-/// 直达热键落 `keys.key_actions`（`special:<方案id>`）。
-/// 见 `docs/redesign/overlay-mode-config.md`。残留旧配置的告警见 `warn_legacy_special_modes`。
+// ⛔ `SpecialModeConfig` 已删除。特殊模式的实例集合改由「带 `[overlay]` 段的已安装方案」
+// 定义（`EngineManager::overlay_modes`）：呈现配置落方案文件的 `[overlay]` 段，引导键与
+// 直达热键落 `keys.key_actions`（`special:<方案id>`）。
+// 见 `docs/redesign/overlay-mode-config.md`。残留旧配置的告警见 `warn_legacy_special_modes`。
 // ───────────────────────── input（输入行为）─────────────────────────
 
 /// 「检索范围」智能档的放宽增强（设计见 `docs/design/smart-filter-scope-relax.md`）。
@@ -1666,6 +1666,7 @@ pub enum SmartMethod {
 ///   diff 式宿主（终端/Chromium）不双写，但部分宿主整段画下划线、WPS 智能标点顶屏会清空。
 /// - DirectCommit：顶码时真提交，余码新组合延迟到触发键 keyup 才开（照抄真实输入法时序），
 ///   靠隔一拍消息泵躲开 diff 合并；真提交无下划线歧义、WPS 不清空。
+///
 /// TODO(per-app)：后续可按宿主进程名 override（当前仅全局默认）。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -3132,19 +3133,6 @@ fn default_shift_behavior() -> String {
     "temp_english".to_string()
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            schema: SchemaConfig::default(),
-            input: InputConfig::default(),
-            keys: KeysConfig::default(),
-            ui: UiConfig::default(),
-            stats: StatsConfig::default(),
-            debug: DebugConfig::default(),
-        }
-    }
-}
-
 /// 用户配置目录的就绪探测结果。
 ///
 /// 存在的意义是把「系统尚未就绪」与「用户确实没有配置」分开——两者此前都表现为
@@ -4122,7 +4110,7 @@ mod tests {
     /// 出厂默认的 `select_key_groups = ["semicolon_quote"]` 折算成两条选词绑定。
     #[test]
     fn default_select_key_group_folds_into_session_actions() {
-        let mut c = Config::default();
+        let c = Config::default();
         let sa = c.keys.effective_session_actions();
         assert_eq!(
             sa.get("semicolon").map(String::as_str),

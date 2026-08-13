@@ -67,10 +67,10 @@ fn usage_err(form: &str) -> i32 {
 
 fn cmd_list(prefix: Option<&str>) -> i32 {
     for fld in registry() {
-        if let Some(p) = prefix {
-            if !fld.key.starts_with(p) {
-                continue;
-            }
+        if let Some(p) = prefix
+            && !fld.key.starts_with(p)
+        {
+            continue;
         }
         println!("{:<48} {}", fld.key, type_label(fld.ty));
     }

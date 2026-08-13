@@ -393,13 +393,12 @@ mod imp {
             Ok(())
         }
 
-        /// 渲染文本到 BGRA 缓冲区。
+        /// 渲染文本到 BGRA 缓冲区（用基准字号）。
         ///
         /// - `buf`: 目标 BGRA 缓冲区（已含背景，预乘 alpha）
         /// - `buf_width`/`buf_height`: 缓冲区尺寸
         /// - `x`/`y`: 文本左上角（像素坐标）
         /// - `color`: 文本颜色 [B, G, R, A]
-        /// 绘制文本（用基准字号）。
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text(
             &self,

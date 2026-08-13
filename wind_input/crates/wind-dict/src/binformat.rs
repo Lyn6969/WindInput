@@ -9,7 +9,7 @@ use std::path::Path;
 use tracing::info;
 
 /// wdb 魔数 "WDIC"
-const MAGIC: [u8; 4] = [b'W', b'D', b'I', b'C'];
+const MAGIC: [u8; 4] = *b"WDIC";
 
 /// 原子写临时文件序号：并发写同一目标时避免 `.tmp` 文件名冲突（对齐 Go atomicWriteSeq）。
 static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -232,12 +232,12 @@ impl DictReader {
             }
         }
 
-        if lo < key_count {
-            if let Some(idx) = self.read_key_index(lo) {
-                let found_code = self.read_string(idx.code_off, idx.code_len);
-                if found_code == code {
-                    return self.collect_entries(&idx, code);
-                }
+        if lo < key_count
+            && let Some(idx) = self.read_key_index(lo)
+        {
+            let found_code = self.read_string(idx.code_off, idx.code_len);
+            if found_code == code {
+                return self.collect_entries(&idx, code);
             }
         }
         Vec::new()
@@ -326,6 +326,12 @@ impl DictReader {
 /// 二进制词典写入器（用于将 rime dict.yaml 转换为 .wdb）
 pub struct DictWriter {
     keys: Vec<(String, Vec<(String, i32)>)>, // (code, [(text, weight)])
+}
+
+impl Default for DictWriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DictWriter {

@@ -91,10 +91,12 @@ mod tests {
     /// 三字段 roundtrip。
     #[test]
     fn last_state_roundtrip() {
-        let mut rs = RuntimeState::default();
-        rs.last_chinese_mode = false;
-        rs.last_full_width = true;
-        rs.last_chinese_punct = false;
+        let rs = RuntimeState {
+            last_chinese_mode: false,
+            last_full_width: true,
+            last_chinese_punct: false,
+            ..Default::default()
+        };
         let s = toml::to_string_pretty(&rs).unwrap();
         let back: RuntimeState = toml::from_str(&s).unwrap();
         assert!(!back.last_chinese_mode);

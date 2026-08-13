@@ -63,6 +63,11 @@ pub(crate) fn build_settings_args(pairs: &[(&str, &str)]) -> String {
 /// 同源。此前这一步在 Swift 侧重做了一遍，等于让另一门语言去猜 Rust 的引号规则。
 ///
 /// 仅认双引号、不认转义：值来自本进程内部拼装，不含引号字面量。
+///
+/// 仅 macOS 走 IPC argv 通路，非 macOS 下无调用点；但引号往返的单元测试要在所有平台上跑
+/// （切词规则与 `build_settings_args` 是一对，任一平台改坏都该被拦住），故不加 `cfg` 编译
+/// 掉本函数，只在非 macOS 下豁免 dead_code。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn settings_argv(page: Option<&str>, extra: &str) -> Vec<String> {
     let mut argv = Vec::new();
     if let Some(p) = page {
@@ -1370,7 +1375,7 @@ impl Coordinator {
         // 读端 apply_shadow_in 对空码直接 return，写了也永不生效）——仅保留复制。
         // 判据与写端 `candidate_op` 同源，见 `candidate_op_scope`。
         let items = if let Some(scope) = scope {
-            let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
+            let cand_id = (!cand.id.is_empty()).then_some(cand.id.as_str());
             let has_rule = self.shadow_has_rule(&scope.schema, &scope.code, &word, cand_id);
             // 拼音普通候选**只放行置顶**，前移/后移仍禁（`position=0` 位置语义稳定，
             // `position=N` 在候选集变动后失去意义）；命令候选不受限。

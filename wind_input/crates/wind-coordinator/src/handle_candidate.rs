@@ -1310,6 +1310,7 @@ impl Coordinator {
     ///   要进那个模式，把它**空缓冲帧**的能力提前一格给出来。没有这条，走让位路径的引导键
     ///   永远到不了 mix 的空缓冲帧（夺取路径的 `mix_buffer` 恒等于残余码，至少一个字符），
     ///   那个成员对这类配置形同虚设——用户报的「z 进的快捷输入没有重复输入功能」正是它。
+    ///
     /// `frame_empty` = 这一帧的正常候选是否为空，**只约束来源 ②**：
     ///
     /// - ① `z_key_repeat` 是用户显式打开的开关，「按 z 重复上屏」就是它的全部语义，
@@ -2030,10 +2031,11 @@ impl Coordinator {
         }
     }
 
-    /// 主输入路拼音选词 —— 组合区逐步转换（C）。
-    /// 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
-    /// **留在组合区不上屏到应用**，返回 UpdateComposition。
-    /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
+    // 主输入路拼音选词 —— 组合区逐步转换（C）。此段说明本节整体行为，不属于下面任何单个
+    // 函数（原属的函数已迁走），故用普通注释：
+    // 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
+    // **留在组合区不上屏到应用**，返回 UpdateComposition。
+    // 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
     // 此处原有 `clamp_candidate_display`（换行/制表→空格 + 可选截断），已随「短语候选
     // 不再一行化」删除：它唯一的两个调用点都传 max=0，实际只在做一行化，而一行化会连
     // 上屏文本一起改掉。杜绝多行候选现由渲染层 `wind_ui` 的 `visible_whitespace` 承担
@@ -2698,7 +2700,7 @@ impl Coordinator {
             // None → 落回 word 匹配）。**必须在此传下去**——`word` 记的是当次求值结果，
             // `date`/`time` 类短语次日即失配，规则表现为「昨天调好、今天被还原」。
             // redb 事务持久，无需显式落盘。
-            let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
+            let cand_id = (!cand.id.is_empty()).then_some(cand.id.as_str());
             let r = match op {
                 CandidateOp::MoveTop => store.pin_shadow(&sh_schema, &code, &word, cand_id, 0),
                 CandidateOp::MoveUp => {
@@ -3530,7 +3532,7 @@ mod finalize_candidates_tests {
     fn mixed_pinyin_exact_sits_between_codetable_exact_and_prefix() {
         let (ct_exact, py_exact, ct_prefix) = xu_scene();
         // 故意以最不利顺序放入，确保结果由排序而非原序决定。
-        let mut cands = vec![ct_prefix, py_exact, ct_exact];
+        let mut cands = [ct_prefix, py_exact, ct_exact];
         cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
@@ -3546,7 +3548,7 @@ mod finalize_candidates_tests {
     #[test]
     fn non_mixed_keeps_weight_order_for_pinyin() {
         let (_, py_exact, ct_prefix) = xu_scene();
-        let mut cands = vec![py_exact, ct_prefix];
+        let mut cands = [py_exact, ct_prefix];
         cands.sort_by(|a, b| candidate_display_order(a, b, false, false, XU_LEN));
         assert_eq!(
             cands[0].text, "弹幕",
@@ -3573,7 +3575,7 @@ mod finalize_candidates_tests {
             source: CandidateSource::Phrase,
             ..Default::default()
         };
-        let mut cands = vec![prefix_phrase, ct_prefix];
+        let mut cands = [prefix_phrase, ct_prefix];
         cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         assert_eq!(
             cands[0].text, "弹幕",
@@ -3593,7 +3595,7 @@ mod finalize_candidates_tests {
             is_common: false,
             ..py_exact
         };
-        let mut cands = vec![rare, ct_prefix];
+        let mut cands = [rare, ct_prefix];
         cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         assert_eq!(
             cands[0].text, "弹幕",
@@ -3610,7 +3612,7 @@ mod finalize_candidates_tests {
             weight: 13, // 1321 / 100
             ..py_exact.clone()
         };
-        let mut cands = vec![xu_low, py_exact];
+        let mut cands = [xu_low, py_exact];
         cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         assert_eq!(cands[0].text, "需", "同档内仍按权重降序（69 > 13）");
     }
@@ -3625,7 +3627,7 @@ mod finalize_candidates_tests {
         let youshi = cand_ordered("有时", 2, 24, 0);
         for ignore_weight in [false, true] {
             // 故意以「有时」在前的顺序放入，确保是排序而非原序决定结果。
-            let mut cands = vec![youshi.clone(), yi.clone()];
+            let mut cands = [youshi.clone(), yi.clone()];
             cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false, XU_LEN));
             assert_eq!(
                 cands[0].text, "一",
@@ -3642,11 +3644,11 @@ mod finalize_candidates_tests {
         let main_low = cand_ordered("主低", 0, 100, 1); // 主库、低权重
         let extra_high = cand_ordered("扩高", 1, 5, 999); // 次选库、高权重
         // weight 模式：权重降序主导 → 扩高(999) 在前。
-        let mut w = vec![main_low.clone(), extra_high.clone()];
+        let mut w = [main_low.clone(), extra_high.clone()];
         w.sort_by(|a, b| candidate_display_order(a, b, false, false, XU_LEN));
         assert_eq!(w[0].text, "扩高", "weight 模式高权重应靠前");
         // natural 模式：忽略权重 → base_order 升序主导，主库(0) 在前。
-        let mut n = vec![main_low, extra_high];
+        let mut n = [main_low, extra_high];
         n.sort_by(|a, b| candidate_display_order(a, b, true, false, XU_LEN));
         assert_eq!(
             n[0].text, "主低",

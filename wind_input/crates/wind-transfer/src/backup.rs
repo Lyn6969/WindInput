@@ -71,29 +71,28 @@ pub fn create_backup(
     };
 
     // 文件域：config / state
-    if let Some(cfg) = src.user_config_file {
-        if cfg.is_file() {
-            add(
-                &mut w,
-                "config/config.toml".into(),
-                &std::fs::read(cfg)?,
-                "config",
-                serde_json::Value::Null,
-            )?;
-        }
+    if let Some(cfg) = src.user_config_file
+        && cfg.is_file()
+    {
+        add(
+            &mut w,
+            "config/config.toml".into(),
+            &std::fs::read(cfg)?,
+            "config",
+            serde_json::Value::Null,
+        )?;
     }
-    if opts.include_state {
-        if let Some(st) = src.state_file {
-            if st.is_file() {
-                add(
-                    &mut w,
-                    "state/state.toml".into(),
-                    &std::fs::read(st)?,
-                    "state",
-                    serde_json::Value::Null,
-                )?;
-            }
-        }
+    if opts.include_state
+        && let Some(st) = src.state_file
+        && st.is_file()
+    {
+        add(
+            &mut w,
+            "state/state.toml".into(),
+            &std::fs::read(st)?,
+            "state",
+            serde_json::Value::Null,
+        )?;
     }
 
     // 数据域：逐 schema 四表 + 全局 phrases
@@ -162,20 +161,20 @@ pub fn create_backup(
     }
 
     // 文件域：用户方案 / 主题整目录
-    if let Some(dir) = src.user_schemas_dir {
-        if dir.is_dir() {
-            for (name, path) in walk_dir(dir, "schemas/")? {
-                let data = std::fs::read(&path)?;
-                add(&mut w, name, &data, "schema_file", serde_json::Value::Null)?;
-            }
+    if let Some(dir) = src.user_schemas_dir
+        && dir.is_dir()
+    {
+        for (name, path) in walk_dir(dir, "schemas/")? {
+            let data = std::fs::read(&path)?;
+            add(&mut w, name, &data, "schema_file", serde_json::Value::Null)?;
         }
     }
-    if let Some(dir) = src.user_themes_dir {
-        if dir.is_dir() {
-            for (name, path) in walk_dir(dir, "themes/")? {
-                let data = std::fs::read(&path)?;
-                add(&mut w, name, &data, "theme_file", serde_json::Value::Null)?;
-            }
+    if let Some(dir) = src.user_themes_dir
+        && dir.is_dir()
+    {
+        for (name, path) in walk_dir(dir, "themes/")? {
+            let data = std::fs::read(&path)?;
+            add(&mut w, name, &data, "theme_file", serde_json::Value::Null)?;
         }
     }
 

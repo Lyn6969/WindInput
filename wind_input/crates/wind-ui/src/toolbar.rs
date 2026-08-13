@@ -308,10 +308,10 @@ impl Toolbar {
     /// 配置自动隐藏（启动/配置重载时经 SetToolbarAutoHide 下发）。
     /// 淡出中关闭开关 → 恢复不透明；开启且当前可见 → 立即起表。
     pub fn set_auto_hide(&mut self, enabled: bool, delay_ms: u64) {
-        if self.auto_hide.configure(enabled, delay_ms) {
-            if let Err(e) = self.window.update_with_alpha(255) {
-                tracing::warn!("Toolbar restore alpha: {}", e);
-            }
+        if self.auto_hide.configure(enabled, delay_ms)
+            && let Err(e) = self.window.update_with_alpha(255)
+        {
+            tracing::warn!("Toolbar restore alpha: {}", e);
         }
         if enabled && self.visible {
             // 淡出中重新配置：先恢复不透明再重新计时（configure(true) 不返回 was_fading）。
@@ -1046,6 +1046,8 @@ impl WindowMouse for ToolbarMouse {
 }
 
 /// 圆角填充：复用 view 的抗锯齿 + 预乘混合实现，保持各窗口圆角一致。
+/// 参数形状与 `view::fill_rounded` 一一对应（转发用），故同样豁免参数数量检查。
+#[allow(clippy::too_many_arguments)]
 fn fill_rounded(
     buf: &mut [u8],
     buf_w: u32,

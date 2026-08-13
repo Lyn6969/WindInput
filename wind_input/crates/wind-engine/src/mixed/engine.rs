@@ -746,17 +746,16 @@ impl Engine for MixedEngine {
         let mut pinyin_preedit: Option<String> = None;
         // 高亮跟随用的拆分形态：判据比上面宽（见 `pinyin_split_of`），单音节 + 残码也提供。
         let mut pinyin_split: Option<String> = None;
-        if input_len >= self.min_pinyin_length {
-            if let Some(sec) = &self.secondary {
-                if let Ok(py) = sec.convert(input, max_candidates) {
-                    pinyin_preedit = Self::pinyin_preedit_of(&py);
-                    pinyin_split = Self::pinyin_split_of(&py, input);
-                    // ⚠️ 拼音候选**不再 ÷100**：与码表的隔离由 `truncation_tier` 表达。
-                    // 那个除法是整数除法，拼音词频中位数 34 会被**整除归零**——量程被偏置
-                    // 吃掉的最直接后果。
-                    pinyin = py.candidates;
-                }
-            }
+        if input_len >= self.min_pinyin_length
+            && let Some(sec) = &self.secondary
+            && let Ok(py) = sec.convert(input, max_candidates)
+        {
+            pinyin_preedit = Self::pinyin_preedit_of(&py);
+            pinyin_split = Self::pinyin_split_of(&py, input);
+            // ⚠️ 拼音候选**不再 ÷100**：与码表的隔离由 `truncation_tier` 表达。
+            // 那个除法是整数除法，拼音词频中位数 34 会被**整除归零**——量程被偏置
+            // 吃掉的最直接后果。
+            pinyin = py.candidates;
         }
 
         // 3. 合并 → 按截断档位稳定排序 → 按文本去重

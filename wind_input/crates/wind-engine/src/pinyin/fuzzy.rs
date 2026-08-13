@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 pub const MAX_FUZZY_COMBOS: usize = 64;
 
 /// 模糊音配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FuzzyConfig {
     pub zh_z: bool,
     pub ch_c: bool,
@@ -23,24 +23,6 @@ pub struct FuzzyConfig {
     pub in_ing: bool,
     pub ian_iang: bool,
     pub uan_uang: bool,
-}
-
-impl Default for FuzzyConfig {
-    fn default() -> Self {
-        Self {
-            zh_z: false,
-            ch_c: false,
-            sh_s: false,
-            n_l: false,
-            f_h: false,
-            r_l: false,
-            an_ang: false,
-            en_eng: false,
-            in_ing: false,
-            ian_iang: false,
-            uan_uang: false,
-        }
-    }
 }
 
 impl FuzzyConfig {
@@ -188,10 +170,10 @@ fn split_initial_final(syllable: &str) -> (&str, &str) {
 fn part_options<'a>(part: &'a str, groups: &[FuzzyGroup], config: &FuzzyConfig) -> Vec<&'a str> {
     let mut opts = vec![part];
     for group in groups {
-        if let Some(other) = group.counterpart(part, config) {
-            if !opts.contains(&other) {
-                opts.push(other);
-            }
+        if let Some(other) = group.counterpart(part, config)
+            && !opts.contains(&other)
+        {
+            opts.push(other);
         }
     }
     opts
@@ -210,7 +192,7 @@ fn combo_count(per_syllable: &[Vec<(String, usize)>], limit: usize) -> usize {
                 continue;
             }
             next[j] = next[j].saturating_add(dp[j]); // 该音节取原值
-            if j + 1 <= limit {
+            if j < limit {
                 next[j + 1] = next[j + 1].saturating_add(dp[j].saturating_mul(alts));
             }
         }

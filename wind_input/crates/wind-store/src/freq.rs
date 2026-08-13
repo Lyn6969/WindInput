@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+/// 分页词频查询结果：`(本页的 (code, text, 记录) 列表, 匹配总数)`。
+pub type FreqPage = (Vec<(String, String, FreqRecord)>, usize);
+
 /// 词频记录（解耦权重，只记真实使用数据）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreqRecord {
@@ -168,7 +171,7 @@ impl Store {
         prefix: &str,
         offset: usize,
         limit: usize,
-    ) -> anyhow::Result<(Vec<(String, String, FreqRecord)>, usize)> {
+    ) -> anyhow::Result<FreqPage> {
         let scan = format!("{schema}\u{0}{prefix}");
         self.with_db(|db| {
             let txn = db.begin_read()?;

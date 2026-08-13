@@ -780,13 +780,13 @@ impl UiManager {
                 }
             }
             // toast 到期自动隐藏
-            if let Some(deadline) = toast_hide_at {
-                if std::time::Instant::now() >= deadline {
-                    if let Some(t) = &toast {
-                        t.hide();
-                    }
-                    toast_hide_at = None;
+            if let Some(deadline) = toast_hide_at
+                && std::time::Instant::now() >= deadline
+            {
+                if let Some(t) = &toast {
+                    t.hide();
                 }
+                toast_hide_at = None;
             }
             // 工具栏显隐迟滞推进。无待定项时 is_active()=false 直接跳过（不取时间）。
             if toolbar_gate.is_active() {
@@ -1046,29 +1046,29 @@ impl UiManager {
                             }
                         }
                         // 工具栏
-                        if let Some(tb) = &toolbar {
-                            if tb.is_visible() {
-                                let path = dir.join(format!("toolbar_{ts}.png"));
-                                match tb.capture_to_file(&path) {
-                                    Ok(_) => {
-                                        saved += 1;
-                                        info!("Screenshot saved: {:?}", path);
-                                    }
-                                    Err(e) => tracing::warn!("Screenshot toolbar: {}", e),
+                        if let Some(tb) = &toolbar
+                            && tb.is_visible()
+                        {
+                            let path = dir.join(format!("toolbar_{ts}.png"));
+                            match tb.capture_to_file(&path) {
+                                Ok(_) => {
+                                    saved += 1;
+                                    info!("Screenshot saved: {:?}", path);
                                 }
+                                Err(e) => tracing::warn!("Screenshot toolbar: {}", e),
                             }
                         }
                         // 状态提示
-                        if let Some(st) = &status_tip {
-                            if st.is_visible() {
-                                let path = dir.join(format!("status_tip_{ts}.png"));
-                                match st.capture_to_file(&path) {
-                                    Ok(_) => {
-                                        saved += 1;
-                                        info!("Screenshot saved: {:?}", path);
-                                    }
-                                    Err(e) => tracing::warn!("Screenshot status_tip: {}", e),
+                        if let Some(st) = &status_tip
+                            && st.is_visible()
+                        {
+                            let path = dir.join(format!("status_tip_{ts}.png"));
+                            match st.capture_to_file(&path) {
+                                Ok(_) => {
+                                    saved += 1;
+                                    info!("Screenshot saved: {:?}", path);
                                 }
+                                Err(e) => tracing::warn!("Screenshot status_tip: {}", e),
                             }
                         }
                         // 悬停提示（编码反查气泡）
@@ -1083,29 +1083,29 @@ impl UiManager {
                             }
                         }
                         // 右键菜单
-                        if let Some(pm) = &popup_menu {
-                            if pm.is_visible() {
-                                let path = dir.join(format!("popup_menu_{ts}.png"));
-                                match pm.capture_to_file(&path) {
-                                    Ok(_) => {
-                                        saved += 1;
-                                        info!("Screenshot saved: {:?}", path);
-                                    }
-                                    Err(e) => tracing::warn!("Screenshot popup_menu: {}", e),
+                        if let Some(pm) = &popup_menu
+                            && pm.is_visible()
+                        {
+                            let path = dir.join(format!("popup_menu_{ts}.png"));
+                            match pm.capture_to_file(&path) {
+                                Ok(_) => {
+                                    saved += 1;
+                                    info!("Screenshot saved: {:?}", path);
                                 }
+                                Err(e) => tracing::warn!("Screenshot popup_menu: {}", e),
                             }
                         }
                         // Toast（通常不可见，有则顺带保存）
-                        if let Some(t) = &toast {
-                            if t.is_visible() {
-                                let path = dir.join(format!("toast_{ts}.png"));
-                                match t.capture_to_file(&path) {
-                                    Ok(_) => {
-                                        saved += 1;
-                                        info!("Screenshot saved: {:?}", path);
-                                    }
-                                    Err(e) => tracing::warn!("Screenshot toast: {}", e),
+                        if let Some(t) = &toast
+                            && t.is_visible()
+                        {
+                            let path = dir.join(format!("toast_{ts}.png"));
+                            match t.capture_to_file(&path) {
+                                Ok(_) => {
+                                    saved += 1;
+                                    info!("Screenshot saved: {:?}", path);
                                 }
+                                Err(e) => tracing::warn!("Screenshot toast: {}", e),
                             }
                         }
                         info!("UI screenshots taken: {}, dir: {:?}", saved, dir);

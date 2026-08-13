@@ -37,11 +37,11 @@ impl<T: Clone> Debouncer<T> {
 
     /// 轮询：若已到期则取出并清空待定值返回 Some，否则 None。
     pub fn poll(&mut self) -> Option<T> {
-        if let Some(at) = self.fire_at {
-            if Instant::now() >= at {
-                self.fire_at = None;
-                return self.pending.take();
-            }
+        if let Some(at) = self.fire_at
+            && Instant::now() >= at
+        {
+            self.fire_at = None;
+            return self.pending.take();
         }
         None
     }

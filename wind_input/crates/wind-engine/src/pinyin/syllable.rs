@@ -17,6 +17,12 @@ pub struct SyllableTrie {
     root: TrieNode,
 }
 
+impl Default for SyllableTrie {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SyllableTrie {
     pub fn new() -> Self {
         let mut trie = Self {

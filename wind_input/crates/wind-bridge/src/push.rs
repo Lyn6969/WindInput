@@ -250,10 +250,10 @@ impl PushServer {
         if clients.is_empty() {
             return false;
         }
-        if active != 0 {
-            if let Some(c) = clients.iter().find(|c| c.token == active) {
-                return c.tx.send(data.to_vec()).is_ok();
-            }
+        if active != 0
+            && let Some(c) = clients.iter().find(|c| c.token == active)
+        {
+            return c.tx.send(data.to_vec()).is_ok();
         }
         if clients.len() == 1 {
             clients[0].tx.send(data.to_vec()).is_ok()
@@ -514,20 +514,13 @@ fn push_writer_loop(
     use windows::Win32::Storage::FileSystem::*;
 
     let pipe = pipe.0;
-    loop {
-        match rx.recv() {
-            Ok(data) => {
-                let mut bytes_written: u32 = 0;
-                let write_ok =
-                    unsafe { WriteFile(pipe, Some(&data), Some(&mut bytes_written), None) };
-                if write_ok.is_err() {
-                    debug!("Push client 0x{:016X} write failed, removing", token);
-                    break;
-                }
-            }
-            Err(_) => {
-                break;
-            }
+    // recv 出错（发送端全部析构）即退出循环，与写失败同样走下面的清理。
+    while let Ok(data) = rx.recv() {
+        let mut bytes_written: u32 = 0;
+        let write_ok = unsafe { WriteFile(pipe, Some(&data), Some(&mut bytes_written), None) };
+        if write_ok.is_err() {
+            debug!("Push client 0x{:016X} write failed, removing", token);
+            break;
         }
     }
 

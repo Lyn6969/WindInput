@@ -7492,8 +7492,8 @@ fn test_codetable_auto_phrase_single_char_is_not_a_word() {
 /// 不与方案挂钩，故前缀命中一律避让、不占首位——码表下与更长编码补全按权重同档、拼音/混输下
 /// 降到拼音精确候选之下。**不按语法类型区分**（`$CC`/`$SS`/静态同规则），也不再靠 40M 类别硬顶。
 ///
-/// 回归：marker 来自 `lookup_prefix`（前缀枚举、码严格更长＝非完全匹配），曾被标 `is_exact_code=true`
-/// + `PHRASE_WEIGHT_BASE`(40M，该常量后已整体删除) 抬进精确档并整体上浮，压过普通候选（用户报「系统/用户短语前缀
+/// 回归：marker 来自 `lookup_prefix`（前缀枚举、码严格更长＝非完全匹配），曾被标 `is_exact_code=true` +
+/// `PHRASE_WEIGHT_BASE`(40M，该常量后已整体删除) 抬进精确档并整体上浮，压过普通候选（用户报「系统/用户短语前缀
 /// 匹配时优先级偏高、压普通编码/候选」）。现改为 `is_exact_code=false` + `is_prefix=!codetable` +
 /// `weight=hit.weight`。低权重（1）确保 marker 可靠沉到码表候选之下，隔离出「避让」这一单一断言。
 /// 构造组短语码 `nia`（严格长于输入 `ni` → 前缀枚举命中）。

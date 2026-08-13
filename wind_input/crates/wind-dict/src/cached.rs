@@ -669,7 +669,7 @@ mod tests {
         d.merge_single("qq".into(), "抢".into(), 1, 0);
         let mut w = WdatWriter::new();
         d.export_to_wdat(&mut w);
-        w.write(&dir.join("z.wdat")).unwrap();
+        w.write(dir.join("z.wdat")).unwrap();
 
         let loaded = CachedDict::load_at_with(&yaml, &dir.join("cache/z.wdat"), false).unwrap();
         assert!(

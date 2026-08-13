@@ -26,11 +26,10 @@ impl Dag {
         let n = input.len();
         let mut nodes = vec![Vec::new(); n];
 
-        for i in 0..n {
-            let matches = trie.match_at(input, i);
-            for syl in matches {
+        for (i, slot) in nodes.iter_mut().enumerate() {
+            for syl in trie.match_at(input, i) {
                 let end = i + syl.len();
-                nodes[i].push(DagNode {
+                slot.push(DagNode {
                     start: i,
                     end,
                     syllable: syl,
@@ -123,13 +122,8 @@ impl Dag {
             }
         }
 
-        // 找到最远可达位置
-        let mut best = 0;
-        for i in 0..=n {
-            if dp[i] >= 0 {
-                best = i;
-            }
-        }
+        // 找到最远可达位置（从后往前找第一个可达点，命中即停）
+        let best = dp.iter().rposition(|&v| v >= 0).unwrap_or(0);
 
         &self.input[best..]
     }
@@ -241,11 +235,11 @@ impl SegGraph {
     pub fn from_dag(dag: &Dag) -> Self {
         let len = dag.input_len();
         let mut edges = vec![Vec::new(); len + 1];
-        for p in 0..len {
+        for (p, slot) in edges.iter_mut().take(len).enumerate() {
             let mut ends: Vec<usize> = dag.edges_from(p).iter().map(|n| n.end).collect();
             ends.sort_unstable();
             ends.dedup();
-            edges[p] = ends;
+            *slot = ends;
         }
         Self::finish(edges, len)
     }

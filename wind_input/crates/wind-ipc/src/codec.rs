@@ -410,6 +410,9 @@ pub fn encode_clear_composition() -> Vec<u8> {
 ///
 /// 用于 bridge pipe 上的同步状态响应（如 ToggleMode、MenuCommand 等）。
 /// 与 EncodeActivationStatusPush 载荷格式一致，但 command 不同。
+// 状态位是**线协议的扁平字段**，逐个传即逐个写入报文；聚合成结构体只会在编码前多一层
+// 搬运，还要让 C++ 侧的字段顺序去对齐一个 Rust 结构体。故三个 encode 函数一律豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn encode_status_update(
     chinese_mode: bool,
     full_width: bool,
@@ -442,6 +445,7 @@ pub fn encode_status_update(
 /// C++ 端 AsyncReader 收到后 Post 到 TSF 线程做 _SyncStateFromResponse + _EnsureHostRenderSetup。
 ///
 /// 与 StatePush 的区别：本命令是 activation 握手回包，必须携带完整 hotkeys + hostRenderAvail。
+#[allow(clippy::too_many_arguments)]
 pub fn encode_activation_status_push(
     chinese_mode: bool,
     full_width: bool,
@@ -494,6 +498,7 @@ pub fn encode_state_push(
 }
 
 /// 状态编码公共逻辑（StatusUpdate / StatePush / ActivationStatusPush 共用）
+#[allow(clippy::too_many_arguments)]
 fn encode_status_update_ex(
     command: u16,
     chinese_mode: bool,

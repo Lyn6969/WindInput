@@ -25,7 +25,7 @@ fn test_real_wubi_candidates() {
     let _ = std::fs::remove_file(path.with_extension("wdat"));
 
     let dict = CachedDict::load(&path).expect("加载五笔词典");
-    assert!(dict.len() > 0, "五笔词典应非空");
+    assert!(!dict.is_empty(), "五笔词典应非空");
 
     // 精确查找：a → 工/戈
     let a = dict.search("a");
@@ -56,7 +56,7 @@ fn test_real_pinyin_candidates() {
     let _ = std::fs::remove_file(path.with_extension("wdat"));
 
     let dict = CachedDict::load(&path).expect("加载拼音词典");
-    assert!(dict.len() > 0, "拼音词典应非空");
+    assert!(!dict.is_empty(), "拼音词典应非空");
 
     // 拼音 key 加载时去空格："a ba" → "aba"
     let aba = dict.search("aba");

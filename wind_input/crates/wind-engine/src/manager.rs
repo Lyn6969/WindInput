@@ -1268,7 +1268,7 @@ impl EngineManager {
                 .unwrap_or(usize::MAX);
             (pos, id.to_string())
         };
-        out.sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)));
+        out.sort_by_key(|a| rank(&a.0));
         out
     }
 
@@ -3022,15 +3022,15 @@ impl EngineManager {
         let build_lock = wind_dict::reader_pool::file_lock(combined);
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
         // 拿锁后复查
-        if Self::combined_cache_fresh(&paths, combined, COMBINED_CACHE_TAG) {
-            if let Ok(reader) = wind_dict::reader_pool::open_wdat(combined) {
-                info!(
-                    "Using combined cache: {} ({} keys)",
-                    combined.display(),
-                    reader.key_count()
-                );
-                return Some(CachedDict::Mmap(reader));
-            }
+        if Self::combined_cache_fresh(&paths, combined, COMBINED_CACHE_TAG)
+            && let Ok(reader) = wind_dict::reader_pool::open_wdat(combined)
+        {
+            info!(
+                "Using combined cache: {} ({} keys)",
+                combined.display(),
+                reader.key_count()
+            );
+            return Some(CachedDict::Mmap(reader));
         }
 
         // 按 code 聚合所有源词库条目（前面的库优先级更高，先加入；同 text 取更高权重）
@@ -3074,7 +3074,7 @@ impl EngineManager {
 
         let mut writer = wind_dict::datformat::WdatWriter::new();
         for (code, mut entries) in agg {
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             writer.add(code, entries);
         }
         match writer.write(combined) {
@@ -3306,7 +3306,7 @@ impl EngineManager {
 
         for (code, mut entries) in agg {
             // 同 code 下按权重降序，保证候选顺序稳定
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             // order 取排序后的叶内序号，与改前 `writer.add`（内部 with_local_order）语义一致；
             // 额外携带 boundary（v4）。
             let with_order: Vec<(String, i32, u32, u64)> = entries

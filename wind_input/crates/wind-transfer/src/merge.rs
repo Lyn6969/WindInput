@@ -1,17 +1,12 @@
 //! 合并引擎:导入/还原的策略与结果类型。逐表 dry-run 计算在各功能任务里接线到 store。
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Strategy {
+    #[default]
     Merge,
     Replace,
-}
-
-impl Default for Strategy {
-    fn default() -> Self {
-        Strategy::Merge
-    }
 }
 
 impl Strategy {

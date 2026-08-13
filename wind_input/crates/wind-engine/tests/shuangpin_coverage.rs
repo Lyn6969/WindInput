@@ -45,7 +45,7 @@ fn schema_dir() -> std::path::PathBuf {
 
 /// 双拼可用的键位：26 字母 + 各方案用到的符号键（微软用 `;` 作韵母键）。
 fn keys() -> Vec<u8> {
-    (b'a'..=b'z').chain([b';']).collect()
+    (b'a'..=b'z').chain(*b";").collect()
 }
 
 /// 一组击键产出的**完整音节**；无匹配（原样回写）返回 `None`。
@@ -283,7 +283,7 @@ const OFFICIAL_ZERO_STROKES: &[(&str, [(&str, &str); 12])] = &[
 fn official_zero_initial_strokes_work() {
     let mut failures = Vec::new();
     for (id, table) in OFFICIAL_ZERO_STROKES {
-        let conv = load(&id);
+        let conv = load(id);
         for (stroke, want) in table {
             match syllable_of(&conv, stroke) {
                 Some(got) if got == *want => {}
@@ -319,7 +319,7 @@ fn o_guided_layouts_reject_initial_letter_strokes() {
         ("er", "er"),
     ];
     for id in ["mspy", "sogou", "abc"] {
-        let conv = load(&id);
+        let conv = load(id);
         for (stroke, foreign) in FOREIGN {
             assert_ne!(
                 syllable_of(&conv, stroke).as_deref(),

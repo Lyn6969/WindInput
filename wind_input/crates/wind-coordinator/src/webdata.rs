@@ -1150,12 +1150,11 @@ impl Coordinator {
             self.engine_mgr.invalidate_schema(id);
         }
         for p in &r.restored {
-            if let Some(rel) = p.strip_prefix("schemas/") {
-                if let Some(id) = rel.strip_suffix(".schema.toml") {
-                    if !id.contains('/') {
-                        self.engine_mgr.invalidate_schema(id);
-                    }
-                }
+            if let Some(rel) = p.strip_prefix("schemas/")
+                && let Some(id) = rel.strip_suffix(".schema.toml")
+                && !id.contains('/')
+            {
+                self.engine_mgr.invalidate_schema(id);
             }
         }
         if touched_phrase {

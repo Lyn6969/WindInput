@@ -461,15 +461,15 @@ impl AppCompat {
     /// （`{user_dir}/compat.toml`）。任一文件缺失/解析失败均静默跳过。
     pub fn load(data_dir: Option<&Path>, user_dir: Option<&Path>) -> Self {
         let mut apps: Vec<AppCompatRule> = Vec::new();
-        if let Some(d) = data_dir {
-            if let Some(sys) = load_file(&d.join(COMPAT_FILE_NAME)) {
-                apps = sys;
-            }
+        if let Some(d) = data_dir
+            && let Some(sys) = load_file(&d.join(COMPAT_FILE_NAME))
+        {
+            apps = sys;
         }
-        if let Some(u) = user_dir {
-            if let Some(user) = load_file(&u.join(COMPAT_FILE_NAME)) {
-                apps = merge_rules(apps, user);
-            }
+        if let Some(u) = user_dir
+            && let Some(user) = load_file(&u.join(COMPAT_FILE_NAME))
+        {
+            apps = merge_rules(apps, user);
         }
         Self::from_rules(apps)
     }

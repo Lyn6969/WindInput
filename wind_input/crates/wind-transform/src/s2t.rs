@@ -280,20 +280,19 @@ fn apply_step(group: &[Dict], input: &[u8]) -> Vec<u8> {
 fn group_longest_prefix<'a>(group: &'a [Dict], input: &[u8]) -> Option<(usize, &'a [u8])> {
     let mut best: Option<(usize, &'a [u8])> = None;
     for d in group {
-        if let Some((n, val)) = d.longest_prefix(input) {
-            if best.map_or(true, |(bl, _)| n > bl) {
-                best = Some((n, val));
-            }
+        if let Some((n, val)) = d.longest_prefix(input)
+            && best.is_none_or(|(bl, _)| n > bl)
+        {
+            best = Some((n, val));
         }
     }
     best
 }
 
 fn utf8_step(b: u8) -> usize {
-    if b < 0x80 {
+    // < 0x80 是 ASCII；0x80..0xC0 是本不该出现在此的续字节，也按 1 跳过以免死循环。
+    if b < 0xC0 {
         1
-    } else if b < 0xC0 {
-        1 // 错误中间字节，按 1 跳过避免死循环
     } else if b < 0xE0 {
         2
     } else if b < 0xF0 {

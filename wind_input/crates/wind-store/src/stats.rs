@@ -379,15 +379,15 @@ impl Store {
             if d == today {
                 s.today = t;
             }
-            if let Some(td) = today_date {
-                if let Ok(dd) = NaiveDate::parse_from_str(d, "%Y-%m-%d") {
-                    let days = (td - dd).num_days();
-                    if (0..7).contains(&days) {
-                        s.week = s.week.saturating_add(t);
-                    }
-                    if (0..30).contains(&days) {
-                        s.month = s.month.saturating_add(t);
-                    }
+            if let Some(td) = today_date
+                && let Ok(dd) = NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            {
+                let days = (td - dd).num_days();
+                if (0..7).contains(&days) {
+                    s.week = s.week.saturating_add(t);
+                }
+                if (0..30).contains(&days) {
+                    s.month = s.month.saturating_add(t);
                 }
             }
         }
@@ -562,16 +562,20 @@ mod tests {
     fn stats_jsonl_roundtrip_skip_existing() {
         let path = tmp("wind_st_io.redb");
         let s = Store::open(&path).unwrap();
-        let mut d = DailyStats::default();
-        d.chinese = 42;
+        let d = DailyStats {
+            chinese: 42,
+            ..Default::default()
+        };
         s.put_daily_stat("2026-07-01", &d).unwrap();
         let text = s.export_stats_jsonl().unwrap();
         assert!(text.contains("2026-07-01"));
 
         let path2 = tmp("wind_st_io2.redb");
         let s2 = Store::open(&path2).unwrap();
-        let mut local = DailyStats::default();
-        local.chinese = 7;
+        let local = DailyStats {
+            chinese: 7,
+            ..Default::default()
+        };
         s2.put_daily_stat("2026-07-01", &local).unwrap();
         // overwrite=false：已存在日跳过
         let (imp, _) = s2.import_stats_jsonl(&text, false).unwrap();

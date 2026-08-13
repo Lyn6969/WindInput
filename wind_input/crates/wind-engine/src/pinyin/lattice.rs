@@ -283,6 +283,12 @@ pub struct LatticeBuilder {
     max_word_len: usize,
 }
 
+impl Default for LatticeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatticeBuilder {
     pub fn new() -> Self {
         // 10 而非 6：6 会把「中华人民共和国」(7 音节) 挡在词图外，却放行它的语义碎片

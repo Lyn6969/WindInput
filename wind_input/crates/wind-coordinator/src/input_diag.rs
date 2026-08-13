@@ -4,18 +4,13 @@
 const IS_PASSWORD_BIT: u64 = 1 << 31;
 const IS_NUMERIC_PASSWORD_BIT: u64 = 1 << 63;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InputDiagReason {
+    #[default]
     None,
     CompartmentDisabled,
     InputScopePassword,
     NumericPassword,
-}
-
-impl Default for InputDiagReason {
-    fn default() -> Self {
-        InputDiagReason::None
-    }
 }
 
 /// 判定禁用原因。compartment（DLL 已放行所有键）优先级最高。

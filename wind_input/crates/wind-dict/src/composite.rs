@@ -98,6 +98,7 @@ impl CompositeDict {
     ///   - 前缀查询时，同 text 多码取**最短码**(离输入最近)及其更小 natural_order；
     ///   - 每层叠加该层 `base_order()`（设计者经 [[dictionaries]].base_order 配置），
     ///     使等权/`base_sort=natural` 时按设计者指定的层间基序排列（取代旧的按注册位置偏移）。
+    ///
     /// 与 Go composite.go `searchInternal` 对齐。
     fn merge_search(&self, query: &str, limit: usize, kind: Query) -> Vec<Candidate> {
         let layers = self.layers.read().unwrap();

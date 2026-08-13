@@ -59,7 +59,7 @@ impl AbbrevMatcher {
         let letters: Vec<char> = input.chars().collect();
         let len = letters.len();
 
-        if len < 2 || len > 6 {
+        if !(2..=6).contains(&len) {
             return Vec::new();
         }
 
@@ -113,7 +113,7 @@ impl AbbrevMatcher {
         }
 
         // 按权重排序
-        candidates.sort_by(|a, b| b.weight.cmp(&a.weight));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.weight));
         candidates.truncate(limit);
         candidates
     }

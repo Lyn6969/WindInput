@@ -779,6 +779,8 @@ fn initial_bottom_right(w: u32, h: u32, scale: f32) -> (i32, i32) {
 
 /// 窗口矩形与屏幕虚拟区域的可见交集在两个方向上是否都 ≥ `min`（纯几何，可单测）。
 /// 用"可见余量"而非"任意相交"：只露极少（如 1px）也视为屏外，保证用户能重新抓到窗口。
+/// 参数是两个矩形加一个阈值，展开成标量便于逐项单测，不包成 Rect 对象。
+#[allow(clippy::too_many_arguments)]
 fn rect_visible(
     x: i32,
     y: i32,

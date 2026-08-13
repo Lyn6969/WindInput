@@ -811,14 +811,13 @@ pub(crate) struct ActiveCompat {
 /// 唯一的覆盖方式是构造完整 `FocusData` 并走那条带 UI/IPC 副作用的路径，于是「门控条件
 /// 写错」这类缺陷极易漏网——本仓已有多次「门控退化后测试仍全绿」的先例。
 ///
-/// - `crossed`      焦点是否**跨进程**切入。同应用内的焦点跳转为 false，否则用户手切的
-///                  模式会在换输入框时被拉回初始值（「初始值」与「锁定」的分界线）。
-/// - `per_app`      `state_scope="app"` 的既有按应用记忆语义。
-/// - `old_has_rule` / `new_has_rule`
-///                  切换前后的进程是否配了 compat.toml 初始状态规则。两者**取或**，使规则
-///                  同时覆盖「进入规则应用」和「离开规则应用」两个方向：只看 new 会让从
-///                  Everything 切出去后英文状态残留给下一个应用；而放宽成「规则表非空」
-///                  又会让任意两个无规则应用之间的切换也重算，把用户手切的状态冲掉。
+/// - `crossed`：焦点是否**跨进程**切入。同应用内的焦点跳转为 false，否则用户手切的
+///   模式会在换输入框时被拉回初始值（「初始值」与「锁定」的分界线）。
+/// - `per_app`：`state_scope="app"` 的既有按应用记忆语义。
+/// - `old_has_rule` / `new_has_rule`：切换前后的进程是否配了 compat.toml 初始状态规则。
+///   两者**取或**，使规则同时覆盖「进入规则应用」和「离开规则应用」两个方向：只看 new
+///   会让从 Everything 切出去后英文状态残留给下一个应用；而放宽成「规则表非空」又会让
+///   任意两个无规则应用之间的切换也重算，把用户手切的状态冲掉。
 pub(crate) fn should_reapply_initial(
     crossed: bool,
     per_app: bool,
@@ -1225,7 +1224,7 @@ impl Coordinator {
             Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
         // redb 用户数据库（用户偏好数据：词频、自定义词、shadow 规则，应随用户漫游）。
         let store = user_dir.as_deref().and_then(|d| {
-            let _ = std::fs::create_dir_all(&d);
+            let _ = std::fs::create_dir_all(d);
             let p = d.join("userdata.redb");
             match Store::open(&p) {
                 Ok(s) => {
@@ -1717,7 +1716,7 @@ impl Coordinator {
                 full_width: init_full,
                 chinese_punct: init_punct,
                 s2t_enabled: config.input.s2t.enabled,
-                filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
+                filter_mode: wind_candidate::FilterMode::from_config(&config.input.filter_mode),
                 scope_relaxed: false,
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
@@ -2618,7 +2617,8 @@ impl Coordinator {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.toolbar_visible = new_cfg.ui.toolbar.visible;
                     s.s2t_enabled = new_cfg.input.s2t.enabled;
-                    let new_mode = wind_candidate::FilterMode::from_str(&new_cfg.input.filter_mode);
+                    let new_mode =
+                        wind_candidate::FilterMode::from_config(&new_cfg.input.filter_mode);
                     let changed = s.filter_mode != new_mode;
                     s.filter_mode = new_mode;
                     changed
@@ -5587,7 +5587,7 @@ impl Coordinator {
         if text.is_empty() {
             return;
         }
-        let source = if text.chars().any(|ch| !ch.is_ascii()) {
+        let source = if !text.is_ascii() {
             CommitSource::Candidate
         } else {
             CommitSource::Punctuation
@@ -5942,7 +5942,7 @@ impl MessageHandler for Coordinator {
             return;
         }
         // 不足一格也算一格：触控板的单次轻扫 delta 可能小于 120，直接整除会得 0（滚不动）。
-        let notches = (delta.abs() / WHEEL_DELTA).max(1).min(MAX_NOTCHES);
+        let notches = (delta.abs() / WHEEL_DELTA).clamp(1, MAX_NOTCHES);
         let up = delta > 0;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
@@ -6286,10 +6286,10 @@ impl MessageHandler for Coordinator {
             // 只处理纯修饰键：有字符的键归 keydown 的 try_activate_mode 管（英文模式下
             // 必须让它出字），两条路各管一半、不重叠。判据是键的形态而非动词类别，
             // 见 docs/design/schema-key-actions.md §4.1。
-            if keymap::is_pure_modifier_vk(data.key_code) {
-                if let Some(act) = self.handle_bound_modifier_key_up(data.key_code) {
-                    return act;
-                }
+            if keymap::is_pure_modifier_vk(data.key_code)
+                && let Some(act) = self.handle_bound_modifier_key_up(data.key_code)
+            {
+                return act;
             }
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
@@ -10963,7 +10963,7 @@ mod ext_envelope_tests {
             drop(s);
             c.per_page(None)
         };
-        assert!(per_page >= 2 && per_page < 12, "本用例要求每页 2..12 项");
+        assert!((2..12).contains(&per_page), "本用例要求每页 2..12 项");
 
         // 下滚一格 → 高亮下移一项（不是翻一页）
         c.handle_candidate_scroll(-120);
@@ -11177,7 +11177,8 @@ mod hover_reset_tests {
     #[test]
     fn every_overlay_refill_clears_hover() {
         // (入口名, 调用) —— 名字进断言消息，失败时直接指出是哪条路径漏了。
-        let cases: Vec<(&str, fn(&Coordinator, &mut State))> = vec![
+        type RefillCase = (&'static str, fn(&Coordinator, &mut State));
+        let cases: Vec<RefillCase> = vec![
             ("特殊模式 update_special_candidates", |c, st| {
                 let _ = c.update_special_candidates(st);
             }),

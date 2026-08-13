@@ -31,7 +31,7 @@ pub fn call(suffix: &str, method: &str, params: Value) -> anyhow::Result<Value> 
         use std::fs::OpenOptions;
         let mut stream = OpenOptions::new().read(true).write(true).open(&endpoint)?;
         stream.write_all(&frame)?;
-        return finish(read_response(&mut stream)?);
+        finish(read_response(&mut stream)?)
     }
     #[cfg(not(any(unix, windows)))]
     {

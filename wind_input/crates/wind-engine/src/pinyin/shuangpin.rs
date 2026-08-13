@@ -51,10 +51,13 @@ impl Layout {
     pub fn from_toml(path: &Path) -> anyhow::Result<Layout> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("读取双拼布局 {} 失败: {}", path.display(), e))?;
-        Self::from_str(&text)
+        Self::from_toml_str(&text)
     }
 
-    pub fn from_str(toml_text: &str) -> anyhow::Result<Layout> {
+    /// 解析双拼布局 TOML 文本。命名与 [`from_toml`](Self::from_toml) 对称（一个吃路径、
+    /// 一个吃文本），不叫 `from_str`——那个名字属于 `FromStr` trait，而本函数的错误类型是
+    /// `anyhow::Error`，实现 trait 反而会把调用点的错误语境挤掉。
+    pub fn from_toml_str(toml_text: &str) -> anyhow::Result<Layout> {
         let raw: RawLayout = toml::from_str(toml_text)?;
         let mut initials: HashMap<u8, String> = HashMap::new();
         // 声母自映射补全：26 字母默认映射自身
@@ -315,10 +318,11 @@ impl ShuangpinConverter {
 
         if self.layout.has_zero_pairs() {
             // 显式零声母键对映射（优先路径，与旧 zero_initials 互斥）。
-            if let Some(syl) = self.layout.zero_pair(key1, key2) {
-                if self.is_valid(syl) && !results.iter().any(|r| r == syl) {
-                    results.push(syl.to_string());
-                }
+            if let Some(syl) = self.layout.zero_pair(key1, key2)
+                && self.is_valid(syl)
+                && !results.iter().any(|r| r == syl)
+            {
+                results.push(syl.to_string());
             }
         } else {
             // 1. 零声母（旧路径：三子路径查找）
@@ -369,7 +373,7 @@ impl ShuangpinConverter {
             for init in initial_candidates {
                 for f in self.layout.finals_of(key2) {
                     let syllable = normalize_pinyin(&format!("{}{}", init, f));
-                    if self.is_valid(&syllable) && !results.iter().any(|r| *r == syllable) {
+                    if self.is_valid(&syllable) && !results.contains(&syllable) {
                         results.push(syllable);
                     }
                 }
@@ -387,8 +391,8 @@ impl ShuangpinConverter {
             if key1 == key2 {
                 let single = (key1 as char).to_string();
                 if self.is_valid(&single)
-                    && self.layout.zero_of(key1).iter().any(|s| *s == single)
-                    && !results.iter().any(|r| *r == single)
+                    && self.layout.zero_of(key1).contains(&single)
+                    && !results.contains(&single)
                 {
                     results.push(single);
                 }
@@ -555,7 +559,7 @@ a = ["a", "ai", "an", "ang", "ao"]
 
     #[test]
     fn layout_parse_and_self_map() {
-        let lay = Layout::from_str(XIAOHE).unwrap();
+        let lay = Layout::from_toml_str(XIAOHE).unwrap();
         assert_eq!(lay.id, "xiaohe");
         assert_eq!(lay.name, "小鹤双拼");
         // 显式声母
@@ -575,7 +579,7 @@ a = ["a", "ai", "an", "ang", "ao"]
     #[test]
     fn layout_symbol_key_as_final() {
         let t = "[meta]\nid=\"x\"\nname=\"x\"\n[finals]\n\";\" = [\"ing\"]\n";
-        let lay = Layout::from_str(t).unwrap();
+        let lay = Layout::from_toml_str(t).unwrap();
         assert!(lay.is_final_key(b';'));
         assert_eq!(lay.finals_of(b';'), &["ing".to_string()]);
     }
@@ -595,7 +599,7 @@ a = ["a", "ai", "an", "ang", "ao"]
 [finals]
 k = ["ao"]
 "#;
-        let result = Layout::from_str(bad);
+        let result = Layout::from_toml_str(bad);
         assert!(result.is_err(), "缺 [meta] 的 toml 应返回 Err");
     }
 
@@ -608,7 +612,7 @@ name = "无 id 方案"
 [finals]
 k = ["ao"]
 "#;
-        let result = Layout::from_str(bad);
+        let result = Layout::from_toml_str(bad);
         assert!(result.is_err(), "meta 缺 id 字段应返回 Err");
     }
 
@@ -625,7 +629,7 @@ zh = "x"
 [finals]
 k = ["ao"]
 "#;
-        let result = Layout::from_str(bad);
+        let result = Layout::from_toml_str(bad);
         assert!(result.is_err(), "多字符键名应被 key_byte 校验拒绝");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -788,7 +792,7 @@ name = "x"
 [finals]
 ";" = ["ing"]
 "#;
-        let cs = Layout::from_str(t).unwrap().code_char_set().unwrap();
+        let cs = Layout::from_toml_str(t).unwrap().code_char_set().unwrap();
         assert!(
             cs.contains('/') && cs.contains_leading('/'),
             "声母键应可起头"
@@ -811,7 +815,7 @@ name = "x"
 "-" = ["ang"]
 ";" = ["ing"]
 "#;
-        let cs = Layout::from_str(t).unwrap().code_char_set().unwrap();
+        let cs = Layout::from_toml_str(t).unwrap().code_char_set().unwrap();
         assert!(cs.contains('-'), "`-` 应是码元");
         assert!(cs.contains(';'), "`;` 不得被 `-` 的解析失败连累");
         assert!(cs.contains('a') && cs.contains('z'), "a-z 范围应完好");
@@ -828,7 +832,7 @@ k = ["ao"]
 [zero_pairs]
 abc = "a"
 "#;
-        let result = Layout::from_str(bad);
+        let result = Layout::from_toml_str(bad);
         assert!(result.is_err(), "zero_pairs 三字符键应被拒绝");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(

@@ -46,6 +46,10 @@ const HL_FG: [u8; 4] = FG;
 /// 无选中哨兵
 const NONE_SEL: usize = usize::MAX;
 
+/// 一层菜单的几何：`(左, 上, 宽, 高, 该层各项的命中矩形 [(项下标, 矩形)])`。
+/// 内容几何与窗口几何（含阴影 margin）同型，故共用此别名。
+type LayerGeom = (i32, i32, u32, u32, Vec<(usize, Rect)>);
+
 /// 一个打开的菜单层级
 struct Level {
     /// 本层菜单项（内容源）
@@ -299,7 +303,7 @@ impl MenuState {
         let k = self.deepest();
         let sel = self.levels[k].selected;
         if sel != NONE_SEL
-            && self.levels[k].items.get(sel).map_or(false, is_submenu)
+            && self.levels[k].items.get(sel).is_some_and(is_submenu)
             && self.levels.len() == k + 1
         {
             self.open_child(k, true);
@@ -485,17 +489,17 @@ impl PopupMenu {
                 // hover 文字未配时沿用正文色（与旧的 color("menu_hover_text", fg) 兜底一致）。
                 self.hl_fg = h.text_color.unwrap_or(self.fg);
             }
-            if let Some(d) = &item.disabled {
-                if let Some(c) = d.text_color {
-                    self.disabled = c;
-                }
+            if let Some(d) = &item.disabled
+                && let Some(c) = d.text_color
+            {
+                self.disabled = c;
             }
         }
         // 分隔线：线色取 background.color。
-        if let Some(sep) = &theme.views.menu_separator {
-            if let Some(c) = sep.bg_color {
-                self.sep = c;
-            }
+        if let Some(sep) = &theme.views.menu_separator
+            && let Some(c) = sep.bg_color
+        {
+            self.sep = c;
         }
         // 字号可能被主题改了，同步渲染器基准（否则测量仍按旧字号，宽高算错）。
         self.renderer.set_base_size(self.font_px * self.scale);
@@ -709,10 +713,8 @@ impl PopupMenu {
             .as_ref()
             .map(|s| s.margins())
             .unwrap_or((0, 0, 0, 0));
-        let mut geom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> =
-            Vec::with_capacity(snap.len());
-        let mut wgeom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> =
-            Vec::with_capacity(snap.len());
+        let mut geom: Vec<LayerGeom> = Vec::with_capacity(snap.len());
+        let mut wgeom: Vec<LayerGeom> = Vec::with_capacity(snap.len());
         for k in 0..snap.len() {
             let (items, selected) = &snap[k];
             let (mut root, cw, ch, content_hits) = self.build_view(items, *selected);

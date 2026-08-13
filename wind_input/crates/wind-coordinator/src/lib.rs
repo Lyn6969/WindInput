@@ -80,15 +80,15 @@ pub(crate) fn is_foreground_fullscreen() -> bool {
             return false;
         }
         // 判据①:系统通知状态(游戏 D3D 独占 / PPT 放映等系统级全屏)。
-        if let Ok(state) = SHQueryUserNotificationState() {
-            if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
-                tracing::debug!(
-                    "is_foreground_fullscreen=true 判据①(通知状态) state={} class={}",
-                    state.0,
-                    foreground_class_name(hwnd)
-                );
-                return true;
-            }
+        if let Ok(state) = SHQueryUserNotificationState()
+            && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
+        {
+            tracing::debug!(
+                "is_foreground_fullscreen=true 判据①(通知状态) state={} class={}",
+                state.0,
+                foreground_class_name(hwnd)
+            );
+            return true;
         }
         // 判据②:前台窗口矩形 ⊇ 显示器物理矩形。
         let mut wr = RECT::default();

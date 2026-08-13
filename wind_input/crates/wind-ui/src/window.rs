@@ -201,7 +201,7 @@ mod platform {
                     0,
                     width as i32,
                     height as i32,
-                    parent.unwrap_or(HWND::default()),
+                    parent.unwrap_or_default(),
                     HMENU::default(),
                     instance,
                     None,
@@ -462,10 +462,10 @@ mod platform {
             ) {
                 let key = hwnd.0 as isize;
                 let handler = MOUSE_HANDLERS.with(|m| m.borrow().get(&key).cloned());
-                if let Some(h) = handler {
-                    if let Some(lr) = h.borrow_mut().on_message(hwnd, msg, wparam, lparam) {
-                        return lr;
-                    }
+                if let Some(h) = handler
+                    && let Some(lr) = h.borrow_mut().on_message(hwnd, msg, wparam, lparam)
+                {
+                    return lr;
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

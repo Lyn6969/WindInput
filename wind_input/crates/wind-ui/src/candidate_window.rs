@@ -536,6 +536,9 @@ impl CandidateWindow {
         self.theme = theme;
     }
 
+    /// 一帧候选窗的完整状态。参数即协调器下发的字段本身，包成结构体只会在 IPC 解包与
+    /// 本调用之间多一次搬运。
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         preedit: &str,
@@ -2207,10 +2210,10 @@ impl CandidateWindow {
             if let (Some(band), Some(p)) = (preedit_band.take(), pager.take()) {
                 preedit_band = Some(band.child(p));
             }
-        } else if !self.vertical {
-            if let Some(p) = pager.take() {
-                list = list.child(p);
-            }
+        } else if !self.vertical
+            && let Some(p) = pager.take()
+        {
+            list = list.child(p);
         }
         // 竖排未并入的翻页栏：候选区独立行（与 list 同属候选区，随 swap 一起移动）。
         // 独立行按主题 behavior.pager_align（left/center/right，默认 center）水平对齐：包一层

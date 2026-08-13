@@ -581,7 +581,7 @@ pub(crate) fn dispatch_command(
         CMD_TOGGLE_MODE => {
             let (status, commit_text) = handler.handle_toggle_mode();
             if !commit_text.is_empty() {
-                let chinese_mode = status.as_ref().map_or(false, |s| s.chinese_mode);
+                let chinese_mode = status.as_ref().is_some_and(|s| s.chinese_mode);
                 Some(encode_commit_text(
                     &commit_text,
                     None,

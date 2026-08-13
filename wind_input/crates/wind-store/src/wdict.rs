@@ -711,7 +711,7 @@ mod tests {
     /// 超过 64 字节的拼接：bitmask 装不下 → 整体降级为 0，不给半截错误边界。
     #[test]
     fn overlong_code_degrades_to_zero() {
-        let spaced = vec!["zhuang"; 12].join(" "); // 12*6=72B
+        let spaced = ["zhuang"; 12].join(" "); // 12*6=72B
         let (flat, mask) = split_spaced_code(&spaced);
         assert_eq!(flat.len(), 72);
         assert_eq!(mask, 0, "超长码整体降级");

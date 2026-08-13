@@ -5,9 +5,10 @@
 use serde::{Deserialize, Serialize};
 
 /// 候选词来源
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CandidateSource {
     #[serde(rename = "")]
+    #[default]
     None,
     #[serde(rename = "codetable")]
     CodeTable,
@@ -17,12 +18,6 @@ pub enum CandidateSource {
     English,
     #[serde(rename = "phrase")]
     Phrase,
-}
-
-impl Default for CandidateSource {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// 候选词元数据

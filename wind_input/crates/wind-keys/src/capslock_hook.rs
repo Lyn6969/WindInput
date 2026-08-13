@@ -88,10 +88,10 @@ mod imp {
                 // 程序）可能会——拦下它们既无意义，又会让那些工具行为异常。
                 if (info.flags & LLKHF_INJECTED).0 == 0 {
                     let msg = wparam.0 as u32;
-                    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                        if let Some(cb) = CALLBACK.get() {
-                            cb();
-                        }
+                    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                        && let Some(cb) = CALLBACK.get()
+                    {
+                        cb();
                     }
                     // ★ down 和 up **都要吃**。只吃 down 会让系统状态机收到不成对的
                     // 事件，某些宿主会据此认为该键仍处于按下状态。

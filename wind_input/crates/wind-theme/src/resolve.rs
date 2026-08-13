@@ -470,23 +470,23 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
     // 菜单项状态 patch：与候选窗 item 同构——节点显式值优先，未配落到 palette 默认色。
     // 之前只建了基态，hover/disabled 全靠 popup_menu.rs 直读 token，导致主题里写的
     // menu.item.hover / .disabled 不生效。
-    if let Some(m) = v.menu.as_ref() {
-        if let Some(item) = rv.menu_item.as_mut() {
-            item.hover = resolve_state(
-                m.item.hover.as_deref(),
-                palette,
-                is_dark,
-                tk("menu_hover_bg"),
-                tk("menu_hover_text"),
-            );
-            item.disabled = resolve_state(
-                m.item.disabled.as_deref(),
-                palette,
-                is_dark,
-                None,
-                tk("menu_disabled"),
-            );
-        }
+    if let Some(m) = v.menu.as_ref()
+        && let Some(item) = rv.menu_item.as_mut()
+    {
+        item.hover = resolve_state(
+            m.item.hover.as_deref(),
+            palette,
+            is_dark,
+            tk("menu_hover_bg"),
+            tk("menu_hover_text"),
+        );
+        item.disabled = resolve_state(
+            m.item.disabled.as_deref(),
+            palette,
+            is_dark,
+            None,
+            tk("menu_disabled"),
+        );
     }
     // 菜单分隔线（menu.separator）：线色走 background.color，默认 menu_separator。
     rv.menu_separator = v

@@ -1365,7 +1365,7 @@ columns:
         // 空码 → 无信息。
         assert_eq!(syllable_boundary_mask(""), 0);
         // 超长码（拼接 ≥64B）：bitmask 装不下 → 整体降级为 0，不给半截错误边界。
-        let long = vec!["zhuang"; 12].join(" "); // 12*6 = 72B
+        let long = ["zhuang"; 12].join(" "); // 12*6 = 72B
         assert_eq!(syllable_boundary_mask(&long), 0);
     }
 

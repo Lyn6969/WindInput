@@ -96,6 +96,9 @@ fn freq_tier(c: &Candidate, input: &str) -> u8 {
 ///
 /// 策略：`Step`（默认/逐次提升）count 降序、last_used 降序 tiebreak（抗误选）；
 /// `Top`（一次到顶/MRU）last_used 降序、count 降序 tiebreak（最近选的置该档之首）。
+// 八个参数都是彼此正交的重排旋钮（策略/保护/时钟/档位/前缀提升），打包成 struct 只是把
+// 同样多的字段换个地方列，调用点反而看不出自己传了什么。
+#[allow(clippy::too_many_arguments)]
 pub fn rerank_codetable_usedfirst(
     candidates: &mut [Candidate],
     recs: &HashMap<String, FreqRecord>,

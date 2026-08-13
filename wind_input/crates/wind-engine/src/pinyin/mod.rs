@@ -2787,45 +2787,45 @@ impl Engine for PinyinEngine {
         // 简拼/混合简拼另走一支：它们的 code 与击键**不同域**，故 `top.code == completed`
         // 恒不成立（`nhao` 一个完整音节都切不出，`completed` 是空串），此前因此完全没有
         // 分隔显示——`nhao` 原样显示为 `nhao`，`nh` 显示为 `nh`。见下方分支。
-        if sp_result.is_none() && !has_sep {
-            if let Some(top) = candidates.first() {
-                if top.boundary != 0 && top.code == completed && !completed.is_empty() {
-                    preedit_display = render_preedit(completed, top.boundary, &partial_syllable);
-                } else if top.is_sentence && top.boundary != 0 && top.code == raw_input {
-                    // 混合整句（step 2b）：它的 code 是整串**击键**、boundary 也在击键空间
-                    // （简拼段每字母一位），故直接渲染击键串即可，得 `b'z'd'hao'bu'hao`。
-                    // 走不到上一支是因为 `completed` 对这类输入恒为空串——`bzdhaobuhao`
-                    // 从位置 0 就切不出完整音节。
-                    preedit_display = render_preedit(raw_input, top.boundary, "");
-                } else if top.is_abbrev && top.boundary != 0 {
-                    // 简拼（`nh`→`n'h`）与混合简拼（`nhao`→`n'hao`）的分段显示。
-                    //
-                    // **切的是击键串，不是候选的 code。** 直接渲染 code 会显示成 `ni'hao`：
-                    // 用户只敲了 4 键却看到 5 个字母，退格与光标编辑立刻错位。这里用候选
-                    // 自带的真值音节序列去切 `raw_input`，声母段吃 1 字节、音节段吃整段
-                    // （见 `render_keystroke_preedit`）。
-                    //
-                    // 对不上就保持原显示：preedit 是显示层，宁可少一个分隔符，
-                    // 也不能给出与击键长度不符的串。
-                    if let Some((head, used)) =
-                        mixed_abbrev::syllables_from_boundary(&top.code, top.boundary).and_then(
-                            |syls| mixed_abbrev::render_keystroke_preedit(raw_input, &syls),
-                        )
-                    {
-                        if used == raw_input.len() {
-                            preedit_display = head;
-                        } else if top.consumed_length != 0 && used == top.consumed_length {
-                            // 部分匹配（step 6.2 前缀回退）：余下的击键**自己再切一遍**，
-                            // 别整段甩上去。`bzdnihaob` 选中「不知道」(消费 bzd) 后尾巴是
-                            // `nihaob`，含完整音节 `ni`/`hao` + 残码 `b`——整段追加会显示成
-                            // `b'z'd'nihaob`，该切的地方没切。走 compose_segment 得
-                            // `ni'hao'b`，最终 `b'z'd'ni'hao'b`。
-                            let (tail, _, _) = self.compose_segment(&raw_input[used..]);
-                            preedit_display = format!("{head}'{tail}");
-                        }
-                        // 其余情形（走不完且不是部分候选）保持原显示：那说明模式与击键
-                        // 对不上，硬拼只会给出与击键长度不符的串。
+        if sp_result.is_none()
+            && !has_sep
+            && let Some(top) = candidates.first()
+        {
+            if top.boundary != 0 && top.code == completed && !completed.is_empty() {
+                preedit_display = render_preedit(completed, top.boundary, &partial_syllable);
+            } else if top.is_sentence && top.boundary != 0 && top.code == raw_input {
+                // 混合整句（step 2b）：它的 code 是整串**击键**、boundary 也在击键空间
+                // （简拼段每字母一位），故直接渲染击键串即可，得 `b'z'd'hao'bu'hao`。
+                // 走不到上一支是因为 `completed` 对这类输入恒为空串——`bzdhaobuhao`
+                // 从位置 0 就切不出完整音节。
+                preedit_display = render_preedit(raw_input, top.boundary, "");
+            } else if top.is_abbrev && top.boundary != 0 {
+                // 简拼（`nh`→`n'h`）与混合简拼（`nhao`→`n'hao`）的分段显示。
+                //
+                // **切的是击键串，不是候选的 code。** 直接渲染 code 会显示成 `ni'hao`：
+                // 用户只敲了 4 键却看到 5 个字母，退格与光标编辑立刻错位。这里用候选
+                // 自带的真值音节序列去切 `raw_input`，声母段吃 1 字节、音节段吃整段
+                // （见 `render_keystroke_preedit`）。
+                //
+                // 对不上就保持原显示：preedit 是显示层，宁可少一个分隔符，
+                // 也不能给出与击键长度不符的串。
+                if let Some((head, used)) =
+                    mixed_abbrev::syllables_from_boundary(&top.code, top.boundary)
+                        .and_then(|syls| mixed_abbrev::render_keystroke_preedit(raw_input, &syls))
+                {
+                    if used == raw_input.len() {
+                        preedit_display = head;
+                    } else if top.consumed_length != 0 && used == top.consumed_length {
+                        // 部分匹配（step 6.2 前缀回退）：余下的击键**自己再切一遍**，
+                        // 别整段甩上去。`bzdnihaob` 选中「不知道」(消费 bzd) 后尾巴是
+                        // `nihaob`，含完整音节 `ni`/`hao` + 残码 `b`——整段追加会显示成
+                        // `b'z'd'nihaob`，该切的地方没切。走 compose_segment 得
+                        // `ni'hao'b`，最终 `b'z'd'ni'hao'b`。
+                        let (tail, _, _) = self.compose_segment(&raw_input[used..]);
+                        preedit_display = format!("{head}'{tail}");
                     }
+                    // 其余情形（走不完且不是部分候选）保持原显示：那说明模式与击键
+                    // 对不上，硬拼只会给出与击键长度不符的串。
                 }
             }
         }
@@ -3424,8 +3424,10 @@ mod tests {
     #[test]
     fn engine_applies_fuzzy_config() {
         let dict = CachedDict::Memory(CodetableDict::empty());
-        let mut fz = FuzzyConfig::default();
-        fz.zh_z = true;
+        let fz = FuzzyConfig {
+            zh_z: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
         assert!(eng.fuzzy_zh_z(), "with_fuzzy 注入的 zh_z=true 应被引擎持有");
     }
@@ -4191,8 +4193,10 @@ mod tests {
         let mut raw = CodetableDict::empty();
         raw.merge_single("shi".to_string(), "是".to_string(), 100, 0);
         let dict = CachedDict::Memory(raw);
-        let mut fz = FuzzyConfig::default();
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
 
         let r = eng.convert("si", 10).unwrap();
@@ -4205,8 +4209,10 @@ mod tests {
         // 反向：词典 "si"→"四"，输入 "shi" 应命中「四」
         let mut raw2 = CodetableDict::empty();
         raw2.merge_single("si".to_string(), "四".to_string(), 100, 0);
-        let mut fz2 = FuzzyConfig::default();
-        fz2.sh_s = true;
+        let fz2 = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng2 = PinyinEngine::new(Config::default(), CachedDict::Memory(raw2)).with_fuzzy(fz2);
         let r2 = eng2.convert("shi", 10).unwrap();
         assert!(
@@ -4235,8 +4241,10 @@ mod tests {
         raw.merge_single("si".to_string(), "四".to_string(), 100, 0);
         raw.merge_single("shi".to_string(), "是".to_string(), 9000, 0);
         let dict = CachedDict::Memory(raw);
-        let mut fz = FuzzyConfig::default();
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
 
         let r = eng.convert("si", 10).unwrap();
@@ -4267,8 +4275,10 @@ mod tests {
         let mut raw = CodetableDict::empty();
         raw.merge_single("si".to_string(), "四".to_string(), 9000, 0);
         raw.merge_single("shi".to_string(), "是".to_string(), 9000, 0);
-        let mut fz = FuzzyConfig::default();
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         let r = eng.convert("si", 10).unwrap();
@@ -4441,8 +4451,10 @@ mod tests {
         let mut raw = CodetableDict::empty();
         raw.merge_single("shengri".to_string(), "生日".to_string(), 100, 0);
         let dict = CachedDict::Memory(raw);
-        let mut fz = FuzzyConfig::default();
-        fz.en_eng = true;
+        let fz = FuzzyConfig {
+            en_eng: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
 
         let r = eng.convert("shenri", 10).unwrap();
@@ -4475,8 +4487,10 @@ mod tests {
         let mut raw = CodetableDict::empty();
         raw.merge_single("si".to_string(), "四".to_string(), 1000, 0);
         raw.merge_single("shi".to_string(), "是".to_string(), 1000, 1);
-        let mut fz = FuzzyConfig::default();
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         let r = eng.convert("si", 10).unwrap();
@@ -4508,8 +4522,10 @@ mod tests {
         // 模糊命中：码 shi，经 s↔sh 由输入 si 召回；词频显著高于补全（真实词库中
         // 「是」正是高频字），折扣后仍应有竞争力。
         raw.merge_single("shi".to_string(), "是".to_string(), 900_000, 99);
-        let mut fz = FuzzyConfig::default();
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         const LIMIT: usize = 20;
@@ -4530,9 +4546,11 @@ mod tests {
     fn fuzzy_hits_non_initial_syllables_via_lookup() {
         let mut raw = CodetableDict::empty();
         raw.merge_single("beijingshi".to_string(), "北京市".to_string(), 5000, 0);
-        let mut fz = FuzzyConfig::default();
-        fz.in_ing = true;
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            in_ing: true,
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         let r = eng.convert("beijinsi", 20).unwrap();
@@ -4560,8 +4578,10 @@ mod tests {
         raw.merge_single("zhongzhou".to_string(), "中州".to_string(), 5000, 0);
         // 覆盖末音节的字，供 Viterbi 拼出整句
         raw.merge_single("ming".to_string(), "明".to_string(), 5000, 1);
-        let mut fz = FuzzyConfig::default();
-        fz.zh_z = true;
+        let fz = FuzzyConfig {
+            zh_z: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         // zhong|zou|ming：词典无覆盖整串的词条 → 只能靠词图拼接
@@ -4592,8 +4612,10 @@ mod tests {
         raw.merge_single("sixiang".to_string(), "思想".to_string(), 26_000, 0);
         // 模糊命中的整词（码 shixiang，经 s↔sh 由 sixiang 召回）
         raw.merge_single("shixiang".to_string(), "是想".to_string(), 30_000, 1);
-        let mut fz = FuzzyConfig::default();
-        fz.sh_s = true;
+        let fz = FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         let r = eng.convert("sixiang", 10).unwrap();
@@ -4614,8 +4636,10 @@ mod tests {
         raw.merge_single("zhongguo".to_string(), "中国".to_string(), 30_000, 0);
         // zongguo 下只有子短语单字，没有码 == zongguo 的精确整词
         raw.merge_single("zong".to_string(), "总".to_string(), 20_000, 1);
-        let mut fz = FuzzyConfig::default();
-        fz.zh_z = true;
+        let fz = FuzzyConfig {
+            zh_z: true,
+            ..Default::default()
+        };
         let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
 
         let r = eng.convert("zongguo", 10).unwrap();

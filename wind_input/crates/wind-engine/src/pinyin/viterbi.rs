@@ -45,6 +45,12 @@ struct DpEntry {
 /// 计算并写入 `WordNode.log_prob`，解码器只做最优路径 DP。
 pub struct ViterbiDecoder {}
 
+impl Default for ViterbiDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ViterbiDecoder {
     pub fn new() -> Self {
         Self {}
