@@ -37,7 +37,7 @@ const TAB_GLYPH: char = '\u{21E5}';
 /// 显示要的是「看得见有个换行」，上屏要的是「真的换行」。
 ///
 /// 不这么做的后果不是「看不见」而是「排版坏掉」：DirectWrite 的 `CreateTextLayout`
-/// 把 `\n` 当硬换行，`measure_text_styled` 于是返回 N 倍行高，而 `view.rs` 的盒模型
+/// 把 `\n` 当硬换行，`TextRenderer::measure` 于是返回 N 倍行高，而 `view.rs` 的盒模型
 /// 按内容高布局 → 该候选被撑成多行、整个候选窗变高且行高参差。
 ///
 /// CRLF 只出一个符号（不是两个）——它在用户眼里就是一个换行。

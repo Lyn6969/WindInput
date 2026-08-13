@@ -7,7 +7,7 @@
 //!
 //! 九宫格图 / 阴影模糊 / z 分层 / 渐变背景均已支持。
 
-use crate::text::dwrite::TextRenderer;
+use crate::text::dwrite::{TextRenderer, TextStyle};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::{
@@ -511,14 +511,23 @@ impl View {
         self.arrange(x, y);
     }
 
+    /// 本节点文本的排版样式（字号回退到渲染器基准字号）。
+    ///
+    /// 三处用到它——measure、paint 里算水平对齐、caret 量前半段——过去各自重复
+    /// `(font_size.unwrap_or(base), font_weight.unwrap_or(0), family.as_deref())`
+    /// 这串取值。收成一处是因为**它们必须完全一致**：measure 与 paint 的样式一旦分叉，
+    /// 布局按一种宽度排、文字按另一种画，表现为文字整体偏移或超出节点框。
+    fn text_style(&self, tr: &TextRenderer) -> TextStyle<'_> {
+        TextStyle {
+            family: self.font_family.as_deref(),
+            size: self.font_size.unwrap_or(tr.base_size()),
+            weight: self.font_weight.unwrap_or(0),
+        }
+    }
+
     fn measure(&mut self, tr: &TextRenderer) {
         let (cw, ch) = if let Some(t) = &self.text {
-            let m = tr.measure_text_styled(
-                t,
-                self.font_size.unwrap_or(tr.base_size()),
-                self.font_weight.unwrap_or(0),
-                self.font_family.as_deref(),
-            );
+            let m = tr.measure(t, &self.text_style(tr));
             (m.width, m.height)
         } else {
             let mut main = 0.0f32;
@@ -716,10 +725,8 @@ impl View {
         }
         // 文本
         if let Some(t) = &self.text {
-            let size = self.font_size.unwrap_or(tr.base_size());
-            let weight = self.font_weight.unwrap_or(0);
-            let family = self.font_family.as_deref();
-            let m = tr.measure_text_styled(t, size, weight, family);
+            let ts = self.text_style(tr);
+            let m = tr.measure(t, &ts);
             let cx0 = r.x + self.padding.l;
             let content_w = r.w - self.padding.w();
             let content_h = r.h - self.padding.h();
@@ -729,16 +736,14 @@ impl View {
                 Align::End => cx0 + content_w - m.width,
             };
             let ty = r.y + self.padding.t + (content_h - m.height) * 0.5;
-            let _ = tr.draw_text_styled(
+            let _ = tr.draw(
                 buf,
                 buf_w,
                 buf_h,
                 tx.max(r.x),
                 ty.max(r.y),
                 t,
-                size,
-                weight,
-                family,
+                &ts,
                 self.text_color,
             );
             // 插入符：覆盖在已绘文本之上，按前半段宽度定位。前半段单独整形与其在整串中的
@@ -747,7 +752,7 @@ impl View {
                 let hw = if cp == 0 {
                     0.0
                 } else {
-                    tr.measure_text_styled(&t[..cp], size, weight, family).width
+                    tr.measure(&t[..cp], &ts).width
                 };
                 fill_rounded(
                     buf,

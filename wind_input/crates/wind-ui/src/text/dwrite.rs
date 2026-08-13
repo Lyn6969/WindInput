@@ -19,6 +19,56 @@ pub struct TextMetrics {
     pub height: f32,
 }
 
+/// 一次文字排版所需的全部字体属性。
+///
+/// ## 为什么收成结构体
+///
+/// 这些属性要穿过三个后端（DirectWrite / CoreText / mock）和全部测量与绘制调用点。
+/// 散开成位置参数时，每加一项都要改所有签名——重构前的 `draw_text_styled` 已是 11 个参数，
+/// 再加行高、斜体就到 13 个，而参数越多，传错顺序时编译器越抓不到（`size`/`weight`
+/// 都是数值，换个位置照样编译）。
+///
+/// 隔壁 wind-ui-rust 走过这条路并留下了教训：字重就是因为"每加一项都要改所有签名"
+/// 而**没有进签名**，改走线程局部注入——于是字重成了隐式全局状态，某条路径忘了复位，
+/// 后续无关文字就跟着变粗，且只在特定绘制顺序下显形。收成结构体后新增属性只是加一个
+/// 字段，签名不动、调用点不动。
+///
+/// 本仓暂不设 `line_height`：View 引擎还没有行高概念，高度直接取自后端度量。
+/// 加字段前先让它在渲染路径里真正生效，否则就是「声明未实现」。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextStyle<'a> {
+    /// 字族名。`None` = 用渲染器的全局字体族。
+    pub family: Option<&'a str>,
+    /// 字号（设备像素，调用方已按 DPI 缩放）。
+    pub size: f32,
+    /// 字重（400=常规、700=粗）。`0` = 继承渲染器默认，沿用既有约定。
+    pub weight: i32,
+}
+
+impl<'a> TextStyle<'a> {
+    /// 只指定字号，字重与字体族取默认。
+    pub fn new(size: f32) -> Self {
+        Self {
+            family: None,
+            size,
+            weight: 0,
+        }
+    }
+
+    /// 换字重（`0` = 继承默认）。
+    pub fn with_weight(self, weight: i32) -> Self {
+        Self { weight, ..self }
+    }
+
+    /// 换字体族（`None`/空串 = 用全局字体族）。
+    pub fn with_family(self, family: Option<&'a str>) -> Self {
+        Self {
+            family: family.filter(|s| !s.trim().is_empty()),
+            ..self
+        }
+    }
+}
+
 /// 测量缓存容量上限；超过即整体清空。
 ///
 /// 不做 LRU：候选窗每帧的文本集合高度重复（同一批候选、序号、注释反复测量），
@@ -35,14 +85,17 @@ const MEASURE_CACHE_CAP: usize = 4096;
 ///
 /// 字号用 `to_bits()` 而非 `as u32`：字号是 DPI 缩放后的浮点（如 14.4/16.8），
 /// 取整会让相邻字号撞进同一个键。
+///
+/// ⚠️ 给 [`TextStyle`] 加字段时**必须同步加进这里**——漏一项就是某段文本静默套用另一段
+/// 的宽度。这正是它按整个 `TextStyle` 取参、而非重新罗列各项的原因：字段列表只有一处。
 #[cfg_attr(not(windows), allow(dead_code))]
-fn measure_key(text: &str, size: f32, weight: i32, family: Option<&str>) -> u64 {
+fn measure_key(text: &str, ts: &TextStyle) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
-    size.to_bits().hash(&mut h);
-    weight.hash(&mut h);
-    family.hash(&mut h);
+    ts.size.to_bits().hash(&mut h);
+    ts.weight.hash(&mut h);
+    ts.family.hash(&mut h);
     h.finish()
 }
 
@@ -109,7 +162,7 @@ pub use imp::TextRenderer;
 /// Windows 实现（DirectWrite）。非 Windows 平台见文件末尾的 mock。
 #[cfg(windows)]
 mod imp {
-    use super::{MEASURE_CACHE_CAP, TextMetrics, measure_key};
+    use super::{MEASURE_CACHE_CAP, TextMetrics, TextStyle, measure_key};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -351,36 +404,30 @@ mod imp {
             self.measure_text_sized(text, self.font_size)
         }
 
-        /// 测量文本尺寸（指定字号；宽含尾随空白，高为行高）。
+        /// 测量文本尺寸（指定字号，其余取默认；宽含尾随空白，高为行高）。
         pub fn measure_text_sized(&self, text: &str, size: f32) -> TextMetrics {
-            self.measure_text_styled(text, size, 0, None)
+            self.measure(text, &TextStyle::new(size))
         }
 
-        /// 测量文本尺寸（指定字号 + 字重 + 字体族覆盖）。结果按 `measure_key` 缓存。
-        pub fn measure_text_styled(
-            &self,
-            text: &str,
-            size: f32,
-            weight: i32,
-            family: Option<&str>,
-        ) -> TextMetrics {
+        /// 测量文本尺寸。结果按 `measure_key` 缓存。
+        pub fn measure(&self, text: &str, ts: &TextStyle) -> TextMetrics {
             if text.is_empty() {
                 return TextMetrics {
                     width: 0.0,
-                    height: size * 1.2,
+                    height: ts.size * 1.2,
                 };
             }
-            let key = measure_key(text, size, weight, family);
+            let key = measure_key(text, ts);
             if let Some(m) = self.measure_cache.borrow().get(&key) {
                 return m.clone();
             }
             // 排版失败走等宽近似回退，且**不入缓存**：失败多是暂时性的（资源紧张、
             // 字体集正在切换），一旦把回退值固化，这段文本就会一直按错误宽度布局
             // 直到下次整体清空——而清空只在换字体/换字根时发生，可能永远等不到。
-            let Some(m) = self.measure_layout(text, size, weight, family) else {
+            let Some(m) = self.measure_layout(text, ts) else {
                 return TextMetrics {
-                    width: text.chars().count() as f32 * size * 0.6,
-                    height: size * 1.2,
+                    width: text.chars().count() as f32 * ts.size * 0.6,
+                    height: ts.size * 1.2,
                 };
             };
             let mut c = self.measure_cache.borrow_mut();
@@ -392,21 +439,26 @@ mod imp {
         }
 
         /// 走一次 DirectWrite 排版取度量。任一 COM 环节失败返回 `None`
-        /// （由 [`TextRenderer::measure_text_styled`] 决定回退值，并跳过缓存）。
-        fn measure_layout(
-            &self,
-            text: &str,
-            size: f32,
-            weight: i32,
-            family: Option<&str>,
-        ) -> Option<TextMetrics> {
+        /// （由 [`TextRenderer::measure`] 决定回退值，并跳过缓存）。
+        fn measure_layout(&self, text: &str, ts: &TextStyle) -> Option<TextMetrics> {
             let layout = self
-                .create_layout(text, size, weight, family, f32::MAX / 2.0, f32::MAX / 2.0)
+                .create_layout(
+                    text,
+                    ts.size,
+                    ts.weight,
+                    ts.family,
+                    f32::MAX / 2.0,
+                    f32::MAX / 2.0,
+                )
                 .ok()?;
             unsafe {
                 let mut m = DWRITE_TEXT_METRICS::default();
                 layout.GetMetrics(&mut m).ok()?;
-                let height = if m.height > 0.0 { m.height } else { size * 1.2 };
+                let height = if m.height > 0.0 {
+                    m.height
+                } else {
+                    ts.size * 1.2
+                };
                 Some(TextMetrics {
                     width: m.widthIncludingTrailingWhitespace,
                     height,
@@ -458,7 +510,7 @@ mod imp {
         /// - `buf_width`/`buf_height`: 缓冲区尺寸
         /// - `x`/`y`: 文本左上角（像素坐标）
         /// - `color`: 文本颜色 [R, G, B, A]（`A` 为文字自身不透明度，见
-        ///   [`TextRenderer::draw_text_styled`] 步骤 3 的二次混合）
+        ///   [`TextRenderer::draw`] 步骤 3 的二次混合）
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text(
             &self,
@@ -482,7 +534,7 @@ mod imp {
             )
         }
 
-        /// 绘制文本（指定字号）。
+        /// 绘制文本（指定字号，其余取默认）。
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text_sized(
             &self,
@@ -495,12 +547,21 @@ mod imp {
             size: f32,
             color: [u8; 4],
         ) -> Result<(), String> {
-            self.draw_text_styled(buf, buf_width, buf_height, x, y, text, size, 0, None, color)
+            self.draw(
+                buf,
+                buf_width,
+                buf_height,
+                x,
+                y,
+                text,
+                &TextStyle::new(size),
+                color,
+            )
         }
 
-        /// 绘制文本（指定字号 + 字重 + 字体族覆盖）。
+        /// 绘制文本。
         #[allow(clippy::too_many_arguments)]
-        pub fn draw_text_styled(
+        pub fn draw(
             &self,
             buf: &mut [u8],
             buf_width: u32,
@@ -508,9 +569,7 @@ mod imp {
             x: f32,
             y: f32,
             text: &str,
-            size: f32,
-            weight: i32,
-            family: Option<&str>,
+            ts: &TextStyle,
             color: [u8; 4],
         ) -> Result<(), String> {
             if text.is_empty() || buf_width == 0 || buf_height == 0 {
@@ -549,9 +608,9 @@ mod imp {
                     (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
                 let layout = self.create_layout(
                     text,
-                    size,
-                    weight,
-                    family,
+                    ts.size,
+                    ts.weight,
+                    ts.family,
                     buf_width as f32,
                     buf_height as f32,
                 )?;
@@ -823,7 +882,7 @@ pub use imp::TextRenderer;
 /// 让候选窗/工具栏/菜单等布局逻辑能在 Linux 上编译与跑测试。
 #[cfg(all(not(windows), not(target_os = "macos")))]
 mod imp {
-    use super::TextMetrics;
+    use super::{TextMetrics, TextStyle};
 
     pub struct TextRenderer {
         font_size: f32,
@@ -865,15 +924,9 @@ mod imp {
             }
         }
 
-        /// mock：字重/字体族不影响等宽近似测量，委托 sized。
-        pub fn measure_text_styled(
-            &self,
-            text: &str,
-            size: f32,
-            _weight: i32,
-            _family: Option<&str>,
-        ) -> TextMetrics {
-            self.measure_text_sized(text, size)
+        /// mock：字重/字体族不影响等宽近似测量，只取字号。
+        pub fn measure(&self, text: &str, ts: &TextStyle) -> TextMetrics {
+            self.measure_text_sized(text, ts.size)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -905,9 +958,9 @@ mod imp {
             Ok(())
         }
 
-        /// mock：绘制空操作（字重/字体族忽略）。
+        /// mock：绘制空操作（样式忽略）。
         #[allow(clippy::too_many_arguments)]
-        pub fn draw_text_styled(
+        pub fn draw(
             &self,
             _buf: &mut [u8],
             _buf_width: u32,
@@ -915,9 +968,7 @@ mod imp {
             _x: f32,
             _y: f32,
             _text: &str,
-            _size: f32,
-            _weight: i32,
-            _family: Option<&str>,
+            _ts: &TextStyle,
             _color: [u8; 4],
         ) -> Result<(), String> {
             Ok(())
@@ -929,7 +980,7 @@ mod imp {
 // 需要真实 DirectWrite 出字形，故 gate 到 Windows。
 #[cfg(all(test, windows))]
 mod alpha_text_tests {
-    use super::imp::TextRenderer;
+    use super::{TextRenderer, TextStyle};
 
     const W: u32 = 48;
     const H: u32 = 48;
@@ -949,19 +1000,17 @@ mod alpha_text_tests {
     fn draw_block(alpha: u8) -> Vec<u8> {
         let r = TextRenderer::new("微软雅黑", 32.0).expect("建 TextRenderer");
         let mut buf = white_buf();
-        r.draw_text_styled(
+        r.draw(
             &mut buf,
             W,
             H,
             0.0,
             0.0,
             "\u{2588}",
-            32.0,
-            0,
-            None,
+            &TextStyle::new(32.0),
             [0, 0, 0, alpha],
         )
-        .expect("draw_text_styled");
+        .expect("draw");
         buf
     }
 
@@ -998,7 +1047,7 @@ mod alpha_text_tests {
     }
 }
 
-// 测量缓存的**接线**测试：键函数再正确，没接进 `measure_text_styled` 也是白搭，
+// 测量缓存的**接线**测试：键函数再正确，没接进 `TextRenderer::measure` 也是白搭，
 // 而 `measure_key_tests` 直接调键函数，接线断了它照样全绿。这里从公开的测量入口进，
 // 用缓存条目数确认它真的被查过、被写过。
 //
@@ -1006,10 +1055,15 @@ mod alpha_text_tests {
 // 键本身的正确性由跨平台的 `measure_key_tests` 在 Linux CI 上守。
 #[cfg(all(test, windows))]
 mod measure_cache_tests {
-    use super::imp::TextRenderer;
+    use super::{TextRenderer, TextStyle};
 
     fn tr() -> TextRenderer {
         TextRenderer::new("微软雅黑", 14.0).expect("建 DirectWrite TextRenderer")
+    }
+
+    /// 默认样式 + 指定字号。
+    fn ts(size: f32) -> TextStyle<'static> {
+        TextStyle::new(size)
     }
 
     /// 测量结果入缓存，重复测量命中而不新增条目。
@@ -1017,9 +1071,9 @@ mod measure_cache_tests {
     fn repeated_measure_hits_cache() {
         let r = tr();
         assert_eq!(r.measure_cache_len(), 0, "起手应为空");
-        let a = r.measure_text_styled("你好", 14.0, 400, None);
+        let a = r.measure("你好", &ts(14.0));
         assert_eq!(r.measure_cache_len(), 1, "首次测量应入缓存");
-        let b = r.measure_text_styled("你好", 14.0, 400, None);
+        let b = r.measure("你好", &ts(14.0));
         assert_eq!(r.measure_cache_len(), 1, "重复测量应命中，不得新增");
         assert_eq!(a.width, b.width, "命中值须与首次一致");
         assert_eq!(a.height, b.height);
@@ -1029,7 +1083,7 @@ mod measure_cache_tests {
     #[test]
     fn empty_text_does_not_populate_cache() {
         let r = tr();
-        let _ = r.measure_text_styled("", 14.0, 400, None);
+        let _ = r.measure("", &ts(14.0));
         assert_eq!(r.measure_cache_len(), 0);
     }
 
@@ -1037,7 +1091,7 @@ mod measure_cache_tests {
     #[test]
     fn set_font_family_clears_cache() {
         let mut r = tr();
-        let _ = r.measure_text_styled("你好", 14.0, 400, None);
+        let _ = r.measure("你好", &ts(14.0));
         assert_eq!(r.measure_cache_len(), 1);
         r.set_font_family("宋体");
         assert_eq!(r.measure_cache_len(), 0, "换字体族须清空测量缓存");
@@ -1047,8 +1101,8 @@ mod measure_cache_tests {
     #[test]
     fn distinct_sizes_are_cached_separately() {
         let r = tr();
-        let small = r.measure_text_styled("你好", 12.0, 400, None);
-        let large = r.measure_text_styled("你好", 24.0, 400, None);
+        let small = r.measure("你好", &ts(12.0));
+        let large = r.measure("你好", &ts(24.0));
         assert_eq!(r.measure_cache_len(), 2, "两种字号应各占一条");
         assert!(
             large.width > small.width,
@@ -1065,36 +1119,41 @@ mod measure_cache_tests {
 // 静默套用另一段的宽度——布局错位，且因为是缓存命中路径，重现条件依赖于测量顺序，极难定位。
 #[cfg(test)]
 mod measure_key_tests {
-    use super::measure_key;
+    use super::{TextStyle, measure_key};
+
+    /// 字号 14、字重 400、指定字体族的基准样式。
+    fn base_style() -> TextStyle<'static> {
+        TextStyle::new(14.0)
+            .with_weight(400)
+            .with_family(Some("微软雅黑"))
+    }
 
     /// 同一组输入恒得同一个键（缓存能命中的前提）。
     #[test]
     fn same_inputs_yield_same_key() {
-        let a = measure_key("你好", 14.0, 400, Some("微软雅黑"));
-        let b = measure_key("你好", 14.0, 400, Some("微软雅黑"));
-        assert_eq!(a, b);
+        assert_eq!(
+            measure_key("你好", &base_style()),
+            measure_key("你好", &base_style())
+        );
     }
 
     /// 四项输入各自独立参与键——逐项只改一个，键都必须变。
     #[test]
     fn each_input_affects_key() {
-        let base = measure_key("你好", 14.0, 400, Some("微软雅黑"));
+        let s = base_style();
+        let base = measure_key("你好", &s);
+        assert_ne!(base, measure_key("你好啊", &s), "文本");
         assert_ne!(
             base,
-            measure_key("你好啊", 14.0, 400, Some("微软雅黑")),
-            "文本"
-        );
-        assert_ne!(
-            base,
-            measure_key("你好", 16.0, 400, Some("微软雅黑")),
+            measure_key("你好", &TextStyle { size: 16.0, ..s }),
             "字号"
         );
+        assert_ne!(base, measure_key("你好", &s.with_weight(700)), "字重");
         assert_ne!(
             base,
-            measure_key("你好", 14.0, 700, Some("微软雅黑")),
-            "字重"
+            measure_key("你好", &s.with_family(Some("宋体"))),
+            "字体族"
         );
-        assert_ne!(base, measure_key("你好", 14.0, 400, Some("宋体")), "字体族");
     }
 
     /// 字号必须按 `to_bits()` 精确入键，不能取整。
@@ -1104,9 +1163,11 @@ mod measure_key_tests {
     /// 一两个像素时恰好落进这个区间，表现为某一档 DPI 下注释宽度突然用了正文的值。
     #[test]
     fn fractional_sizes_do_not_collide() {
-        let a = measure_key("你好", 16.25, 400, None);
-        let b = measure_key("你好", 16.8, 400, None);
-        assert_ne!(a, b, "同一整数区间内的两个字号不得共用缓存键");
+        assert_ne!(
+            measure_key("你好", &TextStyle::new(16.25)),
+            measure_key("你好", &TextStyle::new(16.8)),
+            "同一整数区间内的两个字号不得共用缓存键"
+        );
     }
 
     /// `None`（用全局字体族）与显式指定不是一回事：`set_font_family` 只会让前者失效。
@@ -1114,20 +1175,24 @@ mod measure_key_tests {
     /// 更糟的是反过来——全局族的条目被显式族的值命中，直接就是错误宽度。
     #[test]
     fn none_family_differs_from_explicit() {
+        let s = TextStyle::new(14.0);
         assert_ne!(
-            measure_key("你好", 14.0, 400, None),
-            measure_key("你好", 14.0, 400, Some("微软雅黑")),
+            measure_key("你好", &s),
+            measure_key("你好", &s.with_family(Some("微软雅黑"))),
         );
     }
 
-    /// 空串字体族与 `None` 也要分开——调用方 `View::font_family` 会把空串过滤成 `None`，
-    /// 但本函数不该依赖上游的这个约定。
+    /// 空串字体族经 `with_family` 归一成 `None`——统一在构造处收口，免得各调用点
+    /// 各自过滤，漏一处就多出一条与 `None` 等价却不同键的缓存。
     #[test]
-    fn empty_family_differs_from_none() {
-        assert_ne!(
-            measure_key("你好", 14.0, 400, None),
-            measure_key("你好", 14.0, 400, Some("")),
+    fn empty_family_normalizes_to_none() {
+        let s = TextStyle::new(14.0);
+        assert_eq!(
+            measure_key("你好", &s),
+            measure_key("你好", &s.with_family(Some(""))),
+            "空串字体族应归一为 None"
         );
+        assert_eq!(s.with_family(Some("  ")).family, None, "纯空白也应归一");
     }
 }
 

@@ -28,7 +28,7 @@ use core_text::font_descriptor::{CTFontDescriptor, kCTFontCascadeListAttribute};
 use core_text::line::CTLine;
 use core_text::string_attributes::{kCTFontAttributeName, kCTForegroundColorAttributeName};
 
-use super::dwrite::TextMetrics;
+use super::dwrite::{TextMetrics, TextStyle};
 
 /// 主字体载入失败时的系统回退字体族。
 const FALLBACK_FAMILY: &str = "Helvetica";
@@ -179,33 +179,27 @@ impl TextRenderer {
         }
     }
 
-    /// 测量文本（带字重/字体族覆盖）。镜像 dwrite `measure_text_styled`。
-    pub fn measure_text_styled(
-        &self,
-        text: &str,
-        size: f32,
-        weight: i32,
-        family: Option<&str>,
-    ) -> TextMetrics {
+    /// 测量文本。镜像 dwrite 的 `TextRenderer::measure`。
+    pub fn measure(&self, text: &str, ts: &TextStyle) -> TextMetrics {
         if text.is_empty() {
             return TextMetrics {
                 width: 0.0,
-                height: size * 1.2,
+                height: ts.size * 1.2,
             };
         }
-        let font = self.font_styled(size, weight, family);
+        let font = self.font_styled(ts.size, ts.weight, ts.family);
         let line = make_line(text, &font, None);
         let b = line.get_typographic_bounds();
         let height = (b.ascent + b.descent + b.leading) as f32;
         TextMetrics {
             width: b.width as f32,
-            height: if height > 0.0 { height } else { size * 1.2 },
+            height: if height > 0.0 { height } else { ts.size * 1.2 },
         }
     }
 
-    /// 绘制文本（带字重/字体族覆盖）。镜像 dwrite `draw_text_styled`。
+    /// 绘制文本。镜像 dwrite 的 `TextRenderer::draw`。
     #[allow(clippy::too_many_arguments)]
-    pub fn draw_text_styled(
+    pub fn draw(
         &self,
         buf: &mut [u8],
         buf_width: u32,
@@ -213,12 +207,10 @@ impl TextRenderer {
         x: f32,
         y: f32,
         text: &str,
-        size: f32,
-        weight: i32,
-        family: Option<&str>,
+        ts: &TextStyle,
         color: [u8; 4],
     ) -> Result<(), String> {
-        if text.is_empty() || buf_width == 0 || buf_height == 0 || size <= 0.0 {
+        if text.is_empty() || buf_width == 0 || buf_height == 0 || ts.size <= 0.0 {
             return Ok(());
         }
         let w = buf_width as usize;
@@ -226,7 +218,7 @@ impl TextRenderer {
         if buf.len() < w * h * 4 {
             return Err("buffer too small".into());
         }
-        let font = self.font_styled(size, weight, family);
+        let font = self.font_styled(ts.size, ts.weight, ts.family);
         // color 为 [R,G,B,A]（与 palette/View 叶子色约定一致）；给 CGColor 真 R/G/B。
         let cg_color = CGColor::rgb(
             color[0] as f64 / 255.0,
