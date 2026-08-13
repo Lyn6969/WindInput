@@ -8,57 +8,16 @@ use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, View, ViewImage, ViewLayer};
 use crate::window::LayeredWindow;
 
-/// Toast 屏幕位置（相对光标所在显示器工作区）。API 可按需扩展更多位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastPosition {
-    Center,
-    TopCenter,
-    BottomCenter,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
+/// 位置/类型枚举已下沉至 wind-ui-types；再导出保持 `wind_ui::toast::*` 原路径成立。
+pub use wind_ui_types::{ToastKind, ToastPosition};
 
-impl ToastPosition {
-    /// 从配置字符串解析（未知→BottomCenter）。
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "center" => Self::Center,
-            "top_center" | "top" => Self::TopCenter,
-            "top_left" => Self::TopLeft,
-            "top_right" => Self::TopRight,
-            "bottom_left" => Self::BottomLeft,
-            "bottom_right" => Self::BottomRight,
-            _ => Self::BottomCenter,
-        }
-    }
-}
-
-/// Toast 类型（决定强调色）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastKind {
-    Info,
-    Success,
-    Error,
-}
-
-impl ToastKind {
-    /// 左侧强调条颜色（RGBA）。
-    fn accent(self) -> [u8; 4] {
-        match self {
-            Self::Info => [64, 158, 255, 255],
-            Self::Success => [82, 196, 110, 255],
-            Self::Error => [245, 108, 108, 255],
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "success" => Self::Success,
-            "error" => Self::Error,
-            _ => Self::Info,
-        }
+/// 左侧强调条颜色（RGBA）。渲染色表属于渲染端，不随类型下沉；
+/// 类型来自外部 crate 无法加私有固有方法，故为模块私有自由函数。
+fn accent(kind: ToastKind) -> [u8; 4] {
+    match kind {
+        ToastKind::Info => [64, 158, 255, 255],
+        ToastKind::Success => [82, 196, 110, 255],
+        ToastKind::Error => [245, 108, 108, 255],
     }
 }
 
@@ -166,7 +125,7 @@ impl Toast {
         // 边框：主题 toast.border 优先；未配沿用「按提示等级取色 + 2dp」的内置默认。
         let (border_color, border_width) = match self.border {
             Some((c, w)) => (c, w.unwrap_or(2.0 * s).max(1.0)),
-            None => (kind.accent(), (2.0 * s).max(1.0)),
+            None => (accent(kind), (2.0 * s).max(1.0)),
         };
         let mut card = View::container(Layout::Row)
             .cross(Align::Center)

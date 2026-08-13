@@ -11,6 +11,7 @@ members = [
     "crates/wind-transform",
     "crates/wind-theme",
     "crates/wind-transfer",
+    "crates/wind-ui-types",
     "crates/wind-ui",
     "crates/wind-cmdbar",
     "crates/wind-phrase",

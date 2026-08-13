@@ -1,0 +1,16 @@
+[package]
+name = "wind-ui-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# 仅为 UiCommand::SetTheme(Box<Resolved>)；wind-theme 无平台依赖。
+wind-theme = { path = "../wind-theme" }
+
+[target.'cfg(windows)'.dependencies]
+# 仅为 UiCommand::SetHostRender(HostRenderArc)；该变体本身 #[cfg(windows)]，
+# 非 Windows target 下 wind-bridge 不进入本 crate 的依赖闭包。
+wind-bridge = { path = "../wind-bridge" }
+
+[lints]
+workspace = true

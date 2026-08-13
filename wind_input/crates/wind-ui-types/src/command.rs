@@ -1,0 +1,191 @@
+//! 正向协议：协调器 → 渲染端的 [`UiCommand`]，及全局热键条目、翻页器 tag 常量。
+
+use crate::candidate::CandidateItem;
+use crate::diag::InputDiagView;
+use crate::menu::{MenuAnchor, MenuItemSpec};
+use crate::toast::{ToastKind, ToastPosition};
+use crate::toolbar::ToolbarState;
+
+/// UI 命令
+#[derive(Debug)]
+pub enum UiCommand {
+    /// 更新候选列表
+    UpdateCandidates {
+        preedit: String,
+        /// 编码区插入符位置：`preedit` 内的**字节**偏移（恒在字符边界）。自绘 preedit 栏据此
+        /// 画竖线；等于 `preedit.len()` 即光标在末尾。
+        preedit_caret: usize,
+        /// 模式指示文本（拼/双/快/英/符 或全称）；空=不显示。有 preedit 空间时随候选窗持久显示。
+        mode_label: String,
+        candidates: Vec<CandidateItem>,
+        /// 键盘选中项（页内下标），空格上屏目标
+        selected: usize,
+        /// 鼠标悬停项（页内下标），-1 表示无；与 selected 独立
+        hover: i32,
+        /// 当前页（1 起）
+        page: usize,
+        /// 总页数（含动态加载估计）
+        total_pages: usize,
+        caret_x: i32,
+        caret_y: i32,
+        /// 光标高度（用于上翻时定位到光标上方）
+        caret_height: i32,
+        /// 光标坐标是否有效（无效时窗口仅临时显示、不锁定锚点）
+        caret_valid: bool,
+        /// 固定位置模式（ui.candidate.position_mode=fixed）：忽略光标，用 fixed_x/fixed_y 定位。
+        fixed: bool,
+        /// 固定位置的**内容左上**屏幕坐标；(0,0) 表示尚未设定，由 UI 侧落到屏幕默认锚点。
+        fixed_x: i32,
+        fixed_y: i32,
+    },
+    /// 隐藏候选窗口
+    HideCandidates,
+    /// 一次性通知 toast（方案切换/词库就绪/错误等）；duration_ms 后自动隐藏。
+    ShowToast {
+        text: String,
+        position: ToastPosition,
+        kind: ToastKind,
+        duration_ms: u64,
+    },
+    /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏。
+    /// (x,y)=光标点(y 为底端)，caret_height 上翻定位用，offset_x/y 用户位置微调。
+    ShowStatusTip {
+        text: String,
+        x: i32,
+        y: i32,
+        caret_height: i32,
+        offset_x: i32,
+        offset_y: i32,
+        /// 自动隐藏时长（毫秒）；0=常驻不自动隐藏（display_mode=always）。
+        duration_ms: u64,
+        /// 固定位置模式（position_mode=fixed）：用 fixed_x/fixed_y 作屏幕坐标，忽略光标。
+        fixed: bool,
+        fixed_x: i32,
+        fixed_y: i32,
+    },
+    /// 隐藏状态提示气泡（常驻模式失焦/切走输入法时）。
+    HideStatusTip,
+    /// 显示/更新输入诊断 HUD（右键「高级」开）。惰性创建，可拖动，双击复制。
+    ShowInputDiag(InputDiagView),
+    /// 隐藏输入诊断 HUD。
+    HideInputDiag,
+    /// 复制输入诊断 HUD 当前显示的文本到剪贴板（右键菜单）。
+    /// 走 UI 线程而非协调器直接写剪贴板：文本以**实际渲染的行**为准（含分区隐藏结果），
+    /// 那份只有 UI 侧有。
+    CopyInputDiagText,
+    /// 更新常驻工具栏状态（中英/方案/标点/全半角）
+    UpdateToolbar(ToolbarState),
+    /// 隐藏工具栏
+    HideToolbar,
+    /// 设置工具栏位置（启动恢复持久化位置 / 焦点换屏后落到该屏的记忆位置）
+    SetToolbarPos { x: i32, y: i32 },
+    /// 把工具栏落到指定显示器工作区的右下角——焦点切到一块从未拖过工具栏的屏时下发。
+    /// 传边界而非坐标：右下角要减工具栏自身尺寸，那只有 UI 侧知道。
+    SetToolbarCorner { work_right: i32, work_bottom: i32 },
+    /// 工具栏自动隐藏配置（开关 + 超时毫秒）。来自 ui.toolbar.auto_hide / auto_hide_delay，
+    /// 协调器 apply_ui_config（启动 + 配置重载）下发。
+    SetToolbarAutoHide { enabled: bool, delay_ms: u64 },
+    /// 工具栏纵向排列（true=竖条）。来自 ui.toolbar.vertical，
+    /// 协调器 apply_ui_config（启动 + 配置重载）下发。
+    SetToolbarVertical(bool),
+    /// 应用主题（协调器加载解析后下发）
+    SetTheme(Box<wind_theme::Resolved>),
+    /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。
+    SetCandidateLayout(bool),
+    /// 预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
+    /// 来自 ui.candidate.preedit_display == "candidate_inline"。
+    SetPreeditEmbedded(bool),
+    /// 候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
+    SetCandidateFontSize(f32),
+    /// 候选字体族（空=默认）。来自 ui.font.family。
+    SetCandidateFontFamily(String),
+    /// 悬停提示激活延迟（毫秒）。来自 ui.tooltip.delay。
+    SetTooltipDelay(i32),
+    /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
+    SetCandidateFlipWhenAbove(bool),
+    /// 候选窗在光标上方时交换编码栏与候选栏位置。来自 ui.candidate.swap_preedit_when_above。
+    SetCandidateSwapWhenAbove(bool),
+    /// 翻页栏并入编码栏行右对齐显示。来自 ui.candidate.pager_in_preedit。
+    SetPagerInPreedit(bool),
+    /// 翻页栏显示覆盖（""跟随主题/"hide"/"auto"/"always"）。来自 ui.candidate.pager_bar_display。
+    SetPagerDisplay(String),
+    /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
+    SetPageNumberDisplay(String),
+    /// 拆字字根字体（PUA 字根字符渲染）：TTF 文件路径 + DWrite 家族名（取自方案 [engine.chaizi]）。
+    SetTooltipChaiziFont { path: String, family: String },
+    /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）。
+    ShowCandidateMenu {
+        items: Vec<MenuItemSpec>,
+        anchor: MenuAnchor,
+    },
+    /// 转发键给打开的菜单（方向键/回车/ESC/空格）；菜单窗无焦点，键由协调器转发
+    MenuKey(u32),
+    /// 隐藏菜单
+    HideMenu,
+    /// 写剪贴板（菜单"复制"由协调器驱动 → UI 侧执行）
+    CopyToClipboard(String),
+    /// 用资源管理器打开路径（菜单"打开配置目录"）
+    OpenPath(String),
+    /// 启动应用程序并传参（如 wind_setting.exe `--page dict`）。
+    OpenApp { path: String, args: String },
+    /// 截图所有可见 UI 窗口，保存到 dir 目录（由协调器根据 config 确定）。
+    TakeScreenshot { dir: String },
+    /// 将候选窗口截图复制到剪贴板（候选不可见则提示）。
+    ScreenshotCandidateToClipboard,
+    /// 截图状态提示气泡到文件（状态提示右键菜单「截图此窗口」）。
+    ScreenshotStatusTip { dir: std::path::PathBuf },
+    /// 复制悬停提示（编码反查气泡）文本到剪贴板（其右键菜单「复制内容」）。
+    CopyTooltipText,
+    /// 截图悬停提示到文件（其右键菜单「截图此窗口」）。
+    ScreenshotTooltip { dir: std::path::PathBuf },
+    /// 设置悬停提示右键菜单打开状态（开启时抑制其 WM_MOUSELEAVE 自动隐藏）。
+    SetTooltipMenuOpen(bool),
+    /// 标记状态气泡的右键菜单开/关（打开期间抑制自动隐藏）。
+    SetStatusMenuOpen(bool),
+    /// 请求上报状态气泡当前位置：UI 侧回 `UiEvent::StatusTipMoved`。
+    /// 供「固定位置」开关把当前实际位置落盘，而不是跳到陈旧的 custom_x/custom_y。
+    ReportStatusTipPos,
+    /// 请求上报候选窗当前位置：UI 侧回 `UiEvent::CandidateWindowMoved`。
+    /// 供「定位方式」切到 fixed 时就地固定——窗口正显示着就用它当前的位置，
+    /// 不显示则不上报（协调器留空，首显时由 UI 落到屏幕默认锚点）。
+    ReportCandidatePos,
+    /// 注册全局热键（Win32 RegisterHotKey，线程级）。覆盖式：先反注册旧列表再注册新列表，
+    /// 空列表 = 仅清除已注册项。来自 keys.global_hotkeys（协调器构建，启动/配置重载时下发）。
+    RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
+    /// 关闭 UI
+    Shutdown,
+    /// 注入 host-render 管理器（Windows）；协调器 `set_host_render` 后下发，
+    /// UI 线程收到后在消息循环中激活 SHM 分流路径。
+    #[cfg(windows)]
+    SetHostRender(HostRenderArc),
+}
+
+/// `HostRenderManager` 不派生 Debug，包一层使 UiCommand 可 derive Debug。
+#[cfg(windows)]
+pub struct HostRenderArc(pub std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>);
+
+#[cfg(windows)]
+impl std::fmt::Debug for HostRenderArc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostRenderManager")
+    }
+}
+
+/// 全局热键条目（协调器按 keys.global_hotkeys 构建，UI 线程经 Win32 RegisterHotKey 注册）。
+/// `modifiers` 为 Win32 RegisterHotKey 修饰位（MOD_ALT=0x1/MOD_CONTROL=0x2/MOD_SHIFT=0x4/
+/// MOD_WIN=0x8），与 wind-ipc 的 MOD_* 位序不同（ALT/SHIFT 互换），转换在协调器侧完成。
+#[derive(Debug, Clone)]
+pub struct GlobalHotkeyEntry {
+    /// RegisterHotKey 热键 ID（UI 线程内唯一即可）
+    pub id: i32,
+    /// Win32 修饰位
+    pub modifiers: u32,
+    /// Windows 虚拟键码
+    pub vk: u32,
+    /// 触发后回送协调器的热键动作名（与 dispatch_hotkey 的 action 一致）
+    pub action: String,
+}
+
+/// 翻页器命中/悬停 tag（远高于候选下标，避免冲突）
+pub const HOVER_PAGE_PREV: i32 = 100_000;
+pub const HOVER_PAGE_NEXT: i32 = 100_001;

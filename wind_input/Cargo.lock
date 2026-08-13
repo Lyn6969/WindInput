@@ -2631,8 +2631,17 @@ dependencies = [
  "wind-ipc",
  "wind-keys",
  "wind-theme",
+ "wind-ui-types",
  "windows",
  "windows-core 0.58.0",
+]
+
+[[package]]
+name = "wind-ui-types"
+version = "0.1.0"
+dependencies = [
+ "wind-bridge",
+ "wind-theme",
 ]
 
 [[package]]

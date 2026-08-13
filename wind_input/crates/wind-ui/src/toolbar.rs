@@ -21,43 +21,9 @@ use crate::view::Rect;
 use crate::window::{LayeredWindow, WindowMouse};
 use wind_theme::schema::Dim;
 
-/// 工具栏状态（由协调器推送）
-#[derive(Debug, Clone)]
-pub struct ToolbarState {
-    pub chinese_mode: bool,
-    /// 有效显示标签：中文模式取方案 icon_label（如 "拼"/"五"），无则 "中"；
-    /// 英文小写为 "英"，大写锁定为 "A"（由协调器预计算后填入）。
-    pub icon_label: String,
-    pub caps_lock: bool,
-    pub full_width: bool,
-    pub chinese_punct: bool,
-    /// 简繁转换当前是否启用（格内显示 "繁" 并高亮）
-    pub s2t_enabled: bool,
-    /// 是否显示简繁格（默认 false；用户开启简繁功能后显示）
-    pub s2t_shown: bool,
-    /// 密码框强制英文生效中：仅影响**呈现**（模式格显 "英" 且不高亮）。
-    ///
-    /// 独立于 `icon_label` 而非直接改写它：后者是「当前方案标签」的单一语义，且会经
-    /// StatusUpdate 下发写入 TSF 的 `_inputTypeLabel`（持久值）。把这种随焦点来去的
-    /// 临时态烧进标签，离开密码框时就得指望下一次状态推送把它改回来，漏一次图标即
-    /// 长期卡在 "英"。
-    pub password_suppress: bool,
-}
-
-impl Default for ToolbarState {
-    fn default() -> Self {
-        Self {
-            chinese_mode: true,
-            icon_label: "中".to_string(),
-            caps_lock: false,
-            full_width: false,
-            chinese_punct: true,
-            s2t_enabled: false,
-            s2t_shown: false,
-            password_suppress: false,
-        }
-    }
-}
+/// 状态数据类型已下沉至 wind-ui-types；再导出保持 `wind_ui::toolbar::ToolbarState`
+/// 原路径成立。
+pub use wind_ui_types::ToolbarState;
 
 /// 一个单元格：文本 + 高亮(激活态，如中文/简繁开) + 淡显(次要状态，如半角/简) + 点击动作
 struct Cell {

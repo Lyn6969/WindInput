@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# 表现层协议类型（UiCommand/UiEvent 等）的定义处；本 crate 原路径 pub use 再导出。
+wind-ui-types = { path = "../wind-ui-types" }
 wind-theme = { path = "../wind-theme" }
 wind-candidate = { path = "../wind-candidate" }
 wind-bridge = { path = "../wind-bridge" }
