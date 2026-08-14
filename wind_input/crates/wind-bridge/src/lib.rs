@@ -27,6 +27,10 @@ pub mod shared_memory_posix;
 // Windows：命名 SHM 写端 + 命名 Event（带 AppContainer SDDL）+ HostRenderManager
 #[cfg(windows)]
 pub mod host_render_windows;
+// 语言栏图标 SHM：与 host-render 共用底层命名 SHM，但走双缓冲而非推帧
+// （`GetIcon` 是被动回调，无需 Event 与后台线程）。
+#[cfg(windows)]
+pub mod icon_shm_windows;
 #[cfg(windows)]
 pub mod named_event;
 #[cfg(windows)]

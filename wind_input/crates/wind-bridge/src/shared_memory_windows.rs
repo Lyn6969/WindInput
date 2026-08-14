@@ -100,6 +100,16 @@ impl WindowsSharedMemory {
         self.size
     }
 
+    /// 整段映射的可写视图，供**自带布局与并发协议**的使用方（如语言栏图标 SHM）。
+    ///
+    /// [`Self::write_frame`] 那套是 host-render 帧格式专用；图标 SHM 走的是
+    /// 双缓冲 + seqlock，布局完全不同，故这里只出借原始字节、不施加任何格式。
+    /// 调用方负责保证写入不越界、并在切换活动 slot 前完成数据写入。
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr/size 来自成功的 MapViewOfFile，生命周期由 &mut self 约束
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+
     /// 编码并写入一帧可见帧。
     ///
     /// 内部自增 sequence，以新序号覆盖 `p.sequence`，成功返回新 seq。
