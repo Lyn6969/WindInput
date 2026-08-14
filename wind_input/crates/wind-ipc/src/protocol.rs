@@ -940,6 +940,161 @@ impl SharedRenderHeader {
 }
 
 // ──────────────────────────────────────────────
+// 语言栏图标 SHM（服务端预渲染 → wind_tsf 的 GetIcon 消费）
+// ──────────────────────────────────────────────
+
+/// 图标 SHM 魔数 `'WICO'`（字节序 W,I,C,O，小端读作 `0x4F43_4957`）。
+pub const ICON_SHM_MAGIC: u32 = 0x4F43_4957;
+pub const ICON_SHM_VERSION: u32 = 1;
+
+/// 图标 SHM 名（不走握手，两端各自按固定规则拼）。
+///
+/// ⚠️ **跨仓命名契约，无编译期约束**：C++ 侧 `Globals.h` 的 `WIND_ICON_SHM_NAME`
+/// 必须与本函数结果逐字一致，否则 DLL 永远打不开 SHM、静默退回本地绘制
+/// （表现为「图标能显示但从不跟随标点变化」，没有任何报错）。
+///
+/// `suffix` 取 `wind_config::variant::pipe_suffix()`（`""` / `"_dev"`），
+/// 与主/推送管道同源。**不要**改用 `app_dir_name()` 那套 `Dev` 风格后缀——
+/// macOS 侧曾因两种后缀风格混用，导致 dev 变体的 bridge/SHM 全程握不上手。
+///
+/// `Local\` 前缀提供终端服务会话级隔离，与 HostRender 的 SHM 同策略（不含 SID）。
+pub fn icon_shm_name(suffix: &str) -> String {
+    format!("Local\\WindInput_IconShm{suffix}")
+}
+
+/// 预渲染的尺寸档，对应 100/125/150/175/200% DPI。
+///
+/// 备多档而非按 DPI 现算一个，是因为 `ITfLangBarItemButton::GetIcon` **没有尺寸参数**：
+/// 图标多大由我们创建位图时决定，系统拿去后如何缩放不可见。备齐档位后，
+/// 选档逻辑将来若要修正，改的只是选择，不必重做渲染。
+pub const ICON_SIZES: [u16; 5] = [16, 20, 24, 28, 32];
+
+/// 主题档：亮色任务栏用深色图标，暗色任务栏用浅色图标。
+pub const ICON_THEME_LIGHT: u8 = 0;
+pub const ICON_THEME_DARK: u8 = 1;
+pub const ICON_THEME_COUNT: usize = 2;
+
+/// 变体总数 = 尺寸档 × 主题档。
+pub const ICON_VARIANT_COUNT: usize = ICON_SIZES.len() * ICON_THEME_COUNT;
+
+/// 单个变体的位图字节数（BGRA，非预乘）。
+pub const fn icon_variant_bytes(size_px: u16) -> usize {
+    (size_px as usize) * (size_px as usize) * 4
+}
+
+/// 单 slot 字节数 = 全部变体位图之和。
+pub const fn icon_slot_stride() -> usize {
+    let mut total = 0usize;
+    let mut i = 0usize;
+    while i < ICON_SIZES.len() {
+        total += icon_variant_bytes(ICON_SIZES[i]) * ICON_THEME_COUNT;
+        i += 1;
+    }
+    total
+}
+
+/// 变体表相对 SHM 基址的偏移（紧跟 header）。
+pub const ICON_TABLE_OFFSET: usize = IconShmHeader::SIZE;
+
+/// slot 0 起点。表尾对齐到 256 边界，留出加变体档位的余量。
+pub const ICON_SLOT0_OFFSET: usize = 256;
+
+/// SHM 总大小，取 64 KiB 整（实际用量约 48.8 KiB）。
+pub const ICON_SHM_SIZE: usize = 64 * 1024;
+
+/// 图标 SHM 头部（64 B）。
+///
+/// 双缓冲：写端始终写 `1 - active_slot`，写完再切换 `active_slot` 并递增 `sequence`。
+/// 读端读 `sequence` → 拷贝 → 重读 `sequence`，两次不等说明拷贝期间发生了切换，重试。
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct IconShmHeader {
+    pub magic: u32,         // @0
+    pub version: u32,       // @4
+    pub sequence: u32,      // @8   每次更新递增（读端据此做 seqlock 校验）
+    pub active_slot: u32,   // @12  0 或 1
+    pub variant_count: u32, // @16
+    pub slot_stride: u32,   // @20  单 slot 字节数
+    pub slot0_offset: u32,  // @24  slot 0 相对 SHM 基址偏移
+    pub table_offset: u32,  // @28  变体表相对 SHM 基址偏移
+    pub reserved: [u32; 8], // @32..64
+}
+
+impl IconShmHeader {
+    pub const SIZE: usize = 64;
+
+    pub fn new() -> Self {
+        Self {
+            magic: ICON_SHM_MAGIC,
+            version: ICON_SHM_VERSION,
+            sequence: 0,
+            active_slot: 0,
+            variant_count: ICON_VARIANT_COUNT as u32,
+            slot_stride: icon_slot_stride() as u32,
+            slot0_offset: ICON_SLOT0_OFFSET as u32,
+            table_offset: ICON_TABLE_OFFSET as u32,
+            reserved: [0; 8],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        // SAFETY: repr(C, packed) 且字段总长恰为 SIZE，无填充
+        unsafe { std::mem::transmute_copy(self) }
+    }
+}
+
+impl Default for IconShmHeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 变体表条目（16 B）。两个 slot 共用同一张表，`offset` 相对**所属 slot 起点**。
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct IconVariant {
+    pub size_px: u16,  // @0
+    pub theme: u8,     // @2   ICON_THEME_LIGHT / ICON_THEME_DARK
+    pub flags: u8,     // @3
+    pub offset: u32,   // @4   相对所属 slot 起点
+    pub byte_len: u32, // @8
+    pub reserved: u32, // @12
+}
+
+impl IconVariant {
+    pub const SIZE: usize = 16;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        // SAFETY: repr(C, packed) 且字段总长恰为 SIZE，无填充
+        unsafe { std::mem::transmute_copy(self) }
+    }
+}
+
+/// 按固定顺序（尺寸档外层、主题内层）生成变体表。
+///
+/// 顺序即契约：C++ 侧靠 `(size_px, theme)` 匹配而非下标，故顺序变化不会致错，
+/// 但保持稳定可以让排查时的十六进制转储可读。
+pub fn icon_variant_table() -> Vec<IconVariant> {
+    let mut table = Vec::with_capacity(ICON_VARIANT_COUNT);
+    let mut offset = 0u32;
+    for &size_px in &ICON_SIZES {
+        for theme in [ICON_THEME_LIGHT, ICON_THEME_DARK] {
+            let byte_len = icon_variant_bytes(size_px) as u32;
+            table.push(IconVariant {
+                size_px,
+                theme,
+                flags: 0,
+                offset,
+                byte_len,
+                reserved: 0,
+            });
+            offset += byte_len;
+        }
+    }
+    table
+}
+
+// ──────────────────────────────────────────────
 // Modifier flags
 // ──────────────────────────────────────────────
 
@@ -1118,6 +1273,92 @@ mod input_diag_wire_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 头部与表项的实际内存布局必须等于两端约定的常量。
+    ///
+    /// `repr(C, packed)` 下加字段不会报错，只会悄悄改变后续字段偏移——
+    /// 而 C++ 侧是按固定偏移读的，届时读到的是错位的垃圾值。这条断言是唯一的拦截点。
+    #[test]
+    fn icon_shm_struct_sizes_match_declared() {
+        assert_eq!(std::mem::size_of::<IconShmHeader>(), IconShmHeader::SIZE);
+        assert_eq!(std::mem::size_of::<IconVariant>(), IconVariant::SIZE);
+        assert_eq!(IconShmHeader::new().to_bytes().len(), 64);
+    }
+
+    /// 头部关键字段的字节偏移——C++ 侧按这些偏移读。
+    #[test]
+    fn icon_shm_header_field_offsets() {
+        let mut h = IconShmHeader::new();
+        h.sequence = 0xA1A2_A3A4;
+        h.active_slot = 1;
+        let b = h.to_bytes();
+        assert_eq!(&b[0..4], &ICON_SHM_MAGIC.to_le_bytes()); // magic @0
+        assert_eq!(&b[4..8], &ICON_SHM_VERSION.to_le_bytes()); // version @4
+        assert_eq!(&b[8..12], &0xA1A2_A3A4u32.to_le_bytes()); // sequence @8
+        assert_eq!(&b[12..16], &1u32.to_le_bytes()); // active_slot @12
+        assert_eq!(&b[16..20], &(ICON_VARIANT_COUNT as u32).to_le_bytes()); // variant_count @16
+        assert_eq!(&b[32..64], &[0u8; 32]); // reserved @32..64
+    }
+
+    /// 魔数字节序必须是可读的 'W','I','C','O'——十六进制转储时能一眼认出是图标 SHM。
+    #[test]
+    fn icon_shm_magic_reads_as_wico() {
+        assert_eq!(&ICON_SHM_MAGIC.to_le_bytes(), b"WICO");
+    }
+
+    /// 布局自洽：表不越进 slot0，双 slot 不超出 SHM 总大小。
+    ///
+    /// 加尺寸档时最容易越界，而越界的后果是写穿到下一个 slot——
+    /// 表现为某些档位的图标随机变成别的档位的内容，极难反查。
+    #[test]
+    fn icon_shm_layout_fits_without_overlap() {
+        let table_end = ICON_TABLE_OFFSET + IconVariant::SIZE * ICON_VARIANT_COUNT;
+        assert!(
+            table_end <= ICON_SLOT0_OFFSET,
+            "变体表 {table_end} 越进了 slot0 起点 {ICON_SLOT0_OFFSET}"
+        );
+        let needed = ICON_SLOT0_OFFSET + icon_slot_stride() * 2;
+        assert!(
+            needed <= ICON_SHM_SIZE,
+            "双 slot 共需 {needed} 字节，超出 SHM 总大小 {ICON_SHM_SIZE}"
+        );
+    }
+
+    /// 变体表覆盖全部 (尺寸 × 主题) 组合，且偏移首尾相接、无空洞无重叠。
+    #[test]
+    fn icon_variant_table_is_contiguous_and_complete() {
+        let table = icon_variant_table();
+        assert_eq!(table.len(), ICON_VARIANT_COUNT);
+
+        let mut expect_offset = 0u32;
+        for v in &table {
+            assert_eq!({ v.offset }, expect_offset, "变体表出现空洞或重叠");
+            assert_eq!({ v.byte_len }, icon_variant_bytes(v.size_px) as u32);
+            expect_offset += v.byte_len;
+        }
+        // 表末偏移恰好等于单 slot 长度：既无剩余也无溢出
+        assert_eq!(expect_offset as usize, icon_slot_stride());
+
+        // 每个尺寸档都要有亮/暗两份
+        for &size in &ICON_SIZES {
+            for theme in [ICON_THEME_LIGHT, ICON_THEME_DARK] {
+                assert!(
+                    table.iter().any(|v| v.size_px == size && v.theme == theme),
+                    "缺变体 size={size} theme={theme}"
+                );
+            }
+        }
+    }
+
+    /// SHM 名的变体后缀走管道那套 `_dev`，不是应用目录那套 `Dev`。
+    ///
+    /// 这两种风格混用过一次（macOS 侧），后果是 dev 变体两端各开各的共享内存、
+    /// 全程握不上手且无任何报错。C++ 侧 `Globals.h` 的 `WIND_ICON_SHM_NAME` 必须逐字一致。
+    #[test]
+    fn icon_shm_name_uses_pipe_style_suffix() {
+        assert_eq!(icon_shm_name(""), "Local\\WindInput_IconShm");
+        assert_eq!(icon_shm_name("_dev"), "Local\\WindInput_IconShm_dev");
+    }
 
     #[test]
     fn shared_render_header_field_offsets_match_go_swift() {
