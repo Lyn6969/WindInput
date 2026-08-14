@@ -2853,6 +2853,23 @@ impl Coordinator {
         self.engine_mgr.active_schema_id()
     }
 
+    /// 可选方案的 `(id, 显示名, 短称)`，**顺序即 [`MenuCmd::SchemaSelect`] 的下标**。
+    ///
+    /// 给自绘方案选择器的宿主用（Android）：桌面在协调器里直接构建菜单树，移动端的
+    /// 选择器长什么样由宿主决定，只要拿到条目与下标即可。顺序必须原样透传——
+    /// 宿主自行排序会让回送的下标指向另一个方案。
+    pub fn schema_entries(&self) -> Vec<(String, String, String)> {
+        self.engine_mgr
+            .available_schemas()
+            .into_iter()
+            .map(|id| {
+                let name = self.engine_mgr.schema_name(&id);
+                let short = self.engine_mgr.schema_icon_label(&id);
+                (id, name, short)
+            })
+            .collect()
+    }
+
     /// 当前**已启用**的方案列表（`schema.available`，测试/诊断用）。
     ///
     /// 与 [`Self::active_schema_id`] 不同，这里回答的是「哪些方案会被启动预热覆盖」。
@@ -4922,19 +4939,29 @@ impl Coordinator {
     ///
     /// 非 Windows 桌面形态下是空操作，故调用方无需自己加 cfg。
     pub fn publish_initial_langbar_icon(&self) {
+        self.publish_langbar_icon_now();
+    }
+
+    /// 按当前状态立即重渲并发布图标。调试菜单改了呈现参数后靠它落地。
+    ///
+    /// ⚠ **只写共享内存，不通知 DLL。** `GetIcon` 是被动回调，DLL 要收到状态推送
+    /// （`OnUpdate(TF_LBI_ICON)`）或焦点切换（`ForceRefresh`）才会重取。呈现参数变化
+    /// 不构成状态变化，故调试菜单改完要等下一次焦点切换/模式切换才看得到——
+    /// 关掉菜单时焦点回到宿主，通常正好触发一次。
+    pub fn publish_langbar_icon_now(&self) {
         #[cfg(all(feature = "desktop-ui", windows))]
         self.publish_langbar_icon(&self.build_status());
     }
 
-    /// 把当前状态渲染成语言栏图标并投送共享内存。
+    /// 图标发布器单例。首次访问时创建；创建失败缓存为 `None`（DLL 会退回本地绘制）。
     ///
-    /// 失败一律只记日志：DLL 侧在读不到 SHM 时会退回本地 DirectWrite 绘制，
-    /// 图标不会消失，只是不跟随标点状态——不值得为此中断状态推送。
+    /// 抽出来是因为调试菜单要在**发布之外**访问它（读当前形状画勾选、改形状），
+    /// 而 `get_or_init` 的初始化逻辑只该有一份。
     #[cfg(all(feature = "desktop-ui", windows))]
-    fn publish_langbar_icon(&self, s: &StatusUpdateData) {
-        use wind_ui::langbar_icon::{BadgeShape, IconSpec, LangBarIconPublisher, PunctBadge};
-
-        let cell = ICON_PUBLISHER.get_or_init(|| {
+    pub(crate) fn icon_publisher()
+    -> &'static std::sync::Mutex<Option<wind_ui::langbar_icon::LangBarIconPublisher>> {
+        use wind_ui::langbar_icon::{BadgeShape, LangBarIconPublisher};
+        ICON_PUBLISHER.get_or_init(|| {
             let suffix = wind_config::variant::pipe_suffix();
             match LangBarIconPublisher::new(suffix, BadgeShape::default()) {
                 Ok(p) => {
@@ -4946,7 +4973,35 @@ impl Coordinator {
                     std::sync::Mutex::new(None)
                 }
             }
-        });
+        })
+    }
+
+    /// 对发布器做一次改动，随后立即重发。发布器不可用时是空操作。
+    ///
+    /// 收成一个函数而不是每个调试项各写一遍「取锁 → 改 → 发布」：漏掉最后那步重发
+    /// 的症状是「点了菜单毫无变化」，而调试菜单本身就是用来看变化的。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    pub(crate) fn tweak_langbar_icon(
+        &self,
+        f: impl FnOnce(&mut wind_ui::langbar_icon::LangBarIconPublisher),
+    ) {
+        if let Ok(mut guard) = Self::icon_publisher().lock()
+            && let Some(p) = guard.as_mut()
+        {
+            f(p);
+        }
+        self.publish_langbar_icon_now();
+    }
+
+    /// 把当前状态渲染成语言栏图标并投送共享内存。
+    ///
+    /// 失败一律只记日志：DLL 侧在读不到 SHM 时会退回本地 DirectWrite 绘制，
+    /// 图标不会消失，只是不跟随标点状态——不值得为此中断状态推送。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    fn publish_langbar_icon(&self, s: &StatusUpdateData) {
+        use wind_ui::langbar_icon::{IconSpec, PunctBadge};
+
+        let cell = Self::icon_publisher();
 
         // 与工具栏同口径：CapsLock 开启时中文模式实际在打英文（见 build_status 的
         // effective_chinese），此时不该显示中文标点角标。

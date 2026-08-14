@@ -217,7 +217,79 @@ impl Coordinator {
                     });
                 }
             }
+            // 语言栏图标调试项：改呈现参数后立即重渲重发。
+            // 非 Windows 桌面形态下压根没有发布器，菜单项也不会被构建出来，故是空操作。
+            #[cfg(all(feature = "desktop-ui", windows))]
+            MenuCmd::IconBadgeShape(i) => self.tweak_langbar_icon(|p| {
+                p.set_shape(wind_ui::langbar_icon::BadgeShape::from_index(i))
+            }),
+            #[cfg(all(feature = "desktop-ui", windows))]
+            MenuCmd::IconToggleColors => {
+                let on = !self.icon_debug_state().map(|s| s.1).unwrap_or(false);
+                self.tweak_langbar_icon(|p| p.set_colored(on));
+            }
+            #[cfg(all(feature = "desktop-ui", windows))]
+            MenuCmd::IconToggleSizeMarks => {
+                let on = !self.icon_debug_state().map(|s| s.2).unwrap_or(false);
+                self.tweak_langbar_icon(|p| p.set_size_marks(on));
+            }
+            #[cfg(not(all(feature = "desktop-ui", windows)))]
+            MenuCmd::IconBadgeShape(_)
+            | MenuCmd::IconToggleColors
+            | MenuCmd::IconToggleSizeMarks => {}
         }
+    }
+
+    /// 图标发布器当前的呈现参数 `(形状下标, 是否彩色, 是否烧尺寸标记)`；
+    /// 发布器不可用时返回 `None`。菜单勾选态与翻转开关共用它，避免两处各记一份状态
+    /// ——菜单勾选与实际行为不同步会让用户反复点同一项。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    pub(crate) fn icon_debug_state(&self) -> Option<(u8, bool, bool)> {
+        let guard = Coordinator::icon_publisher().lock().ok()?;
+        let p = guard.as_ref()?;
+        Some((p.shape().index(), p.colored(), p.size_marks()))
+    }
+
+    /// Dev 变体专属的语言栏图标调试子菜单。
+    ///
+    /// 为什么值得做：16×16 上哪种角标可辨只能真机看，而每换一种就得提权部署 + 重启
+    /// 输入法，成本高到根本比不动。渲染搬到服务端后形状本就是运行时参数，接上菜单后
+    /// 比选退化成点几下——这正是当初把渲染从 DLL 挪到服务端换来的东西。
+    ///
+    /// 刻意**不持久化**：调试项，重启回默认；真正定下来的形状走代码里的默认值。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    fn build_icon_debug_menu(&self) -> Vec<wind_ui_types::MenuItemSpec> {
+        use wind_ui::langbar_icon::BadgeShape;
+        use wind_ui_types::MenuItemSpec as M;
+        let cmd = |c: MenuCmd| MenuKind::Command(c);
+        let Some((cur_shape, colored, marks)) = self.icon_debug_state() else {
+            return vec![M::label("图标共享内存不可用")];
+        };
+        let mut items: Vec<M> = BadgeShape::ALL
+            .iter()
+            .map(|&sh| {
+                M::leaf(
+                    sh.label(),
+                    cmd(MenuCmd::IconBadgeShape(sh.index())),
+                    true,
+                    sh.index() == cur_shape,
+                )
+            })
+            .collect();
+        items.push(M::separator());
+        items.push(M::leaf(
+            "彩色角标",
+            cmd(MenuCmd::IconToggleColors),
+            true,
+            colored,
+        ));
+        items.push(M::leaf(
+            "烧尺寸档标记",
+            cmd(MenuCmd::IconToggleSizeMarks),
+            true,
+            marks,
+        ));
+        items
     }
 
     /// 状态提示气泡右键菜单「常驻显示」：在 always/temp 间翻转 display_mode 并立即生效。
@@ -986,7 +1058,8 @@ impl Coordinator {
             .collect();
 
         // 高级子菜单：截图等不常用功能 + 打开各数据目录（分隔线独立成组）
-        let advanced_children = vec![
+        #[allow(unused_mut)]
+        let mut advanced_children = vec![
             M::leaf(
                 "截图所有窗口到文件",
                 cmd(MenuCmd::TakeScreenshot),
@@ -1023,6 +1096,14 @@ impl Coordinator {
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         ];
+
+        // 图标调试项**只在 Dev 变体出现**：它暴露的是"还没定下来的呈现参数"，
+        // 正式用户看到只会困惑（何况其中两种形状已被否决）。
+        #[cfg(all(feature = "desktop-ui", windows))]
+        if wind_config::variant::is_dev() {
+            advanced_children.push(M::separator());
+            advanced_children.push(M::submenu("语言栏图标", self.build_icon_debug_menu()));
+        }
 
         // 应用独立配置：所有 per-app 规则（均落在用户层 compat.toml）聚合于此。
         //
