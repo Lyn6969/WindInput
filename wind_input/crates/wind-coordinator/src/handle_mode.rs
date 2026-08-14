@@ -604,6 +604,105 @@ impl Coordinator {
         }
     }
 
+    /// 可选双拼布局 `(id, 显示名)`，扫描安装目录与用户目录的 `schemas/shuangpin/*.toml`。
+    pub fn shuangpin_layouts(&self) -> Vec<(String, String)> {
+        self.engine_mgr.shuangpin_layouts()
+    }
+
+    /// `shuangpin` 方案当前生效的布局 id（非双拼方案返回空串）。
+    pub fn active_shuangpin_layout(&self) -> String {
+        self.engine_mgr.shuangpin_layout_of("shuangpin")
+    }
+
+    /// 设置双拼布局并落盘。
+    ///
+    /// 落点是**方案覆盖层** `schema_overrides/shuangpin.toml` 而不是用户 config.toml：
+    /// `layout` 属于方案维度（`[engine.pinyin.shuangpin]`），覆盖文件与 `.schema.toml`
+    /// 用完全相同的段名，由 `read_schema` 深合并——写法与方案作者的内联写法一致，
+    /// 不需要第二套键名。
+    ///
+    /// **读改写而非整文件覆盖**：这个文件还承载词库启停等其它方案覆盖项，
+    /// 整体覆盖会把它们一起抹掉，而症状要等到用户下次发现某个词库自己开回来了才暴露。
+    ///
+    /// 写完必须重建引擎集：覆盖文件只在引擎构建期读，`reload_user_config` 又按
+    /// `cfg.schema` 是否变化决定重不重建——改布局不动 `cfg.schema`，走那条路会
+    /// 「写进去了但打字还是老布局」。
+    ///
+    /// @return 是否成功（布局 id 不在清单里、或落盘失败均为 false）
+    pub fn set_shuangpin_layout(&self, layout_id: &str) -> bool {
+        if !self
+            .engine_mgr
+            .shuangpin_layouts()
+            .iter()
+            .any(|(id, _)| id == layout_id)
+        {
+            warn!("set_shuangpin_layout: 未知布局 {}", layout_id);
+            return false;
+        }
+        let Some(dir) = Config::user_config_dir().map(|d| d.join("schema_overrides")) else {
+            warn!("set_shuangpin_layout: 用户配置目录不可用");
+            return false;
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("set_shuangpin_layout: 建目录失败: {}", e);
+            return false;
+        }
+        let path = dir.join("shuangpin.toml");
+        let mut root: toml::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.parse::<toml::Value>().ok())
+            .unwrap_or_else(|| toml::Value::Table(toml::value::Table::new()));
+        let mut cursor = &mut root;
+        for key in ["engine", "pinyin", "shuangpin"] {
+            let table = match cursor {
+                toml::Value::Table(t) => t,
+                _ => {
+                    warn!("set_shuangpin_layout: 覆盖文件结构异常，放弃写入");
+                    return false;
+                }
+            };
+            cursor = table
+                .entry(key.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        }
+        match cursor {
+            toml::Value::Table(t) => {
+                t.insert("layout".into(), toml::Value::String(layout_id.to_string()));
+            }
+            _ => {
+                warn!("set_shuangpin_layout: [engine.pinyin.shuangpin] 不是表，放弃写入");
+                return false;
+            }
+        }
+        // ⚠ 必须走 `toml::to_string`（文档序列化），不能用 `Value::to_string()`：
+        // 后者把根表输出成**内联表** `{ engine = { pinyin = … } }`，那不是合法的
+        // TOML 文档，回读时解析失败 → 覆盖被静默忽略，症状是「选了没反应」，
+        // 而文件明明写出来了。
+        let text = match toml::to_string(&root) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("set_shuangpin_layout: 序列化失败: {}", e);
+                return false;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, text) {
+            warn!("set_shuangpin_layout: 写 {} 失败: {}", path.display(), e);
+            return false;
+        }
+
+        let cfg = self.rt().config.clone();
+        self.engine_mgr.reload_from_config(&cfg);
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.input_buffer.clear();
+            s.candidates.clear();
+            s.preedit.clear();
+        }
+        self.notify_ui_hide();
+        self.push_state_update();
+        true
+    }
+
     /// 选择第 N 个主题。
     pub(crate) fn select_theme(&self, index: usize) {
         let list = self.list_themes();

@@ -30,6 +30,12 @@ use wind_dict::cached::{CachedDict, ReverseIndex};
 /// 统一落此键空间（P2c）。区别于恰好同名的真实方案 id "pinyin"（如临时拼音默认目标）。
 pub const PINYIN_DATA_SCHEMA: &str = "pinyin";
 
+/// 双拼方案未声明 `layout` 时的缺省布局。
+///
+/// 独立成常量而非各处写字面量：设置页要显示「当前选的是哪个」，那个判断与引擎实际
+/// 加载哪份布局必须同源，否则会出现「设置页显示自然码、打起来是小鹤」。
+pub const DEFAULT_SHUANGPIN_LAYOUT: &str = "xiaohe";
+
 /// 码表词频应用策略（见 docs/redesign/frequency.md §3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreqStrategy {
@@ -555,7 +561,7 @@ impl EngineManager {
             return None;
         }
         let layout_id = if schema.engine.pinyin.shuangpin.layout.is_empty() {
-            "xiaohe".to_string()
+            DEFAULT_SHUANGPIN_LAYOUT.to_string()
         } else {
             schema.engine.pinyin.shuangpin.layout.clone()
         };
@@ -565,6 +571,35 @@ impl EngineManager {
         crate::pinyin::shuangpin::Layout::from_toml(&lp)
             .map(|lay| lay.final_key_set())
             .ok()
+    }
+
+    /// 指定方案**当前生效**的双拼布局 id（已合并 `schema_overrides/<id>.toml`）。
+    ///
+    /// 非双拼方案、或方案读不出来时返回空串。方案没写 `layout` 时返回缺省的 `xiaohe`
+    /// ——与 [`build_shuangpin_finals`](Self::build_shuangpin_finals) 的兜底同源，
+    /// 两处若分叉，设置页会显示一个和实际生效的不是同一个布局。
+    pub fn shuangpin_layout_of(&self, schema_id: &str) -> String {
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return String::new();
+        };
+        let Some(schema) =
+            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
+        else {
+            return String::new();
+        };
+        if !schema
+            .engine
+            .pinyin
+            .scheme
+            .eq_ignore_ascii_case("shuangpin")
+        {
+            return String::new();
+        }
+        if schema.engine.pinyin.shuangpin.layout.is_empty() {
+            DEFAULT_SHUANGPIN_LAYOUT.to_string()
+        } else {
+            schema.engine.pinyin.shuangpin.layout.clone()
+        }
     }
 
     /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取最长者=全码,简码可能
