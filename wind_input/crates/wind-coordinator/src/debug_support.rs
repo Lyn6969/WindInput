@@ -99,4 +99,41 @@ impl Coordinator {
             .map(|c| self.cand_s2t_text(&s, c))
             .collect()
     }
+
+    // ── webdata 契约测试(wind-webdata,crate 外)的白盒支撑 ──
+    // 测试要验证「记账 → RPC 读出」的联动,记账入口是 pub(crate);经 debug_* 暴露,
+    // 生产路径不调用。
+
+    /// 上屏记账转发(仅测试)。
+    pub fn debug_record_commit(
+        &self,
+        text: &str,
+        code_len: u32,
+        candidate_pos: i32,
+        source: wind_store::stats::CommitSource,
+    ) {
+        self.record_commit(text, code_len, candidate_pos, source);
+    }
+
+    /// 顶层输入统计兜底转发(仅测试)。
+    pub fn debug_record_input_stats(&self, action: &wind_bridge::handler::KeyAction) {
+        self.record_input_stats(action);
+    }
+
+    /// 本次按键是否已被具体上屏路径记账(仅测试)。
+    pub fn debug_stat_recorded(&self) -> bool {
+        self.stat_recorded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 短语层查询,返回命中文本(仅测试)。
+    pub fn debug_phrase_texts(&self, code: &str) -> Vec<String> {
+        self.phrases
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup(code, &[], &|_| String::new())
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
+    }
 }

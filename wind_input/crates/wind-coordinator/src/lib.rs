@@ -12,6 +12,8 @@ pub(crate) mod debug_support;
 #[cfg(windows)]
 pub mod direct_switch;
 pub mod edit_ops;
+#[cfg(test)]
+mod freq_learn_tests;
 pub mod handle_addword;
 pub mod handle_candidate;
 pub mod handle_cmdbar;
@@ -40,7 +42,7 @@ mod quick_eval;
 pub mod stats;
 pub mod theme_style;
 pub mod watchdog;
-pub mod webdata;
+pub mod web_host;
 
 pub use coordinator::{Coordinator, request_restart, restart_signal, set_settings_url_provider};
 

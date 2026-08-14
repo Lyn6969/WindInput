@@ -34,7 +34,8 @@
 | `src/handle_config.rs` | 配置更新处理（引擎/热键/UI/工具栏） |
 | `src/handle_tooltip.rs` | 候选悬停提示（编码/拆字/拼音反查） |
 | `src/hotkey_match.rs` | key_down 热键匹配 |
-| `src/webdata.rs` | Web 设置数据 RPC（schema/dict/temp/freq/shadow/phrase/stats/theme 命名空间，经 wind-rpc 转发）。**已窄面化**：`WebDataHost` trait（16 方法）承载对宿主的全部依赖，RPC 本体是 `WebDataRpc: WebDataHost` 的默认方法——默认方法编译期看不见 Coordinator 字段，窄面由编译器守门。★新增 RPC 需要新宿主能力时**必须加在 WebDataHost 上**，勿绕道；调用方（service/tests）需 `use …webdata::WebDataRpc` |
+| `src/web_host.rs` | `WebDataHost` trait（16 方法）+ 转发 impl：设置页数据 RPC（**独立 crate `wind-webdata`**）消费宿主能力的窄面。依赖方向 webdata→coordinator，本 crate 因此不依赖 wind-transfer/fontdb（Android 闭包免 C 依赖、check-android 免 NDK 的关键，Cargo.toml 有⚠注释）。★新增 RPC 需要新宿主能力时**必须加在本 trait 上** |
+| `src/freq_learn_tests.rs` | 词频路由/选词记账/自动造词/加词的 crate 内行为测试（白盒零 RPC；原住 webdata 契约测试，按「是否用 web_data_rpc」分拣回归） |
 | `src/host_services.rs` | `HostServices` trait（剪贴板等平台能力注入面）+ 桌面/headless 实现；收录判据见模块文档 |
 | `src/stats.rs` | 输入统计采集 |
 | `src/watchdog.rs` | 看门狗 |

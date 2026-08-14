@@ -17,6 +17,7 @@ default = []
 [dependencies]
 wind-ipc = { path = "../../crates/wind-ipc" }
 wind-coordinator = { path = "../../crates/wind-coordinator" }
+wind-webdata = { path = "../../crates/wind-webdata" }
 wind-bridge = { path = "../../crates/wind-bridge" }
 wind-config = { path = "../../crates/wind-config" }
 wind-store = { path = "../../crates/wind-store" }

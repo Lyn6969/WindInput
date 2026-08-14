@@ -9,8 +9,9 @@ wind-bridge = { path = "../wind-bridge" }
 wind-config = { path = "../wind-config" }
 wind-host = { path = "../wind-host" }
 wind-store = { path = "../wind-store" }
-wind-transfer = { path = "../wind-transfer" }
 wind-dict = { path = "../wind-dict" }
+# ⚠ 勿加 wind-transfer/fontdb：它们随 webdata 独立进了 wind-webdata（依赖方向
+# webdata → coordinator），是 Android 闭包免 C 依赖（check-android 免 NDK）的关键。
 wind-engine = { path = "../wind-engine" }
 wind-candidate = { path = "../wind-candidate" }
 wind-transform = { path = "../wind-transform" }
@@ -32,7 +33,6 @@ chrono = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-fontdb = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
@@ -50,6 +50,8 @@ default = ["desktop-ui"]
 desktop-ui = ["dep:wind-ui"]
 
 [dev-dependencies]
+# tests/ 的数据域 RPC 断言经 wind-webdata（dev 环允许）
+wind-webdata = { path = "../wind-webdata" }
 wind-config = { path = "../wind-config" }
 wind-host = { path = "../wind-host" }
 wind-keys = { path = "../wind-keys" }

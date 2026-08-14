@@ -1,0 +1,29 @@
+[package]
+name = "wind-webdata"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# 依赖方向是本 crate → coordinator（反过来会把 wind-transfer/fontdb 拉回
+# Android 闭包）；Android 形态（wind-android）不依赖本 crate。
+wind-coordinator = { path = "../wind-coordinator", default-features = false }
+wind-config = { path = "../wind-config" }
+wind-engine = { path = "../wind-engine" }
+wind-store = { path = "../wind-store" }
+wind-reverse = { path = "../wind-reverse" }
+wind-theme = { path = "../wind-theme" }
+wind-candidate = { path = "../wind-candidate" }
+wind-keys = { path = "../wind-keys" }
+wind-transfer = { path = "../wind-transfer" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+chrono = "0.4"
+fontdb = "0.22"
+
+[dev-dependencies]
+wind-bridge = { path = "../wind-bridge" }
+
+[lints]
+workspace = true

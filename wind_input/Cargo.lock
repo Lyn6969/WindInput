@@ -2801,7 +2801,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "core-foundation-sys",
- "fontdb",
  "serde",
  "serde_json",
  "toml 0.8.23",
@@ -2821,10 +2820,10 @@ dependencies = [
  "wind-reverse",
  "wind-store",
  "wind-theme",
- "wind-transfer",
  "wind-transform",
  "wind-ui",
  "wind-ui-types",
+ "wind-webdata",
  "windows",
  "winreg",
 ]
@@ -3042,6 +3041,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "wind-webdata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fontdb",
+ "serde_json",
+ "toml 0.8.23",
+ "tracing",
+ "wind-bridge",
+ "wind-candidate",
+ "wind-config",
+ "wind-coordinator",
+ "wind-engine",
+ "wind-keys",
+ "wind-reverse",
+ "wind-store",
+ "wind-theme",
+ "wind-transfer",
+]
+
+[[package]]
 name = "wind_rpc"
 version = "0.1.0"
 dependencies = [
@@ -3080,6 +3101,7 @@ dependencies = [
  "wind-store",
  "wind-theme",
  "wind-ui",
+ "wind-webdata",
  "windows",
  "winresource",
 ]
