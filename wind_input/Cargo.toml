@@ -63,8 +63,17 @@ anyhow = "1"
 thiserror = "2"
 # Database
 redb = "2"
-# Image processing
-image = "0.25"
+# Image processing。features 裁到主题背景图实际支持的格式（消费点唯一：
+# wind-ui image_cache 的 `image::open` + screenshot 的 PNG 编码）。默认全格式会把
+# avif(rav1e)/exr/tiff 全家桶拖进依赖闭包，编译重且无消费者——新增格式支持时在此追加。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+    "bmp",
+    "rayon",
+] }
 # Config
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
