@@ -313,6 +313,10 @@ fn main() {
     startup_trace::stage("coordinator-begin");
     let coordinator = wind_coordinator::Coordinator::new(push_server.clone());
     startup_trace::stage("coordinator-done");
+    // 语言栏图标：状态推送只在状态**变化**时发生，这里补一次初始发布，否则开机后到
+    // 用户第一次切换中英/标点之前，DLL 都读不到共享内存、只能本地绘制（图标正常但
+    // 没有标点角标）。非 Windows 桌面形态下是空操作。
+    coordinator.publish_initial_langbar_icon();
     // 注入 host-render 管理器（与 BridgeServer 共享同一实例），供后续写帧/隐藏使用。
     #[cfg(windows)]
     coordinator.set_host_render(host_render.clone());

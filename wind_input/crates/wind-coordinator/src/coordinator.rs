@@ -827,6 +827,19 @@ pub(crate) fn should_reapply_initial(
     crossed && (per_app || old_has_rule || new_has_rule)
 }
 
+/// 语言栏图标发布器（Windows 桌面形态）。
+///
+/// 做成进程级单例而非 [`Coordinator`] 字段，理由是它对应的资源本身就是进程级唯一的：
+/// 共享内存名固定（`Local\WindInput_IconShm{_dev}`），一个进程开两份没有意义。
+/// 附带好处是不必改动全部构造器。
+///
+/// 内层 `Option` 为 `None` = 创建失败。这不是致命错误——DLL 侧读不到 SHM 会退回
+/// 本地 DirectWrite 绘制，图标照常显示，只是不跟随标点状态。
+#[cfg(all(feature = "desktop-ui", windows))]
+static ICON_PUBLISHER: std::sync::OnceLock<
+    std::sync::Mutex<Option<wind_ui::langbar_icon::LangBarIconPublisher>>,
+> = std::sync::OnceLock::new();
+
 /// 中央协调器
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
@@ -4894,6 +4907,74 @@ impl Coordinator {
             &s.icon_label,
         );
         self.push_server.push_to_active(&encoded);
+
+        // 图标位图与状态推送同源同时机：DLL 收到本次推送后会 OnUpdate(TF_LBI_ICON)，
+        // 系统随即回调 GetIcon 去读 SHM——那时新位图必须已经在里面。
+        #[cfg(all(feature = "desktop-ui", windows))]
+        self.publish_langbar_icon(&s);
+    }
+
+    /// 服务启动后发布一次初始图标。
+    ///
+    /// [`Self::push_state_update`] 只在状态**变化**时调用。少了这一次补发，开机后到
+    /// 用户第一次切换中英或标点之前，共享内存始终是空的，DLL 只能走本地绘制——
+    /// 图标显示正常但没有角标，看起来像「功能根本没做」而不是「还没初始化」。
+    ///
+    /// 非 Windows 桌面形态下是空操作，故调用方无需自己加 cfg。
+    pub fn publish_initial_langbar_icon(&self) {
+        #[cfg(all(feature = "desktop-ui", windows))]
+        self.publish_langbar_icon(&self.build_status());
+    }
+
+    /// 把当前状态渲染成语言栏图标并投送共享内存。
+    ///
+    /// 失败一律只记日志：DLL 侧在读不到 SHM 时会退回本地 DirectWrite 绘制，
+    /// 图标不会消失，只是不跟随标点状态——不值得为此中断状态推送。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    fn publish_langbar_icon(&self, s: &StatusUpdateData) {
+        use wind_ui::langbar_icon::{BadgeShape, IconSpec, LangBarIconPublisher, PunctBadge};
+
+        let cell = ICON_PUBLISHER.get_or_init(|| {
+            let suffix = wind_config::variant::pipe_suffix();
+            match LangBarIconPublisher::new(suffix, BadgeShape::default()) {
+                Ok(p) => {
+                    tracing::info!(shm = p.shm_name(), "语言栏图标共享内存已就绪");
+                    std::sync::Mutex::new(Some(p))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "语言栏图标共享内存创建失败，DLL 将退回本地绘制");
+                    std::sync::Mutex::new(None)
+                }
+            }
+        });
+
+        // 与工具栏同口径：CapsLock 开启时中文模式实际在打英文（见 build_status 的
+        // effective_chinese），此时不该显示中文标点角标。
+        let effective_chinese = s.chinese_mode && !s.caps_lock;
+        let spec = IconSpec {
+            label: s.icon_label.clone(),
+            // 英文模式下标点恒为半角且不可切换（`toolbar.rs` 的渲染同样这么处理），
+            // 角标此时没有信息量，故不画。
+            punct: if !effective_chinese {
+                PunctBadge::None
+            } else if s.chinese_punct {
+                PunctBadge::Chinese
+            } else {
+                PunctBadge::English
+            },
+            // 密码框 / 无编辑上下文 / 键盘禁用都是 **DLL 本地判定**的状态，服务端无从得知；
+            // 那几种情况下 DLL 根本不读 SHM，直接本地绘制。故这里恒为 false。
+            dimmed: false,
+            // 状态驱动的发布恒用相位 0；演示动画由它自己的定时器推进相位。
+            frame: 0,
+        };
+
+        if let Ok(mut guard) = cell.lock()
+            && let Some(p) = guard.as_mut()
+            && let Err(e) = p.publish(&spec)
+        {
+            tracing::warn!(error = %e, "发布语言栏图标失败");
+        }
     }
 
     /// 焦点事件携带的 caret 落缓存的**唯一入口**。
