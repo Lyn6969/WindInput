@@ -2,7 +2,8 @@
 [alias]
 # headless 形态（Android/FFI 路径）在 host 上的编译门。
 check-headless = "check -p wind-coordinator --no-default-features"
-# Android target 编译门。check 虽不链接，但 zstd-sys/bzip2-sys（wind-transfer→zip）
-# 的 build script 要编 C 源：需 NDK 交叉 clang（设 CC_aarch64_linux_android/AR_… 指向
-# NDK 的 aarch64-linux-android*-clang / llvm-ar）。本机无 NDK 时此门由 CI 承接。
-check-android = "check -p wind-coordinator --no-default-features --target aarch64-linux-android"
+# Android target 编译门：wind-android 全包（闭包含 coordinator headless + uniffi/
+# tracing-android 的 cfg 分支）。webdata 独立成 wind-webdata 后闭包为纯 Rust，
+# **免 NDK 本机可跑**（rustup target add aarch64-linux-android 即可）；编不过且报
+# 缺 C 编译器 = 有人把 -sys crate 混回了闭包，先查依赖别配 NDK。
+check-android = "check -p wind-android --target aarch64-linux-android"

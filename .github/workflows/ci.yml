@@ -48,26 +48,25 @@ jobs:
       - name: dev.sh ci
         run: ./scripts/dev.sh ci
 
-      # headless/Android 防走样两道闸（与 .cargo/config.toml 的 alias 同一份命令）:
-      # ① android target 下 check 同时锁三件事——headless 可编译、依赖闭包过 Android、
-      #    wind-ui-types 没长出无条件平台依赖(target 过滤让 cfg 化依赖出闭包,泄漏即编不过);
+      # headless/Android 防走样三道闸:
+      # ① check 对象是 **wind-android 全包**(闭包含 coordinator headless):同时锁四件事——
+      #    headless 可编译、依赖闭包过 Android、wind-ui-types 没长出无条件平台依赖、
+      #    FFI 层自身(uniffi 宏/cdylib/tracing-android 的 cfg 分支)在 Android target 可编。
+      #    此前只 check coordinator,主线改动破坏 FFI 要等 Android 仓 build 才炸。
       # ② tree-grep 断言依赖边本身——wind-ui 的平台代码全在 cfg 内,理论上可能在 android
       #    下编成空壳而不报错,①抓不到"coordinator 又直连 wind-ui"的回归,须对边断言。
-      # ⚠ 依赖闭包里 zstd-sys/bzip2-sys（wind-transfer→zip）的 build script 要编 C 源，
-      # 需 NDK 的交叉 clang（cc crate 认 CC_<target> 环境变量）——「check 不链接」躲不开
-      # build script。runner 预装 NDK（ANDROID_NDK_LATEST_HOME）。
-      - name: coordinator headless (aarch64-linux-android)
+      # ③ C 依赖卫兵:webdata(wind-transfer→zip→zstd-sys/bzip2-sys、fontdb)独立成
+      #    wind-webdata 后,Android 闭包为纯 Rust——check 因此**不再需要 NDK**,本机也可跑。
+      #    刻意不配 NDK 环境变量:谁把 -sys crate 混回闭包,这一步会当场编不过而暴露。
+      - name: wind-android headless (aarch64-linux-android)
         working-directory: wind_input
-        run: |
-          TOOLCHAIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android24-clang"
-          export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
-          cargo check-android
+        run: cargo check -p wind-android --target aarch64-linux-android
 
-      - name: coordinator 依赖树无 wind-ui
+      - name: android 依赖树无 wind-ui / 无 C 依赖
         working-directory: wind_input
         run: |
           ! cargo tree -p wind-coordinator --no-default-features -e normal | grep -q "wind-ui v"
+          ! cargo tree -p wind-android --target aarch64-linux-android -e normal | grep -qE "zstd-sys|bzip2-sys|fontdb"
 
       - name: 交叉编译 TSF DLL (x64 + x86)
         run: |
