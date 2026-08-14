@@ -9,6 +9,13 @@ wind-ui-types = { path = "../wind-ui-types" }
 wind-theme = { path = "../wind-theme" }
 wind-candidate = { path = "../wind-candidate" }
 wind-bridge = { path = "../wind-bridge" }
+# 协议常量与结构：语言栏图标 SHM 的尺寸档与变体表（langbar_icon）、host-render 常量
+# （HOST_WINDOW_CANDIDATE / HostRenderHitRect）、macOS forwarder 的帧编码。
+#
+# 置于通用依赖而非 target-specific：langbar_icon 的几何绘制与合成是平台无关逻辑，
+# 其单元测试要能在 CI 的 Linux test job 上跑到。经 wind-bridge 本就传递依赖它，
+# 提为直接依赖不增加任何编译成本。
+wind-ipc = { path = "../wind-ipc" }
 # 仅用于 startup_trace：UI 线程若在窗口创建阶段退出，主线程与主日志都可能毫无察觉
 wind-config = { path = "../wind-config" }
 tiny-skia = { workspace = true }
@@ -26,17 +33,14 @@ chrono = "0.4"
 windows = { workspace = true, features = ["Win32_System_StationsAndDesktops"] }
 # `#[implement]` 宏展开引用 `::windows_core`，需作为直接依赖（版本随 windows 0.58）。
 windows-core = "0.58"
-# host-render 协议常量（HOST_WINDOW_CANDIDATE）与 HostRenderHitRect。
-wind-ipc = { path = "../wind-ipc" }
 
-# macOS：CoreText 真字形文本后端（text/coretext.rs）；
-# wind-ipc 供 manager_macos forwarder 编码 host-render / 候选命中 / 状态帧。
+# macOS：CoreText 真字形文本后端（text/coretext.rs）。
+# （wind-ipc 已提为通用依赖，manager_macos forwarder 的帧编码照旧可用。）
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 core-graphics = "0.25"
 core-text = "22.0.0"
-wind-ipc = { path = "../wind-ipc" }
 # 全局热键（global_hotkey_macos）复用 key_inject 的 VK → CGKeyCode 表，禁止另起一份。
 wind-keys = { path = "../wind-keys" }
 # 扩展信封的 JSON body（`shot.panel` 等）。手拼字符串在这里不安全：路径里可能有

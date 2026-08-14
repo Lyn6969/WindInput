@@ -29,6 +29,11 @@ pub mod input_diag_hud;
 /// macOS 输入源切换（TISSelectInputSource）。对位 Windows 的 DirectSwitchHotkeys 注册表。
 #[cfg(target_os = "macos")]
 pub mod input_source_macos;
+/// 语言栏图标（Windows TSF 输入指示器）的离屏渲染。
+///
+/// 渲染逻辑本身平台无关（几何绘制 + 蒙版合成），故不整模块 cfg——非 Windows 上
+/// 文本后端是 mock，字形部分为空，但角标与合成逻辑仍可被 CI 的 Linux test job 覆盖。
+pub mod langbar_icon;
 pub mod manager;
 /// macOS host-render forwarder：把 UiCommand 光栅化进 POSIX SHM + push 推帧给 .app。
 #[cfg(target_os = "macos")]
