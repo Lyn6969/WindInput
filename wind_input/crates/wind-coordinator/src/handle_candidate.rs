@@ -2926,16 +2926,40 @@ impl Coordinator {
 
     /// [`Self::mouse_select`] 的实现，返回主输入路实际推送的 KeyAction 供测试断言
     /// （overlay / `$CC` 命令 / 越界等不经 push 的路径返回 None）。
+    ///
+    /// 页内下标 → 绝对下标的换算在此，**页范围校验也在此**：桌面候选窗只画当前页，
+    /// 点到页外即为坐标算错，必须拒绝。移动端不是这样（见 [`Self::select_candidate_at`]）。
     fn mouse_select_action(&self, page_local: usize) -> Option<KeyAction> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.candidates.is_empty() {
-            return None;
-        }
-        let (start, end) = self.page_range(&state);
+        let (start, end) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.page_range(&state)
+        };
         let idx = start + page_local;
-        if idx >= end || idx >= state.candidates.len() {
+        if idx >= end {
             return None;
         }
+        self.select_candidate_at(idx)
+    }
+
+    /// **按绝对下标选词**：`mouse_select` 与移动端滚动候选栏的共同内核。
+    ///
+    /// 移动端的候选栏是一条可滚动的长列表，没有"页"这个视觉概念，用户想点第几个就点第几个。
+    /// 而桌面的选词入口全部以**页内下标**表达（数字键 1-9、鼠标点击当前页），移动端此前
+    /// 只能合成数字键去凑，于是**永远选不了第 10 个及以后的候选**。
+    ///
+    /// 分页仍然保留、也仍然有意义：它决定空格上屏的目标与数字键的语义。这里只是把
+    /// 「选哪一个」从视图坐标里解放出来。
+    ///
+    /// @return 主输入路实际产生的 KeyAction（overlay / `$CC` 命令 / 越界返回 None）
+    pub(crate) fn select_candidate_at(&self, idx: usize) -> Option<KeyAction> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if idx >= state.candidates.len() {
+            return None;
+        }
+        // 统计用的位置：**相对当前页首**，与数字键的 `num-1` 保持同一量纲（既有约定）。
+        // 移动端不翻页（滚动条不动 `current_page`），页首恒为 0，于是如实记成绝对位次
+        // ——「用户选了第 37 个」正是首选率统计要回答的问题。
+        let page_local = idx.saturating_sub(self.page_range(&state).0);
         // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。
         if state.candidates[idx].is_command {
             let src = state.candidates[idx].phrase_template.clone();
