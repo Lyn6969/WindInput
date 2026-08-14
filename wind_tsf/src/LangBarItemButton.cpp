@@ -513,14 +513,31 @@ static HICON _CreateIconFromBgra(const BYTE* bgra, int size)
 //
 // 改取**主显示器的实时 DPI**：指示器画在任务栏上，而任务栏在主显示器
 // （把窗口拖到别的屏时指示器并不跟着走，实测点数不变正与此一致）。
-// `GetDpiForMonitor` 是显式查询，**不随调用进程的 DPI 感知级别被虚拟化**——
-// 这正是这里需要的性质，`GetDeviceCaps` 与 `GetDpiForWindow` 都没有。
-// 动态取符号，与 `TextService.cpp` 的 `ConvertToPhysicalCoordinates` 同一惯例。
+//
+// ⚠⚠ **只换 API 不够，还必须临时抬高本线程的 DPI 感知级别。**
+// `GetDpiForMonitor` 同样受调用进程的感知级别支配：DPI-unaware 进程一律得到 96，
+// system-aware 进程一律得到进程启动时的系统 DPI，只有 per-monitor-aware 才拿到真值。
+// 我起初以为它是不受虚拟化的显式查询，**实测被推翻**：改用它之后记事本
+// （Win11 自带，per-monitor-v2）已能实时跟随，而 EverEdit（老程序）依旧不动、
+// 且与记事本给出不同档位——同一台机器上对同一个全局事实出现两个答案，
+// 就说明读到的不是那个事实。
+//
+// `SetThreadDpiAwarenessContext` 是这种「混合感知」场景的正解：它按线程临时改写
+// 上下文，即使宿主进程整体声明为 unaware 也能拿到真值。窗口开得**尽可能窄**——
+// 期间任何窗口/DC 操作都会跟着改变语义，故其中只放这一次查询。
+//
+// 动态取符号（Win10 1607+），与 `TextService.cpp` 的 `ConvertToPhysicalCoordinates`
+// 同一惯例；取不到就退回原样调用，至少不比从前差。
 //
 // 已知局限：多任务栏时各屏 DPI 可能不同，而 `GetIcon` 只能返回**一个** HICON，
 // 无法同时服侍两块屏，只能以主屏为准。
 static int _LangBarIconSizePx()
 {
+    using SetThreadDpiAwarenessContextFn =
+        DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    static auto pSetThreadDpiAwarenessContext =
+        reinterpret_cast<SetThreadDpiAwarenessContextFn>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
     static auto pGetDpiForMonitor =
         reinterpret_cast<decltype(&GetDpiForMonitor)>(
             GetProcAddress(GetModuleHandleW(L"shcore.dll"), "GetDpiForMonitor"));
@@ -528,12 +545,21 @@ static int _LangBarIconSizePx()
     UINT dpi = 0;
     if (pGetDpiForMonitor != nullptr)
     {
+        DPI_AWARENESS_CONTEXT prevCtx = nullptr;
+        if (pSetThreadDpiAwarenessContext != nullptr)
+            prevCtx = pSetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
         // 主显示器的左上角恒为 (0,0)，故这一点必落在主屏上。
         POINT origin = { 0, 0 };
         HMONITOR hMon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
         UINT dpiX = 0, dpiY = 0;
         if (hMon != nullptr && SUCCEEDED(pGetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
             dpi = dpiX;
+
+        // 必须无条件还原：本函数由语言栏在宿主线程上回调，留下一个被抬高的上下文
+        // 会让宿主后续的窗口/坐标操作换一套语义，那种缺陷与图标毫无表面关联。
+        if (prevCtx != nullptr)
+            pSetThreadDpiAwarenessContext(prevCtx);
     }
     if (dpi == 0)
     {
@@ -549,10 +575,10 @@ static int _LangBarIconSizePx()
         dpi = 96;
 
     int iconSize = MulDiv(16, (int)dpi, 96);
+    // 钳到档位表两端。上限 48 = 300%；再往上仍会被系统放大，而放大是实测最糊的情形
+    // （同机对照：原生无缩放那档明显更清晰），故再加档要连 SHM 一起放大。
     if (iconSize < 16) iconSize = 16;
-    // 上限即最大尺寸档。250% 以上会被压回 32 再由系统放大——实测「原生无缩放最清晰」，
-    // 故这里的钳制是有代价的；要覆盖更高缩放须先在 Rust 侧加 40/48 档（并放大 SHM）。
-    if (iconSize > 32) iconSize = 32;
+    if (iconSize > 48) iconSize = 48;
     return iconSize;
 }
 

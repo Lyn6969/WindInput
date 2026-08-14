@@ -454,8 +454,11 @@ constexpr uint32_t MAX_HOST_RENDER_RECTS = 256;
 // consistent snapshot.
 
 constexpr uint32_t ICON_SHM_MAGIC   = 0x4F434957; // 'WICO' (bytes W,I,C,O)
-constexpr uint32_t ICON_SHM_VERSION = 1;
-constexpr uint32_t ICON_SHM_SIZE    = 64 * 1024;
+// v2：尺寸档补到 7 档（含 40/48，覆盖 250/300% 缩放），SHM 随之放大到 128 KiB。
+// 与 Rust 侧 wind-ipc/protocol.rs 的同名常量必须逐字一致；版本不匹配时本端直接判失败
+// 退回本地绘制（图标还在、只是没角标），而不是硬读出一张错位的花屏。
+constexpr uint32_t ICON_SHM_VERSION = 2;
+constexpr uint32_t ICON_SHM_SIZE    = 128 * 1024;
 
 // Theme tiers. The taskbar's own theme decides which one to pick; the DLL detects it
 // locally (IsSystemDarkMode) rather than being told, so there is no stale window.

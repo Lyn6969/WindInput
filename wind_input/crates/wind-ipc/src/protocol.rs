@@ -945,7 +945,12 @@ impl SharedRenderHeader {
 
 /// 图标 SHM 魔数 `'WICO'`（字节序 W,I,C,O，小端读作 `0x4F43_4957`）。
 pub const ICON_SHM_MAGIC: u32 = 0x4F43_4957;
-pub const ICON_SHM_VERSION: u32 = 1;
+/// 布局版本。v2 加了 40/48 两档并放大了 SHM（见 [`ICON_SIZES`]）。
+///
+/// 版本不匹配时读端直接判失败、退回本地绘制，而不是硬读——DLL 与服务分属两个
+/// 部署单元，先更新哪个都可能。降级的表现是「图标还在、只是没有角标」，可接受；
+/// 硬读的表现是任务栏上出现一张错位的花屏。
+pub const ICON_SHM_VERSION: u32 = 2;
 
 /// 图标 SHM 名（不走握手，两端各自按固定规则拼）。
 ///
@@ -962,12 +967,16 @@ pub fn icon_shm_name(suffix: &str) -> String {
     format!("Local\\WindInput_IconShm{suffix}")
 }
 
-/// 预渲染的尺寸档，对应 100/125/150/175/200% DPI。
+/// 预渲染的尺寸档，对应 100/125/150/175/200/250/300% DPI。
 ///
 /// 备多档而非按 DPI 现算一个，是因为 `ITfLangBarItemButton::GetIcon` **没有尺寸参数**：
 /// 图标多大由我们创建位图时决定，系统拿去后如何缩放不可见。备齐档位后，
 /// 选档逻辑将来若要修正，改的只是选择，不必重做渲染。
-pub const ICON_SIZES: [u16; 5] = [16, 20, 24, 28, 32];
+///
+/// 40/48 两档是真机实测补的：300% 缩放下该给 48，而档位表原本止于 32，
+/// DLL 只能取最接近的 32 再由系统放大——放大正是最糊的那种情形
+/// （同机对照：原生无缩放的那档明显更清晰）。
+pub const ICON_SIZES: [u16; 7] = [16, 20, 24, 28, 32, 40, 48];
 
 /// 主题档：亮色任务栏用深色图标，暗色任务栏用浅色图标。
 pub const ICON_THEME_LIGHT: u8 = 0;
@@ -996,11 +1005,16 @@ pub const fn icon_slot_stride() -> usize {
 /// 变体表相对 SHM 基址的偏移（紧跟 header）。
 pub const ICON_TABLE_OFFSET: usize = IconShmHeader::SIZE;
 
-/// slot 0 起点。表尾对齐到 256 边界，留出加变体档位的余量。
-pub const ICON_SLOT0_OFFSET: usize = 256;
+/// slot 0 起点。表尾对齐到 512 边界，留出加变体档位的余量。
+///
+/// ⚠ 加尺寸档时**必须一并复核本值**：变体表紧跟 64 B 的 header，可用空间是
+/// `ICON_SLOT0_OFFSET - ICON_TABLE_OFFSET`，每个变体 16 B。原来的 256 只放得下
+/// 12 个变体，而 7 档 × 2 主题 = 14 个已经装不下——`icon_shm_layout_fits_without_overlap`
+/// 正是为这一步准备的。
+pub const ICON_SLOT0_OFFSET: usize = 512;
 
-/// SHM 总大小，取 64 KiB 整（实际用量约 48.8 KiB）。
-pub const ICON_SHM_SIZE: usize = 64 * 1024;
+/// SHM 总大小，取 128 KiB 整（7 档双主题双缓冲实际用量约 109 KiB）。
+pub const ICON_SHM_SIZE: usize = 128 * 1024;
 
 /// 图标 SHM 头部（64 B）。
 ///
