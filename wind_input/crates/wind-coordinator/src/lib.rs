@@ -3,8 +3,12 @@
 //! 与 Go 版本 `wind_input/internal/coordinator/` 对齐。
 
 pub mod auto_phrase;
+pub(crate) mod candidate_nav;
 pub(crate) mod comment;
+pub(crate) mod config_bundle;
+pub(crate) mod construct;
 pub mod coordinator;
+pub(crate) mod debug_support;
 #[cfg(windows)]
 pub mod direct_switch;
 pub mod edit_ops;
@@ -27,6 +31,7 @@ pub mod handle_url;
 pub mod host_services;
 pub mod hotkey_match;
 pub mod input_diag;
+pub(crate) mod key_convert;
 pub mod key_gate;
 pub mod layout;
 pub mod pipeline;

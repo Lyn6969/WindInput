@@ -12,6 +12,12 @@
 
 use crate::handle_mode::MixLens;
 use crate::pipeline::{ModeKind, Rewind};
+// 平移到子模块的项以原路径保真（handle_* 均经 `crate::coordinator::` 引用，勿改回直连）。
+pub(crate) use crate::config_bundle::{ConfigBundle, schema_bound_modifier_vks};
+pub(crate) use crate::key_convert::{
+    char_to_main_vk, en_case_variants, full_width_source_char, numpad_char, numpad_to_main,
+    printable_char, punct_char, wind_mods_to_win32,
+};
 use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;
 use std::collections::HashMap;
@@ -21,14 +27,14 @@ use tracing::{debug, info, trace, warn};
 use wind_keys::keymap;
 
 use wind_bridge::handler::*;
-use wind_bridge::push::{PushConfig, PushServer};
+use wind_bridge::push::PushServer;
 use wind_candidate::{Candidate, CandidateSource};
 use wind_config::Config;
 use wind_config::PreeditDisplay;
-use wind_config::hotkey::{self, CompiledHotkeys};
+use wind_config::hotkey;
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{
-    EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_WIN, calc_key_hash,
+    EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
 };
 use wind_store::Store;
 use wind_store::stat_collector::{StatCollector, StatEvent};
@@ -37,9 +43,6 @@ use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui_types::CandidateItem;
 use wind_ui_types::{GlobalHotkeyEntry, UiCommand, UiEvent};
-// UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
-#[cfg(all(feature = "desktop-ui", not(target_os = "macos")))]
-use wind_ui::manager::UiManager;
 use wind_ui_types::{ToastKind, ToastPosition};
 
 /// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素）。微信 reflow 后的
@@ -49,30 +52,6 @@ const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 
 /// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
 pub(crate) const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
-
-/// wind 修饰位（SHIFT=0x1/CTRL=0x2/ALT=0x4/WIN=0x8，见 wind-ipc MOD_*）→ Win32 位序
-/// （ALT=0x1/CTRL=0x2/SHIFT=0x4/WIN=0x8，即 ALT 与 SHIFT 互换）。
-/// RegisterHotKey 的 fsModifiers 与 DirectSwitchHotkeys 的 Modifiers 低位（TF_MOD_*）同用此位序。
-fn wind_mods_to_win32(mods: u32) -> u32 {
-    const WIN32_MOD_ALT: u32 = 0x0001;
-    const WIN32_MOD_CONTROL: u32 = 0x0002;
-    const WIN32_MOD_SHIFT: u32 = 0x0004;
-    const WIN32_MOD_WIN: u32 = 0x0008;
-    let mut win = 0u32;
-    if mods & MOD_SHIFT != 0 {
-        win |= WIN32_MOD_SHIFT;
-    }
-    if mods & MOD_CTRL != 0 {
-        win |= WIN32_MOD_CONTROL;
-    }
-    if mods & MOD_ALT != 0 {
-        win |= WIN32_MOD_ALT;
-    }
-    if mods & MOD_WIN != 0 {
-        win |= WIN32_MOD_WIN;
-    }
-    win
-}
 
 /// 取进程 ID 对应的可执行文件名（如 "Weixin.exe"）。对齐 Go `bridge.GetProcessName`：
 /// OpenProcess(QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW，取末段文件名。
@@ -113,177 +92,6 @@ fn process_name(pid: u32) -> String {
 #[cfg(not(windows))]
 fn process_name(_pid: u32) -> String {
     String::new()
-}
-
-/// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
-/// 解析配对表（每项 2 字符 "（）"）为 (左,右) 字符对，忽略非法项。
-fn parse_pairs(list: &[String]) -> Vec<(char, char)> {
-    list.iter()
-        .filter_map(|s| {
-            let mut it = s.chars();
-            match (it.next(), it.next(), it.next()) {
-                (Some(l), Some(r), None) => Some((l, r)),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// 解析配对跳出键名 → VK 码集合。支持 tab / enter(return) / space / escape(esc)；
-/// 大小写与首尾空白不敏感，未知名忽略。这些非可打印键不在 keymap 的 KEY_TABLE
-/// （引导/触发用的 OEM 符号键）内，故在此单独映射。
-fn parse_jump_out_keys(list: &[String]) -> std::collections::HashSet<u32> {
-    list.iter()
-        .filter_map(|s| match s.trim().to_lowercase().as_str() {
-            "tab" => Some(keymap::VK_TAB),
-            "enter" | "return" => Some(keymap::VK_RETURN),
-            "space" => Some(keymap::VK_SPACE),
-            "escape" | "esc" => Some(keymap::VK_ESCAPE),
-            // `right_symbol` 不是键名（右符号是哪个键取决于配对表），由
-            // `parse_jump_out_on_right_symbol` 单独解析成开关。
-            _ => None,
-        })
-        .collect()
-}
-
-/// `jump_out_keys` 是否含「右符号键本身」这一特殊值 → 打 `）` 跳出已插入的 `（）`。
-/// 与 VK 集合分开表示：右符号不是固定按键，取决于当前生效的配对表。
-fn parse_jump_out_on_right_symbol(list: &[String]) -> bool {
-    list.iter()
-        .any(|s| s.trim().to_lowercase() == wind_config::config::JUMP_OUT_RIGHT_SYMBOL)
-}
-
-pub(crate) fn punct_char(key_code: u32, shift: bool) -> Option<char> {
-    use keymap::*;
-    let (base, shifted) = match key_code {
-        0x30 => ('0', ')'),
-        0x31 => ('1', '!'),
-        0x32 => ('2', '@'),
-        0x33 => ('3', '#'),
-        0x34 => ('4', '$'),
-        0x35 => ('5', '%'),
-        0x36 => ('6', '^'),
-        0x37 => ('7', '&'),
-        0x38 => ('8', '*'),
-        0x39 => ('9', '('),
-        VK_SEMICOLON => (';', ':'),
-        VK_EQUAL => ('=', '+'),
-        VK_COMMA => (',', '<'),
-        VK_MINUS => ('-', '_'),
-        VK_PERIOD => ('.', '>'),
-        VK_SLASH => ('/', '?'),
-        VK_BACKTICK => ('`', '~'),
-        VK_LBRACKET => ('[', '{'),
-        VK_BACKSLASH => ('\\', '|'),
-        VK_RBRACKET => (']', '}'),
-        VK_QUOTE => ('\'', '"'),
-        _ => return None,
-    };
-    Some(if shift { shifted } else { base })
-}
-
-/// 小键盘键 → 主键盘等价键 `(vk, 是否需 Shift)`。非小键盘键返回 None。
-///
-/// `numpad_behavior = follow_main` 的**唯一实现手段**：在分派前把小键盘键重写成主键盘等价键，
-/// 此后全部模式（普通 / 临拼 / 临英 / 特殊 / mix / URL）自动与主键盘一致，无需各 handler
-/// 各自复制一份数字键语义——「各处自行实现」正是小键盘在多数模式下被静默吞掉的成因。
-///
-/// 运算符须连 Shift 一并归一（主键盘 `*` = Shift+8、`+` = Shift+=），归一后 `punct_char`
-/// 自然给出正确字符，且 `if modifiers & MOD_SHIFT == 0` 的选词臂会正确地不匹配。
-pub(crate) fn numpad_to_main(key_code: u32) -> Option<(u32, bool)> {
-    use keymap::*;
-    Some(match key_code {
-        0x60..=0x69 => (key_code - 0x60 + VK_0, false), // Numpad0-9 → 主键盘 0-9
-        0x6A => (0x38, true),                           // * = Shift+8
-        0x6B => (VK_EQUAL, true),                       // + = Shift+=
-        0x6D => (VK_MINUS, false),                      // -
-        0x6E => (VK_PERIOD, false),                     // .
-        0x6F => (VK_SLASH, false),                      // /
-        _ => return None,
-    })
-}
-
-/// 全角态下「TSF 已吃下的键」→ 待转换的源字符。
-///
-/// **覆盖面必须 ⊇ C++ 的全角吃键集**（`KeyEventSink.cpp` 的 `english_fullwidth` /
-/// `chinese_fullwidth_number` / `chinese_fullwidth_space` 三个分支：Letter|Number|
-/// Punctuation|Space，含小键盘）。返回 None 会让调用方 PassThrough → 键已被吃下 →
-/// 「吃了再吐」→ 严格 TSF 宿主(Chrome/Electron)直接丢键。C++ 吃键分支增删时须同步此处。
-///
-/// 空格与小键盘都不在 `printable_char` 覆盖内（`punct_char` 无 VK_SPACE），故在此收口，
-/// 供英文全角与 CapsLock+全角两条路径共用，避免两处各记一套而漂移。
-pub(crate) fn full_width_source_char(key_code: u32, shift: bool) -> Option<char> {
-    if key_code == keymap::VK_SPACE {
-        return Some(' ');
-    }
-    printable_char(key_code, shift).or_else(|| numpad_char(key_code))
-}
-
-/// 小键盘键码 → 字符（数字 0-9 / 运算符 * + - / / 小数点 .）。非小键盘键返回 None。
-pub(crate) fn numpad_char(key_code: u32) -> Option<char> {
-    match key_code {
-        0x60..=0x69 => Some((b'0' + (key_code - 0x60) as u8) as char),
-        0x6A => Some('*'),
-        0x6B => Some('+'),
-        0x6D => Some('-'),
-        0x6E => Some('.'),
-        0x6F => Some('/'),
-        _ => None,
-    }
-}
-
-/// 用户输入的大小写**变形候选**：按 全小写 → 首字母大写 → 全大写 的固定次序产出，
-/// 并剔除与原文相同的那一项（原文自身是首候选，无需重复）。纯 ASCII 语义即够用——
-/// 临英缓冲只可能由 VK 字母 / 数字 / ASCII 标点组成。
-///
-/// 之所以是「枚举三形态」而非旧的「检测输入形态 → 适配词库候选」（`detect_en_case` /
-/// `adapt_en_case`，已删）：Shift+字母是临英的进入方式，缓冲首字母**恒为大写**，
-/// 于是旧检测恒返回 Title，把整列词库候选强制套成 `Hello`/`Help`/`Held`，
-/// 而词库里 86% 的词本是小写。触发方式的副作用被当成了用户的大小写意图。
-/// 现在词库候选一律保持原文，大小写改由用户在这几个变形候选里显式选。
-///
-/// 副产物：对全大写、混合大小写输入也自洽——原文是哪种形态，缺的另两种就自动补齐。
-/// 无字母的缓冲（如 `123`）三形态皆等于原文，返回空表。
-pub(crate) fn en_case_variants(s: &str) -> Vec<String> {
-    let lower = s.to_lowercase();
-    let mut chars = lower.chars();
-    let title = match chars.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    };
-    // 三形态间也可能互等（单个小写字母 "a" → title/upper 同为 "A"），故一并有序去重。
-    let mut out: Vec<String> = Vec::with_capacity(3);
-    for v in [lower, title, s.to_uppercase()] {
-        if v != s && !out.contains(&v) {
-            out.push(v);
-        }
-    }
-    out
-}
-
-/// 可打印字符 → 主键盘 VK（无 Shift 态）。找不到返回 `None`。
-///
-/// [`punct_char`] 的反向查询。仅供配置体检使用（启动一次），故用线性扫描而非反查表——
-/// 建表反而多一份需要与 `punct_char` 保持同步的真相源。
-fn char_to_main_vk(ch: char) -> Option<u32> {
-    (0x20u32..=0xFF).find(|&vk| punct_char(vk, false) == Some(ch))
-}
-
-/// VK + shift → 可打印 ASCII 字符（字母按 shift 决定大小写、数字/符号复用 punct_char）。
-/// 用于网址模式原样累积与前缀探测。非可打印键返回 None。
-pub(crate) fn printable_char(key_code: u32, shift: bool) -> Option<char> {
-    match key_code {
-        keymap::VK_A..=keymap::VK_Z => {
-            let base = (key_code - 0x41) as u8;
-            Some(if shift {
-                (b'A' + base) as char
-            } else {
-                (b'a' + base) as char
-            })
-        }
-        keymap::VK_0..=keymap::VK_9 if !shift => Some((b'0' + (key_code - 0x30) as u8) as char),
-        _ => punct_char(key_code, shift),
-    }
 }
 
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
@@ -634,139 +442,6 @@ pub(crate) struct SmartSymbolArm {
     pub(crate) hold_pending_commit: bool,
 }
 
-/// 配置 + 其轻量派生缓存的不可变快照；运行时整体原子替换以支持热重载。
-/// 重型组件（引擎/方案/词典）不在内，仍需重启才能完全切换。
-pub(crate) struct ConfigBundle {
-    pub(crate) config: Config,
-    pub(crate) compiled_hotkeys: CompiledHotkeys,
-    /// 会话态按键绑定（`keys.session_actions` 编译一次）。**不只是导航**——二期起还装
-    /// `cancel`，故不叫 `nav_keys`。动作值域在 `wind-config`，表在 `wind-keys`，两者由
-    /// 本结构体所在的 crate 拼起来（唯一同时看得见两边的地方）。
-    pub(crate) session_keys: keymap::KeyBinds<wind_config::SessionAction>,
-    pub(crate) cn_pairs: Vec<(char, char)>,
-    pub(crate) en_pairs: Vec<(char, char)>,
-    /// 配对跳出键的 VK 码集合（预解析自 `auto_pair.jump_out_keys`，空=不启用）。
-    pub(crate) jump_out_keys: std::collections::HashSet<u32>,
-    /// 输入右符号本身是否跳出（`jump_out_keys` 含 `right_symbol`）。对称配对不受此项影响。
-    pub(crate) jump_out_on_right_symbol: bool,
-    /// 「英半列有自定义标点映射」的源字符集合（预解析自 `punct.custom_mappings`，空=英文模式
-    /// 行为与历史一致）。这是 DLL 吃键与本侧出字的**同源判据**，且在英文标点键的热路径上每键
-    /// 都要查——故预计算，别在按键时重新遍历 `custom_mappings`。有序集合使推送字节可复现。
-    pub(crate) custom_en_punct_chars: std::collections::BTreeSet<char>,
-}
-
-/// 所有方案 `[key_actions]` 里绑过的纯修饰键 VK（并集）。
-///
-/// 取并集而非活跃方案那一份：`CompiledHotkeys` 随 activation 推给 C++，按活跃方案裁剪
-/// 就得在每次切方案后重推，漏一次的表现是「刚切完方案这个键不灵、点下别的窗口又灵了」。
-/// 并集是静态的，代价只是别的方案里多转发一个不动作的 keyup（keydown 侧纯修饰键一律
-/// 放行，宿主无感）。理由详见 [`EngineManager::all_key_action_keys`]。
-fn schema_bound_modifier_vks(mgr: &EngineManager) -> std::collections::BTreeSet<u32> {
-    mgr.all_key_action_keys()
-        .iter()
-        .filter_map(|name| keymap::modifier_name_to_vk(name))
-        .collect()
-}
-
-/// 加载期告警：`keys.session_actions` 里认不出的键名 / 动词。
-///
-/// ★ 静默忽略与「这个功能坏了」完全同形——用户无从分辨自己拼错了、还是该功能压根没实现。
-/// 这是 `is_supported_key_action` 当初立的口径，本表沿用。
-///
-/// 分两条报而不是合并成一条：键名错与动词错的修法不同，合并后用户还要自己二选一去试。
-fn warn_unknown_session_actions(config: &Config) {
-    for (name, verb) in &config.keys.session_actions {
-        if wind_config::SessionAction::parse_checked(verb).is_none() {
-            warn!(
-                "keys.session_actions[\"{name}\"] = \"{verb}\"：动词无法识别，该绑定被忽略。\
-                 可选 page_prev / page_next / highlight_up / highlight_down / none",
-            );
-            continue;
-        }
-        if keymap::session_key_name_to_vk(name).is_none() {
-            warn!(
-                "keys.session_actions[\"{name}\"]：键名无法识别，该绑定被忽略。\
-                 可选 tab / shift+tab / capslock / pageup / pagedown / up / down / left / \
-                 right / home / end，以及符号键 minus / equal / lbracket / rbracket / \
-                 comma / period / semicolon / quote / slash / backtick / backslash",
-            );
-        }
-    }
-}
-
-impl ConfigBundle {
-    /// `schema_bound_modifiers` = 所有方案 `[key_actions]` 里出现过的**纯修饰键** VK
-    /// （见 [`Coordinator::schema_bound_modifier_vks`]）。它们要追加进 `key_up` 转发集，
-    /// 否则 TSF 根本不把这些键的 keyup 送过来——`CompiledHotkeys` 编译自全局 config，
-    /// 方案文件不在其中，这是 keyup 类绑定唯一的可达性来源。
-    fn build(mut config: Config, schema_bound_modifiers: &std::collections::BTreeSet<u32>) -> Self {
-        // 归一化 + 存量迁移。放在这里而不是只在 `Config::load()` 里：本函数是**所有**
-        // 配置生效的必经之路（启动、热重载、RPC 改配置后的 `refresh_config_in_memory`、
-        // 测试直接构造）。挂在 load 上会漏掉后三条——设置页保存一次就绕过了迁移，
-        // 而消费点已改成只读新表，表现是「保存后引导键全失效」。`normalize` 幂等。
-        config.normalize();
-        let mut compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
-        // action 用专门的 `schema_bound` 而不是 `toggle_mode`：`is_toggle_mode_keycode` 按
-        // action 过滤，混用会让「只在某方案里绑了 rshift」的键在所有方案里都切中英文
-        // （与 `select_key_groups` 那次踩的是同一个坑，见该函数的 ⚠ 注释）。
-        for vk in schema_bound_modifiers {
-            // 修饰键的 hash 要带通用位+具体位，与 `compile_toggle_mode_key` 同构：
-            // C++ `GetCurrentModifiers()` 对修饰键同时返回两者，只带一边匹配不上。
-            if let Some(hash) = hotkey::compile_modifier_key_up_hash(*vk) {
-                compiled_hotkeys.key_up.push(hotkey::HotkeyEntry {
-                    tsf_hash: hash,
-                    match_hash: hash,
-                    action: "schema_bound".to_string(),
-                });
-            }
-        }
-        warn_unknown_session_actions(&config);
-        // 会话态按键绑定。数据源是 `effective_session_actions()`＝四组键组配置的展开结果
-        // ⊕ `session_actions`（后者优先）。
-        //
-        // ★ 合并只在这里发生，**配置文件里两套各自保持原样**——设置页的四个勾选框读的正是
-        // 存储层，折算若写回存储，界面就永远显示为空。判据见该函数的文档。
-        //
-        // ★ 这里是两个 crate 的接缝：动作值域（`SessionAction`）在 `wind-config`，绑定表
-        // （`KeyBinds`）在 `wind-keys`，而 `wind-config` 不能反向依赖 `wind-keys`（后者经
-        // `wind-cmdbar` 依赖它，加进去成环）。本函数是唯一同时看得见两者的地方。
-        //
-        // 表**直接持有 `SessionAction`**，不再翻译成某个中间枚举——一期那层 `NavAction`
-        // 映射在加 `cancel` 时立刻成了瓶颈（新动词没有对应的 `NavAction`）。
-        // 显式 `none` 与写错的动词都在此过滤掉；后者由上一行的 `warn_unknown_session_actions`
-        // 报出来，静默忽略与「功能坏了」完全同形。
-        let effective_session = config.keys.effective_session_actions();
-        let session_keys =
-            keymap::KeyBinds::from_binds(effective_session.iter().filter_map(|(name, verb)| {
-                let action = wind_config::SessionAction::parse(verb);
-                action.is_enabled().then_some((name.as_str(), action))
-            }));
-        let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
-        let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
-        let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
-        let jump_out_on_right_symbol =
-            parse_jump_out_on_right_symbol(&config.input.auto_pair.jump_out_keys);
-        // 英文模式下需要 DLL 吃下转发的标点键 = 「配了英半列自定义」∪「英文智能符号参与集」。
-        // 两个来源都是「英文半角下 DLL 默认透传、core 却需要收到」的键，合并成一份推送即可
-        // （DLL 侧判据是数据驱动的字符集查表，集合变大自动多吃，无需改 C++）。
-        let custom_en_punct_chars: std::collections::BTreeSet<char> =
-            wind_punct::custom_english_punct_chars(&config.input)
-                .into_iter()
-                .chain(wind_punct::english_smart_source_chars(&config.input))
-                .collect();
-        Self {
-            config,
-            compiled_hotkeys,
-            session_keys,
-            cn_pairs,
-            en_pairs,
-            jump_out_keys,
-            jump_out_on_right_symbol,
-            custom_en_punct_chars,
-        }
-    }
-}
-
 /// 当前焦点进程派生的 caret 兼容态，字段取自 `compat.toml` 的 `[[apps]]` 规则。
 ///
 /// focus_gained / ime_activated 时按 `client_token` 高 32 位的 PID 解析进程名并缓存
@@ -945,7 +620,7 @@ pub struct Coordinator {
     /// 尚未 reflow」整帧丢弃，候选一次都不下发）。
     caret_independent: std::sync::atomic::AtomicBool,
     /// 启动时预热全部已装方案（桌面默认开；移动端关，见构造里的说明）
-    eager_prewarm: std::sync::atomic::AtomicBool,
+    pub(crate) eager_prewarm: std::sync::atomic::AtomicBool,
     /// 0=Idle 1=Preparing 2=Ready 3=Failed（见 [`Coordinator::readiness`]）
     readiness_state: std::sync::atomic::AtomicU8,
     pending_first_show: Mutex<bool>,
@@ -978,7 +653,7 @@ pub struct Coordinator {
     /// [`Coordinator::notify_ui_hide`]——那里有 40+ 个调用点，无法逐一确认是否已持锁，
     /// 加锁即埋死锁。「窗口隐藏即清空悬停」这句话至此才在真相源上成立，而不只在 UI 侧的
     /// 防抖状态（`CandidateMouse::reset_hover`）上成立。
-    hover_index: std::sync::atomic::AtomicI32,
+    pub(crate) hover_index: std::sync::atomic::AtomicI32,
     /// 本轮组合的首显是否用了**非权威**坐标（fast 的试探采样 / instant 沿用的旧坐标）。
     /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
     /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
@@ -1205,200 +880,6 @@ pub(crate) enum InputOutcome {
 }
 
 impl Coordinator {
-    /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程。
-    /// 桌面专属（desktop-ui）：headless/Android 走 `new_headless_with_ui`。
-    #[cfg(feature = "desktop-ui")]
-    pub fn new(push_server: Arc<PushServer>) -> Arc<Self> {
-        let data_dir = Config::data_dir();
-        let config = Config::load(data_dir.as_deref()).unwrap_or_default();
-        info!("Active schema: {}", config.active_schema());
-
-        // UI 管理器（候选窗口线程）。
-        // macOS 无进程内窗口：把 UiCommand 喂给 host-render forwarder，光栅化进 POSIX SHM
-        // 再经 push 管道推帧给 .app。其余平台走 Windows LayeredWindow 的 UiManager。
-        #[cfg(target_os = "macos")]
-        let (ui_tx, event_rx) = {
-            let (tx, rx) = std::sync::mpsc::channel::<UiCommand>();
-            // 候选/菜单的**鼠标**交互确实经 push/bridge 协议从 .app 回流，不走这里；
-            // 但进程内仍有 UiEvent 源——全局热键由服务进程自己注册（语义要求本输入法
-            // 未激活时也生效，.app 只在被 IMK 拉起后才在），触发后经本通道回协调器。
-            // 后续拖动落点回报（CandidateWindowMoved / StatusTipMoved）等也走这条。
-            let (ev_tx, ev_rx) = std::sync::mpsc::channel::<UiEvent>();
-            let sink: Arc<dyn wind_bridge::HostRenderSink> = push_server.clone();
-            let suffix = push_server.suffix().to_string();
-            if let Err(e) = std::thread::Builder::new()
-                .name("ui-forwarder-macos".into())
-                .spawn(move || wind_ui::manager_macos::forwarder_thread(rx, ev_tx, sink, suffix))
-            {
-                warn!("Failed to spawn macOS host-render forwarder: {}", e);
-            }
-            (tx, Some(ev_rx))
-        };
-        #[cfg(not(target_os = "macos"))]
-        let (ui_tx, event_rx) = match UiManager::new() {
-            Ok(mut ui) => {
-                let tx = ui.sender();
-                let rx = ui.take_event_rx();
-                std::mem::forget(ui); // 进程生命周期内保持 UI 线程存活
-                (tx, rx)
-            }
-            Err(e) => {
-                warn!("Failed to create UI manager: {}", e);
-                let (tx, _rx) = std::sync::mpsc::channel();
-                (tx, None)
-            }
-        };
-
-        // 用户配置目录（%APPDATA%\WindInput）：config.toml / userdata.redb / 词频等用户偏好。
-        let user_dir =
-            Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
-        // redb 用户数据库（用户偏好数据：词频、自定义词、shadow 规则，应随用户漫游）。
-        let store = user_dir.as_deref().and_then(Self::open_user_store);
-        let coordinator = Self::build(
-            config,
-            data_dir.as_deref(),
-            push_server,
-            ui_tx,
-            user_dir,
-            store,
-            None, // 生产路径：override 目录由 EngineManager 取用户配置目录下的默认值
-        );
-
-        // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
-        if let Some(rx) = event_rx {
-            let c = Arc::clone(&coordinator);
-            std::thread::spawn(move || {
-                for ev in rx {
-                    c.handle_ui_event(ev);
-                }
-                debug!("UI event channel closed");
-            });
-        }
-
-        // 注册 keys.global_hotkeys 全局热键（RegisterHotKey）：启动即注册，
-        // 不依赖 IME 激活——全局热键的语义就是在本输入法未激活时也生效。
-        coordinator.sync_global_hotkeys();
-
-        // CapsLock 全局钩子：仅当 keys.session_actions 里配了 capslock 才安装。
-        // （动作消费线程已在内部构造函数里起好，见那里。）
-        coordinator.sync_capslock_hook();
-
-        // 同步 activate_ime 到 DirectSwitchHotkeys 注册表：同样启动即同步（该热键的
-        // 语义就是在本输入法未激活时切换过来），且不依赖 UI 线程创建成功
-        // （Go 版把同步放在 UI 回调装配里，UI 创建失败会静默跳过——已规避）。
-        coordinator.sync_direct_switch_hotkey();
-
-        // 后台预热：提前构建其余方案的引擎与缓存（拼音 merged/unigram、码表 per-dict），
-        // 避免首次切换到拼音/临时拼音/码表时同步重熔大词库造成几十秒卡顿。
-        // single-flight 构建锁保证预热与用户切换不重复构建；按方案顺序逐个建（后台低频）。
-        //
-        // ⚠ 移动端可经 `set_eager_prewarm(false)` 关掉这段：手机上「把所有已装方案的
-        // 词库都编译一遍」的代价是几秒 CPU + 数十 MB 内存，而启动那几秒正是用户最可能
-        // 在打字的时候——预热线程与按键线程抢 state 锁，实测直接把主线程拖到 ANR。
-        // 关掉后方案在**首次切换时**按需加载（切换时等一下可以接受，启动卡死不行）。
-        {
-            let c = Arc::clone(&coordinator);
-            std::thread::spawn(move || {
-                // 延迟启动有两个作用，缺一不可：
-                // ① 让宿主有机会在构造返回后调 `set_eager_prewarm(false)`——本线程在
-                //    构造**末尾**就已 spawn，不等就会抢在宿主表态之前读到默认值 true；
-                // ② 避开启动期的锁竞争高峰（宿主此时正在建视图、要焦点、可能已在收键）。
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                if !c.eager_prewarm.load(std::sync::atomic::Ordering::Relaxed) {
-                    debug!("启动预热已关闭（宿主声明按需加载）");
-                    return;
-                }
-                let active = c.engine_mgr.active_schema_id();
-                // available_schemas 只含「可切换的方案」。临时拼音 / 临时英文的目标引擎
-                // **不在其中**（它们是模式的实现，不是可切换方案），此前因此漏出预热范围：
-                // 实测首次按引导键进临拼时才同步加载 52 万词条的拼音库 + 英文库，用户感到
-                // 顿一下。两者都只在启用时才预热，不给没开这些功能的用户白付内存。
-                let mut targets: Vec<String> = c.engine_mgr.available_schemas().to_vec();
-                // ⚠ `temp_pinyin_target()` **自身就会 `ensure_loaded`**（它的语义是「可用才
-                // 返回」），故这一行本身即完成了临拼引擎的加载，下面循环里那次只是复查跳过。
-                // 看着绕，但比在此复制一份「开关 + 方案适用性 + 目标解析」的判据强——那套判据
-                // 是所有临拼入口的公共门卫，抄一份必然漂移。
-                if let Some(t) = c.engine_mgr.temp_pinyin_target() {
-                    targets.push(t);
-                }
-                if c.rt().config.input.temp_english.show_candidates {
-                    targets.push("english".to_string());
-                }
-                for id in targets {
-                    if id == active || c.engine_mgr.is_loaded(&id) {
-                        continue;
-                    }
-                    let t0 = std::time::Instant::now();
-                    if c.engine_mgr.prewarm_schema(&id) {
-                        debug!("Prewarmed schema {} in {:?}", id, t0.elapsed());
-                    } else {
-                        debug!("Prewarm skipped/failed for schema {}", id);
-                    }
-                }
-                debug!("Schema prewarm done");
-            });
-        }
-
-        // 恢复持久化的工具栏位置（按前台窗口所在显示器的 key 查找）。
-        // 与运行期换屏走同一个函数——判据分成两套迟早漂移。
-        coordinator.init_toolbar_pos();
-
-        // 加载并下发初始主题。明暗必须走 resolve_theme_dark（system 实时探测系统明暗），
-        // 不能硬编码 false——否则跟随系统在**冷启动**这一刻永远回落亮色（实时跟随另有 WM_SETTINGCHANGE
-        // 路径，故只在启动瞬间错、切一次系统主题就"自愈"，与 theme_style 的其余消费点保持同一出口）。
-        let name = coordinator
-            .theme_name
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        coordinator.push_theme(&name, coordinator.resolve_theme_dark());
-        // 下发候选布局方向（ui.candidate.layout == "vertical"）。
-        let vertical = coordinator
-            .rt()
-            .config
-            .ui
-            .candidate
-            .layout
-            .eq_ignore_ascii_case("vertical");
-        let _ = coordinator
-            .ui_tx
-            .send(UiCommand::SetCandidateLayout(vertical));
-        // 下发预编辑内联模式：仅 candidate_inline 需内联候选首单元（app_inline 不显示、candidate_top 独立条）。
-        let embedded = coordinator.rt().config.ui.candidate.preedit().embedded();
-        let _ = coordinator
-            .ui_tx
-            .send(UiCommand::SetPreeditEmbedded(embedded));
-        // 候选字号覆盖 + 悬停提示延迟初值
-        let rt0 = coordinator.rt();
-        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFontSize(
-            rt0.config.ui.candidate.font_size,
-        ));
-        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFlipWhenAbove(
-            rt0.config.ui.candidate.flip_when_above,
-        ));
-        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateSwapWhenAbove(
-            rt0.config.ui.candidate.swap_preedit_when_above,
-        ));
-        let _ = coordinator.ui_tx.send(UiCommand::SetPagerInPreedit(
-            rt0.config.ui.candidate.pager_in_preedit,
-        ));
-        let _ = coordinator
-            .ui_tx
-            .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
-        // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]。
-        // 库已在 build 内加载，此处仅补发字体（sync 按变更检测，重复调用幂等）。
-        // 快捷输入格式表的用户调整（右键调序/停用）：真相在 store，这里装载运行时镜像。
-        // 必须在 store 就位之后——构造体内只能给空初值。
-        coordinator.reload_quick_adjust();
-        coordinator.sync_chaizi_assets();
-        // 注释词库首次加载（`[[ui.comment_dicts]]`，出厂为空数组=不加载任何库）。
-        coordinator.sync_comment_dicts();
-        // 统一应用外观项（幂等）：补齐上面手动块未含的候选字体族 / 翻页栏 / 页码 / 字号跟随主题，
-        // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
-        coordinator.apply_ui_config();
-        coordinator
-    }
-
     /// 注入宿主服务（剪贴板等平台能力）。重复注入静默忽略（`OnceLock` 语义）。
     ///
     /// Android FFI 必须在首个可能触碰剪贴板的调用之前注入——未注入时首次取用
@@ -1472,102 +953,6 @@ impl Coordinator {
             .unwrap_or(false);
         #[cfg(not(windows))]
         return false;
-    }
-
-    /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
-    pub fn new_headless(config: Config, data_dir: Option<&Path>) -> Arc<Self> {
-        // 无头模式无 UI 消费端：丢弃 rx，notify_ui_* 的 send 会静默失败（已用 `let _ =` 忽略）
-        let (ui_tx, _rx) = std::sync::mpsc::channel();
-        drop(_rx);
-        // PushServer::new 零副作用（不起线程不开管道，副作用全在 start()，headless
-        // 从不调）；无客户端时 push_* 全是遍历空表的 no-op。勿为 headless 把它
-        // feature 门控——40+ 调用点会跟着裂开，得不偿失。
-        let push_server = Arc::new(PushServer::new(PushConfig {
-            suffix: String::new(),
-            write_timeout_ms: 30_000,
-        }));
-        Self::build(config, data_dir, push_server, ui_tx, None, None, None)
-    }
-
-    /// 无头 + **指定方案 override 目录**（测试用）。
-    ///
-    /// `new_headless` 让 `EngineManager` 自己取 `Config::user_config_dir()/schema_overrides`
-    /// ——那是**真实用户目录**，测试写进去会污染用户配置，于是一切「方案级覆盖」的行为都
-    /// 没法在集成测试里验证。方案级 `[key_actions]` 的分派 bug 正是因此漏到了真机上。
-    pub fn new_headless_with_override(
-        config: Config,
-        data_dir: Option<&Path>,
-        override_dir: Option<std::path::PathBuf>,
-    ) -> Arc<Self> {
-        let (ui_tx, _rx) = std::sync::mpsc::channel();
-        drop(_rx);
-        let push_server = Arc::new(PushServer::new(PushConfig {
-            suffix: String::new(),
-            write_timeout_ms: 30_000,
-        }));
-        Self::build(
-            config,
-            data_dir,
-            push_server,
-            ui_tx,
-            None,
-            None,
-            override_dir,
-        )
-    }
-
-    /// 无头 + **保留 UI 通道接收端**（测试用）。
-    ///
-    /// `new_headless` 丢弃 rx，于是一切「发给 UI 的内容」在测试里都不可见——而候选的注释段、
-    /// 悬停提示这些是在**发送路径上**算出来的，不回写 `state.candidates`。要验证它们只有两条路：
-    /// 收这个 rx，或者另写一个「按同样规则再算一遍」的 debug 方法。后者是假测试的经典形态——
-    /// 它证明不了生产路径接对了，决策函数写好但消费端没接的情况照样全绿。
-    pub fn new_headless_with_ui(
-        config: Config,
-        data_dir: Option<&Path>,
-    ) -> (Arc<Self>, std::sync::mpsc::Receiver<UiCommand>) {
-        Self::new_headless_with_ui_at(config, data_dir, None)
-    }
-
-    /// 无头 + UI 通道 + **用户数据目录**（Android 生产路径）。
-    ///
-    /// 与 [`Self::new_headless_with_ui`] 的唯一区别是开不开 redb store，而这个区别不小：
-    /// store 为 `None` 时**系统短语层为空**（构造期的 `sync_system_phrases` 整段跳过）、
-    /// 用户词频与自造词不落盘。表现是「短语一条也不出」而不是报错，故无头宿主一旦要
-    /// 进入生产形态（而非只跑按键逻辑测试），必须走这个入口给出用户目录。
-    pub fn new_headless_with_ui_at(
-        config: Config,
-        data_dir: Option<&Path>,
-        user_dir: Option<&Path>,
-    ) -> (Arc<Self>, std::sync::mpsc::Receiver<UiCommand>) {
-        let (ui_tx, rx) = std::sync::mpsc::channel();
-        let push_server = Arc::new(PushServer::new(PushConfig {
-            suffix: String::new(),
-            write_timeout_ms: 30_000,
-        }));
-        let user_dir = user_dir.map(|d| d.to_path_buf());
-        let store = user_dir.as_deref().and_then(Self::open_user_store);
-        (
-            Self::build(config, data_dir, push_server, ui_tx, user_dir, store, None),
-            rx,
-        )
-    }
-
-    /// 打开用户目录下的 redb（缺目录时创建）。失败只 warn：store 不可用时协调器
-    /// 退化为「不落盘」而非拒绝启动。
-    fn open_user_store(dir: &Path) -> Option<Arc<Store>> {
-        let _ = std::fs::create_dir_all(dir);
-        let p = dir.join("userdata.redb");
-        match Store::open(&p) {
-            Ok(s) => {
-                info!("Opened redb store: {}", p.display());
-                Some(Arc::new(s))
-            }
-            Err(e) => {
-                warn!("Failed to open redb store {}: {}", p.display(), e);
-                None
-            }
-        }
     }
 
     /// 当前是否有活跃组合（编码缓冲非空）。
@@ -1661,44 +1046,7 @@ impl Coordinator {
             .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 无头 + 注入 redb store（测试用）：用于 web_data_rpc 数据域契约测试。
-    pub fn new_headless_with_store(
-        config: Config,
-        data_dir: Option<&Path>,
-        store: Arc<Store>,
-    ) -> Arc<Self> {
-        Self::new_headless_with_store_override(config, data_dir, store, None)
-    }
-
-    /// 无头 + store + **指定方案 override 目录**（测试用）。
-    ///
-    /// 特殊模式的实例集合来自「带 `[overlay]` 段的已安装方案」，而测试不能往真实
-    /// `data/schemas` 里写方案文件。走 override 层即可：`read_schema` 会把它深合并进
-    /// 方案，效果等同该方案自带 `[overlay]` 段，同时保住真实词库不动。
-    pub fn new_headless_with_store_override(
-        config: Config,
-        data_dir: Option<&Path>,
-        store: Arc<Store>,
-        override_dir: Option<std::path::PathBuf>,
-    ) -> Arc<Self> {
-        let (ui_tx, _rx) = std::sync::mpsc::channel();
-        drop(_rx);
-        let push_server = Arc::new(PushServer::new(PushConfig {
-            suffix: String::new(),
-            write_timeout_ms: 30_000,
-        }));
-        Self::build(
-            config,
-            data_dir,
-            push_server,
-            ui_tx,
-            None,
-            Some(store),
-            override_dir,
-        )
-    }
-
-    fn build(
+    pub(crate) fn build(
         config: Config,
         data_dir: Option<&Path>,
         push_server: Arc<PushServer>,
@@ -2993,36 +2341,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// 当前**已启用**的方案列表（`schema.available`，测试/诊断用）。
-    ///
-    /// 与 [`Self::active_schema_id`] 不同，这里回答的是「哪些方案会被启动预热覆盖」。
-    /// 测试用它守住「目标方案确实未启用」这个前提——失去前提的回归用例会在已启用
-    /// 方案上空跑一遍、永远绿。
-    pub fn debug_available_schemas(&self) -> Vec<String> {
-        self.engine_mgr.available_schemas()
-    }
-
-    /// 推给 TSF 的 key_up 热键白名单（测试/诊断用）。
-    ///
-    /// 这正是 `push_activation_status` 发出去的那份，不是另算一遍——修饰键类绑定
-    /// 「能不能被触发」完全取决于它在不在这里面，用旁路重算的值断言等于没测。
-    pub fn debug_key_up_hotkeys(&self) -> Vec<u32> {
-        self.rt().compiled_hotkeys.key_up_tsf_hashes()
-    }
-
-    /// 直接装载短语层（仅测试用）：`(code, text, weight, position, is_system)`。
-    ///
-    /// ★ 补的是一个**结构性**测试缺口：真机短语层经 redb `store` 建立，而 headless 测试的
-    /// `store` 是 `None` → 短语层恒空 → 所有依赖短语的判据（`has_code_prefix` 的前缀命中、
-    /// z 的活码身份、夺取回路的触发条件）在测试里全都走不到。测试演示的是「z 是死码」那条
-    /// 分支，真机跑的是「z 有 37 条 `zz*` 前缀」那条——两边结构性分叉，测试再绿也盖不住真机。
-    ///
-    /// 这个缺口让「让位判据与候选构建门槛不同源」整个漏到真机（见 `has_code_prefix` 文档）。
-    pub fn debug_install_phrases(&self, records: Vec<(String, String, i32, i32, bool)>) {
-        *self.phrases.write().unwrap_or_else(|e| e.into_inner()) =
-            wind_phrase::PhraseLayer::from_records(records);
-    }
-
     /// 当前是否中文标点（测试/诊断用）
     pub fn is_chinese_punct(&self) -> bool {
         self.state
@@ -3037,271 +2355,6 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .chinese_mode
-    }
-
-    /// 是否还有更多候选未加载（测试/诊断用）
-    /// 当前激活的 overlay 模式类别名；`None` = 普通输入。仅供测试断言。
-    pub fn debug_active_mode(&self) -> Option<&'static str> {
-        match self.state.lock().unwrap_or_else(|e| e.into_inner()).active {
-            Some(ModeKind::TempPinyin) => Some("temp_pinyin"),
-            Some(ModeKind::TempEnglish) => Some("temp_english"),
-            Some(ModeKind::Url) => Some("url"),
-            Some(ModeKind::Special(_)) => Some("special"),
-            Some(ModeKind::Mix(_)) => Some("mix"),
-            None => None,
-        }
-    }
-
-    pub fn debug_has_more(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .has_more
-    }
-
-    /// 分页信息 (当前页0-based, 页内高亮0-based, 总页数)（测试/诊断用）
-    pub fn debug_page_info(&self) -> (usize, usize, usize) {
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        (s.current_page, s.selected_index, self.total_pages(&s))
-    }
-
-    /// 注入「候选窗当前是否反转排列」（测试/诊断用）。
-    ///
-    /// 刻意走 [`Coordinator::handle_ui_event`] 而非直接写字段——正式路径是 UI 线程发
-    /// `UiEvent::CandidateFlipped`，测试入口跳过分发就测不到那条接线（同 `debug_candidate_op`）。
-    pub fn debug_set_candidate_flipped(&self, flipped: bool) {
-        self.handle_ui_event(UiEvent::CandidateFlipped(flipped));
-    }
-
-    /// 将统计采集器内存数据落库（测试/诊断用；生产由后台线程定时 flush）。
-    pub fn debug_flush_stats(&self) {
-        if let Some(c) = self.stat_collector.as_ref() {
-            c.flush();
-        }
-    }
-
-    /// 当前页候选文本列表（内部简体；测试/诊断用）
-    pub fn debug_page_texts(&self) -> Vec<String> {
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = self.page_range(&s);
-        s.candidates[start..end]
-            .iter()
-            .map(|c| c.text.clone())
-            .collect()
-    }
-
-    /// 当前页候选的"显示文本"（应用简繁后，与候选窗口一致；测试/诊断用）
-    pub fn debug_page_display_texts(&self) -> Vec<String> {
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = self.page_range(&s);
-        s.candidates[start..end]
-            .iter()
-            .map(|c| self.cand_s2t_text(&s, c))
-            .collect()
-    }
-
-    /// 每页候选数（来自配置，至少 1）
-    pub(crate) fn per_page(&self, active: Option<ModeKind>) -> usize {
-        let bundle = self.rt();
-        let cand = &bundle.config.ui.candidate;
-        // overlay 模式(临拼/快捷/短语/临英等,state.active 非空)用扩展档(配置>0 时)。
-        if active.is_some() && cand.per_page_extended > 0 {
-            cand.per_page_extended.max(1)
-        } else {
-            cand.per_page.max(1)
-        }
-    }
-
-    /// 总页数（至少 1）
-    fn total_pages(&self, state: &State) -> usize {
-        let pp = self.per_page(state.active);
-        state.candidates.len().div_ceil(pp).max(1)
-    }
-
-    /// 清除鼠标悬停目标（无需 state 锁，见 [`Coordinator::hover_index`] 的说明）。
-    ///
-    /// 调用点＝一切「悬停不再对应屏幕上任何东西」的时刻：候选窗隐藏、候选列表重新装填、
-    /// 键盘移动高亮/翻页。少接一处的后果是**静默的**——悬停高亮与 tooltip 会在下一次候选窗
-    /// 出现时凭空复现，且鼠标从未移动过。
-    pub(crate) fn clear_hover(&self) {
-        self.hover_index
-            .store(-1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// 当前鼠标悬停目标（原始 tag；-1 = 无）。
-    pub(crate) fn hover_target(&self) -> i32 {
-        self.hover_index.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// 候选列表重新装填 / 组合清空后的**视图复位**：翻页归零、键盘高亮归零、鼠标悬停清除。
-    ///
-    /// # ★★ 三件事必须一起做
-    ///
-    /// 此前只有主路径 `update_candidates` 三件齐全，特殊模式 / 临拼 / 混输 / 快捷输入的
-    /// 8 个装填点都只做了前两件——漏掉的第三件让悬停高亮与 tooltip 跨按键、跨组合、跨模式
-    /// 存活（2026-08-12 用户反馈）。而普通输入每敲一键都重走主路径把残留覆盖掉，
-    /// **该缺陷在主路径上物理不可观测**，只有 overlay 模式才露馅。
-    ///
-    /// 收进一处后，新增候选来源时能漏的只剩「忘了调用本函数」——比在三行里少写一行显眼得多。
-    pub(crate) fn reset_candidate_view(&self, state: &mut State) {
-        state.current_page = 0;
-        state.selected_index = 0;
-        self.clear_hover();
-    }
-
-    /// 上移高亮（页首回卷到上一页末项）；返回是否变化
-    fn move_up(&self, state: &mut State) -> bool {
-        self.clear_hover();
-        if state.candidates.is_empty() {
-            return false;
-        }
-        if state.selected_index > 0 {
-            state.selected_index -= 1;
-        } else if state.current_page > 0 {
-            state.current_page -= 1;
-            let (s, e) = self.page_range(state);
-            state.selected_index = e - s - 1;
-        } else {
-            return false;
-        }
-        true
-    }
-
-    /// 下移高亮（页尾回卷到下一页首项）；返回是否变化
-    fn move_down(&self, state: &mut State) -> bool {
-        self.clear_hover();
-        if state.candidates.is_empty() {
-            return false;
-        }
-        // 接近末页且有更多 → 先动态扩展加载
-        if state.has_more && state.current_page + 2 >= self.total_pages(state) {
-            self.expand_candidates(state);
-        }
-        let (s, e) = self.page_range(state);
-        let page_count = e - s;
-        if state.selected_index + 1 < page_count {
-            state.selected_index += 1;
-        } else if state.current_page + 1 < self.total_pages(state) {
-            state.current_page += 1;
-            state.selected_index = 0;
-        } else {
-            return false;
-        }
-        true
-    }
-
-    /// 上一页（高亮归零）；返回是否变化
-    fn page_prev(&self, state: &mut State) -> bool {
-        self.clear_hover();
-        if state.current_page > 0 {
-            state.current_page -= 1;
-            state.selected_index = 0;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 下一页（高亮归零）；返回是否变化
-    fn page_next(&self, state: &mut State) -> bool {
-        self.clear_hover();
-        // 接近末页且有更多 → 先动态扩展加载，使新页可达
-        if state.has_more && state.current_page + 2 >= self.total_pages(state) {
-            self.expand_candidates(state);
-        }
-        if state.current_page + 1 < self.total_pages(state) {
-            state.current_page += 1;
-            state.selected_index = 0;
-            true
-        } else {
-            // 已在末页仍按向后翻页 ⇒「翻到底了还想看更多」＝明确的放宽意图。
-            self.try_relax_scope_on_page_end(state)
-        }
-    }
-
-    /// 组合结束（输入缓冲已空）时让临时放宽失效，恢复配置的检索范围档位。
-    ///
-    /// 判据取「缓冲是否为空」而非「是否发生了上屏」：上屏、ESC 取消、切焦点清空、模式切换
-    /// 都会清空缓冲，一个判据全覆盖，无需逐路径接线。放宽期间敲字母/退格/翻页时缓冲非空，
-    /// 状态得以保持——找生僻字常要改几次编码。
-    fn expire_scope_override(&self) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !s.scope_relaxed {
-            return;
-        }
-        // ⚠️ 判据是「**当前模式的**输入缓冲已空」。临拼的码在 `temp_pinyin_buffer`，
-        // 而它的 `input_buffer` 恒为空——用 `input_buffer` 一刀切会让临拼刚放宽就在下一次
-        // 按键被清掉，且**静默**（用户只看到「按了没用」）。退出临拼后 `active` 已变回
-        // 非 TempPinyin，走 `input_buffer` 分支照常失效。
-        let ended = if matches!(s.active, Some(ModeKind::TempPinyin)) {
-            s.temp_pinyin_buffer.is_empty()
-        } else {
-            s.input_buffer.is_empty()
-        };
-        if ended {
-            s.scope_relaxed = false;
-        }
-    }
-
-    /// 末页再按向后翻页键 → 临时放宽检索范围为「全部字符」，重建候选并翻到新增的那页。
-    ///
-    /// 设计见 `docs/design/smart-filter-scope-relax.md` §5。这是三类引擎**通用的主入口**：
-    /// 码表候选少、翻两下就到底；拼音候选多，但用户找生僻字本就会一路翻页，翻到底同样是
-    /// 明确信号。挂在既有的「翻不动就返回 false」分支上，不占任何键位。
-    ///
-    /// 返回是否真的发生变化（上层据此决定重绘）。放宽后若没有新增候选则**撤销**，
-    /// 避免留下一个什么也没带来、却会影响后续按键的放宽态。
-    fn try_relax_scope_on_page_end(&self, state: &mut State) -> bool {
-        if !self.rt().config.input.scope_relax.page_end_key {
-            return false;
-        }
-        // 已放宽过就不再重复。放宽是**智能档专属**的补偿：只有智能档会按「同码位有常用字」
-        // 滤掉生僻字，也只有它需要一条把被滤掉的放回来的出路（见上方引用的设计文档，全篇
-        // 以 `filter_mode = "smart"` 为前提）。常用字档若也能放宽，它与智能档的差异就被
-        // 抹平了——用户选「常用字」要的正是一个稳定只出常用字的列表；`Gb18030` 本就不过滤，
-        // 更无可放宽。
-        if state.scope_relaxed || state.filter_mode != wind_candidate::FilterMode::Smart {
-            return false;
-        }
-        // ⚠️ 临拼的码在 `temp_pinyin_buffer`，主路径的在 `input_buffer`——须按当前模式取。
-        // 用 `input_buffer` 一刀切会让临拼**永远触发不了**（那边恒为空），且没有任何报错。
-        let in_temp = matches!(state.active, Some(ModeKind::TempPinyin));
-        let has_input = if in_temp {
-            !state.temp_pinyin_buffer.is_empty()
-        } else {
-            !state.input_buffer.is_empty()
-        };
-        if !has_input {
-            return false;
-        }
-        state.scope_relaxed = true;
-        // 两条路径的候选重建函数不同：临拼走 overlay 的那套（主路径的 `build_candidates`
-        // 读 `input_buffer`，在临拼下会构建出空列表）。
-        let page_before = state.current_page;
-        if in_temp {
-            // ⚠️ `update_temp_pinyin_candidates` 会把 current_page/selected_index 归零，
-            // 重建后须还原，否则用户翻到的位置丢失。
-            self.update_temp_pinyin_candidates(state);
-            state.current_page = page_before;
-        } else {
-            let limit = state.candidate_limit;
-            self.build_candidates(state, limit);
-        }
-        // 判据取「列表里有没有真的出现被滤候选」，而非「总数是否变多」——候选受 limit 截断时
-        // 总数可能不变，那样会误判成「没放出东西」而撤销。
-        if !state.candidates.iter().any(|c| c.is_scope_filtered) {
-            // 该码位本就没有被滤的字 → 原样撤销，别留一个什么也没带来、却会影响后续按键的放宽态
-            state.scope_relaxed = false;
-            return false;
-        }
-        // 放宽出来的候选**追加在末尾**，所以照常翻到下一页就能看到，与「继续往后翻」的动作
-        // 语义完全一致。⚠️ 曾让放宽后的候选按真实顺序插入，结果 `dwi` 的新字（权重 8999 占
-        // 三简位）落到第 1 页第 2 位，视口只能跳回页首——翻页翻着翻着跳回开头，很突兀。
-        if state.current_page + 1 < self.total_pages(state) {
-            state.current_page += 1;
-            state.selected_index = 0;
-        }
-        true
     }
 
     /// 会话态按键绑定的统一执行（配置驱动，见 `keys.session_actions`）：翻页 / 移高亮 /
@@ -4554,7 +3607,7 @@ impl Coordinator {
     }
 
     /// 分发 UI 鼠标事件（在专用线程中执行，可安全加锁/推送）
-    fn handle_ui_event(&self, ev: UiEvent) {
+    pub(crate) fn handle_ui_event(&self, ev: UiEvent) {
         match ev {
             UiEvent::CandidateSelect(i) => self.mouse_select(i),
             UiEvent::Page(dir) => self.mouse_page(dir),
@@ -8820,65 +7873,6 @@ mod first_show_timer_tests {
         // 到期后待办应被取走（说明线程确实醒来处理了），且不 panic
         std::thread::sleep(Duration::from_millis(200));
         assert!(t.pending.lock().unwrap().is_none(), "到期后待办应已被消费");
-    }
-}
-
-#[cfg(test)]
-mod reload_tests {
-    //! 热重载基础：验证 ConfigBundle 能从 Config 正确重建轻量派生缓存。
-    //! （reload_user_config 走磁盘 IO 不在此测；这里测其核心——从配置重建派生状态。）
-    use super::*;
-
-    #[test]
-    fn config_bundle_rebuilds_pairs_from_config() {
-        let mut cfg = Config::default();
-        cfg.input.auto_pair.chinese_pairs = vec!["（）".to_string(), "【】".to_string()];
-        cfg.input.auto_pair.english_pairs = vec!["()".to_string()];
-        let b = ConfigBundle::build(cfg, &Default::default());
-        assert_eq!(b.cn_pairs, vec![('（', '）'), ('【', '】')]);
-        assert_eq!(b.en_pairs, vec![('(', ')')]);
-    }
-
-    #[test]
-    fn parse_jump_out_keys_maps_names_to_vk() {
-        // 支持的键名（大小写/空白不敏感），未知名忽略。
-        let set = parse_jump_out_keys(&[
-            " Tab ".into(),
-            "ENTER".into(),
-            "space".into(),
-            "esc".into(),
-            "unknown".into(),
-        ]);
-        assert!(set.contains(&keymap::VK_TAB));
-        assert!(set.contains(&keymap::VK_RETURN)); // enter → VK_RETURN
-        assert!(set.contains(&keymap::VK_SPACE));
-        assert!(set.contains(&keymap::VK_ESCAPE)); // esc → VK_ESCAPE
-        assert_eq!(set.len(), 4); // "unknown" 被忽略
-        // "return" 别名等价 enter
-        assert!(parse_jump_out_keys(&["return".into()]).contains(&keymap::VK_RETURN));
-        // 空配置 → 空集（不启用）
-        assert!(parse_jump_out_keys(&[]).is_empty());
-    }
-
-    #[test]
-    fn config_bundle_parses_jump_out_keys() {
-        let mut cfg = Config::default();
-        cfg.input.auto_pair.jump_out_keys = vec!["tab".into(), "enter".into()];
-        let b = ConfigBundle::build(cfg, &Default::default());
-        assert!(b.jump_out_keys.contains(&keymap::VK_TAB));
-        assert!(b.jump_out_keys.contains(&keymap::VK_RETURN));
-        assert_eq!(b.jump_out_keys.len(), 2);
-    }
-
-    #[test]
-    fn config_bundle_carries_config_values() {
-        // 改配置 → 重建 bundle → bundle.config 反映新值（热重载替换后读取生效的基础）。
-        let mut cfg = Config::default();
-        cfg.input.symbol.smart_mode = true;
-        cfg.ui.candidate.per_page = 9;
-        let b = ConfigBundle::build(cfg, &Default::default());
-        assert!(b.config.input.symbol.smart_mode);
-        assert_eq!(b.config.ui.candidate.per_page, 9);
     }
 }
 

@@ -1,5 +1,5 @@
 <!-- Parent: ../../AGENTS.md -->
-<!-- Updated: 2026-08-13 -->
+<!-- Updated: 2026-08-14 -->
 
 # wind-coordinator
 
@@ -10,7 +10,12 @@
 | File | Description |
 |------|-------------|
 | `src/lib.rs` | 模块导出（`Coordinator`/重启信号/设置 URL 提供者）；`is_foreground_fullscreen()` 全屏检测（供工具栏全屏隐藏） |
-| `src/coordinator.rs` | 核心：`State`（全部输入态）/`ConfigBundle`/`Coordinator` 定义、构造器（`new`/`new_headless`）、`impl MessageHandler`、**按键主入口 `handle_key_event`（优先级链）**、候选翻页/高亮、统一导航 `apply_nav_key`、配置热重载 `reload_user_config` |
+| `src/coordinator.rs` | 核心：`State`（全部输入态）/`Coordinator` 定义、`build`（83 字段装配点，私有字段以本模块为界不外迁）、`impl MessageHandler`、**按键主入口 `handle_key_event`（优先级链）**、会话键统一分发 `apply_session_action`、配置热重载 `reload_user_config`。平移到子模块的项经 `pub(crate) use` 保真，handle_* 仍从 `crate::coordinator::` 引用 |
+| `src/construct.rs` | 构造器族：生产构造 `new`（desktop-ui）+ headless 家族（`new_headless*`）+ `open_user_store`；装配核心 `build` 留在 coordinator.rs |
+| `src/config_bundle.rs` | `ConfigBundle`（配置 + 轻量派生缓存快照，热重载整体原子替换）+ `parse_pairs`/`parse_jump_out_*` 配置解析 |
+| `src/key_convert.rs` | 键位换算纯函数：`punct_char`/`printable_char`/`numpad_*`/`full_width_source_char`/`en_case_variants`/`wind_mods_to_win32` |
+| `src/candidate_nav.rs` | 候选视图导航：分页/高亮移动/悬停清除/末页检索范围临时放宽（`try_relax_scope_on_page_end`） |
+| `src/debug_support.rs` | `debug_*` 测试/诊断支撑方法（生产路径不调用；生产 tooltip 用的 `DebugSchemaCtx` 族名字带 debug 但**不在**此文件） |
 | `src/pipeline.rs` | `ModeKind`（单一活跃独占模式枚举）+ `Rewind`（夺取回退登记）；含与 Go 决策器的**刻意差异说明**（见下） |
 | `src/handle_candidate.rs` | 候选生成/过滤/shadow/词频重排/分页/选词上屏/右键操作 |
 | `src/handle_temp.rs` | 临时拼音 + 临时英文模式（触发判定/进出/候选刷新/上屏） |
