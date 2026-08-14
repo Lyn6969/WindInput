@@ -135,8 +135,13 @@ fn short_code_protection_off_lets_freq_win() {
 /// 全码位对照：4 码位不设保护，用过的候选正常上浮。
 /// 若把简码保护误做成全局硬保护，本用例会红。
 ///
-/// 现场取自发行词库：`aaaa` → 恭恭敬敬(850) / 工(849)，两条同为精确档。
+/// 现场取自发行词库：`wgkq` → 使(2566) / 使唤(1137) / 覴(120)，前两条同为精确档。
 /// （不用 `aaar`：其次选「菚」是生僻字，被常用字过滤挡在候选之外，测不出重排。）
+///
+/// ⚠️ **不可改用四叠码（`aaaa`/`cccc`…）当现场**：那 25 个码受 gen_dict 的
+/// `[protected_codes]` 保护，权重固定在 8000+ 保护带、次序由上游钦定。拿它们做本用例，
+/// 记频的那条本来就是首选，调频即便完全失效断言照样通过——**假绿**。
+/// 本用例的鉴别力全靠「记频前它不是首选」这个前提。
 #[test]
 fn full_code_still_reranks() {
     let d = data_dir();
@@ -144,15 +149,20 @@ fn full_code_still_reranks() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
-    let (store, path) = store_with("wind_shortcode_fullcode.redb", &[("aaaa", "工", 5)]);
+    let (store, path) = store_with("wind_shortcode_fullcode.redb", &[("wgkq", "使唤", 5)]);
     let coord = Coordinator::new_headless_with_store(wubi_config(true), Some(&d), store);
 
-    press(&coord, "aaaa");
+    press(&coord, "wgkq");
     let all = coord.debug_all_candidate_texts();
     let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();
+    // 前提自检：词库若变动到「使唤」本就排首位，本用例会退化成假绿，故先钉死前提。
+    assert!(
+        head.contains(&"使"),
+        "前提失效——现场应同时有「使」与「使唤」，实际候选: {head:?}"
+    );
     assert_eq!(
         all.first().map(|s| s.as_str()),
-        Some("工"),
+        Some("使唤"),
         "全码位不设保护，用过的候选须正常上浮，实际候选: {head:?}"
     );
 

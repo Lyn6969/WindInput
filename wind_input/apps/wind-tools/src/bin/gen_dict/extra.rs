@@ -69,6 +69,53 @@ pub fn classify(text: &str) -> Category {
     }
 }
 
+/// 把扩展库 CJK 桶的权重**线性压缩**进扩展带 `[weight_min, extra.weight_max]`，
+/// 使整库恒低于主库最低档，同时保留库内相对次序。
+///
+/// ## 为什么是压缩而不是「配 default_weight 抹平」
+///
+/// 抹平（整库同权）会丢掉这 1800+ 条的真实词频差异；线性压缩把这条信息保留下来，
+/// 只是整体平移到主库之下。上游对主库的编排本身就是设计顺序，扩展库是补充，
+/// 补充不该在同码竞争里盖过正编。
+///
+/// ## 为什么必须在数据侧做，而不是引擎侧调 base_order
+///
+/// 引擎排序链是 `weight 降 → base_order 升 → natural_order 升`，`base_order` 在 `weight`
+/// **之后**，只在等权时才起作用。扩展库「品」(1523) 对主库「又」(1318) 权重不等，
+/// `base_order = 1` 永远轮不到——仓库里已有同款翻车记录（欧莱雅反超葡萄牙）。
+///
+/// ## 分辨率损失不影响最终呈现
+///
+/// 压进 119 个档位后同权条目会增多，但引擎在等权时依次落到 `base_order` → `natural_order`
+/// （文件序），而写出前会按「code 升 → weight 降」排序，文件序恰好编码了压缩前的权重序。
+/// 即 schema 注释所说的「整库同权 ⟹ 库内自然序」，顺序信息由文件序继续承载。
+fn compress_into_extra_band(list: &mut [Entry], cfg: &Config) {
+    let cap = cfg.extra.weight_max;
+    if cap <= 0 || list.is_empty() {
+        return; // 0 = 不压缩（旧行为）
+    }
+    let lo_bound = cfg.weight_min.max(1);
+    let (Some(min), Some(max)) = (
+        list.iter().map(|e| e.weight).min(),
+        list.iter().map(|e| e.weight).max(),
+    ) else {
+        return;
+    };
+    // 全库同权：直接落在带顶，相对序本就由文件序承载。
+    if max <= min {
+        for e in list.iter_mut() {
+            e.weight = cap;
+        }
+        return;
+    }
+    let span = (cap - lo_bound).max(0) as f64;
+    let range = (max - min) as f64;
+    for e in list.iter_mut() {
+        let ratio = (e.weight - min) as f64 / range;
+        e.weight = lo_bound + (ratio * span).round() as i64;
+    }
+}
+
 /// 给各桶赋权：CJK 走 unigram 归一化，其余桶保留原权重、缺失则给兜底值。
 pub fn assign_weights(
     buckets: &mut [(Category, Vec<Entry>)],
@@ -102,6 +149,7 @@ pub fn assign_weights(
                         cfg.fallback.priority_10
                     };
                 }
+                compress_into_extra_band(list, cfg);
             }
             _ => {
                 for e in list.iter_mut() {
@@ -277,6 +325,7 @@ pub fn extra_output_path(main_path: &Path, output_name: &str, suffix: &str) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExtraConfig;
 
     #[test]
     fn emoji_wins_over_cjk_for_mixed_text() {
@@ -453,12 +502,20 @@ mod tests {
         );
     }
 
+    /// 分档本身（压缩关闭时的原始语义）。
+    ///
+    /// ★ 必须单独验一次：开启压缩后所有权重都落进 `[1,119]`，档位差被压得只剩几个点，
+    /// 拿压缩后的值断言分档，等于让压缩掩盖掉分档写错——两件事要各测各的。
     #[test]
     fn cjk_bucket_falls_back_by_priority_when_unigram_misses() {
         let cfg = Config {
             jidian_path: "a".into(),
             unigram_path: "b".into(),
             output_path: "c".into(),
+            extra: ExtraConfig {
+                weight_max: 0, // 0 = 不压缩，看分档原值
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut buckets = vec![(
@@ -471,6 +528,60 @@ mod tests {
         assign_weights(&mut buckets, &Unigram::new(), 3.0, &cfg);
         assert_eq!(buckets[0].1[0].weight, 180, "priority_30 档");
         assert_eq!(buckets[0].1[1].weight, 120, "无原始权重落 priority_10");
+    }
+
+    /// ★ 扩展库整库必须落在主库最低档之下——这是「扩展库排在主库之后」的**唯一**保证。
+    /// 引擎侧的 `base_order` 排在 `weight` 之后，只是等权 tiebreaker，压不住高权重词条。
+    #[test]
+    fn cjk_bucket_compressed_below_main_dict_floor() {
+        let cfg = Config {
+            jidian_path: "a".into(),
+            unigram_path: "b".into(),
+            output_path: "c".into(),
+            ..Default::default()
+        };
+        let mut buckets = vec![(
+            Category::Cjk,
+            vec![
+                Entry::new("高频".into(), "abcd".into(), 30, 0),
+                Entry::new("中频".into(), "abce".into(), 20, 1),
+                Entry::new("低频".into(), "abcf".into(), 0, 2),
+            ],
+        )];
+        assign_weights(&mut buckets, &Unigram::new(), 3.0, &cfg);
+        let ws: Vec<i64> = buckets[0].1.iter().map(|e| e.weight).collect();
+        for (e, w) in buckets[0].1.iter().zip(&ws) {
+            assert!(
+                *w <= cfg.extra.weight_max && *w < cfg.fallback.priority_10,
+                "{} 权重 {w} 必须低于主库最低档 {}",
+                e.text,
+                cfg.fallback.priority_10
+            );
+            assert!(*w >= 1, "{} 权重 {w} 不得压到 0 以下", e.text);
+        }
+        // 压缩是线性的：相对次序必须原样保留，否则库内排序就被压坏了。
+        assert!(ws[0] > ws[1] && ws[1] > ws[2], "相对次序应保持: {ws:?}");
+    }
+
+    /// 全库同权时不得除零，且整体落在带顶（相对序此时本就由文件序承载）。
+    #[test]
+    fn cjk_bucket_uniform_weights_do_not_divide_by_zero() {
+        let cfg = Config {
+            jidian_path: "a".into(),
+            unigram_path: "b".into(),
+            output_path: "c".into(),
+            ..Default::default()
+        };
+        let mut buckets = vec![(
+            Category::Cjk,
+            vec![
+                Entry::new("甲".into(), "abcd".into(), 0, 0),
+                Entry::new("乙".into(), "abce".into(), 0, 1),
+            ],
+        )];
+        assign_weights(&mut buckets, &Unigram::new(), 3.0, &cfg);
+        assert_eq!(buckets[0].1[0].weight, cfg.extra.weight_max);
+        assert_eq!(buckets[0].1[1].weight, cfg.extra.weight_max);
     }
 
     #[test]

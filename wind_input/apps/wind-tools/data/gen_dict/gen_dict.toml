@@ -88,6 +88,39 @@ max_gap_ratio_word = 0.65     # 词组：gap/首字权重 > 此比例则保留
 enabled = true
 input_path = "rime-wubi/wubi86_jidian_extra.dict.yaml" # 相对 --cache
 default_weight = 100 # emoji/english/symbols 桶里无原始权重时的兜底值
+# CJK 桶权重上限：补权后线性压缩到 [weight_min, 本值]，使扩展库整库排在主库之后
+# （须 < [fallback].priority_10，由 validate 强制）。
+#
+# 为什么必须在这里压、而不是在方案里配 base_order：引擎排序是
+# `weight 降 → base_order 升`，base_order 在 weight 之后，只是等权时的 tiebreaker。
+# 补权后扩展库「品」(1523) 高于主库「又」(1318)，base_order = 1 压不住它。
+# 0 = 不压缩（保留补权原值）。
+weight_max = 119
+
+# ── 上游编码约定保护 ───────────────────────────────────
+# 这些码整体跳过 unigram 补权与 [demotion] 简码降权，权重 = base_weight + 极点原始优先级，
+# 从而完整保留上游对该码位的候选排序。
+#
+# 背景：词频补全回答的是「这个词多常用」，而上游对这些码的排序表达的是「这个码位约定谁
+# 排第一」，两套语义不可通约。五笔 86 的 25 个键名汉字码（aaaa=工 cccc=又 dddd=大…）即
+# 典型：补权前上游把键名汉字放首位（kkkk/uuuu/wwww/xxxx 四个码上游本就另有安排，故此处
+# 保留原序而非强制键名汉字第一），补权后 26 个里有 14 个被同码词组反超，其中多数还是
+# [demotion] 主动降权所致——「有简码的字让位给词组」对普通编码成立，对键位约定则是错的。
+#
+# base_weight 须高于 [extra].weight_max，且加上原始优先级后仍低于 level3_base_weight
+# （两侧均由 validate 强制）。不必高于 regular_weight_max：保护按**码**施加，同码内不存在
+# 带补权权重的未保护条目，跨码之间引擎不比权重。8000 落在普通带高位只是额外保险
+# （补权公式实际产不出这个量级：最高的「又」也只到 3010）。
+[protected_codes]
+enabled = true
+base_weight = 8000
+codes = [
+    "aaaa", "bbbb", "cccc", "dddd", "eeee", # 工 子 又 大 月
+    "ffff", "gggg", "hhhh", "iiii", "jjjj", # 土 王 目 水 日
+    "kkkk", "llll", "mmmm", "nnnn", "oooo", # 口 田 山 已 火
+    "pppp", "qqqq", "rrrr", "ssss", "tttt", # 之 金 白 木 禾
+    "uuuu", "vvvv", "wwww", "xxxx", "yyyy", # 立 女 人 纟 言
+]
 
 # ── 内置过滤 ───────────────────────────────────────────
 [filter]

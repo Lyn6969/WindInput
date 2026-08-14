@@ -44,6 +44,7 @@ pub struct Config {
     pub demotion: DemotionConfig,
     pub extra: ExtraConfig,
     pub filter: FilterConfig,
+    pub protected_codes: ProtectedCodesConfig,
 
     #[serde(rename = "drop_rules")]
     pub drop_rules: Vec<DropRule>,
@@ -93,6 +94,37 @@ pub struct ExtraConfig {
     pub enabled: bool,
     pub input_path: String,
     pub default_weight: i64,
+    /// 扩展库 CJK 桶的权重上限：补权后线性压缩到 `[weight_min, 本值]`。
+    ///
+    /// **必须低于主库最低档 `fallback.priority_10`**（由 `validate` 强制），这是
+    /// 「扩展库整库排在主库之后」的唯一实现手段——引擎侧的 `base_order` 排在 `weight`
+    /// **之后**，只是等权时的 tiebreaker，压不住任何一条权重更高的扩展库词条
+    /// （见 `wind-config/src/schema.rs` 记的「欧莱雅反超葡萄牙」翻车）。
+    ///
+    /// 0 = 不压缩（保留补权原值，即旧行为）。
+    pub weight_max: i64,
+}
+
+/// 上游特有的**编码约定保护**：这些码的条目整体跳过词频补权与简码降权，
+/// 权重改由极点原始优先级映射，从而完整保留上游设计的候选顺序。
+///
+/// 为什么需要它：我们的词频补全是按「这个**词**有多常用」赋权的，而上游对某些码的
+/// 排序表达的是「这个**码位**约定谁该排第一」——两套语义不可通约。四叠码
+/// （`aaaa`=工 `cccc`=又 `dddd`=大…）就是典型：补权后 26 个里有 14 个的键名汉字
+/// 被同码词组反超，其中相当一部分还是 `apply_demotion` 主动降权造成的
+/// （「有简码的字让位给词组」这条规则对普通编码成立，对键位约定则是错的）。
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProtectedCodesConfig {
+    pub enabled: bool,
+    /// 受保护的完整编码（精确匹配，非前缀）。
+    pub codes: Vec<String>,
+    /// 保护带基准权重：最终权重 = 本值 + 条目的极点原始优先级。
+    ///
+    /// 须高于扩展带与生僻字保底档、且加上原始优先级后仍低于简码带（由 `validate` 强制）。
+    /// 不要求高于 `regular_weight_max`——理由见 `validate` 里的说明（按码保护 ⇒ 同码内
+    /// 不存在未受保护的竞争者）。
+    pub base_weight: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +174,7 @@ impl Default for Config {
             demotion: DemotionConfig::default(),
             extra: ExtraConfig::default(),
             filter: FilterConfig::default(),
+            protected_codes: ProtectedCodesConfig::default(),
             drop_rules: Vec::new(),
             import_tables: Vec::new(),
             passthrough: Vec::new(),
@@ -189,6 +222,28 @@ impl Default for ExtraConfig {
             enabled: true,
             input_path: String::new(),
             default_weight: 100,
+            // 119 = 主库最低档 priority_10(120) - 1：扩展库整库恒排在主库之后。
+            weight_max: 119,
+        }
+    }
+}
+
+impl Default for ProtectedCodesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // 五笔 86 的 25 个键名汉字码（`zzzz` 在上游不存在，故为 25 而非 26）。
+            // 保护的是**整个码**而非单条：同码内所有条目一起按上游原序落进保护带，
+            // 否则未受保护的同码条目会带着补权后的高权重反超。
+            codes: [
+                "aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff", "gggg", "hhhh", "iiii", "jjjj",
+                "kkkk", "llll", "mmmm", "nnnn", "oooo", "pppp", "qqqq", "rrrr", "ssss", "tttt",
+                "uuuu", "vvvv", "wwww", "xxxx", "yyyy",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            base_weight: 8000,
         }
     }
 }
@@ -267,6 +322,49 @@ impl Config {
         if self.target_median <= 0 {
             anyhow::bail!("target_median 必须为正数");
         }
+        // 扩展库带必须整体低于主库最低档，否则「扩展库排在主库之后」不成立。
+        // 引擎侧的 base_order 救不了——它排在 weight 之后，只是等权 tiebreaker。
+        if self.extra.enabled
+            && self.extra.weight_max > 0
+            && self.extra.weight_max >= self.fallback.priority_10
+        {
+            anyhow::bail!(
+                "extra.weight_max({}) 必须低于 fallback.priority_10({})，否则扩展库词条会反超主库，而引擎侧 base_order 排在 weight 之后压不住它",
+                self.extra.weight_max,
+                self.fallback.priority_10
+            );
+        }
+        // 保护带的两侧约束。
+        //
+        // ⚠️ **不要求高于 `regular_weight_max`**：保护是**按码**施加的，受保护码的所有主库
+        // 条目整组进保护带，同码内不存在带着补权权重的未保护条目，跨码之间引擎又不比权重。
+        // 唯一的跨库同码竞争来自扩展库，已由 `extra.weight_max` 压到下方。把 base_weight
+        // 设在普通带高位只是额外保险（补权实际达不到那个量级）。
+        if self.protected_codes.enabled && !self.protected_codes.codes.is_empty() {
+            let base = self.protected_codes.base_weight;
+            if self.extra.enabled && self.extra.weight_max > 0 && base <= self.extra.weight_max {
+                anyhow::bail!(
+                    "protected_codes.base_weight({base}) 必须高于 extra.weight_max({})，否则扩展库词条会反超受保护码，保护形同虚设",
+                    self.extra.weight_max
+                );
+            }
+            if base <= self.fallback.priority_10 {
+                anyhow::bail!(
+                    "protected_codes.base_weight({base}) 必须高于 fallback.priority_10({})，否则受保护码会低于主库生僻字保底档",
+                    self.fallback.priority_10
+                );
+            }
+            // 上界留出原始优先级的加数空间：上游最大优先级为 60（kkkk 的「串口」）。
+            const MAX_ORIG_PRIORITY: i64 = 100;
+            if self.shortcodes.enabled
+                && base + MAX_ORIG_PRIORITY >= self.shortcodes.level3_base_weight
+            {
+                anyhow::bail!(
+                    "protected_codes.base_weight({base}) + 原始优先级上限({MAX_ORIG_PRIORITY}) 必须低于 level3_base_weight({})，否则受保护码会挤进简码权重区间、夺走简码首选",
+                    self.shortcodes.level3_base_weight
+                );
+            }
+        }
         Ok(())
     }
 
@@ -315,6 +413,14 @@ impl Config {
             conflict_report: report_dir.and_then(|d| opt(&self.conflict_report_path, d)),
             demotion_report: report_dir.and_then(|d| opt(&self.demotion_report_path, d)),
         }
+    }
+
+    /// 该编码是否受「上游编码约定保护」——受保护则跳过词频补权与简码降权。
+    ///
+    /// 精确匹配整个码，不做前缀匹配：保护的是具体码位的候选顺序，
+    /// 前缀匹配会把 `cccc` 的保护误扩到 `ccc`/`cc` 等简码上（那些另有简码带管辖）。
+    pub fn is_protected_code(&self, code: &str) -> bool {
+        self.protected_codes.enabled && self.protected_codes.codes.iter().any(|c| c == code)
     }
 
     /// 普通词条的权重上限：启用简码分层时压到 `regular_weight_max` 之下。

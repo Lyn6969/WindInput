@@ -4397,10 +4397,13 @@ fn test_mixed_wubi_exact_priority() {
     }
     let texts = coord.debug_page_texts();
     assert!(!texts.is_empty(), "混输应有候选");
-    assert_eq!(
-        texts[0],
-        "恭恭敬敬",
-        "五笔精确匹配应排首位，实际: {:?}",
+    // 本用例要钉的是**来源**：五笔精确码压过拼音候选。具体是哪条五笔词条属实现细节，
+    // 不可硬编码——`aaaa` 是 gen_dict `[protected_codes]` 保护码，组内次序由上游给定
+    // （上游把键名汉字「工」放首位，补权时代则是「恭恭敬敬」在前）。写死任一具体值都会
+    // 在词库重新生成的前后各红一次，而「拼音候选跑到首位」这个真正要防的回归照样能被抓住。
+    assert!(
+        matches!(texts[0].as_str(), "工" | "恭恭敬敬"),
+        "五笔精确匹配应排首位（aaaa 的五笔候选为 工/恭恭敬敬），实际: {:?}",
         &texts[..texts.len().min(3)]
     );
 }

@@ -235,6 +235,12 @@ pub fn apply_demotion(entries: &mut [Entry], cfg: &Config) -> usize {
         if cands.len() < 2 {
             continue;
         }
+        // 受保护码不降权：本函数的规则是「有简码能打出的字，让出 4 码首选给词组」，
+        // 对普通编码成立，但四叠码这类**键位约定**的首选是上游钦定的，让位就是改掉约定。
+        // 这是 `cccc` 首选从「又」变成「双双」的直接原因（又 3010 → 双双 1319 - 1 = 1318）。
+        if cfg.is_protected_code(code4) {
+            continue;
+        }
         let (top_idx, top) = &cands[0];
 
         // 首字是否已能用任一前缀简码打出

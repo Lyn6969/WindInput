@@ -225,6 +225,14 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
             *weight_buckets.entry("简码".into()).or_default() += 1;
             continue;
         }
+        // 上游编码约定保护：整个码跳过词频补权，权重稍后由 `apply_protected_codes` 统一赋。
+        // 词频回答「这个词多常用」，码位约定回答「这个码谁该排第一」，两者不可通约——
+        // 补权会把 `cccc` 的「又」(原始优先级 40，上游首选) 打成 3010 后再被降权成 1318。
+        // 此处保持 weight 为解析出的原始优先级不动，它正是稍后赋权的输入。
+        if cfg.is_protected_code(&e.code) {
+            *weight_buckets.entry("保护码".into()).or_default() += 1;
+            continue;
+        }
         let is_char = e.is_single_char();
         // 先读原始优先级再覆写：读到已覆写的值会把生僻字全打成同一档
         let orig_priority = e.weight;
@@ -251,6 +259,14 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
         }
     }
 
+    let n_protected = apply_protected_codes(&mut kept, &unigram, cfg);
+    if n_protected > 0 {
+        eprintln!(
+            "\n      编码约定保护: {n_protected} 条（{} 个码，跳过词频补权与简码降权）",
+            cfg.protected_codes.codes.len()
+        );
+    }
+
     eprintln!("\n      权重分布预览:");
     let mut buckets: Vec<(&String, &usize)> = weight_buckets.iter().collect();
     buckets.sort_by_key(|(k, _)| {
@@ -258,6 +274,9 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
             -1
         } else if k.as_str() == "简码" {
             i64::MAX
+        } else if k.as_str() == "保护码" {
+            // 保护带就夹在普通带与简码带之间，预览里也照这个位置摆。
+            i64::MAX - 1
         } else {
             k.split('-')
                 .next()
@@ -373,6 +392,59 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
 }
 
 /// 扩展词库：按字符类型拆成 4 个文件，各自赋权后写出。
+/// 保护带内相邻档位的间距：留出空隙，便于日后人工在两档之间插值微调。
+const PROTECTED_STEP: i64 = 10;
+
+/// 给受保护码赋权：**极点原始优先级为主键，词频仅作并列裁决**。
+///
+/// ## 为什么词频不能当主键
+///
+/// 上游对这些码的排序表达的是「这个码位约定谁排第一」，而词频回答的是「这个词多常用」，
+/// 两者不可通约。`cccc` 的「又」上游给 40（首选），补权按词频打成 3010 后又被
+/// `apply_demotion` 降成 1318，首选变成「双双」——码位约定就此丢失。
+///
+/// ## 为什么词频又不能完全不用
+///
+/// 上游的「无权重列」与「显式最低档 10」在解析后**同形**（`parse.rs` 对空列返回 10）。
+/// 于是 `qqqq` 的「狗狗」(无权重列) 与「金」(显式 10) 并列，仅靠文件序会让「狗狗」占了
+/// 首选——而 `qqqq` 的键名汉字是「金」。上游自己按 `by_weight` 排，无权重列在 librime 语义下
+/// 恒沉底，故「金 在前」才是上游原意。词频在这里正是区分两者的现成信息。
+///
+/// 判据顺序：原始优先级降 → unigram 词频降 → 原文件序升（三者皆同则保持上游行序）。
+fn apply_protected_codes(entries: &mut [Entry], unigram: &weight::Unigram, cfg: &Config) -> usize {
+    if !cfg.protected_codes.enabled || cfg.protected_codes.codes.is_empty() {
+        return 0;
+    }
+    // 按码分组：保护是按**码**施加的，同码条目必须一起定序，否则组内会混入
+    // 未受保护的补权条目并凭高权重反超（保护单条等于没保护）。
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for (i, e) in entries.iter().enumerate() {
+        if cfg.is_protected_code(&e.code) {
+            groups.entry(e.code.clone()).or_default().push(i);
+        }
+    }
+    let mut total = 0usize;
+    for idxs in groups.values() {
+        let mut ranked: Vec<(usize, i64, i64, usize)> = idxs
+            .iter()
+            .map(|&i| {
+                let e = &entries[i];
+                let freq = unigram.get(&e.text).copied().unwrap_or(0);
+                (i, e.weight, freq, e.orig_pos)
+            })
+            .collect();
+        // 主键：上游优先级降；次键：词频降（拆并列）；末键：上游行序升（稳定兜底）。
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
+        let n = ranked.len() as i64;
+        for (rank, (i, ..)) in ranked.iter().enumerate() {
+            entries[*i].weight =
+                cfg.protected_codes.base_weight + (n - rank as i64) * PROTECTED_STEP;
+            total += 1;
+        }
+    }
+    total
+}
+
 fn process_extra(
     cfg: &Config,
     paths: &config::Paths,
@@ -475,4 +547,129 @@ fn process_extra(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod protected_codes_tests {
+    //! 上游编码约定保护（[`apply_protected_codes`]）。
+    //!
+    //! 锁两件事：① 受保护码完整保留上游给出的候选次序；② 上游**没给出**次序时
+    //! （无权重列与显式最低档在解析后同形）由词频裁决，而不是让文件序随便定一个首选。
+    use super::*;
+
+    fn cfg() -> Config {
+        Config {
+            jidian_path: "a".into(),
+            unigram_path: "b".into(),
+            output_path: "c".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 按最终权重降序取文本，即用户看到的候选顺序。
+    fn texts_in_order(entries: &[Entry]) -> Vec<&str> {
+        let mut v: Vec<&Entry> = entries.iter().collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        v.iter().map(|e| e.text.as_str()).collect()
+    }
+
+    /// ★ 上游原序必须原样保留：`cccc` 上游是 又40 > 双双30 > 叕20 > 敠10。
+    /// 补权叠加简码降权曾把首选变成「双双」（又 3010 → 双双 1319 - 1 = 1318）。
+    #[test]
+    fn upstream_order_is_preserved_verbatim() {
+        let mut entries = vec![
+            Entry::new("又".into(), "cccc".into(), 40, 0),
+            Entry::new("双双".into(), "cccc".into(), 30, 1),
+            Entry::new("叕".into(), "cccc".into(), 20, 2),
+            Entry::new("敠".into(), "cccc".into(), 10, 3),
+        ];
+        let n = apply_protected_codes(&mut entries, &weight::Unigram::new(), &cfg());
+        assert_eq!(n, 4);
+        assert_eq!(texts_in_order(&entries), ["又", "双双", "叕", "敠"]);
+    }
+
+    /// ★ 上游本就不把键名汉字放首位的码（kkkk/uuuu/wwww/xxxx）同样照抄不动——
+    /// 保护的是「上游的安排」，不是「键名汉字必须第一」这条我们自己的规则。
+    #[test]
+    fn upstream_non_keyname_first_is_also_preserved() {
+        let mut entries = vec![
+            Entry::new("众人".into(), "wwww".into(), 40, 0),
+            Entry::new("偷偷".into(), "wwww".into(), 30, 1),
+            Entry::new("俗人".into(), "wwww".into(), 20, 2),
+            Entry::new("人".into(), "wwww".into(), 10, 3),
+        ];
+        apply_protected_codes(&mut entries, &weight::Unigram::new(), &cfg());
+        assert_eq!(texts_in_order(&entries), ["众人", "偷偷", "俗人", "人"]);
+    }
+
+    /// ★★ 回归：上游「无权重列」与「显式最低档 10」在解析后同形（`parse.rs` 空列返回 10）。
+    /// `qqqq` 的「狗狗」无权重列、「金」显式 10，仅靠文件序会让「狗狗」占首选——
+    /// 而 `qqqq` 的键名汉字是「金」。词频在此充当并列裁决。
+    #[test]
+    fn ties_are_broken_by_frequency_not_file_order() {
+        let mut unigram = weight::Unigram::new();
+        unigram.insert("金".into(), 500_000);
+        unigram.insert("狗狗".into(), 900);
+        // 文件序里「狗狗」在前，与上游 yaml 一致
+        let mut entries = vec![
+            Entry::new("狗狗".into(), "qqqq".into(), 10, 0),
+            Entry::new("金".into(), "qqqq".into(), 10, 1),
+        ];
+        apply_protected_codes(&mut entries, &unigram, &cfg());
+        assert_eq!(
+            texts_in_order(&entries),
+            ["金", "狗狗"],
+            "同为最低档时应由词频裁决，而不是文件序"
+        );
+    }
+
+    /// 优先级不同则词频**不得**翻盘：上游的显式安排恒压过词频。
+    #[test]
+    fn explicit_priority_outranks_frequency() {
+        let mut unigram = weight::Unigram::new();
+        unigram.insert("双双".into(), 9_000_000); // 词频远高于「又」
+        unigram.insert("又".into(), 1);
+        let mut entries = vec![
+            Entry::new("又".into(), "cccc".into(), 40, 0),
+            Entry::new("双双".into(), "cccc".into(), 30, 1),
+        ];
+        apply_protected_codes(&mut entries, &unigram, &cfg());
+        assert_eq!(
+            texts_in_order(&entries),
+            ["又", "双双"],
+            "上游优先级是主键，词频只在并列时才介入"
+        );
+    }
+
+    /// 未受保护的码一条都不该被碰。
+    #[test]
+    fn unprotected_codes_are_untouched() {
+        let mut entries = vec![
+            Entry::new("工作".into(), "aawt".into(), 30, 0),
+            Entry::new("又".into(), "cccc".into(), 40, 1),
+        ];
+        let n = apply_protected_codes(&mut entries, &weight::Unigram::new(), &cfg());
+        assert_eq!(n, 1, "只应处理 cccc 这一条");
+        assert_eq!(entries[0].weight, 30, "aawt 权重不得变动");
+    }
+
+    /// 保护带整体高于扩展带、且不侵入简码带——这两条是分带设计的边界。
+    #[test]
+    fn protected_band_sits_between_extra_and_shortcode_bands() {
+        let c = cfg();
+        let mut entries = vec![Entry::new("串口".into(), "kkkk".into(), 60, 0)];
+        apply_protected_codes(&mut entries, &weight::Unigram::new(), &c);
+        let w = entries[0].weight;
+        assert!(
+            w > c.extra.weight_max,
+            "须高于扩展带顶 {}",
+            c.extra.weight_max
+        );
+        assert!(w > c.fallback.priority_10, "须高于主库生僻字保底档");
+        assert!(
+            w < c.shortcodes.level3_base_weight,
+            "不得侵入简码带 {}",
+            c.shortcodes.level3_base_weight
+        );
+    }
 }
