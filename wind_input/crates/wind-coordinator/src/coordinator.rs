@@ -944,6 +944,8 @@ pub struct Coordinator {
     /// 合成坐标去骗过闸门（Android 一度就是这么做的，`height` 写 0 还会被判为「宿主
     /// 尚未 reflow」整帧丢弃，候选一次都不下发）。
     caret_independent: std::sync::atomic::AtomicBool,
+    /// 启动时预热全部已装方案（桌面默认开；移动端关，见构造里的说明）
+    eager_prewarm: std::sync::atomic::AtomicBool,
     /// 0=Idle 1=Preparing 2=Ready 3=Failed（见 [`Coordinator::readiness`]）
     readiness_state: std::sync::atomic::AtomicU8,
     pending_first_show: Mutex<bool>,
@@ -1289,9 +1291,23 @@ impl Coordinator {
         // 后台预热：提前构建其余方案的引擎与缓存（拼音 merged/unigram、码表 per-dict），
         // 避免首次切换到拼音/临时拼音/码表时同步重熔大词库造成几十秒卡顿。
         // single-flight 构建锁保证预热与用户切换不重复构建；按方案顺序逐个建（后台低频）。
+        //
+        // ⚠ 移动端可经 `set_eager_prewarm(false)` 关掉这段：手机上「把所有已装方案的
+        // 词库都编译一遍」的代价是几秒 CPU + 数十 MB 内存，而启动那几秒正是用户最可能
+        // 在打字的时候——预热线程与按键线程抢 state 锁，实测直接把主线程拖到 ANR。
+        // 关掉后方案在**首次切换时**按需加载（切换时等一下可以接受，启动卡死不行）。
         {
             let c = Arc::clone(&coordinator);
             std::thread::spawn(move || {
+                // 延迟启动有两个作用，缺一不可：
+                // ① 让宿主有机会在构造返回后调 `set_eager_prewarm(false)`——本线程在
+                //    构造**末尾**就已 spawn，不等就会抢在宿主表态之前读到默认值 true；
+                // ② 避开启动期的锁竞争高峰（宿主此时正在建视图、要焦点、可能已在收键）。
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if !c.eager_prewarm.load(std::sync::atomic::Ordering::Relaxed) {
+                    debug!("启动预热已关闭（宿主声明按需加载）");
+                    return;
+                }
                 let active = c.engine_mgr.active_schema_id();
                 // available_schemas 只含「可切换的方案」。临时拼音 / 临时英文的目标引擎
                 // **不在其中**（它们是模式的实现，不是可切换方案），此前因此漏出预热范围：
@@ -1626,6 +1642,14 @@ impl Coordinator {
             self.readiness_state.store(3, Ordering::Relaxed);
         }
         spawned
+    }
+
+    /// 是否在启动时预热全部已装方案。移动端应设 `false`（理由见构造里的说明）。
+    ///
+    /// 构造返回后**立即**调用即可生效：预热线程有 1.5s 的启动延迟专为此留（见构造处）。
+    pub fn set_eager_prewarm(&self, value: bool) {
+        self.eager_prewarm
+            .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 声明本宿主**不提供光标坐标**（自绘候选条）。
@@ -1964,6 +1988,7 @@ impl Coordinator {
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             caret_independent: std::sync::atomic::AtomicBool::new(false),
+            eager_prewarm: std::sync::atomic::AtomicBool::new(true),
             readiness_state: std::sync::atomic::AtomicU8::new(0),
             pending_first_show: Mutex::new(false),
             pending_first_show_token: Mutex::new(0),
