@@ -4,6 +4,7 @@
 #include "Globals.h"
 #include <olectl.h>  // For CONNECT_E_* constants
 #include <dwrite.h>
+#include <shellscalingapi.h>  // GetDpiForMonitor / MDT_EFFECTIVE_DPI（符号动态取，不静态链接 shcore）
 
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -497,6 +498,64 @@ static HICON _CreateIconFromBgra(const BYTE* bgra, int size)
     return hIcon;
 }
 
+// 语言栏图标应有的边长（物理像素）。
+//
+// ⚠ **不能用 `GetDeviceCaps(GetDC(NULL), LOGPIXELSX)`**，那是本进程启动那一刻的
+// **系统 DPI 快照**，Windows 之后一直按这个值骗它。本 DLL 加载在每一个宿主进程里，
+// 于是同一台机器上会出现两种错：
+//
+//   · 用户改一次缩放后，所有没重启的程序图标一直糊到重启为止；
+//   · 先开的程序与后开的程序给出**不同**的档位——实测记事本与 EverEdit 显示的
+//     尺寸标记点数不同，也就是说其中至少一个必然是错的。
+//
+// 两条都靠调试用的尺寸标记（`IconRenderer::size_marks`）直接看出来的：切换缩放后
+// 按 Shift 强制重画，图标确实变了、点数却不动 ⇒ 重取发生了，错在取到的值。
+//
+// 改取**主显示器的实时 DPI**：指示器画在任务栏上，而任务栏在主显示器
+// （把窗口拖到别的屏时指示器并不跟着走，实测点数不变正与此一致）。
+// `GetDpiForMonitor` 是显式查询，**不随调用进程的 DPI 感知级别被虚拟化**——
+// 这正是这里需要的性质，`GetDeviceCaps` 与 `GetDpiForWindow` 都没有。
+// 动态取符号，与 `TextService.cpp` 的 `ConvertToPhysicalCoordinates` 同一惯例。
+//
+// 已知局限：多任务栏时各屏 DPI 可能不同，而 `GetIcon` 只能返回**一个** HICON，
+// 无法同时服侍两块屏，只能以主屏为准。
+static int _LangBarIconSizePx()
+{
+    static auto pGetDpiForMonitor =
+        reinterpret_cast<decltype(&GetDpiForMonitor)>(
+            GetProcAddress(GetModuleHandleW(L"shcore.dll"), "GetDpiForMonitor"));
+
+    UINT dpi = 0;
+    if (pGetDpiForMonitor != nullptr)
+    {
+        // 主显示器的左上角恒为 (0,0)，故这一点必落在主屏上。
+        POINT origin = { 0, 0 };
+        HMONITOR hMon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        UINT dpiX = 0, dpiY = 0;
+        if (hMon != nullptr && SUCCEEDED(pGetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+            dpi = dpiX;
+    }
+    if (dpi == 0)
+    {
+        // shcore 不可用（Win8 以前）时退回旧取法：不准，但好过没有。
+        HDC hdc = GetDC(NULL);
+        if (hdc != NULL)
+        {
+            dpi = (UINT)GetDeviceCaps(hdc, LOGPIXELSX);
+            ReleaseDC(NULL, hdc);
+        }
+    }
+    if (dpi == 0)
+        dpi = 96;
+
+    int iconSize = MulDiv(16, (int)dpi, 96);
+    if (iconSize < 16) iconSize = 16;
+    // 上限即最大尺寸档。250% 以上会被压回 32 再由系统放大——实测「原生无缩放最清晰」，
+    // 故这里的钳制是有代价的；要覆盖更高缩放须先在 Rust 侧加 40/48 档（并放大 SHM）。
+    if (iconSize > 32) iconSize = 32;
+    return iconSize;
+}
+
 STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
 {
     if (phIcon == nullptr)
@@ -506,18 +565,14 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
 
     WIND_LOG_TRACE(L"GetIcon called\n");
 
-    // Get DPI scaling
+    const int iconSize = _LangBarIconSizePx();
+
     HDC hdcScreen = GetDC(NULL);
     if (hdcScreen == NULL)
     {
         WIND_LOG_ERROR(L"GetIcon: GetDC failed\n");
         return E_FAIL;
     }
-
-    int dpi = GetDeviceCaps(hdcScreen, LOGPIXELSX);
-    int iconSize = MulDiv(16, dpi, 96);  // Scale icon size based on DPI
-    if (iconSize < 16) iconSize = 16;
-    if (iconSize > 32) iconSize = 32;
 
     // ── 优先取服务端预渲染的图标 ──
     //
