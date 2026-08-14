@@ -408,9 +408,11 @@ impl StatusTip {
     }
 
     /// 固定坐标显示（position_mode=fixed）：(fx,fy) 为内容左上屏幕坐标，不随光标。
-    pub fn show_fixed(&mut self, text: &str, fx: i32, fy: i32) {
-        self.ensure_scale(fx, fy);
-        let (_cw, _ch, ml, mt) = self.render_bubble(text);
+    /// `caret_*` 只在 (fx,fy)==(0,0)（从未设定过位置）时用于选屏，见 [`fixed_anchor`]。
+    pub fn show_fixed(&mut self, text: &str, fx: i32, fy: i32, caret_x: i32, caret_y: i32) {
+        let (probe_x, probe_y) = anchor_probe(fx, fy, caret_x, caret_y);
+        self.ensure_scale(probe_x, probe_y);
+        let (cw, ch, ml, mt) = self.render_bubble(text);
         self.mouse.borrow_mut().margin = (ml as i32, mt as i32);
         // 拖动中：跳过重新定位，避免状态刷新把窗口拽回去（拖动本身已用 SetWindowPos 定位）。
         let m = self.mouse.borrow();
@@ -418,8 +420,9 @@ impl StatusTip {
             return;
         }
         drop(m);
-        // 内容锚点 (fx,fy) − 左/上 margin，阴影向四周溢出。
-        self.window.show(fx - ml as i32, fy - mt as i32);
+        let (ax, ay) = fixed_anchor(fx, fy, caret_x, caret_y, cw, ch);
+        // 内容锚点 − 左/上 margin，阴影向四周溢出。
+        self.window.show(ax - ml as i32, ay - mt as i32);
     }
 
     /// 将当前渲染帧保存为 PNG 文件（截图用）。
@@ -499,7 +502,8 @@ impl StatusTip {
         Some((buf, w, h, px - ml as i32, py - mt as i32, has_shadow))
     }
 
-    /// host-render：固定坐标模式，直接用 (fx, fy) 作内容左上屏幕坐标。
+    /// host-render：固定坐标模式，(fx, fy) 为内容左上屏幕坐标。
+    /// 与 [`Self::show_fixed`] 同一套锚点解析（[`fixed_anchor`]），两条渲染路径必须一致。
     /// 返回 `(bgra, w, h, screen_x, screen_y, software_shadow)`；text 为空返回 None。
     #[cfg(windows)]
     pub fn render_frame_fixed(
@@ -507,18 +511,94 @@ impl StatusTip {
         text: &str,
         fx: i32,
         fy: i32,
+        caret_x: i32,
+        caret_y: i32,
     ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
         if text.is_empty() {
             return None;
         }
-        self.ensure_scale(fx, fy);
-        let (buf, w, h, _cw, _ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
-        Some((buf, w, h, fx - ml as i32, fy - mt as i32, has_shadow))
+        let (probe_x, probe_y) = anchor_probe(fx, fy, caret_x, caret_y);
+        self.ensure_scale(probe_x, probe_y);
+        let (buf, w, h, cw, ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
+        let (ax, ay) = fixed_anchor(fx, fy, caret_x, caret_y, cw, ch);
+        Some((buf, w, h, ax - ml as i32, ay - mt as i32, has_shadow))
     }
+}
+
+/// `custom_x/custom_y` 的「从未设定」哨兵。配置默认即 0，而 (0,0) 恰是**主显示器**左上角
+/// —— 固定位置模式下这正是「气泡永远在主屏」的另一条通路：用户刚打开开关还没拖过，
+/// 气泡就钉死在主屏角上，且此前 fixed 路径完全不做屏幕钳制，副屏拔掉后再也拖不回来。
+const FIXED_UNSET: (i32, i32) = (0, 0);
+
+/// `ensure_scale` 的探测点：未设定固定位置时，DPI 必须按**光标所在屏**取，
+/// 否则会拿主屏缩放去排版一个即将落在副屏的气泡（★ 顺序契约：scale → 尺寸 → 落点）。
+fn anchor_probe(fx: i32, fy: i32, caret_x: i32, caret_y: i32) -> (i32, i32) {
+    if (fx, fy) == FIXED_UNSET {
+        (caret_x, caret_y)
+    } else {
+        (fx, fy)
+    }
+}
+
+/// 固定位置模式的**内容左上**锚点。
+///
+/// - 已设定：原样使用用户拖定的绝对坐标（「固定」就该是固定，不跟随焦点换屏）。
+/// - 未设定（(0,0) 哨兵）：落到**光标所在屏**，而不是主屏左上角。
+///
+/// 两种情况都过一次 [`crate::sys::clamp_to_work_area`]：它按落点反查显示器、不预设原点，
+/// 所以既不会把副屏的合法负坐标拽回主屏，又能在副屏被拔掉后把气泡拉回可见区域
+/// （否则那对绝对坐标已不属于任何显示器，气泡不可见也就无法再拖动纠正）。
+fn fixed_anchor(fx: i32, fy: i32, caret_x: i32, caret_y: i32, cw: u32, ch: u32) -> (i32, i32) {
+    let (ax, ay) = if (fx, fy) == FIXED_UNSET {
+        (caret_x, caret_y)
+    } else {
+        (fx, fy)
+    };
+    crate::sys::clamp_to_work_area(ax, ay, cw, ch)
+}
+
+/// [`clamp_below_or_above`] 的纯几何内核：在给定工作区 `bounds` 内定位气泡。
+///
+/// 抽出来是为了可测——原实现整段埋在 `#[cfg(windows)]` + unsafe 里，Linux CI 上一行都跑不到。
+/// 要锁住的性质是**坐标不得假设桌面原点为 (0,0)**：主显示器左上角才是虚拟桌面原点，
+/// 摆在主屏左侧/上方的副屏工作区坐标为负，任何 `max(0)` 都会把气泡推回主屏
+/// （见本模块测试 `left_monitor_negative_x_survives`）。
+// 非 Windows 下唯一的调用者在 `#[cfg(windows)]` 分支里，非 test 构建会判其为 dead_code。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn place_below_or_above(
+    x: i32,
+    y_below: i32,
+    size: (u32, u32),
+    caret_y: i32,
+    caret_h: i32,
+    gap: i32,
+    bounds: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (bl, bt, br, bb) = bounds;
+    let (wi, hi) = (size.0 as i32, size.1 as i32);
+    let (mut nx, mut ny) = (x, y_below);
+    // 下方放不下 → 上翻到光标上方；上方也放不下则贴工作区下沿。
+    if ny + hi > bb {
+        let above = caret_y - caret_h.max(0) - hi - gap;
+        ny = if above >= bt { above } else { bb - hi };
+    }
+    if nx + wi > br {
+        nx = br - wi;
+    }
+    if nx < bl {
+        nx = bl;
+    }
+    if ny < bt {
+        ny = bt;
+    }
+    (nx, ny)
 }
 
 /// 把气泡钳制在光标所在显示器工作区：默认 (x, y_below)；下方放不下则上翻到光标上方
 /// （光标顶端 = caret_y - caret_h）；左右越界贴边。返回内容盒左上屏幕坐标。
+///
+/// 显示器按 **caret 点**反查（`MONITOR_DEFAULTTONEAREST`），故天然跟随光标所在屏；
+/// 查不到工作区时原样返回，**不得**再做任何以 0 为下界的兜底钳制。
 #[cfg_attr(not(windows), allow(unused_variables))]
 fn clamp_below_or_above(
     x: i32,
@@ -529,7 +609,6 @@ fn clamp_below_or_above(
     caret_h: i32,
     gap: i32,
 ) -> (i32, i32) {
-    let (mut nx, mut ny) = (x, y_below);
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::POINT;
@@ -545,29 +624,19 @@ fn clamp_below_or_above(
             };
             if GetMonitorInfoW(mon, &mut mi).as_bool() {
                 let wa = mi.rcWork;
-                let (wi, hi) = (w as i32, h as i32);
-                // 下方放不下 → 上翻到光标上方
-                if ny + hi > wa.bottom {
-                    let above = caret_y - caret_h.max(0) - hi - gap;
-                    ny = if above >= wa.top {
-                        above
-                    } else {
-                        wa.bottom - hi
-                    };
-                }
-                if nx + wi > wa.right {
-                    nx = wa.right - wi;
-                }
-                if nx < wa.left {
-                    nx = wa.left;
-                }
-                if ny < wa.top {
-                    ny = wa.top;
-                }
+                return place_below_or_above(
+                    x,
+                    y_below,
+                    (w, h),
+                    caret_y,
+                    caret_h,
+                    gap,
+                    (wa.left, wa.top, wa.right, wa.bottom),
+                );
             }
         }
     }
-    (nx.max(0), ny.max(0))
+    (x, y_below)
 }
 
 impl StatusTip {
@@ -588,5 +657,77 @@ impl StatusTip {
         {
             1.0
         }
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    //! 气泡落点的纯几何：**坐标不得假设桌面原点为 (0,0)**。
+    //!
+    //! 此前 `clamp_below_or_above` 出口处有一行 `(nx.max(0), ny.max(0))`，把上面按
+    //! `MonitorFromPoint` + `rcWork` 算对的结果又拍回非负象限。摆在主屏左侧/上方的副屏
+    //! 坐标整块为负，于是气泡被吸到主屏边缘——多显示器下的「气泡永远在主屏」。
+    //! 同一病灶本仓在工具栏上踩过一次（`corner_in_work_area` 内明令禁止 `max(0)`）。
+    use super::place_below_or_above;
+
+    /// 主屏（虚拟桌面原点）与摆在它**左侧**的副屏。副屏工作区 x 全为负数——
+    /// 这正是 `max(0)` 会把气泡整块吸回主屏的那种布局。
+    const MAIN: (i32, i32, i32, i32) = (0, 0, 2560, 1368);
+    const LEFT: (i32, i32, i32, i32) = (-1920, 0, 0, 1040);
+    /// 摆在主屏**上方**的副屏：y 为负。
+    const TOP: (i32, i32, i32, i32) = (0, -1080, 1920, -40);
+
+    const TIP: (u32, u32) = (120, 34);
+    const GAP: i32 = 4;
+
+    /// ★ 左侧副屏：负的 x/y 必须原样保留，绝不能被钳到 0（那会跳回主屏）。
+    #[test]
+    fn left_monitor_negative_x_survives() {
+        let (x, y) = place_below_or_above(-1200, 500, TIP, 480, 20, GAP, LEFT);
+        assert_eq!((x, y), (-1200, 500), "副屏内的合法负坐标不该被改写");
+    }
+
+    /// ★ 上方副屏：整块屏的 y 都是负的，上翻后仍须落在该屏内。
+    /// caret 必须取该屏内的坐标（-60），下方放不下（-56 + 34 > -40）故上翻。
+    #[test]
+    fn top_monitor_negative_y_survives() {
+        let caret_y = -60;
+        let (x, y) = place_below_or_above(300, caret_y + GAP, TIP, caret_y, 20, GAP, TOP);
+        assert_eq!(x, 300);
+        assert_eq!(y, caret_y - 20 - 34 - GAP, "应上翻到光标上方，且保持负坐标");
+        assert!(
+            y >= TOP.1 && y + TIP.1 as i32 <= TOP.3,
+            "必须留在上方副屏内"
+        );
+    }
+
+    /// 左侧副屏右边界是 0：贴右边缘时结果为负，同样不该被 `max(0)` 吃掉。
+    #[test]
+    fn left_monitor_right_edge_clamps_to_negative() {
+        let (x, _) = place_below_or_above(-60, 500, TIP, 480, 20, GAP, LEFT);
+        assert_eq!(x, -120, "右溢出应回拉到 right - w = -120，而非 0");
+    }
+
+    /// 主屏常规回归：下方放得下就用下方，坐标原样。
+    #[test]
+    fn main_monitor_below_unchanged() {
+        let (x, y) = place_below_or_above(800, 600, TIP, 580, 20, GAP, MAIN);
+        assert_eq!((x, y), (800, 600));
+    }
+
+    /// 主屏底部：下方放不下 → 上翻到光标上方。
+    #[test]
+    fn main_monitor_flips_above_near_bottom() {
+        let caret_y = 1360;
+        let (_, y) = place_below_or_above(800, 1364, TIP, caret_y, 20, GAP, MAIN);
+        assert_eq!(y, caret_y - 20 - 34 - GAP);
+    }
+
+    /// 上下都放不下（工作区比气泡还矮）时贴下沿，且左上角保持可见。
+    #[test]
+    fn degenerate_short_work_area_pins_to_bottom() {
+        let short = (0, 0, 1920, 30);
+        let (_, y) = place_below_or_above(100, 20, TIP, 10, 10, GAP, short);
+        assert_eq!(y, short.1, "上翻也放不下 → 贴下沿后再被上边界兜回 top");
     }
 }

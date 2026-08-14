@@ -367,6 +367,9 @@ impl Coordinator {
         {
             return;
         }
+        // 与候选窗同款哨兵规避：状态气泡的 UI 侧同样用 (0,0) 表示"尚未设定"。
+        // 两处共用同一约定，缺一处就会出现"拖到主屏左上角后位置记不住"。
+        let (x, y) = avoid_unset_sentinel(x, y);
         let _ = Config::set_user_value(
             &["ui", "status", "custom_x"],
             toml::Value::Integer(x as i64),
@@ -1904,7 +1907,7 @@ fn screenshots_dir() -> Option<String> {
     Config::user_config_dir().map(|d| d.join("screenshots").display().to_string())
 }
 
-/// 候选窗固定位置落盘前的哨兵规避。
+/// 固定位置落盘前的哨兵规避（候选窗与状态气泡共用）。
 ///
 /// UI 侧用 `(0, 0)` 表示"已开启固定但尚未设定位置"（落到屏幕默认锚点），可主屏工作区
 /// 的左上角**往往正是** `(0, 0)`（任务栏在底部时）——用户真把候选窗拖到屏幕最左上角，

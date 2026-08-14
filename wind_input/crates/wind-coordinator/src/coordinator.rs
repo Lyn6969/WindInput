@@ -4262,21 +4262,7 @@ impl Coordinator {
         } else {
             (state.caret_x, state.caret_y, state.caret_height)
         };
-        let valid = ch > 0 && !(cx == 0 && cy == 0) && cx.abs() < 32000 && cy.abs() < 32000;
-        let (caret_x, caret_y, caret_height, caret_valid) = {
-            let mut lv = self
-                .last_valid_caret
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if valid {
-                *lv = (cx, cy, ch);
-                (cx, cy, ch, true)
-            } else if lv.2 > 0 {
-                (lv.0, lv.1, lv.2, true) // 回退到最近有效坐标，避免跑到屏幕左上角
-            } else {
-                (cx, cy, ch, false) // 尚无任何有效坐标：临时显示，待有效坐标到达再重定位
-            }
-        };
+        let (caret_x, caret_y, caret_height, caret_valid) = self.resolve_caret_for_ui(cx, cy, ch);
         let n_items = items.len();
         // 编码区**恒下发**：谁来画由 `preedit_host_owned` 表达。
         // 曾经是「in_app 就发空串」——那等于把渲染策略焊进数据通道，自绘编码栏的宿主
@@ -5255,6 +5241,43 @@ impl Coordinator {
         state.caret_source = data.source;
     }
 
+    /// [`Self::resolve_caret_for_ui`] 的判据内核：这一组坐标本身是否可信（不看历史值）。
+    ///
+    /// ★ **负坐标是合法的**：主显示器左上角才是虚拟桌面原点，摆在主屏左侧/上方的显示器，
+    /// 其坐标整块为负。把负数一并判为"异常"会让副屏用户的光标永远取不到有效坐标，
+    /// 从而永远走回退分支——症状与本次要修的「气泡永远在主屏」一模一样。
+    /// 上界 32000 只用于挡住 i32 溢出级的脏数据（宿主偶发上报的未初始化值）。
+    fn caret_is_valid(x: i32, y: i32, height: i32) -> bool {
+        height > 0 && !(x == 0 && y == 0) && x.abs() < 32000 && y.abs() < 32000
+    }
+
+    /// 解析「用于 UI 定位」的光标坐标：无效坐标回退到最近一次有效坐标。
+    /// 返回 `(x, y, height, valid)`，`valid=false` 表示本进程至今没收到过任何可信坐标。
+    ///
+    /// ★ **候选窗与状态气泡必须共用本函数**。`state.caret_*` 里可以躺着 (0,0)：
+    /// [`Self::handle_caret_update`] 是**先写缓存、后判 `now_valid`** 的（无效坐标写进去了才
+    /// return），所以「读 `state.caret_*` 得到的坐标」与「可信坐标」并不等价。候选窗一直有这道
+    /// 闸门、状态气泡没有，于是同一份 (0,0) 只让气泡飞到主显示器左上角 —— 多显示器下表现为
+    /// 「气泡永远在主屏」，而候选窗一切正常，两者症状分裂正是这道闸门只装了一半造成的。
+    ///
+    /// (0,0) 当哨兵而非合法坐标：主显示器左上角虽是合法位置，但宿主「没有坐标」时报的也是它，
+    /// 两者不可区分；判为无效只损失「光标恰在主屏左上角」这一像素级罕见情形。
+    fn resolve_caret_for_ui(&self, cx: i32, cy: i32, ch: i32) -> (i32, i32, i32, bool) {
+        let valid = Self::caret_is_valid(cx, cy, ch);
+        let mut lv = self
+            .last_valid_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if valid {
+            *lv = (cx, cy, ch);
+            (cx, cy, ch, true)
+        } else if lv.2 > 0 {
+            (lv.0, lv.1, lv.2, true) // 回退到最近有效坐标，避免跑到屏幕左上角
+        } else {
+            (cx, cy, ch, false) // 尚无任何有效坐标：临时显示，待有效坐标到达再重定位
+        }
+    }
+
     /// 在当前光标下方显示状态提示气泡（中英/标点/全半角/方案切换）
     pub(crate) fn show_tip(&self, text: &str) {
         let bundle = self.rt();
@@ -5269,10 +5292,13 @@ impl Coordinator {
         if text.trim().is_empty() {
             return;
         }
-        let (x, y, caret_height) = {
+        // 先放锁再解析：resolve_caret_for_ui 要另取 last_valid_caret 锁，与候选窗路径
+        // （state → last_valid_caret）保持同向，不构成反序。
+        let (raw_x, raw_y, raw_h) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (s.caret_x, s.caret_y, s.caret_height)
         };
+        let (x, y, caret_height, _valid) = self.resolve_caret_for_ui(raw_x, raw_y, raw_h);
         // 常驻(always)→ duration_ms=0(UI 不自动隐藏);否则按 duration 自动隐藏。对齐 Go display_mode。
         let duration_ms = if si.display_mode.eq_ignore_ascii_case("always") {
             0
@@ -11584,5 +11610,65 @@ mod hover_reset_tests {
         let mut st = c.state.lock().unwrap();
         assert!(c.move_down(&mut st), "前置条件——应能下移");
         assert_eq!(c.hover_target(), -1, "键盘移动高亮后悬停应取消");
+    }
+}
+
+#[cfg(test)]
+mod caret_for_ui_tests {
+    //! 「用于 UI 定位的光标坐标」闸门（[`Coordinator::resolve_caret_for_ui`]）。
+    //!
+    //! 本组测试锁的是一个曾按消费者分裂的缺陷：`state.caret_*` 里可以躺着 (0,0)
+    //! （`handle_caret_update` 先写缓存、后判有效性），候选窗一直有回退闸门、状态气泡没有，
+    //! 于是同一份 (0,0) 只让气泡飞到**主显示器左上角**——多显示器下表现为「气泡永远在主屏」，
+    //! 而候选窗一切正常。两者现已共用本函数，测试同时钉住判据与回退。
+    use super::*;
+
+    fn coord() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
+
+    /// ★ 负坐标是**合法**的：主屏左上角才是虚拟桌面原点，左侧/上方的副屏整块为负。
+    /// 若把负数一并判为异常，副屏用户就永远取不到有效坐标 → 永远走回退 → 症状同样是「永远在主屏」。
+    #[test]
+    fn negative_coords_are_valid() {
+        assert!(Coordinator::caret_is_valid(-1200, 500, 20), "左侧副屏");
+        assert!(Coordinator::caret_is_valid(300, -600, 20), "上方副屏");
+    }
+
+    #[test]
+    fn sentinel_and_degenerate_inputs_are_invalid() {
+        assert!(
+            !Coordinator::caret_is_valid(0, 0, 20),
+            "(0,0) 是宿主「没有坐标」的哨兵，不能当成主屏左上角来用"
+        );
+        assert!(
+            !Coordinator::caret_is_valid(500, 500, 0),
+            "height=0 = 宿主尚未 reflow，整组坐标不可信"
+        );
+        assert!(!Coordinator::caret_is_valid(40000, 500, 20), "越界脏数据");
+    }
+
+    /// ★ 修复核心：无效坐标必须回退到最近一次有效坐标，且该坐标可以在副屏（负值）。
+    /// 原样交给 UI 就是「气泡跳到主显示器左上角」。
+    #[test]
+    fn invalid_falls_back_to_last_valid_on_secondary_monitor() {
+        let c = coord();
+        assert_eq!(
+            c.resolve_caret_for_ui(-1500, 400, 20),
+            (-1500, 400, 20, true),
+            "前置条件——副屏坐标应被认为有效并记为最近有效值"
+        );
+        assert_eq!(
+            c.resolve_caret_for_ui(0, 0, 20),
+            (-1500, 400, 20, true),
+            "(0,0) 必须回退到副屏那条，而不是留在主屏原点"
+        );
+    }
+
+    /// 尚无任何历史有效坐标时如实报 `valid=false`，由调用方决定临时显示 / 待重定位。
+    #[test]
+    fn no_history_reports_invalid() {
+        let c = coord();
+        assert_eq!(c.resolve_caret_for_ui(0, 0, 20), (0, 0, 20, false));
     }
 }

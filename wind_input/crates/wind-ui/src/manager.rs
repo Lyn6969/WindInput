@@ -272,7 +272,7 @@ impl UiManager {
                     use wind_bridge::shared_render_frame::FrameParams;
                     use wind_ipc::protocol::HOST_WINDOW_STATUS;
                     let fo = if fixed {
-                        t.render_frame_fixed(&text, fx, fy)
+                        t.render_frame_fixed(&text, fx, fy, x, y)
                     } else {
                         t.render_frame(&text, x, y, ch, ox, oy)
                     };
@@ -302,7 +302,7 @@ impl UiManager {
                 }
                 if !host_ok {
                     if fixed {
-                        t.show_fixed(&text, fx, fy);
+                        t.show_fixed(&text, fx, fy, x, y);
                     } else {
                         t.show(&text, x, y, ch, ox, oy);
                     }
