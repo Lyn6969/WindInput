@@ -94,6 +94,33 @@ pub trait Engine: Send + Sync {
     /// 转换输入为候选词列表
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult>;
 
+    /// 同 [`Self::convert`]，但可要求候选**消费整串输入**（`require_full_match`）。
+    ///
+    /// 只有拼音引擎实现它；其余引擎的候选恒不带 `consumed_length`（视作消费整串），
+    /// 默认转发到 `convert` 即为正确语义。
+    ///
+    /// ## ⚠️ 为什么是参数而不是引擎配置
+    ///
+    /// 混输的**主路径与超码长路径共用同一个拼音子引擎实例**，而两者的取舍不同
+    /// （见 `schema.mix.pinyin_partial_candidates{,_overflow}`）。做成构造期配置就只能
+    /// 让一个实例表现出两种行为——那是必然出错的形态。
+    ///
+    /// ## ⚠️ 过滤必须发生在拼音引擎**内部**（截断之前）
+    ///
+    /// 拼音引擎是「一次性产生 N 条 + 排序 + `truncate(max_candidates)`」，简拼候选在
+    /// `cmp_match_layers` 里是最沉的一层、恒排在部分匹配候选之后。若改由调用方拿到结果再
+    /// `retain`，同音字堆满配额时**简拼词早在截断时就没了**——过滤再准也提不了不在场的候选
+    /// （同 `MixedEngine::truncate_with_pinyin_quota` 的既有教训）。
+    /// 实测 `gedw`：`ge` 的残码同音字 219 条，把混合简拼「各单位」压到第 221 位。
+    fn convert_requiring_full_match(
+        &self,
+        input: &str,
+        max_candidates: usize,
+        _require_full_match: bool,
+    ) -> anyhow::Result<ConvertResult> {
+        self.convert(input, max_candidates)
+    }
+
     /// 重置引擎状态
     fn reset(&self);
 

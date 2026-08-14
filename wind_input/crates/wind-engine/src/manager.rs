@@ -2607,6 +2607,8 @@ impl EngineManager {
                 auto_commit_block_on_english: mix_cfg.auto_commit_block_on_english,
                 block_commit_on_pinyin_word: mix_cfg.block_commit_on_pinyin_word,
                 pinyin_word_min_weight: mix_cfg.pinyin_word_min_weight,
+                pinyin_partial_candidates: mix_cfg.pinyin_partial_candidates,
+                pinyin_partial_candidates_overflow: mix_cfg.pinyin_partial_candidates_overflow,
             };
             return Some(Box::new(crate::mixed::MixedEngine::new(
                 primary, secondary, english, cfg,

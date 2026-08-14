@@ -83,13 +83,21 @@ fn pinyin_alone_splits_nunl_and_consumes_only_three() {
 /// 事实 ②：混输下满 4 码**不清空**。两道守护各自独立成立，任一都足够拦住清空：
 /// (a) `has_pinyin` —— 拼音此刻确有候选「嫩」；
 /// (b) `pinyin_may_continue` —— `nunl` = 完整音节 nun + 合法音节前缀 l（la/le/li…）。
+///
+/// ⚠️ **(a) 的前提在 2026-08-14 起需要显式打开**：`pinyin_partial_candidates` 默认 `false`
+/// 后，「嫩」（`consumed_length=3`，只解释 4 码中的 3 码）在默认配置下**不再进候选列表**
+/// ——那正是本文件开头记的用户诉求，现由该开关根治，见
+/// `mixed_partial_pinyin_filter.rs`。故这里显式开着它，才测得到守护 (a) 本身。
 #[test]
 fn mixed_does_not_clear_on_full_code_with_trailing_partial() {
     let e = MixedEngine::new(
         wubi_engine(),
         Some(Box::new(pinyin_engine())),
         None,
-        MixConfig::default(),
+        MixConfig {
+            pinyin_partial_candidates: true,
+            ..Default::default()
+        },
     );
     let r = e.convert("nunl", 50).unwrap();
 
@@ -99,6 +107,31 @@ fn mixed_does_not_clear_on_full_code_with_trailing_partial() {
         r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
     );
     assert!(!r.should_clear, "有拼音候选 → 满码清空被否决");
+}
+
+/// 出厂配置（`pinyin_partial_candidates = false`）下的对照：「嫩」不再出现，
+/// 但清空仍被守护 (b) `pinyin_may_continue` 独立拦住 —— 用户接着打 `nunlu`… 不会被吞。
+///
+/// 这条与上一条构成单一变量对照：**同一个输入、同一份词库，只有开关不同**。
+#[test]
+fn default_config_drops_the_partial_nen_candidate() {
+    let e = MixedEngine::new(
+        wubi_engine(),
+        Some(Box::new(pinyin_engine())),
+        None,
+        MixConfig::default(),
+    );
+    let r = e.convert("nunl", 50).unwrap();
+
+    assert!(
+        !r.candidates.iter().any(|c| c.text == "嫩"),
+        "出厂配置下只解释 3/4 码的「嫩」不该进候选: {:?}",
+        r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
+    assert!(
+        !r.should_clear,
+        "候选没了，但「拼音还没打完」这道守护仍在，不清空"
+    );
 }
 
 /// 事实 ②的(b)单独成立：**即使把「嫩 nun」从词库里删掉**（拼音此刻无候选），

@@ -1467,6 +1467,17 @@ impl Engine for PinyinEngine {
     }
 
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
+        self.convert_requiring_full_match(input, max_candidates, false)
+    }
+
+    /// 拼音引擎的**唯一**转换实现（`convert` 转发至此）。`require_full_match=true` 时在
+    /// 排序截断**之前**丢弃「未消费整串」的候选，见 trait 侧文档的两条 ⚠️。
+    fn convert_requiring_full_match(
+        &self,
+        input: &str,
+        max_candidates: usize,
+        require_full_match: bool,
+    ) -> anyhow::Result<ConvertResult> {
         if input.is_empty() {
             return Ok(ConvertResult::default());
         }
@@ -2748,6 +2759,29 @@ impl Engine for PinyinEngine {
                 None if has_sep => interp::map_fp_to_raw(&sep_spans, fp_consumed, input),
                 None => fp_consumed,
             };
+        }
+
+        // 「候选须消费整串」过滤（混输经 `schema.mix.pinyin_partial_candidates*` 注入）。
+        //
+        // **位置是本过滤的要害：必须在紧随其后的 `sort_by` + `truncate` 之前。** 部分匹配的
+        // 同音字动辄数百条（`gedw` 里 `code=ge`、`consumed_length=2` 的有 219 条），而简拼候选
+        // 在 `cmp_match_layers` 里是最沉的一层 —— 放到调用方去 `retain` 的话，配额被残码占满时
+        // 简拼词在截断那一步就已经没了（实测「各单位」被压到第 221 位）。
+        //
+        // 判据只能是 `consumed_length`，**不能用 `!is_partial` 代替**：Viterbi 整句走
+        // `insert(0)` 不经算 `is_partial` 的闭包（`aaw` → 「啊啊」consumed=2 而 is_partial=false），
+        // 同文合并还会主动把它置 false。0 = 引擎未标注 ⇒ 按整串算（全仓约定，整串简拼即此形态）。
+        //
+        // ★ 判据切在「解释完整度」而非「候选类型」上，是本过滤成立的全部理由：前缀补全
+        // （预测尚未输入的音节，`wanl` → `wanle`「完了」consumed=4=整串）与残码单字（放弃了
+        // 已经输入的字母）在类型上同为「不精确」，方向却相反。按类型禁用会把正在输入中的
+        // `wanl` 一并打死 —— 实测过滤后 `wanl` 仍有 151 条候选，正是这条判据的价值。
+        //
+        // 基准取 `input.len()` 而非 `query.len()`：上一段刚把 `consumed_length` 回映射到
+        // **原始输入空间**（双拼 → 击键数、含分隔符 → 含 `'` 的串），`query`（剥除分隔符后）
+        // 与它不同域。无分隔符的全拼下二者相等，取错只在双拼/分隔符场景静默失效。
+        if require_full_match {
+            candidates.retain(|c| c.consumed_length == 0 || c.consumed_length >= input.len());
         }
 
         // ⚠️ **引擎侧刻意不用「消费长度优先」排序**（协调器 `candidate_display_order` 用）。

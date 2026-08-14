@@ -453,6 +453,25 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
   背景：调频置顶/shadow 发生在协调器层，引擎 `handle_top_code` 内部 convert 看不到，会顶出权重首选
   而非显示首选。
 
+### 7.5b 拼音候选须消费整串（`pinyin_partial_candidates{,_overflow}`）
+
+混输下拼音会把**只解释了输入开头一截**的候选也交出来：`gedw`（五笔精确全码「青春」）里
+`ge` 是合法音节、`dw` 连音节前缀都不是，于是 `code=ge`、`consumed_length=2` 的同音单字
+**实测 219 条**（真实词库，占 226 条候选的绝大多数）。主流混输实现均不出这类候选。
+
+- 判据：`consumed_length == 0 || >= input.len()`（0 = 未标注 ⇒ 按整串算）。
+  **不可用 `!is_partial` 代替**——Viterbi 整句走 `insert(0)` 不经算 `is_partial` 的闭包
+  （`aaw`→「啊啊」consumed=2 而 `is_partial=false`）。
+- 落点：`Engine::convert_requiring_full_match()`，过滤在**拼音引擎内部、排序 `truncate` 之前**。
+  ⚠️ 由调用方拿结果再 `retain` 是错的：简拼候选在 `cmp_match_layers` 里最沉，配额被残码占满时
+  它在截断那一步就没了（实测混合简拼「各单位」被压到第 221 位，滤掉残码后回到第 2 位）。
+- 两档独立开关：码长内默认**关**（丢弃），超码长默认**开**（保留）——后者已切入纯拼音语境，
+  长拼音的分段上屏要留着。做成参数而非 `PinyinConfig` 字段，是因为两条路径共用同一个子引擎实例。
+- **前缀补全不受影响**：`wanl`→「完了」的 code 是 `wanle`（比输入长）⇒ 消费整串，实测过滤后
+  `wanl` 仍有 151 条候选。判据切在「解释完整度」而非「候选类型」上，正是为此。
+- 连带：`has_pinyin` 随之转假 ⇒ §7.3 的拼音否决①与满码空码清空守护在这类输入下不再拦截
+  （`pinyin_may_continue` 那道仍在）。顺带根治 `nunl` 出「嫩」的老问题。
+
 ### 7.6 混输其它
 
 - **来源提示**：`show_source_hint`（默认关）给拼音候选 comment 加「拼」前缀（`add_source_hints()`）。
@@ -619,6 +638,8 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | `schema.mix.auto_commit_block_on_pinyin` | true（三处同源） | 否决① 粗粒度：有拼音候选即否决上屏；**兼管满码空码清空的两道守护** |
 | `schema.mix.block_commit_on_pinyin_word` | true | 否决② 拼音词拦截（实际主力） |
 | `schema.mix.pinyin_word_min_weight` | 0 | 0=仅结构判据（≥2 汉字消费整串） |
+| `schema.mix.pinyin_partial_candidates` | false（三处同源） | 码长内是否保留「未消费整串」的拼音候选（`gedw` 的 219 条 `ge` 同音字），见 §7.5b |
+| `schema.mix.pinyin_partial_candidates_overflow` | true（三处同源） | 超码长同上；默认保留，长拼音的分段上屏靠它 |
 | `schema.mix.top_code_override_pinyin` | false | 顶码优先，无视拼音否决 |
 | `schema.mix.pinyin_only_overflow` | true | 超码长仅拼音+英文 |
 | `schema.mix.min_pinyin_length` | 2 | 拼音最小触发长 |

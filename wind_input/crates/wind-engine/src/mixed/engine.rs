@@ -82,6 +82,8 @@ impl MixedEngine {
 #[derive(Debug, Clone)]
 pub struct MixConfig {
     pub min_pinyin_length: usize,
+    pub pinyin_partial_candidates: bool,
+    pub pinyin_partial_candidates_overflow: bool,
     pub auto_commit_block_on_pinyin: bool,
     pub pinyin_only_overflow: bool,
     pub top_code_override_pinyin: bool,
@@ -96,6 +98,9 @@ impl Default for MixConfig {
     fn default() -> Self {
         Self {
             min_pinyin_length: 2,
+            // ⚠️ 同为「三处同源」项（见下方 auto_commit_block_on_pinyin 的说明）。
+            pinyin_partial_candidates: false,
+            pinyin_partial_candidates_overflow: true,
             // ⚠️ 三处同源：本处 / `MixGlobal::default()`（wind-config）/ `data/config.toml
             // [schema.mix]` 必须一致，改默认须同步全部三处。出厂默认以 L1⊕L2 为准（L2 覆盖 L1），
             // 即 data/config.toml 里的值。本处曾长期为 false 而另两处为 true，导致引擎单测跑在一个
@@ -120,6 +125,21 @@ pub struct MixedEngine {
     secondary: Option<Box<dyn Engine>>,
     /// 拼音生效的最小输入长度
     min_pinyin_length: usize,
+    /// **码长内**（输入 ≤ 主码表最大码长）是否保留「未消费整串」的拼音候选。
+    ///
+    /// 默认 `false`：`gedw`（五笔精确码「青春」）下拼音把 `ge` 的 219 条同音单字全交出来，
+    /// 每条只解释 4 键中的 2 键 —— 主流混输实现均不出这类候选。关掉后 `gedw` 只剩「青春」，
+    /// 开着简拼时还能让混合简拼词「各单位」从第 221 位浮到第 2 位（同一根因的两面）。
+    ///
+    /// ⚠️ 代价是**失去码长内的分步上屏**（选一条部分候选先上屏、剩余码续输）。正在输入中的
+    /// 拼音不受影响 —— 那是前缀补全（`wanl` → 「完了」，code=`wanle`、消费整串），与残码
+    /// 候选方向相反，见 `Engine::convert_requiring_full_match` 的判据说明。
+    pinyin_partial_candidates: bool,
+    /// **超码长**（输入 > 主码表最大码长，已切入纯拼音语境）是否保留同类候选。
+    ///
+    /// 默认 `true` = 保留：那里正是长拼音输入的地盘，`nihaom` 选「你好」再续打 `ma` 的分步
+    /// 上屏必须留着。与上一项分设两个开关是用户明确要求的取舍（2026-08-14）。
+    pinyin_partial_candidates_overflow: bool,
     /// 全码自动上屏 / 顶码上屏 / **满码空码清空**时，若存在拼音候选则否决（保护拼音用户，
     /// 对齐 Go AutoCommitBlockOnPinyin）。**默认开**（三处同源：`MixConfig::default()` /
     /// `MixGlobal::default()` / `data/config.toml`）。粗粒度：整串只要查得出拼音候选就让路，
@@ -171,6 +191,8 @@ impl MixedEngine {
             primary,
             secondary,
             min_pinyin_length: cfg.min_pinyin_length,
+            pinyin_partial_candidates: cfg.pinyin_partial_candidates,
+            pinyin_partial_candidates_overflow: cfg.pinyin_partial_candidates_overflow,
             auto_commit_block_on_pinyin: cfg.auto_commit_block_on_pinyin,
             pinyin_only_overflow: cfg.pinyin_only_overflow,
             top_code_override_pinyin: cfg.top_code_override_pinyin,
@@ -546,7 +568,17 @@ impl MixedEngine {
             self.primary.has_full_input_match(input) || self.primary.has_longer_code(input);
 
         if self.pinyin_only_overflow {
-            let py = sec.convert(input, max_candidates).unwrap_or_default();
+            // 超码长走**另一个**开关（默认保留部分候选：这里已是纯拼音语境，长拼音的分步
+            // 上屏要留着）。上方三处判据函数（`is_ambiguous_pinyin_word` /
+            // `pinyin_claims_overflow` / `pinyin_has_any`）**刻意仍走 `convert`**：它们问的是
+            // 「拼音够不够格接管这一串 / 这串还算不算中文」，与「哪些候选该显示」正交。
+            let py = sec
+                .convert_requiring_full_match(
+                    input,
+                    max_candidates,
+                    !self.pinyin_partial_candidates_overflow,
+                )
+                .unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let pinyin_split = Self::pinyin_split_of(&py, input);
             let pinyin = py.candidates;
@@ -653,7 +685,17 @@ impl MixedEngine {
             }
             // 英文候选（enable_english 开时）：并入码表位，与拼音一同竞争。
             codetable.extend(self.english_candidates(input, max_candidates));
-            let py = sec.convert(input, max_candidates).unwrap_or_default();
+            // 超码长走**另一个**开关（默认保留部分候选：这里已是纯拼音语境，长拼音的分步
+            // 上屏要留着）。上方三处判据函数（`is_ambiguous_pinyin_word` /
+            // `pinyin_claims_overflow` / `pinyin_has_any`）**刻意仍走 `convert`**：它们问的是
+            // 「拼音够不够格接管这一串 / 这串还算不算中文」，与「哪些候选该显示」正交。
+            let py = sec
+                .convert_requiring_full_match(
+                    input,
+                    max_candidates,
+                    !self.pinyin_partial_candidates_overflow,
+                )
+                .unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let pinyin_split = Self::pinyin_split_of(&py, input);
             let pinyin = py.candidates;
@@ -746,9 +788,15 @@ impl Engine for MixedEngine {
         let mut pinyin_preedit: Option<String> = None;
         // 高亮跟随用的拆分形态：判据比上面宽（见 `pinyin_split_of`），单音节 + 残码也提供。
         let mut pinyin_split: Option<String> = None;
+        // ⚠️ 走 `convert_requiring_full_match` 而非 `convert`：过滤必须在拼音引擎**内部**、
+        // 排序截断之前发生，在这里拿到结果再 `retain` 会漏掉被截断挤掉的候选（见 trait 文档）。
         if input_len >= self.min_pinyin_length
             && let Some(sec) = &self.secondary
-            && let Ok(py) = sec.convert(input, max_candidates)
+            && let Ok(py) = sec.convert_requiring_full_match(
+                input,
+                max_candidates,
+                !self.pinyin_partial_candidates,
+            )
         {
             pinyin_preedit = Self::pinyin_preedit_of(&py);
             pinyin_split = Self::pinyin_split_of(&py, input);

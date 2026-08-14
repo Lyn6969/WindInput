@@ -1194,6 +1194,16 @@ pub struct MixGlobal {
     /// 拼音歧义拦截的词强度权重阈值（0=仅结构判据：≥2 汉字且消费整串；预留真机调）。
     #[serde(default)]
     pub pinyin_word_min_weight: i32,
+    /// 混输**码长内**（输入 ≤ 主码表最大码长）是否保留「未消费整串」的拼音候选。
+    /// 默认 `false`（丢弃）：`gedw`（五笔「青春」）下拼音会把 `ge` 的 219 条同音单字全交出来，
+    /// 每条只解释 4 键中的 2 键。关掉后候选只剩五笔精确码，开着简拼时混合简拼词也能浮上来。
+    /// 代价是码长内没有分步上屏；正在输入中的拼音（`wanl`→「完了」）不受影响。
+    #[serde(default)]
+    pub pinyin_partial_candidates: bool,
+    /// 混输**超码长**（已切入纯拼音语境）是否保留同类候选。默认 `true`（保留）：
+    /// 那里正是长拼音的地盘，`nihaom` 选「你好」再续打的分步上屏要留着。
+    #[serde(default = "default_true")]
+    pub pinyin_partial_candidates_overflow: bool,
     /// 混输时拼音是否产出简拼候选（声母缩写，nh→你好）。默认开=历史行为（此前恒开无开关）。
     /// 关闭后混输里的拼音只认全拼，适合「只把拼音当临时输入补位、不用简拼」的用户；
     /// 简拼会让几乎任何字母串都可能是拼音，关掉可让候选更干净。仅影响混输的拼音子引擎，
@@ -1217,6 +1227,9 @@ impl Default for MixGlobal {
             min_english_length: 0,
             block_commit_on_pinyin_word: true,
             pinyin_word_min_weight: 0,
+            // ⚠️ 同属「三处同源」：本处 / `MixConfig::default()` / `data/config.toml`。
+            pinyin_partial_candidates: false,
+            pinyin_partial_candidates_overflow: true,
             enable_pinyin_abbrev: true,
         }
     }
