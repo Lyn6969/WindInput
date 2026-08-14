@@ -1242,20 +1242,7 @@ impl Coordinator {
         let user_dir =
             Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
         // redb 用户数据库（用户偏好数据：词频、自定义词、shadow 规则，应随用户漫游）。
-        let store = user_dir.as_deref().and_then(|d| {
-            let _ = std::fs::create_dir_all(d);
-            let p = d.join("userdata.redb");
-            match Store::open(&p) {
-                Ok(s) => {
-                    info!("Opened redb store: {}", p.display());
-                    Some(Arc::new(s))
-                }
-                Err(e) => {
-                    warn!("Failed to open redb store {}: {}", p.display(), e);
-                    None
-                }
-            }
-        });
+        let store = user_dir.as_deref().and_then(Self::open_user_store);
         let coordinator = Self::build(
             config,
             data_dir.as_deref(),
@@ -1514,15 +1501,48 @@ impl Coordinator {
         config: Config,
         data_dir: Option<&Path>,
     ) -> (Arc<Self>, std::sync::mpsc::Receiver<UiCommand>) {
+        Self::new_headless_with_ui_at(config, data_dir, None)
+    }
+
+    /// 无头 + UI 通道 + **用户数据目录**（Android 生产路径）。
+    ///
+    /// 与 [`Self::new_headless_with_ui`] 的唯一区别是开不开 redb store，而这个区别不小：
+    /// store 为 `None` 时**系统短语层为空**（构造期的 `sync_system_phrases` 整段跳过）、
+    /// 用户词频与自造词不落盘。表现是「短语一条也不出」而不是报错，故无头宿主一旦要
+    /// 进入生产形态（而非只跑按键逻辑测试），必须走这个入口给出用户目录。
+    pub fn new_headless_with_ui_at(
+        config: Config,
+        data_dir: Option<&Path>,
+        user_dir: Option<&Path>,
+    ) -> (Arc<Self>, std::sync::mpsc::Receiver<UiCommand>) {
         let (ui_tx, rx) = std::sync::mpsc::channel();
         let push_server = Arc::new(PushServer::new(PushConfig {
             suffix: String::new(),
             write_timeout_ms: 30_000,
         }));
+        let user_dir = user_dir.map(|d| d.to_path_buf());
+        let store = user_dir.as_deref().and_then(Self::open_user_store);
         (
-            Self::build(config, data_dir, push_server, ui_tx, None, None, None),
+            Self::build(config, data_dir, push_server, ui_tx, user_dir, store, None),
             rx,
         )
+    }
+
+    /// 打开用户目录下的 redb（缺目录时创建）。失败只 warn：store 不可用时协调器
+    /// 退化为「不落盘」而非拒绝启动。
+    fn open_user_store(dir: &Path) -> Option<Arc<Store>> {
+        let _ = std::fs::create_dir_all(dir);
+        let p = dir.join("userdata.redb");
+        match Store::open(&p) {
+            Ok(s) => {
+                info!("Opened redb store: {}", p.display());
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                warn!("Failed to open redb store {}: {}", p.display(), e);
+                None
+            }
+        }
     }
 
     /// 当前是否有活跃组合（编码缓冲非空）。
