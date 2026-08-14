@@ -1247,7 +1247,7 @@ mod menu_id_tests {
             MenuCmd::IconToggleColors,
             MenuCmd::IconToggleSizeMarks,
             MenuCmd::IconBadgeShape(0),
-            MenuCmd::IconBadgeShape(4),
+            MenuCmd::IconBadgeShape(5),
             MenuCmd::SchemaSelect(0),
             MenuCmd::SchemaSelect(7),
             MenuCmd::ThemeSelect(3),

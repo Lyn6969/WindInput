@@ -256,7 +256,8 @@ impl Coordinator {
     /// 输入法，成本高到根本比不动。渲染搬到服务端后形状本就是运行时参数，接上菜单后
     /// 比选退化成点几下——这正是当初把渲染从 DLL 挪到服务端换来的东西。
     ///
-    /// 刻意**不持久化**：调试项，重启回默认；真正定下来的形状走代码里的默认值。
+    /// 选择记在 state.toml（见 `RuntimeState::langbar_icon_*`）：比选往往跨越好几次
+    /// 部署，而部署必然重启服务——不记住的话每次都被打回默认，等于没得比。
     #[cfg(all(feature = "desktop-ui", windows))]
     fn build_icon_debug_menu(&self) -> Vec<wind_ui_types::MenuItemSpec> {
         use wind_ui::langbar_icon::BadgeShape;
@@ -265,22 +266,32 @@ impl Coordinator {
         let Some((cur_shape, colored, marks)) = self.icon_debug_state() else {
             return vec![M::label("图标共享内存不可用")];
         };
-        let mut items: Vec<M> = BadgeShape::ALL
-            .iter()
-            .map(|&sh| {
-                M::leaf(
-                    sh.label(),
-                    cmd(MenuCmd::IconBadgeShape(sh.index())),
-                    true,
-                    sh.index() == cur_shape,
-                )
-            })
-            .collect();
+        let off = BadgeShape::None;
+        let mut items = vec![
+            // 「关」独立成组：它不是又一种编码方式，而是「一种都不要」。
+            M::leaf(
+                off.label(),
+                cmd(MenuCmd::IconBadgeShape(off.index())),
+                true,
+                off.index() == cur_shape,
+            ),
+            M::separator(),
+        ];
+        items.extend(BadgeShape::ALL.iter().filter(|s| **s != off).map(|&sh| {
+            M::leaf(
+                sh.label(),
+                cmd(MenuCmd::IconBadgeShape(sh.index())),
+                true,
+                sh.index() == cur_shape,
+            )
+        }));
         items.push(M::separator());
+        // 关掉角标时配色无处可施，置灰而非隐藏——菜单项忽隐忽现比置灰更难理解，
+        // 用户会以为功能没了（与状态气泡菜单同一处理）。尺寸标记画在主字上，不受影响。
         items.push(M::leaf(
             "彩色角标",
             cmd(MenuCmd::IconToggleColors),
-            true,
+            off.index() != cur_shape,
             colored,
         ));
         items.push(M::leaf(

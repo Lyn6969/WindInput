@@ -40,6 +40,14 @@ pub enum PunctBadge {
 /// `docs/design/langbar-icon-shared-render.md`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BadgeShape {
+    /// 不画角标，图标退回「只有主字」的旧样子。
+    ///
+    /// 做成形状枚举的一员而非另开一个 `enabled` 布尔：两者并存时可以摆出
+    /// 「关着 + 选了三角」这种自相矛盾的状态，而单选组从类型上就排除了它，
+    /// 菜单上也天然是一组互斥项。
+    ///
+    /// 这一档同时是将来那个用户可见开关的落点——有人就是不想要角标。
+    None,
     /// 右下角直角三角（中实心 / 英空心）。**当前默认。**
     ///
     /// 三角填满角落，同样面积下比圆形更"占地方"，因而在 16px 下比小圆点更醒目；
@@ -73,7 +81,8 @@ impl BadgeShape {
     ///
     /// 单一真相源：菜单项、勾选态还原、`MenuCmd` 的 u8 参数三处都从这里取，
     /// 各写一份的话，加一种形状时漏改任意一处都表现为「点了另一个形状」。
-    pub const ALL: [BadgeShape; 5] = [
+    pub const ALL: [BadgeShape; 6] = [
+        BadgeShape::None,
         BadgeShape::CornerTriangle,
         BadgeShape::OuterRing,
         BadgeShape::CircleSquare,
@@ -84,6 +93,7 @@ impl BadgeShape {
     /// 调试菜单文案。
     pub fn label(self) -> &'static str {
         match self {
+            BadgeShape::None => "不显示角标",
             BadgeShape::CornerTriangle => "右下三角",
             BadgeShape::OuterRing => "最外圈边框",
             BadgeShape::CircleSquare => "圆 / 方（已否决）",
@@ -92,7 +102,35 @@ impl BadgeShape {
         }
     }
 
-    /// 在 [`Self::ALL`] 中的下标，用作菜单命令参数。
+    /// 落盘用的**稳定 id**。
+    ///
+    /// ⚠ 刻意不存 [`Self::index`]：下标是「在 ALL 里排第几」这个位置身份，把它写进
+    /// state.toml 等于让文件格式绑死声明顺序——今天在头上插了一个 `None`，
+    /// 昨天存的 0（三角）明天就读成了「不显示」。凡是活得比进程久的标识都要用名字。
+    pub fn as_id(self) -> &'static str {
+        match self {
+            BadgeShape::None => "none",
+            BadgeShape::CornerTriangle => "corner_triangle",
+            BadgeShape::OuterRing => "outer_ring",
+            BadgeShape::CircleSquare => "circle_square",
+            BadgeShape::RingDot => "ring_dot",
+            BadgeShape::BottomBar => "bottom_bar",
+        }
+    }
+
+    /// 由稳定 id 还原；未知（含空串）回落到默认形状。
+    ///
+    /// 「空串 = 用代码默认」这条让 wind-config 侧不必知道默认是哪种形状——
+    /// 那份知识只存在于本文件的 `#[default]`，两处各写一份迟早对不上。
+    pub fn from_id(id: &str) -> BadgeShape {
+        Self::ALL
+            .iter()
+            .find(|s| s.as_id() == id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 在 [`Self::ALL`] 中的下标，用作菜单命令参数（仅进程内有效，勿落盘）。
     pub fn index(self) -> u8 {
         Self::ALL.iter().position(|&s| s == self).unwrap_or(0) as u8
     }
@@ -439,7 +477,9 @@ impl IconRenderer {
     /// `dark_theme` = 任务栏是暗色（图标应画成浅色）。
     pub fn render(&self, size_px: u16, dark_theme: bool, spec: &IconSpec) -> Vec<u8> {
         let n = size_px as usize;
-        let has_badge = spec.punct != PunctBadge::None;
+        // 关掉角标（shape=None）与「此刻没有标点态可显示」等价处理，走同一条无角标路径——
+        // 于是「关掉」在像素上必然与英文模式下的样子一字不差，不会留下什么残迹。
+        let has_badge = spec.punct != PunctBadge::None && self.shape != BadgeShape::None;
 
         let s = size_px as f32;
         let glyph = self.render_glyph_mask(size_px, spec);
@@ -658,6 +698,9 @@ impl IconRenderer {
         let solid = expand > 0.0;
 
         match self.shape {
+            // 走不到（render 已按 has_badge 短路），但仍显式列出：下面那句
+            // 「新增形状时编译器会在这里报不穷尽」的保证，要求这里不出现通配臂。
+            BadgeShape::None => {}
             BadgeShape::OuterRing => {
                 // 外圈在最外围，与居中的主字几乎不重叠，故**不挖空**：
                 // 挖了反而会削掉主字外缘一整圈，让字凭空变小。
@@ -906,16 +949,12 @@ mod tests {
         }
     }
 
-    /// 三种编码方式两两不同——否则「换一种形状」的开关是空的。
+    /// 各编码方式两两不同——否则「换一种形状」的开关是空的。
+    ///
+    /// 遍历 `ALL` 而非手写列表：新增形状时自动纳入，不会出现「加了一种但没人测」。
     #[test]
     fn badge_shapes_produce_distinct_pixels() {
-        let shapes = [
-            BadgeShape::CircleSquare,
-            BadgeShape::RingDot,
-            BadgeShape::BottomBar,
-            BadgeShape::CornerTriangle,
-            BadgeShape::OuterRing,
-        ];
+        let shapes = BadgeShape::ALL;
         let mut rendered = Vec::new();
         for sh in shapes {
             let r = IconRenderer::new(sh).expect("renderer");
@@ -1079,6 +1118,47 @@ mod tests {
                     "「{label}」在 {size}px 下未居中：残余位移 ({dx:.2}, {dy:.2})"
                 );
             }
+        }
+    }
+
+    /// 关掉角标后必须与「本来就没有角标」逐字节相同。
+    ///
+    /// 这是「关」这一档的全部承诺：不是画一个更小的角标，而是一点痕迹都不留。
+    /// 若哪天挖空蒙版忘了跟着短路，主字上会留下一圈没人填的凹口——那种缺陷肉眼
+    /// 只会觉得「字有点怪」，很难联想到是关掉的那条路径没走干净。
+    #[test]
+    fn shape_none_leaves_no_trace() {
+        let off = IconRenderer::new(BadgeShape::None).expect("renderer");
+        let on = IconRenderer::new(BadgeShape::CornerTriangle).expect("renderer");
+        for &size in &wind_ipc::protocol::ICON_SIZES {
+            let baseline = on.render(size, false, &spec(PunctBadge::None));
+            for p in [PunctBadge::Chinese, PunctBadge::English] {
+                assert_eq!(
+                    off.render(size, false, &spec(p)),
+                    baseline,
+                    "{size}px / {p:?}：关掉角标后仍与无角标基线不同"
+                );
+            }
+        }
+    }
+
+    /// 落盘 id 必须唯一且可往返——它写进 state.toml，活得比进程久。
+    ///
+    /// 未知 id 回落默认这条同样重要：state.toml 是用户可编辑的文本文件，
+    /// 手写错一个字母不该让图标消失或让服务崩掉。
+    #[test]
+    fn badge_shape_id_roundtrips() {
+        let mut seen = std::collections::HashSet::new();
+        for &sh in &BadgeShape::ALL {
+            assert!(seen.insert(sh.as_id()), "{sh:?} 的 id 与别的形状重复");
+            assert_eq!(BadgeShape::from_id(sh.as_id()), sh);
+        }
+        for bogus in ["", "triangle", "CornerTriangle", "0"] {
+            assert_eq!(
+                BadgeShape::from_id(bogus),
+                BadgeShape::default(),
+                "未知 id {bogus:?} 未回落到默认"
+            );
         }
     }
 

@@ -4984,8 +4984,22 @@ impl Coordinator {
         ICON_PUBLISHER.get_or_init(|| {
             let suffix = wind_config::variant::pipe_suffix();
             match LangBarIconPublisher::new(suffix, BadgeShape::default()) {
-                Ok(p) => {
+                Ok(mut p) => {
                     tracing::info!(shm = p.shm_name(), "语言栏图标共享内存已就绪");
+                    // 恢复上次选定的呈现参数。`None`（从未设过）一律不动，保留构造函数
+                    // 给的代码默认——state.toml 侧刻意不重复声明默认值，见其字段注释。
+                    if let Some(dir) = Config::state_dir() {
+                        let rs = wind_config::RuntimeState::load(&dir);
+                        if let Some(id) = rs.langbar_icon_shape.as_deref() {
+                            p.set_shape(BadgeShape::from_id(id));
+                        }
+                        if let Some(on) = rs.langbar_icon_colored {
+                            p.set_colored(on);
+                        }
+                        if let Some(on) = rs.langbar_icon_size_marks {
+                            p.set_size_marks(on);
+                        }
+                    }
                     std::sync::Mutex::new(Some(p))
                 }
                 Err(e) => {
@@ -4996,10 +5010,14 @@ impl Coordinator {
         })
     }
 
-    /// 对发布器做一次改动，随后立即重发。发布器不可用时是空操作。
+    /// 对发布器做一次改动，随后落盘并立即重发。发布器不可用时是空操作。
     ///
-    /// 收成一个函数而不是每个调试项各写一遍「取锁 → 改 → 发布」：漏掉最后那步重发
-    /// 的症状是「点了菜单毫无变化」，而调试菜单本身就是用来看变化的。
+    /// 收成一个函数而不是每个调试项各写一遍「取锁 → 改 → 落盘 → 发布」：漏掉重发那步
+    /// 的症状是「点了菜单毫无变化」、漏掉落盘那步是「重启就忘」，而调试菜单存在的意义
+    /// 恰恰是反复比选——两种症状都直接毁掉它。
+    ///
+    /// 三项一起写回而不是各写各的：读回时也是三项一起读，写入侧按项分散的话，
+    /// 某一项忘了落盘会表现为「另外两项记住了、这项没有」，比整体失效更难注意到。
     #[cfg(all(feature = "desktop-ui", windows))]
     pub(crate) fn tweak_langbar_icon(
         &self,
@@ -5009,7 +5027,19 @@ impl Coordinator {
             && let Some(p) = guard.as_mut()
         {
             f(p);
+            // load-modify-save，与 toolbar_positions / record_last_state 同一模式：
+            // state.toml 是多方共用的文件，整体覆盖会抹掉别人的字段。
+            if let Some(dir) = Config::state_dir() {
+                let mut rs = wind_config::RuntimeState::load(&dir);
+                rs.langbar_icon_shape = Some(p.shape().as_id().to_string());
+                rs.langbar_icon_colored = Some(p.colored());
+                rs.langbar_icon_size_marks = Some(p.size_marks());
+                if let Err(e) = rs.save(&dir) {
+                    tracing::warn!(error = %e, "语言栏图标偏好落盘失败");
+                }
+            }
         }
+        // 锁已在上面的块尾释放——发布内部还要再取一次同一把锁，留在块内会自锁。
         self.publish_langbar_icon_now();
     }
 
