@@ -143,7 +143,15 @@ fn test_wubi_basic_input_and_commit() {
     match commit {
         KeyAction::InsertText { text, .. } => {
             assert!(!text.is_empty(), "上屏文本应非空");
-            assert_eq!(text, "恭恭敬敬", "首选应为权重最高的 恭恭敬敬");
+            // 同 test_mixed_wubi_exact_priority：`aaaa` 是 gen_dict `[protected_codes]`
+            // 保护码，组内次序由上游给定（上游把键名汉字「工」放首位，补权时代则是
+            // 「恭恭敬敬」在前）。本用例要钉的是「空格上屏首选」这条通路，具体是哪条
+            // 五笔词条属实现细节，写死会在词库重新生成的前后各红一次。
+            assert!(
+                matches!(text.as_str(), "工" | "恭恭敬敬"),
+                "空格应上屏五笔首选（aaaa 的五笔候选为 工/恭恭敬敬），实际: {}",
+                text
+            );
         }
         other => panic!("空格应上屏 InsertText，实际: {:?}", other),
     }
