@@ -433,6 +433,70 @@ STDAPI CLangBarItemButton::OnMenuSelect(UINT wID)
     return S_OK;
 }
 
+// 用一块 BGRA（**非预乘**）像素建 HICON。
+//
+// 32bpp alpha 图标的单色掩码位图内容会被系统忽略（alpha 通道才是真正的透明度），
+// 但 ICONINFO 仍要求提供一张，故建一张全 0 的。
+static HICON _CreateIconFromBgra(const BYTE* bgra, int size)
+{
+    HDC hdcScreen = GetDC(NULL);
+    if (hdcScreen == NULL)
+        return NULL;
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    ReleaseDC(NULL, hdcScreen);
+    if (hdcMem == NULL)
+        return NULL;
+
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;  // Top-down DIB，与服务端行序一致
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = nullptr;
+    HBITMAP hColor = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+    if (hColor == NULL || pBits == nullptr)
+    {
+        if (hColor) DeleteObject(hColor);
+        DeleteDC(hdcMem);
+        return NULL;
+    }
+    memcpy(pBits, bgra, static_cast<size_t>(size) * size * 4);
+
+    BITMAPINFO bmiMask = { 0 };
+    bmiMask.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmiMask.bmiHeader.biWidth = size;
+    bmiMask.bmiHeader.biHeight = size;  // Bottom-up for mask (positive height)
+    bmiMask.bmiHeader.biPlanes = 1;
+    bmiMask.bmiHeader.biBitCount = 1;
+    bmiMask.bmiHeader.biCompression = BI_RGB;
+
+    void* pMaskBits = nullptr;
+    HBITMAP hMask = CreateDIBSection(hdcMem, &bmiMask, DIB_RGB_COLORS, &pMaskBits, NULL, 0);
+    if (hMask == NULL || pMaskBits == nullptr)
+    {
+        if (hMask) DeleteObject(hMask);
+        DeleteObject(hColor);
+        DeleteDC(hdcMem);
+        return NULL;
+    }
+    const int maskRowBytes = ((size + 31) / 32) * 4;
+    memset(pMaskBits, 0, static_cast<size_t>(maskRowBytes) * size);
+
+    ICONINFO iconInfo = { 0 };
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmMask = hMask;
+    iconInfo.hbmColor = hColor;
+    HICON hIcon = CreateIconIndirect(&iconInfo);
+
+    DeleteObject(hColor);
+    DeleteObject(hMask);
+    DeleteDC(hdcMem);
+    return hIcon;
+}
+
 STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
 {
     if (phIcon == nullptr)
@@ -454,6 +518,35 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
     int iconSize = MulDiv(16, dpi, 96);  // Scale icon size based on DPI
     if (iconSize < 16) iconSize = 16;
     if (iconSize > 32) iconSize = 32;
+
+    // ── 优先取服务端预渲染的图标 ──
+    //
+    // ⚠ 例外：下面三种状态是**本 DLL 本地判定**的（_bPasswordField / _bNoEditContext
+    // 来自 DocMgr 与 compartment，_bKeyboardDisabled 来自线程级 compartment），
+    // 服务端压根不知道当前宿主处于哪种，它渲染的始终是常规状态。
+    // 这几种情况必须走下面的本地绘制，否则密码框里会显示「中」、禁用态不会变淡。
+    const BOOL localOnlyState = _bPasswordField || _bNoEditContext || _bKeyboardDisabled;
+    if (!localOnlyState)
+    {
+        std::vector<BYTE> shmPixels;
+        int shmSize = 0;
+        if (_iconShm.ReadVariant(iconSize, _bDarkMode != FALSE, shmPixels, shmSize))
+        {
+            HICON hIcon = _CreateIconFromBgra(shmPixels.data(), shmSize);
+            if (hIcon != NULL)
+            {
+                ReleaseDC(NULL, hdcScreen);
+                WIND_LOG_DEBUG_FMT(L"GetIcon: from SHM, want=%d got=%d dark=%d\n",
+                                   iconSize, shmSize, _bDarkMode);
+                *phIcon = hIcon;
+                return S_OK;
+            }
+        }
+    }
+
+    // ── 本地绘制 ──
+    // 服务未启动、SHM 尚未发布、或上面那几种本地态时走这里。
+    // 这条路径**不可删除**：DLL 加载在每一个宿主进程里，而服务的可用性无法保证。
 
     HDC hdcMem = CreateCompatibleDC(hdcScreen);
     if (hdcMem == NULL)

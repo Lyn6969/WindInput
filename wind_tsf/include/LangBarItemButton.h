@@ -4,6 +4,8 @@
 #include <ctfutb.h>
 #include <string>
 
+#include "IconShmReader.h"
+
 class CTextService;
 struct ServiceResponse;
 
@@ -194,6 +196,10 @@ private:
     // Input method type label for Chinese mode display
     // Default: "中", future values: "拼"(Pinyin), "五"(Wubi), "双"(Shuangpin)
     wchar_t _inputTypeLabel[4];
+
+    // 服务端预渲染图标的读端。取不到时 GetIcon 退回本地 DirectWrite 绘制，
+    // 故本对象不可用**不是**错误状态（服务未启动时就是这样）。
+    CIconShmReader _iconShm;
 
     // GUID for this language bar item
     static const GUID _guidLangBarItemButton;

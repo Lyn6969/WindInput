@@ -440,6 +440,63 @@ static_assert(sizeof(HostRenderHitRect) == 20, "HostRenderHitRect must be 20 byt
 // count can never make the DLL read past the buffer.
 constexpr uint32_t MAX_HOST_RENDER_RECTS = 256;
 
+// ============================================================================
+// Language bar icon shared memory (service pre-renders, GetIcon consumes)
+// ============================================================================
+//
+// Mirrors wind-ipc/src/protocol.rs (IconShmHeader / IconVariant). Unlike host-render
+// there is no event and no reader thread: GetIcon is a passive callback, so the DLL
+// simply reads whatever is current at the moment it is asked.
+//
+// Concurrency is double-buffering + seqlock. Writer: fill the inactive slot, release
+// fence, switch activeSlot, then bump sequence LAST. Reader: read sequence, copy,
+// re-read sequence — equal means no publish happened mid-copy, so the copy is a
+// consistent snapshot.
+
+constexpr uint32_t ICON_SHM_MAGIC   = 0x4F434957; // 'WICO' (bytes W,I,C,O)
+constexpr uint32_t ICON_SHM_VERSION = 1;
+constexpr uint32_t ICON_SHM_SIZE    = 64 * 1024;
+
+// Theme tiers. The taskbar's own theme decides which one to pick; the DLL detects it
+// locally (IsSystemDarkMode) rather than being told, so there is no stale window.
+constexpr uint8_t ICON_THEME_LIGHT = 0;
+constexpr uint8_t ICON_THEME_DARK  = 1;
+
+// Upper bound on the variant table, purely so a corrupt count cannot make the DLL
+// walk past the mapping. The real count comes from the header.
+constexpr uint32_t MAX_ICON_VARIANTS = 64;
+
+// Icon SHM header (64 bytes, at start of the mapping), followed by the variant table.
+struct IconShmHeader
+{
+    uint32_t magic;        // ICON_SHM_MAGIC
+    uint32_t version;      // ICON_SHM_VERSION
+    // Bumped on every publish. 0 means "mapping created but nothing published yet" —
+    // the DLL must fall back to local drawing rather than show a blank icon.
+    uint32_t sequence;
+    uint32_t activeSlot;   // 0 or 1
+    uint32_t variantCount;
+    uint32_t slotStride;   // Bytes per slot
+    uint32_t slot0Offset;  // Byte offset from SHM base to slot 0
+    uint32_t tableOffset;  // Byte offset from SHM base to the variant table
+    uint32_t reserved[8];  // Padding to 64 bytes
+};
+static_assert(sizeof(IconShmHeader) == 64, "IconShmHeader must be 64 bytes");
+
+// One pre-rendered variant. Both slots share this table; `offset` is relative to the
+// start of whichever slot is active. Pixels are BGRA, NON-premultiplied (what
+// CreateIconIndirect's hbmColor expects).
+struct IconVariant
+{
+    uint16_t sizePx;   // 16 / 20 / 24 / 28 / 32
+    uint8_t  theme;    // ICON_THEME_*
+    uint8_t  flags;
+    uint32_t offset;   // Relative to the active slot's start
+    uint32_t byteLen;  // sizePx * sizePx * 4
+    uint32_t reserved;
+};
+static_assert(sizeof(IconVariant) == 16, "IconVariant must be 16 bytes");
+
 // Host window kind: identifies which host-rendered window an SHM channel / band window
 // belongs to. Each kind has its own SHM section + per-PID event + band window, because
 // candidate / tooltip / status can all be visible simultaneously.

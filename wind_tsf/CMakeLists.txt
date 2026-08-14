@@ -73,6 +73,7 @@ set(SOURCES
     src/KeyEventSink.cpp
     src/IPCClient.cpp
     src/LangBarItemButton.cpp
+    src/IconShmReader.cpp
     src/CaretEditSession.cpp
     src/DisplayAttributeInfo.cpp
     src/HotkeyManager.cpp

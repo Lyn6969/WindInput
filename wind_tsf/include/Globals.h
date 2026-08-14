@@ -187,6 +187,22 @@ const wchar_t* WindPushPipeName();
 #define PIPE_NAME               WindPipeName()
 #define PUSH_PIPE_NAME          WindPushPipeName()
 
+// 语言栏图标共享内存名（服务端预渲染图标位图 → 本 DLL 的 GetIcon 取用）。
+//
+// ⚠️ **跨仓命名契约，无编译期约束**：必须与 Rust 侧
+// `wind_ipc::protocol::icon_shm_name()` 的结果逐字一致。不一致的表现是
+// OpenFileMappingW 恒失败、图标静默退回 DLL 本地绘制——**能正常显示，只是永远
+// 不跟随标点状态变化**，没有任何报错，极难反查。改名必须两端同步。
+//
+// 与管道名不同，这里**不含 SID**：`Local\` 前缀已提供终端服务会话级隔离，
+// 与 host-render 的 SHM 同策略（见 wind-bridge 的 shm_name_for）。
+// 故可编译期常量，无需运行时求值。
+#ifdef WIND_DEV_VARIANT
+#define WIND_ICON_SHM_NAME      L"Local\\WindInput_IconShm_dev"
+#else
+#define WIND_ICON_SHM_NAME      L"Local\\WindInput_IconShm"
+#endif
+
 // Modifier key flags (using KEY_ prefix to avoid Windows macro conflicts)
 constexpr int KEY_MOD_SHIFT = 0x01;
 constexpr int KEY_MOD_CTRL  = 0x02;
