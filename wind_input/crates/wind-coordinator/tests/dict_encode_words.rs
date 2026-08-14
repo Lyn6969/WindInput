@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use wind_config::Config;
 use wind_coordinator::Coordinator;
+use wind_coordinator::webdata::WebDataRpc;
 
 fn data_dir() -> PathBuf {
     // 三级：crates/wind-coordinator → crates → wind_input → 仓库根（build_dev 在仓库根）。

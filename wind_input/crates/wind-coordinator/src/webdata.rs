@@ -9,7 +9,14 @@
 //! - `schema.references` 暂返 `{}`（删除安全检查未用，前端宽松消费）；
 //!   无 store/themes 时各方法返回合法空集（降级，不报错）。
 
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+
 use serde_json::{Value, json};
+use wind_engine::EngineManager;
+use wind_reverse::ReverseLookup;
+use wind_store::Store;
+use wind_store::stat_collector::StatCollector;
 
 use crate::coordinator::Coordinator;
 
@@ -125,11 +132,102 @@ fn today_str() -> String {
         .to_string()
 }
 
-impl Coordinator {
+/// webdata 消费宿主能力的**窄面**：设置页数据 RPC 对 Coordinator 的全部依赖收敛于此。
+///
+/// ★ webdata 不碰输入态（`State` 与 Coordinator 的 80 余个字段），只消费引擎/存储/
+/// 统计/主题句柄与少数重建入口——新增 RPC 若需新依赖，**必须加在本 trait 上**，
+/// 勿在默认方法里绕道取宿主其它状态（那会无声地把窄面重新擑宽，也阻断后续
+/// 独立成 crate 的路）。
+///
+/// 方法与 Coordinator 固有方法同名时固有优先；转发 impl 内一律用完全限定路径
+/// `Coordinator::xxx(self)` 消歧，否则就是自调递归。
+pub trait WebDataHost {
+    fn engine_mgr(&self) -> &EngineManager;
+    fn user_store(&self) -> Option<&Arc<Store>>;
+    fn stat_collector(&self) -> Option<&StatCollector>;
+    fn reverse_lookup(&self) -> &RwLock<ReverseLookup>;
+    fn themes_dir(&self) -> Option<&Path>;
+    fn rebuild_phrases(&self);
+    fn restore_missing_system_phrases(&self, reason: &str);
+    fn restore_system_phrases(&self) -> usize;
+    fn sync_comment_dicts(&self);
+    fn sync_chaizi_assets(&self);
+    fn reload_user_config(&self) -> bool;
+    fn push_theme(&self, name: &str, is_dark: bool);
+    fn theme_search_dirs(&self) -> Vec<std::path::PathBuf>;
+    fn list_themes_full(&self) -> Vec<(String, String, bool)>;
+    /// 当前生效主题 id（快照）。
+    fn current_theme_name(&self) -> String;
+    /// 当前明暗（system 档按系统实时判定）。语义方法而非暴露 `Mutex<ThemeStyle>`：
+    /// 窄面签名不携带宿主内部类型与锁形态。
+    fn current_theme_is_dark(&self) -> bool;
+}
+
+impl WebDataHost for Coordinator {
+    fn engine_mgr(&self) -> &EngineManager {
+        &self.engine_mgr
+    }
+    fn user_store(&self) -> Option<&Arc<Store>> {
+        self.store.as_ref()
+    }
+    fn stat_collector(&self) -> Option<&StatCollector> {
+        self.stat_collector.as_ref()
+    }
+    fn reverse_lookup(&self) -> &RwLock<ReverseLookup> {
+        &self.reverse
+    }
+    fn themes_dir(&self) -> Option<&Path> {
+        self.themes_dir.as_deref()
+    }
+    fn rebuild_phrases(&self) {
+        Coordinator::rebuild_phrases(self);
+    }
+    fn restore_missing_system_phrases(&self, reason: &str) {
+        Coordinator::restore_missing_system_phrases(self, reason);
+    }
+    fn restore_system_phrases(&self) -> usize {
+        Coordinator::restore_system_phrases(self)
+    }
+    fn sync_comment_dicts(&self) {
+        Coordinator::sync_comment_dicts(self);
+    }
+    fn sync_chaizi_assets(&self) {
+        Coordinator::sync_chaizi_assets(self);
+    }
+    fn reload_user_config(&self) -> bool {
+        Coordinator::reload_user_config(self)
+    }
+    fn push_theme(&self, name: &str, is_dark: bool) {
+        Coordinator::push_theme(self, name, is_dark);
+    }
+    fn theme_search_dirs(&self) -> Vec<std::path::PathBuf> {
+        Coordinator::theme_search_dirs(self)
+    }
+    fn list_themes_full(&self) -> Vec<(String, String, bool)> {
+        Coordinator::list_themes_full(self)
+    }
+    fn current_theme_name(&self) -> String {
+        self.theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn current_theme_is_dark(&self) -> bool {
+        self.theme_style
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve_dark()
+    }
+}
+
+/// 设置页数据 RPC 本体：全部方法为默认实现，只能经 [`WebDataHost`] 窄面触宿主——
+/// 默认方法看不见 Coordinator 字段，窄面约束由编译期保证。调用方
+/// `use 本 trait` 后在 Coordinator 上直接调 `web_data_rpc`。
+pub trait WebDataRpc: WebDataHost {
     /// 枚举本机字体：返回 (family, display_name)。family 为匹配/渲染用名(通常英文),
     /// display_name 优先取该字体含 CJK 字符的本地化名(如"微软雅黑"),否则同 family。
     /// 首次调用扫描系统字体目录（fontdb），开销可接受（设置页打开字体选择时一次）。
-    pub fn list_font_families(&self) -> Vec<(String, String)> {
+    fn list_font_families(&self) -> Vec<(String, String)> {
         fn has_cjk(s: &str) -> bool {
             s.chars().any(|c| {
                 let u = c as u32;
@@ -162,14 +260,14 @@ impl Coordinator {
     }
 
     /// 数据类 RPC 总分派。方法名以 `<ns>.<method>` 形式分组；未知方法返回 Err。
-    pub fn web_data_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
+    fn web_data_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
         match method {
             // ── schema.* ─────────────────────────────────────────
             "schema.list" => self.web_schema_list(params),
             "schema.layouts" => self.web_schema_layouts(),
-            "schema.active" => Ok(json!({ "id": self.engine_mgr.active_schema_id() })),
+            "schema.active" => Ok(json!({ "id": self.engine_mgr().active_schema_id() })),
             "schema.setActive" => {
-                let ok = self.engine_mgr.switch_schema(str_param(params, "id")?);
+                let ok = self.engine_mgr().switch_schema(str_param(params, "id")?);
                 if ok {
                     self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换
                     self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
@@ -185,13 +283,13 @@ impl Coordinator {
             // 调用，让 override 改动在下次使用该方案时按新配置重建生效。
             "schema.invalidate" => {
                 let id = str_param(params, "id")?;
-                self.engine_mgr.invalidate_schema(id);
+                self.engine_mgr().invalidate_schema(id);
                 Ok(json!({ "ok": true }))
             }
             // 全量强制重建词库缓存（CLI `schema rebuild`）：失效全部引擎后删缓存产物。
             // 面向「指纹判新鲜但内容需重建」的场景（如解析器修复后存量缓存静默过期）。
             "schema.rebuildCache" => {
-                let (removed, failed) = self.engine_mgr.rebuild_all_caches();
+                let (removed, failed) = self.engine_mgr().rebuild_all_caches();
                 Ok(json!({ "removed": removed, "failed": failed }))
             }
             // 重启服务（CLI `wind_input restart`）：与托盘菜单同一条 request_restart
@@ -309,7 +407,7 @@ impl Coordinator {
         // 底层 installed_schemas() 仍返回 id 字典序全集（做稳定去重锚点），排序只在此展示层重排。
 
         // 已启用方案 → 配置位置索引，供段①②保持配置顺序。
-        let available = self.engine_mgr.available_schemas();
+        let available = self.engine_mgr().available_schemas();
         let avail_pos: HashMap<&str, usize> = available
             .iter()
             .enumerate()
@@ -331,7 +429,7 @@ impl Coordinator {
         // 复合排序键 (段号, 段内主键, id)：段号先分档；段内主键在启用段是配置位置、
         // 在未启用段是类型档；id 仅在未启用段做字典序 tiebreak（启用段位置唯一，不参与）。
         let mut rows: Vec<((u8, i64, String), Value)> = self
-            .engine_mgr
+            .engine_mgr()
             .installed_schemas()
             .iter()
             // 隐藏方案默认不列；已启用的隐藏方案是例外——用户既然把它放进了 available，
@@ -339,11 +437,11 @@ impl Coordinator {
             .filter(|id| {
                 include_hidden
                     || avail_pos.contains_key(id.as_str())
-                    || !self.engine_mgr.schema_is_hidden(id)
+                    || !self.engine_mgr().schema_is_hidden(id)
             })
             .map(|id| {
                 // 取合并后 Schema 一次，带出方案元信息（备注/版本/图标/作者），供设置页方案列表与详情显示。
-                let merged = self.engine_mgr.schema_merged(id);
+                let merged = self.engine_mgr().schema_merged(id);
                 let engine_type = merged
                     .as_ref()
                     .map(resolve_engine_type)
@@ -351,7 +449,7 @@ impl Coordinator {
                 let info = merged.as_ref().map(|s| &s.schema);
                 let item = json!({
                     "id": id,
-                    "name": self.engine_mgr.schema_name(id),
+                    "name": self.engine_mgr().schema_name(id),
                     "engineType": merged.as_ref().map(resolve_engine_type),
                     "scheme": merged.as_ref().map(|s| {
                         if resolve_engine_type(s) == "pinyin" {
@@ -361,9 +459,9 @@ impl Coordinator {
                         }
                     }).unwrap_or_default(),
                     // 用户目录存在同名 schema.toml 即视为用户方案（可删除）；否则内置。
-                    "builtin": !self.engine_mgr.is_user_schema(id),
+                    "builtin": !self.engine_mgr().is_user_schema(id),
                     // 隐藏方案（英文/快符）：设置页据此决定该行显示什么、能配什么。
-                    "hidden": self.engine_mgr.schema_is_hidden(id),
+                    "hidden": self.engine_mgr().schema_is_hidden(id),
                     // 是否为 **overlay 方案**（方案文件带 `[overlay]` 段）：可由引导键/直达
                     // 热键临时叠加进入（快符/生僻字那类）。设置页据此枚举 `special:<id>`
                     // 动词的可选项，并决定要不要显示 overlay 那一节配置。
@@ -400,7 +498,7 @@ impl Coordinator {
     /// 返回 `[{id, name}]`，供设置页"双拼布局"下拉动态取值（取代前端硬编码）。
     fn web_schema_layouts(&self) -> anyhow::Result<Value> {
         let items: Vec<Value> = self
-            .engine_mgr
+            .engine_mgr()
             .shuangpin_layouts()
             .into_iter()
             .map(|(id, name)| json!({ "id": id, "name": name }))
@@ -410,7 +508,7 @@ impl Coordinator {
 
     fn web_dict_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let prefix = params
             .get("prefix")
             .and_then(|v| v.as_str())
@@ -419,8 +517,7 @@ impl Coordinator {
         let limit = usize_param(params, "limit", 50);
         let offset = usize_param(params, "offset", 0);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 编码前缀须用扁平码（key 是扁平的），用户可能照着列表显示的 `ni hao` 来搜。
         // 下面的**词条内容**搜索仍用原串——那是拿汉字去匹配 text，与音节空格无关。
@@ -469,12 +566,11 @@ impl Coordinator {
 
     fn web_dict_search(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let query = str_param(params, "query").unwrap_or("");
         let limit = usize_param(params, "limit", 50);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表显示的是带空格的音节码（见 word_item），用户很可能照着搜。key 是扁平的，
         // 不拆则 `ni ha` 一条也匹配不到。拆完仍是前缀语义（`ni ha` → `niha`）。
@@ -489,14 +585,13 @@ impl Coordinator {
 
     fn web_dict_add(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         // 设置页传的是转义形态，还原成存储域（真实文本）后再落库/比对。见 [`store_text`]。
         let text = &store_text(text);
         let weight = i32_param(params, "weight");
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let (code, boundary) = self.normalize_add_code(&schema, code, text);
         store.add_user_word(&schema, &code, text, weight, boundary)?;
@@ -527,7 +622,7 @@ impl Coordinator {
     ///
     /// 不一致（用户自定义切分/生僻音）或非拼音方案 → 0，消费方降级回 DAG。
     fn infer_boundary_for(&self, schema: &str, code: &str, text: &str) -> u64 {
-        self.engine_mgr
+        self.engine_mgr()
             .generate_word_pinyin(schema, text)
             // 引擎给的是带空格的音节码，须拆成扁平码再与手输码比对（手输码恒无空格）。
             .map(|spaced| wind_store::wdict::split_spaced_code(&spaced))
@@ -538,15 +633,14 @@ impl Coordinator {
 
     fn web_dict_update(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         // text 在这里是**查找键**（update_user_word_weight 按它匹配记录），
         // 不还原就查不到 → 「改了没反应」。见 [`store_text`]。
         let text = &store_text(text);
         let weight = i32_param(params, "weight");
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 存在则改权重（boundary 沿用）；不存在则新增（upsert 语义）。
         // code 同样先规范化，否则带空格的码既查不到既有记录、又会新增出带空格的 key。
@@ -559,11 +653,10 @@ impl Coordinator {
 
     fn web_dict_remove(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表项的 code 带音节空格（见 word_item），而 key 是扁平的——不拆就删不掉。
         // text 同理：列表给的是转义形态、key 是真实文本，不还原一样删不掉。
@@ -574,10 +667,9 @@ impl Coordinator {
 
     fn web_dict_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let n = store.clear_user_words(&schema)?;
         Ok(json!(n))
@@ -586,15 +678,14 @@ impl Coordinator {
     /// 导出方案数据为单个多段 wdict 文件。`sections` 参数选类型；缺省按引擎类型取默认适用段。
     fn web_dict_export(&self, params: &Value) -> anyhow::Result<Value> {
         let schema_id = str_param(params, "schemaId")?;
-        let data_schema = self.engine_mgr.data_schema_id(schema_id); // 拼音族折叠到 "pinyin"
+        let data_schema = self.engine_mgr().data_schema_id(schema_id); // 拼音族折叠到 "pinyin"
         let etype = self
-            .engine_mgr
+            .engine_mgr()
             .schema_merged(schema_id)
             .map(|s| resolve_engine_type(&s))
             .unwrap_or("codetable");
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let sections = dict_sections_param(params).unwrap_or_else(|| default_dict_sections(etype));
         // engine_type 写入文件头部，供导入时校验来源（防五笔词库导入拼音致编码错乱）。
@@ -613,7 +704,7 @@ impl Coordinator {
         use wind_store::dict_export::DictSection;
         use wind_transfer::merge::Strategy;
         let schema_id = str_param(params, "schemaId")?;
-        let data_schema = self.engine_mgr.data_schema_id(schema_id);
+        let data_schema = self.engine_mgr().data_schema_id(schema_id);
         let content = str_param(params, "content")?;
         let replace = Strategy::from_param(
             params
@@ -622,14 +713,13 @@ impl Coordinator {
                 .unwrap_or(""),
         ) == Strategy::Replace;
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let fmt = wind_store::import_formats::detect_dict_format(content);
         if fmt == wind_store::import_formats::DictFormat::WindDict {
             // 校验来源引擎类型：防跨类型误导（如五笔词库导入拼音方案致编码错乱）。
             let target = self
-                .engine_mgr
+                .engine_mgr()
                 .schema_merged(schema_id)
                 .map(|s| resolve_engine_type(&s))
                 .unwrap_or("codetable");
@@ -677,11 +767,10 @@ impl Coordinator {
     fn web_dict_preview_import(&self, params: &Value) -> anyhow::Result<Value> {
         use wind_store::dict_export::DictSection;
         let schema_id = str_param(params, "schemaId")?;
-        let data_schema = self.engine_mgr.data_schema_id(schema_id);
+        let data_schema = self.engine_mgr().data_schema_id(schema_id);
         let content = str_param(params, "content")?;
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let fmt = wind_store::import_formats::detect_dict_format(content);
         if fmt == wind_store::import_formats::DictFormat::WindDict {
@@ -721,7 +810,7 @@ impl Coordinator {
             }
             // 来源方案/引擎（文件头部）+ 与目标方案的兼容性（引擎类型一致或来源未知）。
             let target = self
-                .engine_mgr
+                .engine_mgr()
                 .schema_merged(schema_id)
                 .map(|s| resolve_engine_type(&s))
                 .unwrap_or("codetable");
@@ -753,12 +842,12 @@ impl Coordinator {
     }
 
     fn web_dict_stats(&self) -> anyhow::Result<Value> {
-        let store = match self.store.as_ref() {
+        let store = match self.user_store() {
             Some(s) => s,
             None => return Ok(json!([])),
         };
         let mut out = Vec::new();
-        for id in self.engine_mgr.available_schemas().iter() {
+        for id in self.engine_mgr().available_schemas().iter() {
             let user_words = store
                 .search_user_words_prefix(id, "", 0)
                 .map(|v| v.len())
@@ -774,7 +863,7 @@ impl Coordinator {
             // ⚠️ 上面 user_words / temp_words **刻意保持原始 id**：它们走
             // `write_data_schema_id` 的按来源分桶，与 shadow 不是同一套归属规则，别顺手改。
             let shadow_rules = store
-                .list_shadow_rules(&self.engine_mgr.data_schema_id(id))
+                .list_shadow_rules(&self.engine_mgr().data_schema_id(id))
                 .map(|v| {
                     v.iter()
                         .map(|(_, r)| r.pinned.len() + r.deleted.len())
@@ -783,7 +872,7 @@ impl Coordinator {
                 .unwrap_or(0);
             out.push(json!({
                 "schemaId": id,
-                "name": self.engine_mgr.schema_name(id),
+                "name": self.engine_mgr().schema_name(id),
                 "userWords": user_words,
                 "tempWords": temp_words,
                 "shadowRules": shadow_rules,
@@ -794,7 +883,7 @@ impl Coordinator {
 
     fn web_schema_get_config(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
-        match self.engine_mgr.schema_merged(id) {
+        match self.engine_mgr().schema_merged(id) {
             Some(schema) => {
                 let etype = resolve_engine_type(&schema);
                 let mut v = serde_json::to_value(schema)?;
@@ -811,7 +900,7 @@ impl Coordinator {
                 // 决定 saveConfig 该不该落盘），这份是「实际按什么跑」（恒为实值，只作 UI 初值）。
                 // 合并成一份会让「跟随基线」与「显式等于基线值」无从区分。
                 if etype == "codetable" {
-                    let eff = self.engine_mgr.effective_codetable(id);
+                    let eff = self.engine_mgr().effective_codetable(id);
                     if let Some(obj) = v.as_object_mut() {
                         obj.insert("effectiveCodetable".to_string(), serde_json::to_value(eff)?);
                     }
@@ -829,7 +918,7 @@ impl Coordinator {
                 //
                 // 只报符号键：字母恒在默认码元集里，全列出来是噪音；「字母绑功能键」那条
                 // 冲突内核另有活码前缀裁决（`bound_action_key_yields`），不归本判据管。
-                let leading_keys: Vec<&str> = match self.engine_mgr.schema_code_char_set(id) {
+                let leading_keys: Vec<&str> = match self.engine_mgr().schema_code_char_set(id) {
                     Some(set) => wind_keys::keymap::symbol_keys()
                         .filter(|(_, ch)| set.contains_leading(*ch))
                         .map(|(name, _)| name)
@@ -853,7 +942,7 @@ impl Coordinator {
             .ok_or_else(|| anyhow::anyhow!("缺少参数 cfg"))?;
         let cfg = &strip_readonly_fields(cfg);
         let base = self
-            .engine_mgr
+            .engine_mgr()
             .schema_base(id)
             .ok_or_else(|| anyhow::anyhow!("方案不存在: {}", id))?;
         let base_json = serde_json::to_value(&base)?;
@@ -863,18 +952,18 @@ impl Coordinator {
         // 保留既有 override 的 dictionaries（附加词库开关由 setDictEnabled 单独管理）。
         if let toml::Value::Table(t) = &mut ov
             && !t.contains_key("dictionaries")
-            && let Some(prev) = self.engine_mgr.get_schema_override(id)
+            && let Some(prev) = self.engine_mgr().get_schema_override(id)
             && let Some(d) = prev.get("dictionaries")
         {
             t.insert("dictionaries".to_string(), d.clone());
         }
-        self.engine_mgr.write_schema_override(id, &ov)?;
+        self.engine_mgr().write_schema_override(id, &ov)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_schema_reset_config(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
-        self.engine_mgr.delete_schema_override(id)?;
+        self.engine_mgr().delete_schema_override(id)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -909,7 +998,7 @@ impl Coordinator {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         let mut merged = self
-            .engine_mgr
+            .engine_mgr()
             .schema_merged(id)
             .ok_or_else(|| anyhow::anyhow!("方案不存在: {}", id))?;
         let mut found = false;
@@ -924,7 +1013,7 @@ impl Coordinator {
         }
         let dicts_val = Self::sparse_dict_overrides(&merged.dictionaries);
         let mut ov = self
-            .engine_mgr
+            .engine_mgr()
             .get_schema_override(id)
             .unwrap_or_else(|| toml::Value::Table(Default::default()));
         if !ov.is_table() {
@@ -935,21 +1024,23 @@ impl Coordinator {
         }
         // 持久化 override（不 invalidate），再对已加载引擎 live 翻该扩展层的 enabled 标志——
         // 扩展词库热插拔：无需重熔大词库即时生效；未加载方案下次构建按新 override 生效。
-        self.engine_mgr.persist_schema_override(id, &ov)?;
-        let live = self.engine_mgr.set_dict_enabled_live(id, dict_id, enabled);
+        self.engine_mgr().persist_schema_override(id, &ov)?;
+        let live = self
+            .engine_mgr()
+            .set_dict_enabled_live(id, dict_id, enabled);
         Ok(json!({ "ok": true, "live": live }))
     }
 
     fn web_schema_delete(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
-        if !self.engine_mgr.is_user_schema(id) {
+        if !self.engine_mgr().is_user_schema(id) {
             anyhow::bail!("内置方案不可删除: {id}");
         }
         let user = Self::user_schemas_dir()?;
         let system = Self::system_schemas_dir();
         // 共享检查基准 = 其余已安装方案(含内置——混输可能引用用户资源)。
         let keep: Vec<String> = self
-            .engine_mgr
+            .engine_mgr()
             .installed_schemas()
             .into_iter()
             .filter(|s| s != id)
@@ -958,9 +1049,9 @@ impl Coordinator {
         let r = wind_transfer::scheme::delete_package(id, &user, system.as_deref(), &keep)?;
         // 级联清词库数据:仅清数据域=方案自身的(拼音族数据在共享 pinyin 域,
         // data_schema_id≠自身时跳过;文件已删读不到类型时回落自身,清空域无害)。
-        if let Some(store) = self.store.as_ref() {
+        if let Some(store) = self.user_store() {
             for sid in &r.schema_ids {
-                if self.engine_mgr.data_schema_id(sid) == *sid {
+                if self.engine_mgr().data_schema_id(sid) == *sid {
                     store.clear_user_words(sid)?;
                     store.clear_temp_words(sid)?;
                     store.clear_freq(sid)?;
@@ -969,7 +1060,7 @@ impl Coordinator {
             }
         }
         for sid in &r.schema_ids {
-            self.engine_mgr.forget_deleted_schema(sid);
+            self.engine_mgr().forget_deleted_schema(sid);
         }
         Ok(json!({
             "ok": true,
@@ -1030,7 +1121,7 @@ impl Coordinator {
         let r = wind_transfer::scheme::import_package(std::path::Path::new(path), &user, strategy)?;
         // 覆盖已加载方案时失效缓存(新方案为安全 no-op);列表可见性由 installed_schemas 实时扫盘天然生效。
         for id in &r.schema_ids {
-            self.engine_mgr.invalidate_schema(id);
+            self.engine_mgr().invalidate_schema(id);
         }
         Ok(json!({
             "imported": r.imported,
@@ -1065,8 +1156,7 @@ impl Coordinator {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let user_dir = wind_config::Config::user_config_dir();
         let cfg_file = user_dir.as_ref().map(|d| d.join("config.toml"));
@@ -1122,8 +1212,7 @@ impl Coordinator {
             })
         });
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let user_dir = wind_config::Config::user_config_dir();
         let cfg_file = user_dir.as_ref().map(|d| d.join("config.toml"));
@@ -1147,14 +1236,14 @@ impl Coordinator {
         let touched_config = r.restored.iter().any(|p| p.starts_with("config/"));
         let touched_phrase = r.restored.iter().any(|p| p == "userdata/phrases.wdict");
         for id in &r.schemas_touched {
-            self.engine_mgr.invalidate_schema(id);
+            self.engine_mgr().invalidate_schema(id);
         }
         for p in &r.restored {
             if let Some(rel) = p.strip_prefix("schemas/")
                 && let Some(id) = rel.strip_suffix(".schema.toml")
                 && !id.contains('/')
             {
-                self.engine_mgr.invalidate_schema(id);
+                self.engine_mgr().invalidate_schema(id);
             }
         }
         if touched_phrase {
@@ -1217,7 +1306,7 @@ impl Coordinator {
         }
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let is_pinyin = self
-            .engine_mgr
+            .engine_mgr()
             .schema_engine_type(schema)
             .map(|t| t == "pinyin")
             .unwrap_or(false);
@@ -1225,16 +1314,19 @@ impl Coordinator {
             // 与自动造词/快捷加词同一取码入口（码源=码表词库自身，规则=方案声明的公式）。
             // 原走 wubi_word_code：拆字表码源 + 硬编码五笔 86 规则，未配拆字的方案恒空、
             // 非五笔方案静默出错。见 docs/design/codetable-auto-phrase.md §2「码源统一」。
-            return self.engine_mgr.encode_words(schema, &refs);
+            return self.engine_mgr().encode_words(schema, &refs);
         }
         // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
         // 回的是**带空格的音节码**，让用户看清拼音词库的音节格式（与 word_item 同形）。
         // 安全前提：写入侧 normalize_add_code 会拆回扁平 key，并把空格当作**显式声明的
         // 切分**采信。逐字反查表回退同样以空格分隔（`gen_pinyin` 以 `.join(" ")` 收尾），
         // 故两条路出来的都是同形的音节码，无需再做区分。
-        let generated = self.engine_mgr.generate_words_pinyin(schema, &refs);
+        let generated = self.engine_mgr().generate_words_pinyin(schema, &refs);
         // 反查表的读锁在循环外取一次：逐词加锁在万级批量上纯属浪费。
-        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+        let reverse = self
+            .reverse_lookup()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         generated
             .into_iter()
             .zip(&refs)
@@ -1247,12 +1339,12 @@ impl Coordinator {
     ///
     /// 同 `dict.encode`：回带空格的音节码，写入侧负责拆回扁平 key。
     fn gen_pinyin_word(&self, text: &str) -> String {
-        let active = self.engine_mgr.active_schema_id();
-        self.engine_mgr
+        let active = self.engine_mgr().active_schema_id();
+        self.engine_mgr()
             .generate_word_pinyin(&active, text)
-            .or_else(|| self.engine_mgr.generate_word_pinyin("pinyin", text))
+            .or_else(|| self.engine_mgr().generate_word_pinyin("pinyin", text))
             .unwrap_or_else(|| {
-                self.reverse
+                self.reverse_lookup()
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .gen_pinyin(text)
@@ -1261,13 +1353,12 @@ impl Coordinator {
 
     fn web_freq_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let prefix = params.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
         let offset = usize_param(params, "offset", 0);
         let limit = usize_param(params, "limit", 50);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let sort = parse_sort(params, &["code", "text", "count", "lastUsed"]);
         // 无搜索且无排序：走 store 分页快路径；否则全量拉取
@@ -1334,9 +1425,9 @@ impl Coordinator {
     /// 之所以选反查而非给词频表扩容加 boundary 字段：词频是长期积累的数据，扩容只能让
     /// 此后新写入的记录带边界，用户会看到「新词有空格、老词没有」的混杂列表。
     fn freq_display_code(&self, schema: &str, code: &str, text: &str) -> String {
-        let mut b = self.engine_mgr.syllable_boundary_of(schema, code, text);
+        let mut b = self.engine_mgr().syllable_boundary_of(schema, code, text);
         if b == 0
-            && let Some(store) = &self.store
+            && let Some(store) = self.user_store()
         {
             let from = |recs: Vec<wind_store::user_words::UserWordRecord>| {
                 recs.into_iter()
@@ -1356,11 +1447,10 @@ impl Coordinator {
 
     fn web_freq_delete(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表项的 code 带音节空格（见 freq_display_code），而词频表 key 是扁平的。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
@@ -1370,20 +1460,18 @@ impl Coordinator {
 
     fn web_freq_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         Ok(json!(store.clear_freq(&schema)?))
     }
 
     fn web_shadow_list(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let mut out = Vec::new();
         for (code, rec) in store.list_shadow_rules(&schema)? {
@@ -1416,10 +1504,9 @@ impl Coordinator {
         );
         let cand_id = params.get("candId").and_then(|v| v.as_str());
         let position = usize_param(params, "position", 0);
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.pin_shadow(&schema, code, word, cand_id, position)?;
         Ok(json!({ "ok": true }))
@@ -1431,10 +1518,9 @@ impl Coordinator {
             str_param(params, "code")?,
             str_param(params, "word")?,
         );
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.delete_shadow(&schema, code, word)?;
         Ok(json!({ "ok": true }))
@@ -1449,10 +1535,9 @@ impl Coordinator {
         // 设置页删规则时回传 `shadow.list` 给出的 candId：动态短语规则的 word 是写入当天的
         // 求值文本，只按 word 定位会删不掉（列表里看得见、点删除无效）。
         let cand_id = params.get("candId").and_then(|v| v.as_str());
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.remove_shadow_rule(&schema, code, word, cand_id)?;
         Ok(json!({ "ok": true }))
@@ -1473,10 +1558,9 @@ impl Coordinator {
         );
         let kind = params.get("type").and_then(|v| v.as_str()).unwrap_or("pin");
         let cand_id = params.get("candId").and_then(|v| v.as_str());
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         if kind == "hide" {
             store.delete_shadow(&schema, code, word)?;
@@ -1489,10 +1573,9 @@ impl Coordinator {
 
     fn web_temp_list(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // code 带音节空格，与用户词库列表（word_item）同形。remove/promote 两个入口
         // 会收到这个串，各自拆回扁平码——三处必须同改，否则「显示得了、删不掉」。
@@ -1510,11 +1593,10 @@ impl Coordinator {
 
     fn web_temp_promote(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表项的 code 带音节空格（见 web_temp_list），key 是扁平的。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
@@ -1524,11 +1606,10 @@ impl Coordinator {
 
     fn web_temp_remove(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 同 promote：列表项的 code 带音节空格，不拆则删不掉。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
@@ -1538,10 +1619,9 @@ impl Coordinator {
 
     fn web_temp_promote_all(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let mut n = 0u64;
         for r in store.search_temp_words_prefix(&schema, "", 0)? {
@@ -1554,10 +1634,9 @@ impl Coordinator {
 
     fn web_temp_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let all = store.search_temp_words_prefix(&schema, "", 0)?;
         let n = all.len();
@@ -1569,8 +1648,7 @@ impl Coordinator {
 
     fn web_phrase_list(&self) -> anyhow::Result<Value> {
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let items: Vec<Value> = store
             .list_phrases()?
@@ -1604,8 +1682,7 @@ impl Coordinator {
             .and_then(|v| v.as_i64())
             .unwrap_or(1800) as i32;
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.add_phrase(code, &store_text(text), position, weight)?;
         self.rebuild_phrases();
@@ -1625,8 +1702,7 @@ impl Coordinator {
             .and_then(|v| v.as_i64())
             .map(|n| n as i32);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // text 是查找键、new_text 是新值，两者都来自设置页，都要还原成存储域。
         let text = store_text(text);
@@ -1650,8 +1726,7 @@ impl Coordinator {
     fn web_phrase_remove(&self, params: &Value) -> anyhow::Result<Value> {
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.remove_phrase(code, &store_text(text))?;
         // 删掉的可能是一条**遮蔽了系统条目**的用户短语（`overrides_system`）——主键只有
@@ -1669,8 +1744,7 @@ impl Coordinator {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // text 是查找键，须还原成存储域（见 `store_text`）——漏了就「开关点了没反应」。
         store.set_phrase_enabled(code, &store_text(text), enabled)?;
@@ -1679,7 +1753,7 @@ impl Coordinator {
     }
 
     fn web_phrase_reset(&self) -> anyhow::Result<Value> {
-        if let Some(store) = self.store.as_ref() {
+        if let Some(store) = self.user_store() {
             store.reset_user_phrases()?;
             // 用户行里可能有遮蔽了系统条目的（`overrides_system`），删掉后那些系统短语
             // 也一并没了 → 补回缺失的，否则要等到 TOML 哈希变动才恢复。
@@ -1691,8 +1765,7 @@ impl Coordinator {
 
     fn web_phrase_list_system(&self) -> anyhow::Result<Value> {
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let items: Vec<Value> = store
             .list_system_phrases()?
@@ -1709,8 +1782,7 @@ impl Coordinator {
 
     fn web_phrase_list_user(&self, params: &Value) -> anyhow::Result<Value> {
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let prefix = params.get("prefix").and_then(|v| v.as_str());
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -1752,8 +1824,7 @@ impl Coordinator {
 
     fn web_phrase_export(&self) -> anyhow::Result<Value> {
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let content = store.export_user_phrases_wdict("")?;
         Ok(json!({ "content": content }))
@@ -1761,8 +1832,7 @@ impl Coordinator {
 
     fn web_phrase_import(&self, params: &Value) -> anyhow::Result<Value> {
         let store = self
-            .store
-            .as_ref()
+            .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let content = str_param(params, "content")?;
         let (imported, skipped) = store.import_user_phrases_wdict(content)?;
@@ -1777,7 +1847,7 @@ impl Coordinator {
 
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
         use chrono::Datelike;
-        let (collector, store) = match (self.stat_collector.as_ref(), self.store.as_ref()) {
+        let (collector, store) = match (self.stat_collector(), self.user_store()) {
             (Some(c), Some(s)) => (c, s),
             _ => return Ok(Self::empty_stats_summary()),
         };
@@ -1887,7 +1957,7 @@ impl Coordinator {
     fn web_stats_daily(&self, params: &Value) -> anyhow::Result<Value> {
         let from = str_param(params, "from")?.to_string();
         let to = str_param(params, "to")?.to_string();
-        let store = match self.store.as_ref() {
+        let store = match self.user_store() {
             Some(s) => s,
             None => return Ok(json!([])),
         };
@@ -1895,7 +1965,7 @@ impl Coordinator {
         let mut by_date: std::collections::HashMap<String, wind_store::stats::DailyStats> =
             store.daily_stats(&from, &to)?.into_iter().collect();
         let today = today_str();
-        if let Some(c) = self.stat_collector.as_ref() {
+        if let Some(c) = self.stat_collector() {
             let ts = c.get_today_stat();
             if today.as_str() >= from.as_str() && today.as_str() <= to.as_str() && ts.total() > 0 {
                 by_date.insert(today.clone(), ts);
@@ -1919,11 +1989,11 @@ impl Coordinator {
     }
 
     fn web_stats_clear(&self) -> anyhow::Result<Value> {
-        if let Some(store) = self.store.as_ref() {
+        if let Some(store) = self.user_store() {
             store.clear_stats()?;
         }
         // 同步清空采集器内存（今日 + 元数据），否则 summary 仍读到旧内存值。
-        if let Some(c) = self.stat_collector.as_ref() {
+        if let Some(c) = self.stat_collector() {
             c.reset();
         }
         Ok(json!({ "ok": true }))
@@ -1936,7 +2006,7 @@ impl Coordinator {
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
             .max(0);
-        let store = match self.store.as_ref() {
+        let store = match self.user_store() {
             Some(s) => s,
             None => return Ok(json!({ "pruned": 0 })),
         };
@@ -1945,7 +2015,7 @@ impl Coordinator {
             .to_string();
         let n = store.prune_stats_before(&before)?;
         // 重建元数据（剔除已删历史）并让采集器重载：先 flush 今日落库，recalc 后 resume。
-        if let Some(c) = self.stat_collector.as_ref() {
+        if let Some(c) = self.stat_collector() {
             c.flush();
             store.recalculate_stats_meta()?;
             c.resume();
@@ -2030,8 +2100,8 @@ impl Coordinator {
         if let Some(u) = wind_config::Config::user_config_dir() {
             dirs.push(u.join("themes"));
         }
-        if let Some(d) = &self.themes_dir {
-            dirs.push(d.clone());
+        if let Some(d) = self.themes_dir() {
+            dirs.push(d.to_path_buf());
         }
         dirs
     }
@@ -2150,19 +2220,11 @@ impl Coordinator {
         // 判据是**目录 id 相同**，不比对文件内容：主题可能被 base 继承链间接影响，
         // 且重解析一次远比误判便宜。用户目录优先于安装目录，所以推一个与内置主题
         // 同 id 的用户主题（如 slug=default）同样会改变实际生效外观，这里一并覆盖。
-        let current = self
-            .theme_name
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let current = self.current_theme_name();
         let reloaded = current == theme_id;
         if reloaded {
             // 明暗沿用当前 style（system 时按系统实时判定），与 on_system_theme_changed 同一出口。
-            let dark = self
-                .theme_style
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .resolve_dark();
+            let dark = self.current_theme_is_dark();
             tracing::info!("导入的是当前主题 {}，重新加载以即时生效", theme_id);
             self.push_theme(&theme_id, dark);
         }
@@ -2195,6 +2257,8 @@ impl Coordinator {
         Ok(json!(out))
     }
 }
+
+impl WebDataRpc for Coordinator {}
 
 /// 存储域 → 设置页显示域：真实文本投影为可编辑的转义形态（真换行→`\n`、制表→`\t`、
 /// 反斜杠→`\\`）。

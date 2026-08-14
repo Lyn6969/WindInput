@@ -34,7 +34,7 @@
 | `src/handle_config.rs` | 配置更新处理（引擎/热键/UI/工具栏） |
 | `src/handle_tooltip.rs` | 候选悬停提示（编码/拆字/拼音反查） |
 | `src/hotkey_match.rs` | key_down 热键匹配 |
-| `src/webdata.rs` | Web 设置数据 RPC（schema/dict/temp/freq/shadow/phrase/stats/theme 命名空间，经 wind-rpc 转发） |
+| `src/webdata.rs` | Web 设置数据 RPC（schema/dict/temp/freq/shadow/phrase/stats/theme 命名空间，经 wind-rpc 转发）。**已窄面化**：`WebDataHost` trait（16 方法）承载对宿主的全部依赖，RPC 本体是 `WebDataRpc: WebDataHost` 的默认方法——默认方法编译期看不见 Coordinator 字段，窄面由编译器守门。★新增 RPC 需要新宿主能力时**必须加在 WebDataHost 上**，勿绕道；调用方（service/tests）需 `use …webdata::WebDataRpc` |
 | `src/host_services.rs` | `HostServices` trait（剪贴板等平台能力注入面）+ 桌面/headless 实现；收录判据见模块文档 |
 | `src/stats.rs` | 输入统计采集 |
 | `src/watchdog.rs` | 看门狗 |

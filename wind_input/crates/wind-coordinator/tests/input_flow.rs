@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
+use wind_coordinator::webdata::WebDataRpc;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP};
 
 fn data_dir() -> PathBuf {
