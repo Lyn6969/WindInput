@@ -10,7 +10,11 @@
 | File | Description |
 |------|-------------|
 | `src/lib.rs` | 模块导出（`Coordinator`/重启信号/设置 URL 提供者）；`is_foreground_fullscreen()` 全屏检测（供工具栏全屏隐藏） |
-| `src/coordinator.rs` | 核心：`State`（全部输入态）/`Coordinator` 定义、`build`（83 字段装配点，私有字段以本模块为界不外迁）、`impl MessageHandler`、**按键主入口 `handle_key_event`（优先级链）**、会话键统一分发 `apply_session_action`、配置热重载 `reload_user_config`。平移到子模块的项经 `pub(crate) use` 保真，handle_* 仍从 `crate::coordinator::` 引用 |
+| `src/coordinator.rs` | 核心：`State`（全部输入态）/`Coordinator` 定义、`build`（83 字段装配点，私有字段以本模块为界不外迁）、会话键统一分发 `apply_session_action`、配置热重载 `reload_user_config`。平移出去的项经 `pub(crate) use` 保真，handle_* 仍从 `crate::coordinator::` 引用 |
+| `src/coordinator/message_handler.rs` | **子模块**：`impl MessageHandler`（TSF 全部事件入口，含**按键主入口 `handle_key_event`（优先级链）**）+ 失焦归属校验 `is_stale_focus_event` + ext 信封解码。子模块可见父私有字段——重度碰私有态的切片进 `src/coordinator/`，不进平级模块 |
+| `src/coordinator/first_show.rs` | **子模块**：候选窗首显闸门（延迟首显判定/释放 + `FirstShowTimer` 共享兜底 timer） |
+| `src/coordinator/push_config.rs` | **子模块**：push 通道推送（activation status / 各配置帧 / `push_state_update`） |
+| `src/coordinator/langbar_icon.rs` | **子模块**：语言栏图标 SHM 发布（`ICON_PUBLISHER` 进程级单例 + 状态角标） |
 | `src/construct.rs` | 构造器族：生产构造 `new`（desktop-ui）+ headless 家族（`new_headless*`）+ `open_user_store`；装配核心 `build` 留在 coordinator.rs |
 | `src/config_bundle.rs` | `ConfigBundle`（配置 + 轻量派生缓存快照，热重载整体原子替换）+ `parse_pairs`/`parse_jump_out_*` 配置解析 |
 | `src/key_convert.rs` | 键位换算纯函数：`punct_char`/`printable_char`/`numpad_*`/`full_width_source_char`/`en_case_variants`/`wind_mods_to_win32` |
