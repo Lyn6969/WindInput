@@ -343,6 +343,7 @@ impl UiManager {
                     UiCommand::UpdateCandidates {
                         preedit,
                         preedit_caret,
+                        preedit_host_owned,
                         mode_label,
                         candidates,
                         selected,
@@ -367,6 +368,13 @@ impl UiManager {
                             caret_x,
                             caret_y
                         );
+                        // 编码区归宿主画时，候选窗拿到数据也不显示——数据恒下发，
+                        // 显示与否由这个标志决定（数据/渲染解耦，见 UiCommand 注释）。
+                        let preedit = if preedit_host_owned {
+                            String::new()
+                        } else {
+                            preedit
+                        };
                         candidate_window.update(
                             &preedit,
                             preedit_caret,

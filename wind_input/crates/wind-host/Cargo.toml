@@ -1,0 +1,11 @@
+[package]
+name = "wind-host"
+version.workspace = true
+edition.workspace = true
+
+# 零依赖是硬约束，不是巧合：本 crate 是宿主与核心之间的接缝，
+# 任何依赖都会顺着接缝渗进宿主侧的依赖闭包（Android 尤其敏感）。
+[dependencies]
+
+[lints]
+workspace = true

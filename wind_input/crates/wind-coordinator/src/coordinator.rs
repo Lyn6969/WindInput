@@ -937,6 +937,15 @@ pub struct Coordinator {
     last_valid_caret: Mutex<(i32, i32, i32)>,
     /// 延迟首次显示：新组合首帧不立即显示候选窗，待 handle_caret_update 收到 reflow 后的权威坐标、
     /// 或兜底 timer 超时再首显，避免在 reflow 前的陈旧坐标处先显示再跳（对齐 Go pendingFirstShow）。
+    /// 宿主不依赖光标坐标（自绘候选条，如 Android）：跳过首显闸门的等待。
+    ///
+    /// 闸门存在的理由是**桌面候选窗要等宿主 reflow 后的权威坐标**才好定位。自绘宿主
+    /// 把候选画在自己的固定位置上，坐标毫无意义——不关掉的话，宿主只能编造一组非零
+    /// 合成坐标去骗过闸门（Android 一度就是这么做的，`height` 写 0 还会被判为「宿主
+    /// 尚未 reflow」整帧丢弃，候选一次都不下发）。
+    caret_independent: std::sync::atomic::AtomicBool,
+    /// 0=Idle 1=Preparing 2=Ready 3=Failed（见 [`Coordinator::readiness`]）
+    readiness_state: std::sync::atomic::AtomicU8,
     pending_first_show: Mutex<bool>,
     /// 上述兜底 timer 的代际令牌：每次 arm 自增，超时回调比对以作废被新按键取代的旧 timer。
     pending_first_show_token: Mutex<u64>,
@@ -1561,6 +1570,73 @@ impl Coordinator {
             .is_empty()
     }
 
+    /// 就绪状态。见 [`wind_host::Readiness`]。
+    pub fn readiness(&self) -> wind_host::Readiness {
+        use std::sync::atomic::Ordering;
+        match self.readiness_state.load(Ordering::Relaxed) {
+            1 => wind_host::Readiness::Preparing,
+            2 => wind_host::Readiness::Ready,
+            3 => wind_host::Readiness::Failed,
+            _ => wind_host::Readiness::Idle,
+        }
+    }
+
+    /// 触发后台准备（幂等、非阻塞）。返回 `false` = 已在进行或已就绪。
+    ///
+    /// 准备的内容是**首次真实查询才会触发的惰性构建**（反查/合并索引，实测真机冷启动
+    /// 同步阻塞 2.8 秒）。故这里走**与 `handle_key_event` 完全相同的按键路径**——
+    /// 另写一条「预加载」必然与真实路径漂移：Android 侧手写预热的第一版就漏掉了释放
+    /// 首显闸门那步，「预热」只花 3ms 返回，惰性构建原样留给了用户的第一次按键。
+    ///
+    /// 喂 'a' 再退格，一进一删回到空缓冲，不留状态。
+    pub fn prepare(self: &Arc<Self>) -> bool {
+        use std::sync::atomic::Ordering;
+        // Idle → Preparing 的 CAS 保证只跑一次
+        if self
+            .readiness_state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        let this = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("wind-prepare".into())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                let key = |vk: u32| wind_bridge::handler::KeyEventData {
+                    key_code: vk,
+                    scan_code: 0,
+                    modifiers: 0,
+                    event_type: wind_ipc::protocol::EVENT_KEY_DOWN,
+                    toggles: 0,
+                    event_seq: 0,
+                    prev_char: 0,
+                };
+                use wind_bridge::handler::MessageHandler;
+                this.handle_key_event(&key(0x41));
+                // 收尾用**退格**而非 ESC：ESC 未必清空编码缓冲，实测预热完缓冲里还留着
+                // 那个 'a'，用户接着打 "aa" 会得到 "aaa"。退格逐码删，一进一删必回空。
+                this.handle_key_event(&key(wind_keys::keymap::VK_BACK));
+                this.readiness_state.store(2, Ordering::Relaxed);
+                info!("prepare 完成，耗时 {:?}", t0.elapsed());
+            })
+            .is_ok();
+        if !spawned {
+            self.readiness_state.store(3, Ordering::Relaxed);
+        }
+        spawned
+    }
+
+    /// 声明本宿主**不提供光标坐标**（自绘候选条）。
+    ///
+    /// 置位后首显闸门直接放行，宿主不必再喂合成 caret。这不是能力协商——没有分支矩阵，
+    /// 只是关掉一段桌面专属的等待逻辑。
+    pub fn set_caret_independent(&self, value: bool) {
+        self.caret_independent
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 无头 + 注入 redb store（测试用）：用于 web_data_rpc 数据域契约测试。
     pub fn new_headless_with_store(
         config: Config,
@@ -1887,6 +1963,8 @@ impl Coordinator {
             comment_dict_paths: Mutex::new(Vec::new()),
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
+            caret_independent: std::sync::atomic::AtomicBool::new(false),
+            readiness_state: std::sync::atomic::AtomicU8::new(0),
             pending_first_show: Mutex::new(false),
             pending_first_show_token: Mutex::new(0),
             candidate_shown: Mutex::new(false),
@@ -3966,7 +4044,12 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let is_first_frame = !authorized && !shown && !only_mode_label;
-        if is_first_frame && !skip_caret_pending && !coords_ready {
+        // 自绘候选的宿主不等坐标：闸门的全部意义是等宿主 reflow 后的权威坐标，
+        // 而它根本不用坐标。
+        let caret_free = self
+            .caret_independent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if is_first_frame && !caret_free && !skip_caret_pending && !coords_ready {
             // 唯一的「等」出口。与下面的放行日志成对，两条合起来即可从服务端日志判定
             // 每一帧走了哪条路、以及是哪个逃生口生效——不必再对着 TSF 日志比时间戳。
             debug!(
@@ -4170,22 +4253,17 @@ impl Coordinator {
             }
         };
         let n_items = items.len();
-        let preedit = if in_app {
-            String::new()
-        } else {
-            state.preedit.clone()
-        };
-        // 编码区插入符位置（preedit 内字节偏移）。in_app 时组合区由宿主画，无需自绘插入符。
-        let preedit_caret = if in_app {
-            0
-        } else {
-            self.ui_caret_bytes(state).min(preedit.len())
-        };
+        // 编码区**恒下发**：谁来画由 `preedit_host_owned` 表达。
+        // 曾经是「in_app 就发空串」——那等于把渲染策略焊进数据通道，自绘编码栏的宿主
+        // 拿不到数据（Android 侧一度只能靠改显示模式配置绕开）。
+        let preedit = state.preedit.clone();
+        let preedit_caret = self.ui_caret_bytes(state).min(preedit.len());
         let (cand_fixed, cand_fixed_x, cand_fixed_y) = self.candidate_fixed_pos();
         // mode_label 已在顶部计算（纳入空则隐藏守卫）：作为候选窗内联标记随候选窗一并显示。
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit,
             preedit_caret,
+            preedit_host_owned: in_app,
             mode_label,
             candidates: items,
             selected,

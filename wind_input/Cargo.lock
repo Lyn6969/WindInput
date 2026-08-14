@@ -2771,6 +2771,7 @@ dependencies = [
  "wind-bridge",
  "wind-config",
  "wind-coordinator",
+ "wind-host",
  "wind-ipc",
  "wind-keys",
  "wind-ui-types",
@@ -2843,6 +2844,7 @@ dependencies = [
  "wind-config",
  "wind-dict",
  "wind-engine",
+ "wind-host",
  "wind-ipc",
  "wind-keys",
  "wind-phrase",
@@ -2889,6 +2891,10 @@ dependencies = [
  "wind-dict",
  "wind-store",
 ]
+
+[[package]]
+name = "wind-host"
+version = "0.1.0"
 
 [[package]]
 name = "wind-ipc"

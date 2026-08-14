@@ -7,6 +7,7 @@ edition.workspace = true
 wind-ipc = { path = "../wind-ipc" }
 wind-bridge = { path = "../wind-bridge" }
 wind-config = { path = "../wind-config" }
+wind-host = { path = "../wind-host" }
 wind-store = { path = "../wind-store" }
 wind-transfer = { path = "../wind-transfer" }
 wind-dict = { path = "../wind-dict" }
@@ -50,6 +51,9 @@ desktop-ui = ["dep:wind-ui"]
 
 [dev-dependencies]
 wind-config = { path = "../wind-config" }
+wind-host = { path = "../wind-host" }
+wind-keys = { path = "../wind-keys" }
+wind-ui-types = { path = "../wind-ui-types" }
 wind-bridge = { path = "../wind-bridge" }
 wind-ipc = { path = "../wind-ipc" }
 

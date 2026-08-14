@@ -15,6 +15,12 @@ pub enum UiCommand {
         /// 编码区插入符位置：`preedit` 内的**字节**偏移（恒在字符边界）。自绘 preedit 栏据此
         /// 画竖线；等于 `preedit.len()` 即光标在末尾。
         preedit_caret: usize,
+        /// 编码区**由宿主自绘**（`preedit_display = app_inline`：编码嵌在宿主组合区里）。
+        ///
+        /// ⚠ 它只回答「谁来画」，**不影响 `preedit` 是否下发**——后者恒有值。
+        /// 此前是「不画就不发」，把渲染策略焊在了数据通道上：自绘编码栏的宿主
+        /// （Android）想拿数据，只能去改一个显示模式配置项。
+        preedit_host_owned: bool,
         /// 模式指示文本（拼/双/快/英/符 或全称）；空=不显示。有 preedit 空间时随候选窗持久显示。
         mode_label: String,
         candidates: Vec<CandidateItem>,

@@ -242,6 +242,46 @@ impl CompiledHotkeys {
             .find(|e| e.match_hash == normalized_hash)
             .map(|e| e.action.as_str())
     }
+
+    /// 在 key_down 集合中按规范化 hash 查**吃键策略**。
+    ///
+    /// 供 `Coordinator::should_handle_key` 用（吃键判定的唯一真相源）。策略位本就在
+    /// 本文件定义，解码也放这里——此前只有 C++ 侧从 `tsf_hash` 高位解，
+    /// 判据实现分居两地，注释里那句「判据须与服务端保持单一真相源」就是这么来的。
+    pub fn key_down_policy(&self, normalized_hash: u32) -> Option<KeyDownPolicy> {
+        self.key_down
+            .iter()
+            .find(|e| e.match_hash == normalized_hash)
+            .map(|e| KeyDownPolicy::from_tsf_hash(e.tsf_hash))
+    }
+}
+
+/// key_down 白名单命中后的吃键策略（`tsf_hash` 高位编码的语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDownPolicy {
+    /// 中英两模式都吃
+    Always,
+    /// 仅中文模式吃；英文模式放行给宿主（吃掉 Ctrl+= 会让宿主的放大失效）
+    ChineseOnly,
+    /// 仅中文模式 + 有会话时吃（置顶/删词 Ctrl+0..9；无会话时宿主可能另有用途）
+    Session,
+    /// 仅注册转发（翻页键组 `-=`、选词键组 `;'`）：无会话时**放行并继续按常规按键
+    /// 逻辑判定**，不是直接不吃——中文模式下它们要当标点处理。
+    ForwardOnly,
+}
+
+impl KeyDownPolicy {
+    fn from_tsf_hash(tsf_hash: u32) -> Self {
+        if tsf_hash & HOTKEY_POLICY_SESSION != 0 {
+            Self::Session
+        } else if tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0 {
+            Self::ChineseOnly
+        } else if tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0 {
+            Self::ForwardOnly
+        } else {
+            Self::Always
+        }
+    }
 }
 
 /// 计算 key_hash（与 wind-ipc::protocol::calc_key_hash 对齐）
