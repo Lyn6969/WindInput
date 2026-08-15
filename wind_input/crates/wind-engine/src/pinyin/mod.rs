@@ -252,6 +252,55 @@ const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 /// 计算机课 41 ✗ / 种花人 0 ✗ 不让位。
 const SENTENCE_YIELD_WEIGHT_FLOOR: i32 = COMPLETION_FAR_WEIGHT_FLOOR / 2;
 
+/// step 6.5b 的**反向闸门**：残码整句强出这个倍数时不让位（配合
+/// [`SENTENCE_KEEP_MAX_COMPLETED_SYLS`] 使用）。
+///
+/// ## 要治的病
+///
+/// 6.5b 的判据是光秃秃的 `is_sentence`，写在 step 2c（残码整句）**存在之前** —— 彼时
+/// 「整句」只有 step 2 那一种，语义是「只解释了 `completed`、把用户按下的残码丢掉了」，
+/// 让位天经地义。step 2c 的整句**消费了整串**，它自己就是「用完残码」的一方，却一并
+/// 被降级：实测 `zaim`/`zdm` 的正解「在吗」被压到 `818 = 819 - 1`，让位给「再买」(819)，
+/// 而「在吗」在词库里 `w=0`（`base.dict.yaml:103576`），补全路径**根本给不出它**
+/// —— 唯一的出路被自己该保护的规则堵死。
+///
+/// ## 判据为什么是「倍数」而不是别的
+///
+/// 试过并**实测否决**的三条：
+/// - **整句一律豁免**：`beijingd`→「背景的」、`zhongguorenm`→「中国人吗」当场翻上首位
+///   （两条都是现有断言），高频字拼出的虚高合成解会全面翻盘；
+/// - **词库中有无同名词条**：「在吗」有(w=0)、「你和」也有(w=0)，区分不开；
+/// - **词条 w 是否为 0**：同上，两者都是 0。
+///
+/// 倍数衡量的是「**词库在这个码上给不出好答案吗**」：补全侧最强者越弱，越说明该码上的
+/// 正解缺频（正是 `w=0` 的病征），此时整句解码（走单字乘积，不吃词条频率）更可信。
+///
+/// ## 取值 24 的标定（真实词库，`completed_syls == 1` 全样本）
+///
+/// | 倍数 | 场景 | 该谁赢 |
+/// |---|---|---|
+/// | **61.3×** | `zaim` 在吗(50189) vs 再买(819) | **整句** |
+/// | 9.0× | `shih` 是和 vs 适合(20624) | 补全 |
+/// | 8.8× | `nih` 你和 vs 你会(11131) | 补全 |
+/// | ≤1.0× | wom/tam/nim/zenm/zhem/shenm/zhid/yinw/xiex/meig/haiy/meiy/bush/jiush/dansh | 补全 |
+///
+/// 第一名 61.3× 与第二名 9.0× 之间空着近 7 倍，24 落在中间、两侧各留 2.6×。
+/// ⚠️ 这道缝是**分层之后**才有的：不限完成音节数时 `duibuq` 的错解「对不去」拿 32.4×、
+/// 而正解型的 `jisuanjik`「计算机看」只有 35.8×，缝仅剩 6%，任何取值都是过拟合。
+const SENTENCE_KEEP_RATIO: i64 = 24;
+
+/// [`SENTENCE_KEEP_RATIO`] 的**适用范围**：只在已完成音节数 ≤ 此值时允许整句反压补全。
+///
+/// **这是基于实测的范围限制，不是从第一性原理推出的**，故取值写死为 1 而非做成配置：
+/// 已完成 ≥ 2 个音节时，补全侧有更长的上下文约束、置信度实测更高，且现有断言
+/// （`beijingd`→「北京的」、`zhongguorenm`→「中国人民」、`nihaom`→「你好吗」）
+/// 全部要求补全赢。只有「1 个完整音节 + 残码」这一层是词频缺失的重灾区
+/// ——上下文最短，词库一旦缺频就再没有别的信号能把正解托上来。
+///
+/// 放宽此值前必须重跑 `sentence_yield_ratio_calibration` 探针：`duibuq`(2 音节) 的
+/// 错解「对不去」拿 32.4×，一旦放行到 2 就会越过 [`SENTENCE_KEEP_RATIO`] 顶掉「对不起」。
+const SENTENCE_KEEP_MAX_COMPLETED_SYLS: u32 = 1;
+
 /// 前缀补全的**每音节权重折扣**：候选每比已输入内容多出一个音节，权重打对折。
 ///
 /// ## 为什么要有它（改动前必读）
@@ -1837,11 +1886,28 @@ impl Engine for PinyinEngine {
         //     ⚠️ 判据是**「这串还可能是码表码吗」，不是「是不是混输」**：混输超码长（>码表最大
         //     码长）的串不可能是码，那里由调用方覆写为放行，否则 `zaiyebuj` 的尾字母 `j` 不参与
         //     组句、打不出「在也不就」，而纯拼音方案一直打得出。
+        //
+        //     ## 「1 个完整音节 + 残码」这一档为什么**延迟定夺**
+        //
+        //     本路径原本要求 `syllables.len() >= 2`，`zaim`/`zdm`（zai + 残码 m）够不着，
+        //     正解「在吗」只能走词典补全 —— 而它在词库里 `w=0`，被一路降级到第 98 位。
+        //     放开到 1 能让整句救回它，但**照原样立即插入会全面引入噪音**：实测 `wom`→「我吗」、
+        //     `tam`→「他吗」、`nim`→「你吗」、`meiy`→「没也」全部挤进第 2 位，且多插的这一条
+        //     还把 `meiy` 的单字「没」顶出了 400 条上限（它原本正卡在第 400 位）。
+        //
+        //     噪音与正解的分野要等 step 4 跑完才看得见（比的是「补全侧最强者有多弱」，
+        //     见 [`SENTENCE_KEEP_RATIO`]），而本路径跑在 step 4 **之前**。故这一档先把整句
+        //     存进 `short_sentence_pending`、**不进候选**，待 6.5b 之后再定夺：不够格的
+        //     压根不出现，于是候选集与放开门槛前逐条一致，连截断边界都不动。
+        //
+        //     `completed_syls >= 2` 仍走原来的立即插入，行为逐字不变。
+        let mut short_sentence_pending: Option<(String, i32, u64)> = None;
         if self.config.use_smart_compose
             && allow_partial_final
-            && syllables.len() >= 2
+            // 原为 `syllables.len() >= 2`（至少两个完整音节才谈得上组句）。放开到 1 是为了
+            // 让 `zaim`/`zdm` 这类「1 音节 + 残码」也能组句，其噪音由 6.5c 的延迟定夺挡住。
+            && !syllables.is_empty()
             && completed_len < query.len()
-            && sp_result.is_none()
             && !has_sep
         {
             let seg_graph = SegGraph::from_dag(&Dag::build(query, trie));
@@ -1875,7 +1941,13 @@ impl Engine for PinyinEngine {
                 let sentence: String = result.words.join("");
                 if !sentence.is_empty() {
                     let weight = sentence_weight(result.log_prob, result.words.len());
-                    if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
+                    // 此处 `completed_syls`（step 4 才定义）尚不可见，用同源的 `syllables`
+                    if syllables.len() as u32 <= SENTENCE_KEEP_MAX_COMPLETED_SYLS {
+                        // 短上下文档：留到 6.5b 之后按 SENTENCE_KEEP_RATIO 定夺（见上方说明）
+                        short_sentence_pending = Some((sentence, weight, result.boundary));
+                    } else if let Some(existing) =
+                        candidates.iter_mut().find(|c| c.text == sentence)
+                    {
                         // 同文合并（`nihaom` 的残码整句「你好吗」与 step4 的前缀补全同文）：
                         // 取更强的身份，理由同 step 2 的同文合并分支。
                         existing.weight = existing.weight.max(weight);
@@ -2679,6 +2751,50 @@ impl Engine for PinyinEngine {
                 if c.weight > target {
                     c.weight = target;
                     c.is_sentence_demoted = true;
+                }
+            }
+        }
+
+        // 6.5c 「1 音节 + 残码」残码整句的**延迟定夺**（step 2c 短上下文档，见那里的长注释）。
+        //
+        // 判据与标定见 [`SENTENCE_KEEP_RATIO`]：整句要强过「最强恰好用完残码的补全」若干倍
+        // 才配进候选 —— 倍数大说明词库在这个码上给不出好答案（`zaim` 的正解「在吗」w=0，
+        // 补全侧最强者只是「再买」819，比值 61×），此时整句解码走单字乘积、不吃词条频率，
+        // 反而更可信。不够格的**根本不插入**，故候选集与放开门槛前逐条一致。
+        //
+        // ★ 放在 6.5b **之后**是有意的：本档整句不参与那轮让位。6.5b 的语义是「整句丢掉了
+        // 残码、该让位给用完残码的补全」，而本档整句消费了整串，压根不是它要治的对象；
+        // 若放在之前，它会被无条件降到 `补全max - 1`，正是「在吗」被压到 818 的原因。
+        if let Some((text, weight, boundary)) = short_sentence_pending {
+            // 补全侧没有「恰好用完残码」的答案（None）时无从比较，放行 —— 与本文件
+            // 「无信息一律放行」一致，且那种情况下整句本就是唯一的整串解释。
+            let strong_enough = exhausting_completion_max
+                .is_none_or(|max_w| i64::from(weight) > i64::from(max_w) * SENTENCE_KEEP_RATIO);
+            if strong_enough {
+                if let Some(existing) = candidates.iter_mut().find(|c| c.text == text) {
+                    // 同文合并：step 4 已把它当前缀补全召回过（`zaim` 的「在吗」w=0）。
+                    // ★ 必须一并提层：w=0 让它吃了 `demote_to_prefix_layer`，
+                    // `is_promoted_completion=false` ⇒ `cmp_match_layers` 的 `eff_prefix` 为真、
+                    // 整条压在前缀层，**跨层不比权重**，只抬 weight 是抬不上来的。
+                    existing.weight = existing.weight.max(weight);
+                    existing.is_partial = false;
+                    existing.is_sentence = true;
+                    existing.is_promoted_completion = true;
+                } else {
+                    candidates.insert(
+                        0,
+                        Candidate {
+                            text,
+                            // 码取整串（含残码）⇒ consumed_length = query.len()，理由同 step 2c
+                            code: query.to_string(),
+                            weight,
+                            natural_order: 0,
+                            source: CandidateSource::Pinyin,
+                            is_sentence: true,
+                            boundary,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
         }
