@@ -74,6 +74,29 @@ toolbar_settings_hole = { light = "${surface}", dark = "${border}" }
 # 工具栏按钮鼠标悬停高亮（极淡：亮色 ~5% 黑 / 暗色 ~8% 白，对齐设计稿 status-btn:hover）。
 toolbar_hover = { light = "#0000000D", dark = "#FFFFFF14" }
 
+# ── 键盘域（移动端软键盘；桌面没有这些控件，取值时不会查到它们）──────────
+#
+# 放在共享的 [colors] 而不是另立视图节点：这里缺的只有颜色，键高/圆角/间距由宿主的
+# 布局系统管（Android 侧 KeyboardDimens + layouts/*.toml）。真要做带背景图/渐变的
+# 键盘节点时，节点仍可引用下面这几个语义色。
+#
+# ⚠ 一律用 ${var} 引用而非写死色值：派生主题（amber/jade/violet…）只覆盖
+# primary 与 accent 系，键盘色靠引用自动跟随——写死的话换成橙色主题，键盘还是蓝的。
+key_bg = "${bg}"
+key_text = "${text}"
+# 副字符角标（键面右上角的数字/符号）
+key_hint = "${text_hint}"
+# 功能键（Shift / 退格 / 符号层 / 回车）：中性色，**刻意不跟随主色**——
+# 它们跟字母键的区别是「功能」而非「强调」，染上主色会和选中态抢视觉。
+key_special_bg = "${border}"
+# 按下态：半透明强调色，由宿主叠在 key_bg 之上（见 ThemeColors.blendOver）。
+# 用 accent_soft 而非独立色值，按下反馈才会跟着主题走。
+key_pressed_bg = "${accent_soft}"
+# 键盘整体底色（键与键之间露出的部分）
+keyboard_bg = "${surface}"
+# 候选条底色：与工具栏同色，两者在视觉上是同一条区
+candidate_bar_bg = "${toolbar_background}"
+
 # 候选窗：12px 圆角 + 柔和投影；padding 提供候选/预编辑统一 inset。
 [window]
 padding = 5
