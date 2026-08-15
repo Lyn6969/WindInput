@@ -13,6 +13,7 @@ members = [
     "crates/wind-transfer",
     "crates/wind-ui-types",
     "crates/wind-host",
+    "crates/wind-mobile",
     "crates/wind-ui",
     "crates/wind-cmdbar",
     "crates/wind-phrase",

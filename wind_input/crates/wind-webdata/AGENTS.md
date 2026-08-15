@@ -7,7 +7,7 @@
 设置页数据 RPC（schema/dict/temp/freq/shadow/phrase/stats/theme 命名空间，方法名与前端 contract.ts 1:1）。由 wind-coordinator 的 webdata 模块独立而来：RPC 本体是 `WebDataRpc: WebDataHost` trait 的默认方法，只能经 `wind_coordinator::web_host::WebDataHost` 窄面（16 方法）触宿主——默认方法看不见 Coordinator 字段，窄面约束由编译器守门。
 
 ## 关键约束
-- **依赖方向：本 crate → wind-coordinator**，绝不能反向。coordinator 不依赖本 crate 的 wind-transfer/fontdb，Android 闭包（wind-android 不依赖本 crate）因此无任何 C 依赖，`cargo check-android` 本机免 NDK 可跑。
+- **依赖方向：本 crate → wind-coordinator**，绝不能反向。coordinator 不依赖本 crate 的 wind-transfer/fontdb，移动端闭包（wind-mobile 不依赖本 crate）因此无任何 C 依赖，`cargo check-android` 本机免 NDK 可跑。
 - 新增 RPC 需要新宿主能力时**加在 WebDataHost 上**（coordinator/src/web_host.rs），勿在默认方法里绕道。
 - 调用方须 `use wind_webdata::WebDataRpc`（service 的 RpcCore、coordinator 的集成测试经 dev-dependencies 环）。
 - ⛔ 不用 blanket impl（`impl<T: WebDataHost> WebDataRpc for T`）：`Arc<Coordinator>` 的方法解析会先命中 T=Arc 的 blanket 候选、bound 不满足即报错而不再 deref——具体 impl 才让 Arc 自动 deref。

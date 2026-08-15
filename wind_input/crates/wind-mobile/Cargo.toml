@@ -1,0 +1,21 @@
+[package]
+name = "wind-mobile"
+version.workspace = true
+edition.workspace = true
+
+# 移动端形态的核心门面。**平台绑定层不在这里**——它住在各自的平台仓
+# （Android: WindInputAndroid/rust/wind-android），只经本 crate 一条 path 依赖对接。
+#
+# 因此这里不该出现 uniffi / jni / objc 之类的绑定框架依赖：本 crate 一旦沾上某个
+# 平台的绑定框架，"接口层"就退化成"那个平台的实现层"，第二个平台再来就只能复制粘贴。
+[dependencies]
+wind-coordinator = { path = "../wind-coordinator", default-features = false }
+wind-host = { path = "../wind-host" }
+wind-bridge = { path = "../wind-bridge" }
+wind-config = { path = "../wind-config" }
+wind-ipc = { path = "../wind-ipc" }
+wind-ui-types = { path = "../wind-ui-types" }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

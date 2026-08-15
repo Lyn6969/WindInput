@@ -49,24 +49,28 @@ jobs:
         run: ./scripts/dev.sh ci
 
       # headless/Android 防走样三道闸:
-      # ① check 对象是 **wind-android 全包**(闭包含 coordinator headless):同时锁四件事——
-      #    headless 可编译、依赖闭包过 Android、wind-ui-types 没长出无条件平台依赖、
-      #    FFI 层自身(uniffi 宏/cdylib/tracing-android 的 cfg 分支)在 Android target 可编。
-      #    此前只 check coordinator,主线改动破坏 FFI 要等 Android 仓 build 才炸。
+      # ① check 对象是 **wind-mobile 全包**(移动端门面,闭包含 coordinator headless):
+      #    同时锁三件事——headless 可编译、依赖闭包过 Android、wind-ui-types 没长出
+      #    无条件平台依赖。此前只 check coordinator,主线改动破坏门面要等安卓仓 build 才炸。
+      #
+      #    ⚠ 曾经 check 的是 wind-android 全包,还多锁一件「FFI 层自身(uniffi 宏/cdylib/
+      #    tracing-android 的 cfg 分支)在 Android target 可编」。绑定层搬去 WindInputAndroid
+      #    仓后这一件**本仓锁不住了**,由该仓 scripts/build-rust.ps1 交叉编译真 .so 时把关
+      #    (比 check 更强,但反馈晚一个仓)。改动 wind-mobile 的公开面时请顺手跑一次安卓仓构建。
       # ② tree-grep 断言依赖边本身——wind-ui 的平台代码全在 cfg 内,理论上可能在 android
       #    下编成空壳而不报错,①抓不到"coordinator 又直连 wind-ui"的回归,须对边断言。
       # ③ C 依赖卫兵:webdata(wind-transfer→zip→zstd-sys/bzip2-sys、fontdb)独立成
       #    wind-webdata 后,Android 闭包为纯 Rust——check 因此**不再需要 NDK**,本机也可跑。
       #    刻意不配 NDK 环境变量:谁把 -sys crate 混回闭包,这一步会当场编不过而暴露。
-      - name: wind-android headless (aarch64-linux-android)
+      - name: wind-mobile headless (aarch64-linux-android)
         working-directory: wind_input
-        run: cargo check -p wind-android --target aarch64-linux-android
+        run: cargo check -p wind-mobile --target aarch64-linux-android
 
       - name: android 依赖树无 wind-ui / 无 C 依赖
         working-directory: wind_input
         run: |
           ! cargo tree -p wind-coordinator --no-default-features -e normal | grep -q "wind-ui v"
-          ! cargo tree -p wind-android --target aarch64-linux-android -e normal | grep -qE "zstd-sys|bzip2-sys|fontdb"
+          ! cargo tree -p wind-mobile --target aarch64-linux-android -e normal | grep -qE "zstd-sys|bzip2-sys|fontdb"
 
       - name: 交叉编译 TSF DLL (x64 + x86)
         run: |

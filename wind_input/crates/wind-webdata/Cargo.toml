@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 # 依赖方向是本 crate → coordinator（反过来会把 wind-transfer/fontdb 拉回
-# Android 闭包）；Android 形态（wind-android）不依赖本 crate。
+# Android 闭包）；移动端形态（wind-mobile）不依赖本 crate。
 wind-coordinator = { path = "../wind-coordinator", default-features = false }
 wind-config = { path = "../wind-config" }
 wind-engine = { path = "../wind-engine" }

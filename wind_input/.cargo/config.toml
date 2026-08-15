@@ -2,8 +2,12 @@
 [alias]
 # headless 形态（Android/FFI 路径）在 host 上的编译门。
 check-headless = "check -p wind-coordinator --no-default-features"
-# Android target 编译门：wind-android 全包（闭包含 coordinator headless + uniffi/
-# tracing-android 的 cfg 分支）。webdata 独立成 wind-webdata 后闭包为纯 Rust，
-# **免 NDK 本机可跑**（rustup target add aarch64-linux-android 即可）；编不过且报
-# 缺 C 编译器 = 有人把 -sys crate 混回了闭包，先查依赖别配 NDK。
-check-android = "check -p wind-android --target aarch64-linux-android"
+# Android target 编译门：wind-mobile 全包（移动端门面，闭包含 coordinator headless）。
+# webdata 独立成 wind-webdata 后闭包为纯 Rust，**免 NDK 本机可跑**
+# （rustup target add aarch64-linux-android 即可）；编不过且报缺 C 编译器 =
+# 有人把 -sys crate 混回了闭包，先查依赖别配 NDK。
+#
+# ⚠ 本门**不再覆盖 FFI 绑定层**（uniffi 宏 / cdylib / tracing-android 的 cfg 分支）——
+# 那一层随 wind-android crate 搬去了 WindInputAndroid 仓，由该仓的 scripts/build-rust.ps1
+# 真正交叉编译 .so 时把关（比 check 更强）。这里过了不等于安卓仓构建得出来。
+check-android = "check -p wind-mobile --target aarch64-linux-android"
