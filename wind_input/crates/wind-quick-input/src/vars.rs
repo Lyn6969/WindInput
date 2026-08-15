@@ -70,10 +70,14 @@ pub(crate) fn date_var(name: &str, y: i32, m: u32, d: u32) -> Option<String> {
         return Some(v);
     }
     if crate::lunar::is_var(name) {
-        // ★ 换算不出（超出 1900–2100，或 2 月 31 日这种非法公历日）时返回 `None`
+        // ★ **换算不出**（超出 1900–2100，或 2 月 31 日这种非法公历日）时返回 `None`
         // 而**不是**空串：空串只在整条模板恰好只有这一个变量时才会让候选消失，
         // 而 `农历$LMD` 会剩下「农历」二字上屏。`None` 让整条模板作废，
         // 公历那几条候选不受影响。
+        //
+        // 这与 `$LF` 在**非节日**返回空串不冲突，两者是不同的问题：那里日期换算成功了、
+        // 只是这一天没有节日名，`$LY年$LMD$LF` 理应给出「丙午年四月廿九」而非整条消失。
+        // 详见 [`crate::lunar::var`] 的「`None` 与空串的分工」。
         return crate::lunar::solar_to_lunar(y, m, d).and_then(|l| crate::lunar::var(name, &l));
     }
     Some(match name {
@@ -152,11 +156,12 @@ mod tests {
         ];
         for name in all {
             let cases = [
-                // 样本日期取端午（2026-06-19）而非任意一天：`$LF` 只在节日当天有值，
-                // 用平常日子做样本会让「白名单放行 ⟺ 取得到值」这条不成立。
-                // 「节日当天之外 $LF 为 None」是**刻意行为**，由
-                // `lunar_vars_are_conditional` 单独覆盖。
-                (FormatKind::Date, date_var(name, 2026, 6, 19).is_some()),
+                // 样本取平常日子（2026-06-14 非节日）而非节日：`$LF` 在非节日返回
+                // **空串而非 None**，故「白名单放行 ⟺ 取得到值」在任意一天都成立。
+                // 拿平常日子做样本才能真正压住这条——用节日当天会让「$LF 在非节日
+                // 退化成 None」这类回归从这里溜过去（由
+                // `festival_is_empty_on_ordinary_days` 正面覆盖）。
+                (FormatKind::Date, date_var(name, 2026, 6, 14).is_some()),
                 (
                     FormatKind::YearMonth,
                     year_month_var(name, 2026, 6).is_some(),
@@ -226,20 +231,38 @@ mod tests {
         assert_eq!(date_var("LYN", 2026, 6, 14).unwrap(), "2026");
     }
 
-    /// ★ 农历变量是**条件性**的：取不到值时返回 `None`（整条模板作废），
-    /// 而不是空串（那会让 `农历$LMD` 剩下「农历」二字上屏）。
+    /// ★ **算不出来** → `None`（整条模板作废）。
     ///
-    /// 三种取不到的情形都要覆盖，它们的成因不同：范围外、公历日非法、当天不是节日。
+    /// 空串在这里是错的：它只在整条模板恰好只有这一个变量时才让候选消失，
+    /// 而 `农历$LMD` 会剩下「农历」二字上屏。两种成因都要覆盖：范围外、公历日非法。
     #[test]
-    fn lunar_vars_are_conditional() {
+    fn unconvertible_dates_kill_the_template() {
         // 超出 1900–2100
         assert!(date_var("LMD", 1899, 12, 31).is_none());
         assert!(date_var("LMD", 2101, 1, 1).is_none());
         // 非法公历日期（儒略日会照算成 3/3，必须挡住）
         assert!(date_var("LMD", 2026, 2, 31).is_none());
-        // 非节日当天没有 $LF，但同一天的其它农历变量照常有值
-        assert!(date_var("LF", 2026, 6, 14).is_none());
-        assert!(date_var("LMD", 2026, 6, 14).is_some());
+        // 范围外时**所有**农历变量一起作废，不能只挡住其中几个
+        for name in ["LY", "LYN", "LZ", "LM", "LD", "LMD", "LF"] {
+            assert!(
+                date_var(name, 2101, 1, 1).is_none(),
+                "${name} 应随换算失败作废"
+            );
+        }
+    }
+
+    /// ★ **算得出来但这一天没有值** → 空串（整条照常出），不是 `None`。
+    ///
+    /// 只有 `$LF` 属于这一类。用户写 `$LY年$LMD$LF` 想要的是「节日当天追加节日名」，
+    /// 平常日子给出「丙午年四月廿九」——让整条消失没人想要。
+    /// 与 `$AMT`「小数超两位返回空串」同一条约定。
+    #[test]
+    fn festival_is_empty_on_ordinary_days() {
+        // 非节日：$LF 有值且为空，同一天其它农历变量照常有值
+        assert_eq!(date_var("LF", 2026, 6, 14).unwrap(), "");
+        assert_eq!(date_var("LMD", 2026, 6, 14).unwrap(), "四月廿九");
+        // 节日当天照常给出节日名
+        assert_eq!(date_var("LF", 2026, 6, 19).unwrap(), "端午节");
     }
 
     /// ★ 年月类不支持农历：农历月与公历月不一一对应，`2026.12` 推不出唯一农历月。

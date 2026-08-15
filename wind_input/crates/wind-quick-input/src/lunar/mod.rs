@@ -127,7 +127,7 @@ impl LunarDate {
     }
 }
 
-/// 是否为农历变量名（`$LY` `$LZ` `$LM` `$LD` `$LMD` `$LF`）。
+/// 是否为农历变量名（`$LY` `$LYN` `$LZ` `$LM` `$LD` `$LMD` `$LF`）。
 ///
 /// 与 [`var`] 的分支**必须一致**：这里认了而那边不认，该变量会静默变成
 /// 「本次取不到值」，症状与超出范围无从区分。由 `vars_and_names_agree` 兜底。
@@ -140,8 +140,22 @@ pub fn is_var(name: &str) -> bool {
 /// 快捷输入（绑用户打进去的日期）与短语（绑当前时间）共用这一份——
 /// 同一个 `$LMD` 在两个配置文件里必须给出同一个答案。
 ///
-/// `$LF` 在非节日返回 `None`，好让「今天是$LF」这类模板在平常日子整条消失，
-/// 而不是产出半截文本。
+/// ## `None` 与空串的分工
+///
+/// 返回值区分两种「没有值」，它们的后果**必须不同**：
+///
+/// - `None` = **不认识这个变量**（如 `$NOPE`）→ 调用方让整条模板作废。
+///   这是配置写错了，带着窟窿上屏比不出候选更糟。
+/// - `Some("")` = 认识，但**本次没有值**（`$LF` 在非节日）→ 渲染成空串，整条照常出。
+///
+/// `$LF` 走后者：`$LY年$LMD$LF` 在平常日子应给出「丙午年四月廿九」，
+/// 端午当天给出「丙午年四月廿九端午节」——追加式写法是用户的实际意图，
+/// 让整条消失反而没人想要。与 `$AMT`「小数超两位返回空串」是同一条约定
+/// （见 [`crate::vars::number_var`]）。
+///
+/// 注意「算不出来」不属于这两者中的任何一个：日期超出 1900–2100 或公历日非法时，
+/// 压根构造不出 [`LunarDate`]，由 [`solar_to_lunar`] 返回 `None` 在更外层作废整条——
+/// 那种情况下 `农历$LMD` 只剩「农历」二字才是真的糟。
 pub fn var(name: &str, l: &LunarDate) -> Option<String> {
     Some(match name {
         "LY" => l.ganzhi(),
@@ -152,7 +166,8 @@ pub fn var(name: &str, l: &LunarDate) -> Option<String> {
         "LM" => l.month_text(),
         "LD" => l.day_text().to_string(),
         "LMD" => l.date_text(),
-        "LF" => l.festival?.to_string(),
+        // 非节日 → 空串（不是 None）。见上文「`None` 与空串的分工」。
+        "LF" => l.festival.unwrap_or("").to_string(),
         _ => return None,
     })
 }
@@ -536,8 +551,11 @@ mod tests {
     /// 该变量会退化成「本次取不到值」，与超出范围的症状完全一样，无从排查。
     #[test]
     fn vars_and_names_agree() {
-        // 端午当天：六个变量（含只在节日有值的 $LF）都应取到值
-        let l = lunar(2026, 6, 19);
+        // 样本取**平常日子**（非节日）：`$LF` 在非节日返回空串而非 None，
+        // 故七个变量在任意一天都该取到值。拿节日当天做样本会让
+        // 「$LF 在非节日退化成 None」的回归从这里溜过去。
+        let l = lunar(2026, 6, 14);
+        assert_eq!(l.festival, None, "样本必须是非节日，否则本测试压不住 $LF");
         for name in ["LY", "LYN", "LZ", "LM", "LD", "LMD", "LF"] {
             assert!(is_var(name), "is_var 应认识 ${name}");
             assert!(var(name, &l).is_some(), "var 应能取到 ${name}");

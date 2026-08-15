@@ -89,14 +89,15 @@ pub(crate) fn eval_expr(text: &str, values: &QuickValues) -> Option<String> {
 
 /// 预检用的日期样本。
 ///
-/// ★ **必须挑一个传统节日**（这里是 2026-06-19 端午），否则 `{lunar(part='festival')}`
-/// 在样本上取不到值，预检会把一条完全正确的配置报成错误。农历变量里只有 `$LF`
-/// 是「大多数日子都没有值」的，随手换个日期就会引入这类误报。
+/// ★ 刻意挑一个**平常日子**（2026-06-14，非节日）。这里曾被迫挑节日：`$LF` 当时在
+/// 非节日返回 `None`，用平常日子会把一条完全正确的 `{lunar(part='festival')}` 配置
+/// 报成错误。`$LF` 改为返回空串后该约束解除，而挑非节日反过来成了一道免费守门——
+/// 若 `$LF` 哪天回归成 `None`，出厂配置会当场被预检报错，不必等用户发现。
 fn date_sample() -> QuickValues {
     QuickValues::Date {
         y: 2026,
         m: 6,
-        d: 19,
+        d: 14,
     }
 }
 
@@ -293,19 +294,52 @@ mod tests {
         assert_eq!(eval_expr("{year()}年", &out).unwrap(), "1899年");
     }
 
-    /// 非节日当天，含 `$LF` 的条目消失而其余农历条目照常。
+    /// ★ 非节日当天 `{lunar(part='festival')}` 求值成**空串**，整条照常出。
+    ///
+    /// 与 `$LF` 变量路径同语义（见 `wind_quick_input::lunar::var`）：表达式路径和
+    /// 变量路径对同一天必须给出同一个答案，否则用户在两种写法间迁移会撞见行为差异。
     #[test]
-    fn lunar_festival_is_conditional() {
+    fn lunar_festival_is_empty_on_ordinary_days() {
         let plain = QuickValues::Date {
             y: 2026,
             m: 6,
             d: 14,
         };
-        assert!(eval_expr("今天是{lunar(part='festival')}", &plain).is_none());
+        assert_eq!(
+            eval_expr("今天是{lunar(part='festival')}", &plain).unwrap(),
+            "今天是"
+        );
+        // 追加式写法：平常日子只少节日名，日期部分照常
+        assert_eq!(
+            eval_expr(
+                "{lunar(part='ganzhi')}年{lunar()}{lunar(part='festival')}",
+                &plain
+            )
+            .unwrap(),
+            "丙午年四月廿九"
+        );
         assert_eq!(eval_expr("农历{lunar()}", &plain).unwrap(), "农历四月廿九");
+
+        // 节日当天照常追加节日名
+        let duanwu = QuickValues::Date {
+            y: 2026,
+            m: 6,
+            d: 19,
+        };
+        assert_eq!(
+            eval_expr(
+                "{lunar(part='ganzhi')}年{lunar()}{lunar(part='festival')}",
+                &duanwu
+            )
+            .unwrap(),
+            "丙午年五月初五端午节"
+        );
     }
 
-    /// ★ 预检的样本日期必须是节日，否则 `{lunar(part='festival')}` 会被误报成配置错误。
+    /// ★ 预检样本取**平常日子**，全部 part 仍须取到值。
+    ///
+    /// `$LF` 若回归成「非节日返回 None」，这里会立刻红——出厂配置被预检误报成
+    /// 配置错误的回归，不该等用户发现。
     #[test]
     fn precheck_sample_covers_all_lunar_parts() {
         let v = date_sample();

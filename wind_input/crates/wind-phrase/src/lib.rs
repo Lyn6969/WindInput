@@ -298,11 +298,20 @@ impl PhraseLayer {
                 // 短语文本按原样出候选：库里存的就是真实文本（含真换行）。
                 // 转义只在系统边界发生（文本文件读写、设置页 UI 进出），见
                 // `wind_dict::store_layer::record_to_candidate` 的同源说明。
-                out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
+                //
+                // 全空展开（如整条只有一个非节日的 `$LF`）不出空候选——
+                // 与前缀路径 `lookup_prefix_at` 同处置。
+                if !text.is_empty() {
+                    out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
+                }
             } else {
-                // 含不支持的模板变量 → 整条跳过（打全码一个候选都没有）。
-                // 前缀路径 `lookup_prefix_at` 对同一失败是**回退原文显示**，两边现象相反
-                // （打全码没反应、打前缀反而看得见字面 `$xxx`），不留日志就没人查得动。
+                // 含**不支持**的模板变量（写错了变量名）→ 整条跳过。前缀路径
+                // `lookup_prefix_at` 对同一失败同处置；两边曾经现象相反（打全码没反应、
+                // 打前缀反而看得见字面 `$xxx` 并原样上屏），已统一。
+                //
+                // 注意「变量取不到值」不走这里：`$LF` 在非节日返回**空串**，整条照常展开
+                // （见 `wind_quick_input::lunar::var` 的「`None` 与空串的分工」）。到得了
+                // 这里的只有真写错的变量名，故留 warn——不留日志就没人查得动。
                 // 隐私红线（docs/logging-convention.md）：warn 不得含词条明文，源文降到 debug。
                 warn!(
                     "短语模板变量不支持，该条被跳过 (chars={})",
@@ -380,11 +389,20 @@ impl PhraseLayer {
                 // $CC → **命令** nav（选中**直接执行**，不二级展开），display 经廉价上下文求值。
                 match &phrase {
                     Phrase::Literal(t) => {
-                        // 旧式简单模板（$Y/$M/$D 等）不含 cmdbar marker/插值，
-                        // parse 后为 Literal；先尝试 expand_template 展开，
-                        // 展开成功用结果，不支持的变量退回原文。
-                        // 对齐 lookup 精确匹配路径的双路径策略。
-                        let display = expand_template(t, &now).unwrap_or_else(|| t.clone());
+                        // 旧式简单模板（$Y/$M/$D 等）不含 cmdbar marker/插值，parse 后为 Literal。
+                        //
+                        // ★ 展开失败 → **跳过该条**，与 [`Self::lookup_at`] 精确路径同处置。
+                        // 这里曾是 `unwrap_or_else(|| t.clone())`「失败退回原文」，后果是同一条
+                        // 短语在两条路径上现象相反：打全码一个候选都没有，打前缀反而看得见字面
+                        // `$LY$LZ$LMD$LF` 且选中即原样上屏。展开产物与模板源不是一回事，
+                        // 源里带着 `$` 语法，回退它等于把乱码当结果。
+                        let Some(display) = expand_template(t, &now) else {
+                            continue;
+                        };
+                        // 全空展开（如整条只有一个非节日的 `$LF`）不出空候选。
+                        if display.is_empty() {
+                            continue;
+                        }
                         out.push(PhraseHit::plain(display, e.weight).with_source(&e.text));
                     }
                     Phrase::Template(_) => {
@@ -665,9 +683,12 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
         // 农历（`$LMD` `$LY` `$LZ` `$LM` `$LD` `$LF`）：与快捷输入的日期候选共用
         // 同一份换算，差别只在数据源——这里绑当前时间，那边绑用户打进去的日期。
         //
-        // 取不到值时返回 None（整条短语被跳过），有两种情形：系统日期超出 1900–2100，
-        // 以及 `$LF` 在非节日当天——后者是刻意的，好让「今天是$LF」这类短语
-        // 只在节日当天出现，平常日子整条消失而不是产出半截文本。
+        // 系统日期超出 1900–2100 时**换算不出**农历 → None（整条短语被跳过），
+        // 免得 `农历$LMD` 只剩「农历」二字上屏。
+        //
+        // 而 `$LF` 在非节日返回**空串**（不是 None）：`$LY年$LMD$LF` 平常日子应给出
+        // 「丙午年四月廿九」、端午当天给出「…端午节」——追加式写法是实际意图，
+        // 让整条消失没人想要。两种「没有值」的分工见 `wind_quick_input::lunar::var`。
         n if wind_quick_input::lunar::is_var(n) => {
             let d = wind_quick_input::lunar::solar_to_lunar(now.year(), now.month(), now.day())?;
             wind_quick_input::lunar::var(n, &d)?
@@ -751,19 +772,65 @@ mod tests {
         assert_eq!(expand_template("$LZ年", &now).unwrap(), "马年");
     }
 
-    /// ★ `$LF` 只在节日当天有值；平常日子整条短语被跳过，
-    /// 而不是产出「今天是」这种半截文本。
+    /// ★ `$LF` 在非节日展开成**空串**，整条照常出——不是整条消失。
+    ///
+    /// 用户写 `$LY年$LMD$LF` 要的是「节日当天追加节日名」，平常日子仍要得到日期。
+    /// 曾经的 `None` 语义会让这类短语一年 355 天打不出来。
     #[test]
-    fn test_expand_lunar_festival_is_conditional() {
+    fn test_expand_lunar_festival_is_empty_on_ordinary_days() {
         let plain = fixed(); // 2026-06-14 不是节日
-        assert!(expand_template("今天是$LF", &plain).is_none());
+        assert_eq!(expand_template("今天是$LF", &plain).unwrap(), "今天是");
+        // 追加式写法：平常日子只少了节日名，日期部分照常
+        assert_eq!(
+            expand_template("$LY年$LMD$LF", &plain).unwrap(),
+            "丙午年四月廿九"
+        );
 
         let duanwu = Local.with_ymd_and_hms(2026, 6, 19, 9, 0, 0).unwrap();
         assert_eq!(
             expand_template("今天是$LF", &duanwu).unwrap(),
             "今天是端午节"
         );
+        assert_eq!(
+            expand_template("$LY年$LMD$LF", &duanwu).unwrap(),
+            "丙午年五月初五端午节"
+        );
         assert_eq!(expand_template("$LMD", &duanwu).unwrap(), "五月初五");
+    }
+
+    /// ★ 用户实际写的那条短语：紧邻的四个农历变量必须各自独立展开。
+    ///
+    /// 两件事同时压：变量名边界（`$LMD` 不能被切成 `$LM`+`D`、`$LY` 不能吞掉后面的 `$LZ`），
+    /// 以及非节日下 `$LF` 不再毒杀整条。
+    #[test]
+    fn test_expand_adjacent_lunar_vars() {
+        let plain = fixed(); // 2026-06-14 非节日
+        assert_eq!(
+            expand_template("$LY$LZ$LMD$LF", &plain).unwrap(),
+            "丙午马四月廿九"
+        );
+        let duanwu = Local.with_ymd_and_hms(2026, 6, 19, 9, 0, 0).unwrap();
+        assert_eq!(
+            expand_template("$LY$LZ$LMD$LF", &duanwu).unwrap(),
+            "丙午马五月初五端午节"
+        );
+        // $LM 与 $LMD 是不同变量，紧邻时不得相互吞并
+        assert_eq!(
+            expand_template("$LM|$LD|$LMD", &plain).unwrap(),
+            "四月|廿九|四月廿九"
+        );
+        // $LY 与 $LYN 同理（前者干支、后者农历年数字）
+        assert_eq!(expand_template("$LY|$LYN", &plain).unwrap(), "丙午|2026");
+    }
+
+    /// ★ 写错的变量名仍须整条作废——「取不到值给空串」不能退化成「什么都放行」。
+    ///
+    /// 这两件事共用一个 `Option`，改 `$LF` 时最容易连带打穿这道保护。
+    #[test]
+    fn test_unknown_var_still_kills_template() {
+        let now = fixed();
+        assert!(expand_template("$LNOPE", &now).is_none());
+        assert!(expand_template("农历$LMD$NOPE", &now).is_none());
     }
 
     #[test]
@@ -1098,6 +1165,65 @@ mod tests {
         assert_eq!(got[0].text, "2026-06-14");
         assert!(got[0].command_src.is_none());
         assert!(got[0].nav_code.is_none());
+    }
+
+    /// ★ 两条路径对同一条短语必须**同处置**——这是用户实际踩到的那个 bug。
+    ///
+    /// 前缀路径曾是 `unwrap_or_else(|| t.clone())`「展开失败退回原文」，于是打全码一个候选
+    /// 都没有、打前缀反而看得见字面 `$LY$LZ$LMD$LF` 且选中即原样上屏。同一条短语在两条
+    /// 路径上现象相反，是最难被用户描述清楚的一类故障。
+    ///
+    /// 用**写错的变量名**做样本而非 `$LF`：`$LF` 如今展开成空串、根本走不到失败分支，
+    /// 拿它当样本这条测试会恒绿而压不住任何东西。
+    #[test]
+    fn test_prefix_and_exact_agree_on_broken_template() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "rq".into(),
+            vec![PhraseEntry {
+                text: "农历$NOPE".into(),
+                weight: 500,
+                position: 0,
+                is_system: false,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        // 前缀路径：不得出候选，更不得把字面 `$NOPE` 端上来
+        let pre = layer.lookup_prefix_at("r", fixed(), &[], 1);
+        assert!(
+            pre.is_empty(),
+            "展开失败的模板不该出现在前缀候选里，实得 {:?}",
+            pre.iter().map(|h| &h.text).collect::<Vec<_>>()
+        );
+        // 精确路径：同样不出候选
+        let exact = layer.lookup_at("rq", fixed(), &[], &no_clip());
+        assert!(exact.is_empty(), "精确路径同样应跳过该条");
+    }
+
+    /// ★ 含 `$LF` 的短语在**非节日**要照常出候选，两条路径都是。
+    ///
+    /// 这是「一年 355 天打不出来」的正面覆盖：`$LF` 展开成空串而非毒杀整条。
+    #[test]
+    fn test_lunar_festival_phrase_survives_ordinary_days() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "nl".into(),
+            vec![PhraseEntry {
+                text: "$LY年$LMD$LF".into(),
+                weight: 500,
+                position: 0,
+                is_system: false,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        // fixed() = 2026-06-14，非节日
+        let exact = layer.lookup_at("nl", fixed(), &[], &no_clip());
+        assert_eq!(exact.len(), 1, "非节日也该出候选");
+        assert_eq!(exact[0].text, "丙午年四月廿九");
+
+        let pre = layer.lookup_prefix_at("n", fixed(), &[], 1);
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].text, "丙午年四月廿九", "两条路径给出同一个答案");
     }
 
     #[test]
