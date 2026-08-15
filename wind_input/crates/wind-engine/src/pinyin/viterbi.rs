@@ -5,6 +5,14 @@
 
 use crate::pinyin::grammar::Grammar;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{Level, debug, enabled, info};
+
+/// 开启语法模型后，每多少次解码汇总一条 INFO 性能日志。
+///
+/// 取 50：一次按键即一次解码，打几句话就能看到一条，既够快感知、又不刷屏。
+/// 关闭语法模型时**一条都不出**——没开这功能的用户不该在日志里看见它。
+const PERF_LOG_EVERY: u64 = 50;
 
 /// Viterbi 解码结果
 #[derive(Debug, Clone)]
@@ -82,6 +90,20 @@ const BEAM_WIDTH: usize = 7;
 /// vs `BeamSearch`）的意图，这里用一次 `match` 在运行时达到同样效果。
 pub struct ViterbiDecoder {
     grammar: Option<Arc<dyn Grammar>>,
+    /// 性能汇总累加器。**仅语法模型开启时写入**——关闭时一次原子操作都不做。
+    perf: PerfStats,
+}
+
+/// 解码性能的滚动累加，每 [`PERF_LOG_EVERY`] 次汇总一条 INFO 后清零。
+///
+/// 用原子量而非 `Mutex`：`decode` 收 `&self`（引擎跨线程共享），而这里只是计数，
+/// 各字段之间不需要互相一致——汇总日志差一两次采样无所谓，不值得为它上锁。
+#[derive(Default)]
+struct PerfStats {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+    queries: AtomicU64,
 }
 
 impl Default for ViterbiDecoder {
@@ -92,13 +114,17 @@ impl Default for ViterbiDecoder {
 
 impl ViterbiDecoder {
     pub fn new() -> Self {
-        Self { grammar: None }
+        Self {
+            grammar: None,
+            perf: PerfStats::default(),
+        }
     }
 
     /// 挂载上下文模型。
     pub fn with_grammar(grammar: Arc<dyn Grammar>) -> Self {
         Self {
             grammar: Some(grammar),
+            perf: PerfStats::default(),
         }
     }
 
@@ -200,10 +226,78 @@ impl ViterbiDecoder {
                 boundary: 0,
             };
         }
-        match self.grammar.as_deref() {
+
+        // ★ 计时本身也要守「关闭时零开销」：`Instant::now` 有几十纳秒成本，
+        // 关闭语法模型且未开 DEBUG 时一次都不取——那条路径的存在意义就是
+        // 「没开这功能的用户一分钱都不用付」，不能被诊断代码破坏。
+        // 开启时无条件计时：都已经付了搭配查询的钱，这点开销不值一提，
+        // 而 INFO 汇总需要它。
+        let on = self.grammar.is_some();
+        let started = (on || enabled!(Level::DEBUG)).then(std::time::Instant::now);
+
+        let mut queries = 0u64;
+        let result = match self.grammar.as_deref() {
             None => Self::decode_dp(nodes, input_len),
-            Some(g) => Self::decode_beam(nodes, input_len, g),
+            Some(g) => Self::decode_beam(nodes, input_len, g, &mut queries),
+        };
+
+        if let Some(t0) = started {
+            let us = t0.elapsed().as_micros() as u64;
+            self.log_perf(on, input_len, nodes, &result, queries, us);
         }
+        result
+    }
+
+    /// 记一次解码的性能。**只记数量与耗时，绝不记输入串或候选文本**
+    /// （日志隐私：INFO 及以下不得出现用户输入内容）。
+    ///
+    /// 两级分工：
+    /// - `DEBUG` 每次一条明细，用于定位「哪一次解码慢」；
+    /// - `INFO` 每 [`PERF_LOG_EVERY`] 次汇总一条，**仅语法模型开启时**，
+    ///   让人不必开 DEBUG 就能感知开启它的代价。
+    fn log_perf(
+        &self,
+        on: bool,
+        input_len: usize,
+        nodes: &[Vec<WordNode>],
+        result: &ViterbiResult,
+        queries: u64,
+        us: u64,
+    ) {
+        if enabled!(Level::DEBUG) {
+            debug!(
+                grammar = on,
+                input_len,
+                nodes = nodes.iter().map(Vec::len).sum::<usize>(),
+                queries,
+                words = result.words.len(),
+                us,
+                "viterbi 解码"
+            );
+        }
+        if !on {
+            return;
+        }
+        self.perf.total_us.fetch_add(us, Ordering::Relaxed);
+        self.perf.queries.fetch_add(queries, Ordering::Relaxed);
+        self.perf.max_us.fetch_max(us, Ordering::Relaxed);
+        // fetch_add 返回旧值，故 `+1` 后才是本次序号。
+        let n = self.perf.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % PERF_LOG_EVERY != 0 {
+            return;
+        }
+        // 取完即清零，让每条汇总覆盖独立的一段窗口（累计均值会把变化抹平）。
+        let total = self.perf.total_us.swap(0, Ordering::Relaxed);
+        let qs = self.perf.queries.swap(0, Ordering::Relaxed);
+        let max = self.perf.max_us.swap(0, Ordering::Relaxed);
+        self.perf.count.store(0, Ordering::Relaxed);
+        info!(
+            decodes = PERF_LOG_EVERY,
+            avg_us = total / PERF_LOG_EVERY,
+            max_us = max,
+            avg_queries = qs / PERF_LOG_EVERY,
+            "语法模型解码性能（近 {PERF_LOG_EVERY} 次）"
+        );
     }
 
     /// 单状态 DP：每个位置只保留一条最优路径。
@@ -287,6 +381,7 @@ impl ViterbiDecoder {
         nodes: &[Vec<WordNode>],
         input_len: usize,
         grammar: &dyn Grammar,
+        queries: &mut u64,
     ) -> ViterbiResult {
         // dp[i] = 到达位置 i 的候选线集合（按末词区分，至多 BEAM_WIDTH 条，分数降序）。
         // 空集合 = 该位置不可达（单状态那侧用 log_prob == NEG_INFINITY 表达同一件事）。
@@ -332,6 +427,7 @@ impl ViterbiDecoder {
                 let target = &mut right[0];
 
                 // 从该位置保留的每条线各扩展一次（beam 宽度即为线数上限）。
+                *queries += src_states.len() as u64;
                 for src in src_states.iter() {
                     // 对齐 librime `Grammar::Evaluate` 的加法形态（`grammar.h:18-26`）。
                     let ctx_score = grammar.query(&Self::context_of(src), &node.word, is_rear);
