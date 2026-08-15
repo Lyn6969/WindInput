@@ -185,6 +185,16 @@ min_syllables = 2
 # 4 以上才够 `zhonghuar`（3 音节）补出 7 音节的「中华人民共和国」。
 max_extra_syllables = 3
 
+# 上下文语言模型（n-gram）。
+# ⚠️ 实验性，尚未正式发布：默认关闭，且不随安装包提供模型文件。
+# 设计、实测与开启方式见 docs/design/language-model-integration.md。
+
+[schema.pinyin.grammar]
+# 0 = 关闭（默认）。关闭时不读模型文件、不占内存，整句结果与没有该功能时逐位相同。
+weight = 0.0
+# 模型文件名，相对 data/schemas/pinyin/grammar/。缺失时自动降级为关闭。
+model = "zh-hans-bgw.gram"
+
 # 拼音自动造词。
 
 [schema.pinyin.auto_learn]

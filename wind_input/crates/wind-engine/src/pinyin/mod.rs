@@ -14,9 +14,11 @@
 pub mod dag;
 pub mod fuzzy;
 pub mod generate;
+pub mod grammar;
 pub mod interp;
 pub mod lattice;
 pub mod mixed_abbrev;
+pub mod octagram;
 pub mod parser;
 pub mod scorer;
 pub mod shuangpin;
@@ -569,7 +571,10 @@ pub struct PinyinEngine {
 
 impl PinyinEngine {
     /// （`with_unigram` 已随 unigram 表并回 dict 移除，见 `lattice::score_node_inner`：
-    /// 词图打分改用词条自身的词典权重，引擎不再需要持有语言模型。）
+    /// 词图打分改用词条自身的**词典权重**。
+    ///
+    /// 注意这句话只对 **unigram** 成立：`with_grammar` 挂的是 n-gram **上下文**模型，
+    /// 提供的是词典里没有的信息——词与词之间的搭配强度，与那次合并不矛盾。）
     pub fn new(config: Config, dict: CachedDict) -> Self {
         Self {
             config,
@@ -594,6 +599,15 @@ impl PinyinEngine {
     /// 注入模糊音配置（取代 with_unigram 中的 FuzzyConfig::default()）。
     pub fn with_fuzzy(mut self, fuzzy: FuzzyConfig) -> Self {
         self.fuzzy_config = fuzzy;
+        self
+    }
+
+    /// 注入上下文语言模型（链式 builder）。
+    ///
+    /// 挂上之后 Viterbi 会从单状态 DP 切到 beam（见 [`ViterbiDecoder`]），
+    /// 每个转移额外拿一份上下文分。不挂则**逐位**维持原行为。
+    pub fn with_grammar(mut self, grammar: Arc<dyn grammar::Grammar>) -> Self {
+        self.viterbi = ViterbiDecoder::with_grammar(grammar);
         self
     }
 

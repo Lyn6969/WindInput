@@ -400,6 +400,51 @@ pub struct PinyinGlobalConfig {
     /// 双拼相关的全局行为（`[schema.pinyin.shuangpin]`）。
     #[serde(default)]
     pub shuangpin: PinyinShuangpin,
+    /// 上下文语言模型（n-gram 语法模型）。
+    #[serde(default)]
+    pub grammar: PinyinGrammar,
+}
+
+/// 上下文语言模型（`[schema.pinyin.grammar]`）。
+///
+/// 整句解码原本只有 unigram（词频），分不出「是想 / 思想」这类需要上下文才能定夺的解读。
+/// 本段挂上一个 n-gram 搭配模型给**词与词之间的转移**打分。
+/// 设计与实测见 `docs/design/language-model-integration.md`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PinyinGrammar {
+    /// 影响力权重。**0 = 关闭**：不加载模型文件、不占内存，且整句结果与没有这个
+    /// 功能时**逐位相同**。
+    ///
+    /// 之所以默认关闭：接上模型会大幅重排整句结果（实测跨词边界命中率 88%、
+    /// 搭配分跨度 12.76 nat，是每词固定罚 `WORD_PENALTY`=3.0 的四倍以上），
+    /// 相关常数需要整套重新标定后才谈得上默认开启。
+    #[serde(default = "default_grammar_weight")]
+    pub weight: f64,
+    /// 模型文件名，相对 `data/schemas/pinyin/grammar/`。
+    ///
+    /// 格式是 librime-octagram 的 `.gram`（darts-clone double-array）。
+    /// 模型数据**不随安装包分发**（许可与体积，见设计文档 §5），缺失时自动降级为关闭。
+    #[serde(default = "default_grammar_model")]
+    pub model: String,
+}
+
+fn default_grammar_weight() -> f64 {
+    0.0
+}
+
+fn default_grammar_model() -> String {
+    // 词级（bgw）比字级（bgc）稳健：后者只看字对频次、不理解词边界，实测会把
+    // 「明天再见」改成「明天在建」。标定细节见设计文档 §7 P3。
+    "zh-hans-bgw.gram".to_string()
+}
+
+impl Default for PinyinGrammar {
+    fn default() -> Self {
+        Self {
+            weight: default_grammar_weight(),
+            model: default_grammar_model(),
+        }
+    }
 }
 
 /// 双拼相关的**全局**行为（`[schema.pinyin.shuangpin]`）。
@@ -487,6 +532,7 @@ impl Default for PinyinGlobalConfig {
             auto_learn: AutoLearnConfig::default(),
             completion: PinyinCompletion::default(),
             shuangpin: PinyinShuangpin::default(),
+            grammar: PinyinGrammar::default(),
         }
     }
 }

@@ -72,6 +72,16 @@ fn manager(dir: &Path) -> EngineManager {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["pinyin".to_string()];
     cfg.schema.active = "pinyin".to_string();
+    // 语法模型权重（标定用）。默认 0 = 不加载模型，各项指标应与「没有这功能」时逐位相同。
+    // 标定：`WIND_PINYIN_EVAL_GRAM_WEIGHT=0.2 cargo test ... -- --ignored --nocapture`
+    // ⚠️ 需要 build_dev/data/schemas/pinyin/grammar/ 下有 .gram，否则引擎会
+    // 降级为关闭并只在日志里 warn——**看到指标没变先确认模型真的加载了**。
+    if let Some(w) = std::env::var("WIND_PINYIN_EVAL_GRAM_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        cfg.schema.pinyin.grammar.weight = w;
+    }
     EngineManager::new(&cfg, Some(dir))
 }
 

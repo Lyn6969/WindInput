@@ -2714,6 +2714,34 @@ impl EngineManager {
                 allow_full_pinyin: pg.shuangpin.allow_full_pinyin && mix_pinyin.is_none(),
             };
             let mut engine = PinyinEngine::new(pcfg, dict).with_fuzzy(fuzzy.clone());
+            // 上下文语言模型：weight=0（默认）时**根本不读文件**——既省内存，
+            // 也让「没配就等于没这功能」在字节层面成立。
+            // 模型数据不随安装包分发，缺失时降级为关闭而非报错（见设计文档 §5）。
+            if pinyin_cfg.grammar.weight != 0.0 {
+                let gram_path = schemas
+                    .join("pinyin")
+                    .join("grammar")
+                    .join(&pinyin_cfg.grammar.model);
+                let gcfg = crate::pinyin::octagram::OctagramConfig {
+                    weight: pinyin_cfg.grammar.weight,
+                    ..Default::default()
+                };
+                match crate::pinyin::octagram::OctagramGrammar::open(&gram_path, gcfg) {
+                    Ok(g) => {
+                        info!(
+                            "Loaded grammar model {} ({} units, weight={})",
+                            gram_path.display(),
+                            g.unit_count(),
+                            pinyin_cfg.grammar.weight
+                        );
+                        engine = engine.with_grammar(Arc::new(g));
+                    }
+                    Err(e) => warn!(
+                        "Grammar model unavailable ({}), context scoring disabled: {e:#}",
+                        gram_path.display()
+                    ),
+                }
+            }
             // 双拼方案：按 layout 加载布局并注入 ShuangpinConverter
             if schema
                 .engine

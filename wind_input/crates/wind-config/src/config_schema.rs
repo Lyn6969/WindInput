@@ -160,6 +160,9 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.auto_learn.promote_count", Int),
     f("schema.pinyin.completion.min_syllables", Int),
     f("schema.pinyin.completion.max_extra_syllables", Int),
+    // 上下文语言模型（n-gram）。weight=0 时不加载模型文件，整句结果与没有该功能时逐位相同。
+    f("schema.pinyin.grammar.weight", Float),
+    f("schema.pinyin.grammar.model", Str),
     // 双拼下的全拼降级输入（多人共用机器）。非双拼方案无效，混输次引擎强制关闭。
     // 落在 [schema.pinyin.shuangpin] 子段：它只对双拼有意义，不该混在「所有拼音方案共用」
     // 的顶层里（与 fuzzy/frequency/completion 同为子段）。
