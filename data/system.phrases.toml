@@ -37,6 +37,21 @@ text = '${YC}年${MC}月${DC}日'
 weight = 800
 position = 5
 
+# 农历补两条，weight 低于全部公历形态故恒排其后。$LF 在非节日展开为空，
+# 于是同一条模板平常日子给「农历四月廿九」、端午当天给「农历五月初五端午节」。
+# 农历大全见 zznl。
+[[phrases]]
+code = 'date'
+text = '农历$LMD$LF'
+weight = 600
+position = 6
+
+[[phrases]]
+code = 'date'
+text = '$LY$LZ年$LMD$LF'
+weight = 600
+position = 7
+
 [[phrases]]
 code = 'time'
 text = '$HH:$mm:$ss'
@@ -275,6 +290,72 @@ code = 'zzrq'
 text = '${YC}年${MC}月${DC}日'
 weight = 800
 position = 5
+
+# 与 date 同两条（zzrq 是 date 的 zz 系列入口，两者内容必须一致）。
+[[phrases]]
+code = 'zzrq'
+text = '农历$LMD$LF'
+weight = 600
+position = 6
+
+[[phrases]]
+code = 'zzrq'
+text = '$LY$LZ年$LMD$LF'
+weight = 600
+position = 7
+
+# 农历专用组。取的是**当天**的农历，与快捷输入 `;2026.6.19` 的农历候选同一套换算。
+#
+# $LF（传统节日）在非节日展开为空，故带它的条目平常日子只是少一段、照常出候选；
+# 而 position 7 那条**只有** $LF，整条展开为空时会被丢弃——于是它只在春节、端午、
+# 中秋这些日子自己冒出来，平时不占位。这是「条件性条目」的推荐写法。
+[[phrases]]
+code = 'zznl'
+text = '农历$LMD$LF'
+weight = 1000
+position = 1
+
+[[phrases]]
+code = 'zznl'
+text = '$LMD'
+weight = 900
+position = 2
+
+[[phrases]]
+code = 'zznl'
+text = '$LY$LZ年$LMD$LF'
+weight = 900
+position = 3
+
+[[phrases]]
+code = 'zznl'
+text = '$LYN年$LMD'
+weight = 800
+position = 4
+
+[[phrases]]
+code = 'zznl'
+text = '$LY年'
+weight = 800
+position = 5
+
+[[phrases]]
+code = 'zznl'
+text = '$LZ年'
+weight = 800
+position = 6
+
+[[phrases]]
+code = 'zznl'
+text = '$LF'
+weight = 800
+position = 7
+
+[[phrases]]
+code = 'zznl'
+text = '$Y年$M月$D日 农历$LMD$LF'
+weight = 700
+position = 8
 
 [[phrases]]
 code = 'zzsj'
