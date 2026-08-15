@@ -294,7 +294,7 @@ impl MobileCore {
         if !self.coord.should_handle_key(&probe) {
             return KeyOutcome::passthrough();
         }
-        wind_coordinator::edit_ops::to_outcome(dispatch_key(&self.coord, vk))
+        wind_coordinator::edit_ops::to_outcome(dispatch_key(&self.coord, vk, modifiers))
     }
 
     /// 焦点获得（对应 Android `onStartInput`）。
@@ -538,11 +538,19 @@ fn scan_installed_schemas(data_dir: &Path) -> Vec<String> {
 /// 喂键。**不再喂合成 caret**：核心侧 `set_caret_independent(true)` 已让首显闸门
 /// 对自绘候选的宿主直接放行。此前这里必须编造一组非零坐标去骗过闸门
 /// （`height` 写 0 还会被判为「宿主尚未 reflow」整帧丢弃，候选一次都不下发）。
-fn dispatch_key(coord: &Coordinator, vk: u32) -> BridgeKeyAction {
+fn dispatch_key(coord: &Coordinator, vk: u32, modifiers: u32) -> BridgeKeyAction {
     coord.handle_key_event(&KeyEventData {
         key_code: vk,
         scan_code: 0,
-        modifiers: 0,
+        // ⚠ 必须原样透传，**不能写死 0**。此前这里是 0，而吃键判定
+        // （`should_handle_key`）却收到了真实的 modifiers——判定看得见 Shift、
+        // 派发看不见，两边对同一次按键的认知不一致。
+        //
+        // 后果不是崩溃而是功能缺失：宿主为了让 Shift+字母出大写，只能在 K 侧
+        // 绕过引擎直接上屏一个大写字母，于是中文输入中途按 Shift 会**打断组合**
+        // ——用户看到的是「按了 Shift 就只出一个英文字母」。修好这里之后，
+        // Shift 的语义交还给核心按键链（它本就有完整的修饰键转换，见 key_convert.rs）。
+        modifiers,
         event_type: EVENT_KEY_DOWN,
         toggles: 0,
         event_seq: 0,
