@@ -252,7 +252,7 @@ const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 /// 计算机课 41 ✗ / 种花人 0 ✗ 不让位。
 const SENTENCE_YIELD_WEIGHT_FLOOR: i32 = COMPLETION_FAR_WEIGHT_FLOOR / 2;
 
-/// step 6.5b 的**反向闸门**：残码整句强出这个倍数时不让位（配合
+/// step 6.5b 的**反向闸门**：补全侧最强者弱于此值时，残码整句不让位（配合
 /// [`SENTENCE_KEEP_MAX_COMPLETED_SYLS`] 使用）。
 ///
 /// ## 要治的病
@@ -264,32 +264,38 @@ const SENTENCE_YIELD_WEIGHT_FLOOR: i32 = COMPLETION_FAR_WEIGHT_FLOOR / 2;
 /// 而「在吗」在词库里 `w=0`（`base.dict.yaml:103576`），补全路径**根本给不出它**
 /// —— 唯一的出路被自己该保护的规则堵死。
 ///
-/// ## 判据为什么是「倍数」而不是别的
+/// ## 判据为什么是「补全侧的绝对词频」
 ///
-/// 试过并**实测否决**的三条：
+/// 要回答的问题是「**词库在这个码上给不出好答案吗**」：补全侧最强者越弱，越说明该码上的
+/// 正解缺频（正是 `w=0` 的病征），此时整句解码（走单字乘积、不吃词条频率）更可信。
+///
+/// 实测否决过四条：
 /// - **整句一律豁免**：`beijingd`→「背景的」、`zhongguorenm`→「中国人吗」当场翻上首位
 ///   （两条都是现有断言），高频字拼出的虚高合成解会全面翻盘；
 /// - **词库中有无同名词条**：「在吗」有(w=0)、「你和」也有(w=0)，区分不开；
-/// - **词条 w 是否为 0**：同上，两者都是 0。
+/// - **词条 w 是否为 0**：同上，两者都是 0；
+/// - **整句/补全的倍数**：⚠️ 首版用的就是它（24×），但它要拿**整句分数**去比，而那正是
+///   被语法模型平移的一轴 —— 开启万象模型(w=0.5)后 `zaim` 的「在吗」从 61.3× 掉到 14.0×，
+///   被自己的闸门拦掉，真机复现为「zdm 还是在美国」。跨轴比较的病根一直在，只是
+///   grammar 关闭时恰好没暴露。
 ///
-/// 倍数衡量的是「**词库在这个码上给不出好答案吗**」：补全侧最强者越弱，越说明该码上的
-/// 正解缺频（正是 `w=0` 的病征），此时整句解码（走单字乘积，不吃词条频率）更可信。
+/// **词频是单轴的、且完全不受 grammar 影响**，故改用它。
 ///
-/// ## 取值 24 的标定（真实词库，`completed_syls == 1` 全样本）
+/// ## 取值 2500 的标定（真实词库，`completed_syls == 1` 全样本，grammar 开/关一致）
 ///
-/// | 倍数 | 场景 | 该谁赢 |
+/// | 补全侧最强 | 场景 | 该谁赢 |
 /// |---|---|---|
-/// | **61.3×** | `zaim` 在吗(50189) vs 再买(819) | **整句** |
-/// | 9.0× | `shih` 是和 vs 适合(20624) | 补全 |
-/// | 8.8× | `nih` 你和 vs 你会(11131) | 补全 |
-/// | ≤1.0× | wom/tam/nim/zenm/zhem/shenm/zhid/yinw/xiex/meig/haiy/meiy/bush/jiush/dansh | 补全 |
+/// | **819** | `zaim` 再买 | **整句**（正解「在吗」w=0，补全给不出） |
+/// | 6363 | `xiex` 谢谢 | 补全 |
+/// | 11131 | `nih` 你会 | 补全 |
+/// | 20624 | `shih` 适合 | 补全 |
+/// | 31281 ~ 237059 | zhid/zenm/nim/shenm/meig/haiy/tam/wom/meiy/yinw | 补全 |
 ///
-/// 第一名 61.3× 与第二名 9.0× 之间空着近 7 倍，24 落在中间、两侧各留 2.6×。
-/// ⚠️ 这道缝是**分层之后**才有的：不限完成音节数时 `duibuq` 的错解「对不去」拿 32.4×、
-/// 而正解型的 `jisuanjik`「计算机看」只有 35.8×，缝仅剩 6%，任何取值都是过拟合。
-const SENTENCE_KEEP_RATIO: i64 = 24;
+/// 819 与 6363 之间空着 7.8 倍，2500 落在中间、两侧各留 ~3×。同一组取值在
+/// grammar 关闭与万象 w=0.5 下**都成立**，标定探针见 `grammar_ratio_calibration`。
+const COMPLETION_WEAK_CEILING: i32 = 2500;
 
-/// [`SENTENCE_KEEP_RATIO`] 的**适用范围**：只在已完成音节数 ≤ 此值时允许整句反压补全。
+/// [`COMPLETION_WEAK_CEILING`] 的**适用范围**：只在已完成音节数 ≤ 此值时允许整句反压补全。
 ///
 /// **这是基于实测的范围限制，不是从第一性原理推出的**，故取值写死为 1 而非做成配置：
 /// 已完成 ≥ 2 个音节时，补全侧有更长的上下文约束、置信度实测更高，且现有断言
@@ -297,8 +303,10 @@ const SENTENCE_KEEP_RATIO: i64 = 24;
 /// 全部要求补全赢。只有「1 个完整音节 + 残码」这一层是词频缺失的重灾区
 /// ——上下文最短，词库一旦缺频就再没有别的信号能把正解托上来。
 ///
-/// 放宽此值前必须重跑 `sentence_yield_ratio_calibration` 探针：`duibuq`(2 音节) 的
-/// 错解「对不去」拿 32.4×，一旦放行到 2 就会越过 [`SENTENCE_KEEP_RATIO`] 顶掉「对不起」。
+/// 放宽此值前必须重跑标定探针。**放到 2 会当场打破两条现有断言**：`beijingd` 的补全
+/// 「北京的」只有 1738、`zhongguorenm` 的「中国人民」只有 605，双双低于
+/// [`COMPLETION_WEAK_CEILING`]，于是错解「背景的」「中国人吗」会翻上首位。
+///（`duibuq` 反而安全 —— 它的「对不起」有 3984，够不着那道门槛。）
 const SENTENCE_KEEP_MAX_COMPLETED_SYLS: u32 = 1;
 
 /// 前缀补全的**每音节权重折扣**：候选每比已输入内容多出一个音节，权重打对折。
@@ -2768,8 +2776,11 @@ impl Engine for PinyinEngine {
         if let Some((text, weight, boundary)) = short_sentence_pending {
             // 补全侧没有「恰好用完残码」的答案（None）时无从比较，放行 —— 与本文件
             // 「无信息一律放行」一致，且那种情况下整句本就是唯一的整串解释。
+            // 补全侧没有「恰好用完残码」的答案（None）⇒ 词库在这个码上一无所有，放行。
+            // 有答案时：只有它**弱到不像正解**（见 COMPLETION_WEAK_CEILING）才让整句上位，
+            // 且整句本身要真的更强 —— 后者挡住「补全弱、整句更弱」的双差场景。
             let strong_enough = exhausting_completion_max
-                .is_none_or(|max_w| i64::from(weight) > i64::from(max_w) * SENTENCE_KEEP_RATIO);
+                .is_none_or(|max_w| max_w < COMPLETION_WEAK_CEILING && weight > max_w);
             if strong_enough {
                 if let Some(existing) = candidates.iter_mut().find(|c| c.text == text) {
                     // 同文合并：step 4 已把它当前缀补全召回过（`zaim` 的「在吗」w=0）。

@@ -52,6 +52,37 @@ fn config(schema: &str) -> Config {
     cfg
 }
 
+/// 万象语法模型（420MB）是否可用 —— 不随安装包分发，缺失时相关用例自动跳过。
+fn has_grammar() -> bool {
+    data_dir()
+        .join("schemas/pinyin/grammar/wanxiang-lts-zh-hans.gram")
+        .exists()
+}
+
+fn config_with_grammar(schema: &str) -> Config {
+    let mut cfg = config(schema);
+    cfg.schema.pinyin.grammar.model = "wanxiang-lts-zh-hans.gram".into();
+    cfg.schema.pinyin.grammar.weight = 0.5;
+    cfg
+}
+
+fn candidates_with(cfg: Config, input: &str) -> Vec<String> {
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in input.chars() {
+        let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
+        coord.handle_key_event(&KeyEventData {
+            key_code: vk,
+            scan_code: 0,
+            modifiers: 0,
+            event_type: EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        });
+    }
+    coord.debug_all_candidate_texts()
+}
+
 /// 敲入整串，返回协调器的全部候选文本（已按显示序排好）。
 fn candidates_for(schema: &str, input: &str) -> Vec<String> {
     let coord = Coordinator::new_headless(config(schema), Some(&data_dir()));
@@ -159,6 +190,47 @@ fn long_context_still_yields_to_completion() {
             Some(want),
             "{input} 首选应为「{want}」（已完成音节 ≥2，仍由 6.5b 让位给补全），\
              实际前 6: {:?}",
+            cands.iter().take(6).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// **语法模型开启时同样成立** —— 这条是用户真机反馈换来的。
+///
+/// 闸门首版用「整句/补全的倍数」(24×) 做判据，而整句分数正是被语法模型平移的那一轴：
+/// 开启万象(w=0.5)后 `zaim` 的「在吗」从 61.3× 掉到 14.0×，被自己的闸门拦掉，
+/// 真机表现为「zdm 还是在美国」。判据遂改为**补全侧的绝对词频**
+/// （[`COMPLETION_WEAK_CEILING`]，单轴、不受 grammar 影响）。
+///
+/// 谁再把判据换回依赖整句分数的形态，这里当场变红。
+///
+/// [`COMPLETION_WEAK_CEILING`]: 见 `wind_engine::pinyin` 的同名常量
+#[test]
+fn short_context_sentence_survives_grammar() {
+    if !has_pinyin() {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    if !has_grammar() {
+        eprintln!("跳过：万象语法模型不存在（不随包分发）");
+        return;
+    }
+    for (schema, input) in [("shuangpin", "zdm"), ("pinyin", "zaim")] {
+        let cands = candidates_with(config_with_grammar(schema), input);
+        assert_eq!(
+            cands.first().map(String::as_str),
+            Some("在吗"),
+            "{schema}/{input} 开着语法模型时首选也应为「在吗」，实际前 6: {:?}",
+            cands.iter().take(6).collect::<Vec<_>>()
+        );
+    }
+    // 反向：开着语法模型也不许把噪音整句放上来
+    for (input, want) in [("nih", "你会"), ("shih", "适合")] {
+        let cands = candidates_with(config_with_grammar("pinyin"), input);
+        assert_eq!(
+            cands.first().map(String::as_str),
+            Some(want),
+            "{input} 开着语法模型时首选应仍为「{want}」，实际前 6: {:?}",
             cands.iter().take(6).collect::<Vec<_>>()
         );
     }
