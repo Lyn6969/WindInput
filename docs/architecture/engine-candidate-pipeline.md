@@ -462,7 +462,8 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
 - 判据：`consumed_length == 0 || >= input.len()`（0 = 未标注 ⇒ 按整串算）。
   **不可用 `!is_partial` 代替**——Viterbi 整句走 `insert(0)` 不经算 `is_partial` 的闭包
   （`aaw`→「啊啊」consumed=2 而 `is_partial=false`）。
-- 落点：`Engine::convert_requiring_full_match()`，过滤在**拼音引擎内部、排序 `truncate` 之前**。
+- 落点：`Engine::convert_with_opts()` 的 `ConvertOptions::require_full_match`，过滤在**拼音引擎
+  内部、排序 `truncate` 之前**。
   ⚠️ 由调用方拿结果再 `retain` 是错的：简拼候选在 `cmp_match_layers` 里最沉，配额被残码占满时
   它在截断那一步就没了（实测混合简拼「各单位」被压到第 221 位，滤掉残码后回到第 2 位）。
 - 两档独立开关：码长内默认**关**（丢弃），超码长默认**开**（保留）——后者已切入纯拼音语境，
@@ -471,6 +472,30 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
   `wanl` 仍有 151 条候选。判据切在「解释完整度」而非「候选类型」上，正是为此。
 - 连带：`has_pinyin` 随之转假 ⇒ §7.3 的拼音否决①与满码空码清空守护在这类输入下不再拦截
   （`pinyin_may_continue` 那道仍在）。顺带根治 `nunl` 出「嫩」的老问题。
+
+### 7.5c 残码整句的作用域：超码长开、码长内关（`ConvertOptions::allow_partial_final`）
+
+step 2c（尾部残码参与整句解码）此前在混输下**整体关闭**（`manager.rs` 的
+`enable_partial_final: mix_pinyin.is_none()`）。代价：`zaiyebuj` 的尾字母 `j` 不参与组句，
+一条**消费整串**的候选都没有（首选「在也不」只解释 7/8 键，上屏后 `j` 留在缓冲里），
+而纯拼音方案打得出「在也不就」——主流实现均以「优先匹配输入的音节」为准。
+
+关闭的理由（真机 `aaw`，本意五笔 `aawt`→「工作」，整句「啊啊我」消费满 3/3 键后合法跨过
+`is_pinyin_exact_tier` 的闸门抢走首位）**只在码长内成立**：定长码表（五笔 4 码）之外的串
+不可能是码表码。⇒ 判据从「是不是混输」改为「**这串还可能是码表码吗**」，两条路径各自取值：
+
+| | 码长内 | 超码长 |
+|---|---|---|
+| `require_full_match` | 随 `pinyin_partial_candidates`（出厂丢弃） | 随 `..._overflow`（出厂保留） |
+| `allow_partial_final` | 强制 `false` | 强制 `true` |
+
+落点 `MixedEngine::{in_code_len_opts, overflow_opts}`——两侧各写一个方法而不是传 bool，
+是为了让「同一维度在两侧取值相反」这件事在源码里看得见。`manager.rs` 那行**保持 false**
+（默认关、由调用方覆写），使任何未覆写的调用点行为不变；混输里三处判据函数
+（`is_ambiguous_pinyin_word` / `pinyin_claims_overflow` / `pinyin_has_any`）刻意仍走 `convert`。
+
+实测（协调器层显示序）：`zaiyebuj` 首选变为「在也不就」、`buzhidaok` 首选变为「不知道看」，
+`aaw`／`gedw` 一字未变。
 
 ### 7.6 混输其它
 

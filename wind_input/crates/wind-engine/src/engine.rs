@@ -89,34 +89,56 @@ pub struct ConvertResult {
     pub shadow_code: String,
 }
 
-/// 基础引擎接口
-pub trait Engine: Send + Sync {
-    /// 转换输入为候选词列表
-    fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult>;
-
-    /// 同 [`Self::convert`]，但可要求候选**消费整串输入**（`require_full_match`）。
+/// 调用方按**路径**给拼音引擎的取舍覆写（[`Engine::convert_with_opts`]）。
+///
+/// ## ⚠️ 为什么是参数而不是引擎配置
+///
+/// 混输的**主路径（码长内）与超码长路径共用同一个拼音子引擎实例**，而两者的取舍恰好相反。
+/// 做成构造期配置就只能让一个实例表现出两种行为——那是必然出错的形态。
+///
+/// | | 码长内 | 超码长 |
+/// |---|---|---|
+/// | `require_full_match` | 随 `schema.mix.pinyin_partial_candidates`（出厂丢弃半截候选） | 随 `..._overflow`（出厂保留） |
+/// | `allow_partial_final` | 强制 `false` | 强制 `true` |
+///
+/// 判据是**这串还可能是码表码吗**：定长码表（五笔 4 码）之外的串不可能是码，那里已是纯拼音
+/// 语境，两项都该按纯拼音的规矩来。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConvertOptions {
+    /// 候选必须**消费整串输入**，否则在排序截断**之前**丢弃。
     ///
-    /// 只有拼音引擎实现它；其余引擎的候选恒不带 `consumed_length`（视作消费整串），
-    /// 默认转发到 `convert` 即为正确语义。
-    ///
-    /// ## ⚠️ 为什么是参数而不是引擎配置
-    ///
-    /// 混输的**主路径与超码长路径共用同一个拼音子引擎实例**，而两者的取舍不同
-    /// （见 `schema.mix.pinyin_partial_candidates{,_overflow}`）。做成构造期配置就只能
-    /// 让一个实例表现出两种行为——那是必然出错的形态。
-    ///
-    /// ## ⚠️ 过滤必须发生在拼音引擎**内部**（截断之前）
+    /// ## ⚠️ 过滤必须发生在拼音引擎内部（截断之前）
     ///
     /// 拼音引擎是「一次性产生 N 条 + 排序 + `truncate(max_candidates)`」，简拼候选在
     /// `cmp_match_layers` 里是最沉的一层、恒排在部分匹配候选之后。若改由调用方拿到结果再
     /// `retain`，同音字堆满配额时**简拼词早在截断时就没了**——过滤再准也提不了不在场的候选
     /// （同 `MixedEngine::truncate_with_pinyin_quota` 的既有教训）。
     /// 实测 `gedw`：`ge` 的残码同音字 219 条，把混合简拼「各单位」压到第 221 位。
-    fn convert_requiring_full_match(
+    pub require_full_match: bool,
+    /// 覆写 [`crate::pinyin::Config::enable_partial_final`]（尾部残码参与整句解码，step 2c）。
+    /// `None` = 不覆写，用引擎自身配置。
+    ///
+    /// 混输把该配置整体关掉过，理由是五笔码 `aaw`（本意 `aawt`→工作）会被读成「啊啊我」
+    /// 抢首位。但**那个理由只在码长内成立**：超过码表最大码长的串不可能是码表码，关掉它的
+    /// 代价是 `zaiyebuj` 的尾字母 `j` 不参与组句、打不出「在也不就」（纯拼音方案一直打得出）。
+    /// ⇒ 判据从「是不是混输」改为「这串还可能是码表码吗」。
+    pub allow_partial_final: Option<bool>,
+}
+
+/// 基础引擎接口
+pub trait Engine: Send + Sync {
+    /// 转换输入为候选词列表
+    fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult>;
+
+    /// 同 [`Self::convert`]，但按**调用路径**覆写两项取舍（见 [`ConvertOptions`]）。
+    ///
+    /// 只有拼音引擎实现它；其余引擎的候选恒不带 `consumed_length`（视作消费整串）、
+    /// 也没有整句解码，默认转发到 `convert` 即为正确语义。
+    fn convert_with_opts(
         &self,
         input: &str,
         max_candidates: usize,
-        _require_full_match: bool,
+        _opts: ConvertOptions,
     ) -> anyhow::Result<ConvertResult> {
         self.convert(input, max_candidates)
     }

@@ -9,7 +9,7 @@
 //!
 //! 后置：英文候选、简拼长度惩罚（HasFullSyllable）、convertMixedOverflow 精细档。
 
-use crate::engine::{ConvertResult, Engine, EngineType};
+use crate::engine::{ConvertOptions, ConvertResult, Engine, EngineType};
 use wind_candidate::{Candidate, CandidateSource};
 
 /// 拼音候选的**保底配额分母**：截断时至少给拼音留 `max_candidates / 此值` 席
@@ -379,6 +379,31 @@ impl MixedEngine {
         })
     }
 
+    /// 给拼音子引擎的取舍：**码长内**（输入 ≤ 主码表最大码长）。
+    ///
+    /// `allow_partial_final: Some(false)` —— 这一段的击键串同时是码表码，让尾部残码参与整句
+    /// 解码会抢走码表首位（真机 `aaw`，本意五笔 `aawt`→「工作」，首选变成「啊啊我」）。
+    fn in_code_len_opts(&self) -> ConvertOptions {
+        ConvertOptions {
+            require_full_match: !self.pinyin_partial_candidates,
+            allow_partial_final: Some(false),
+        }
+    }
+
+    /// 给拼音子引擎的取舍：**超码长**（输入 > 主码表最大码长）。
+    ///
+    /// `allow_partial_final: Some(true)` —— 定长码表之外的串不可能是码表码，这里已是纯拼音
+    /// 语境，就该按纯拼音的规矩组句（`zaiyebuj` → 「在也不就」，此前尾字母 `j` 被丢下）。
+    ///
+    /// ⚠️ 两侧**各写一个方法而不是给同一个函数传 bool**：它们是两套取值表，摆在一起才看得出
+    /// 「同一维度在两侧取值相反」（对照表见 [`ConvertOptions`]）。
+    fn overflow_opts(&self) -> ConvertOptions {
+        ConvertOptions {
+            require_full_match: !self.pinyin_partial_candidates_overflow,
+            allow_partial_final: Some(true),
+        }
+    }
+
     /// 合并（码表在前、拼音在后）→ 按档位稳定排序 → 按文本去重 → 带拼音保底配额截断。
     fn merge_sort_dedup(
         mut codetable: Vec<Candidate>,
@@ -573,11 +598,7 @@ impl MixedEngine {
             // `pinyin_claims_overflow` / `pinyin_has_any`）**刻意仍走 `convert`**：它们问的是
             // 「拼音够不够格接管这一串 / 这串还算不算中文」，与「哪些候选该显示」正交。
             let py = sec
-                .convert_requiring_full_match(
-                    input,
-                    max_candidates,
-                    !self.pinyin_partial_candidates_overflow,
-                )
+                .convert_with_opts(input, max_candidates, self.overflow_opts())
                 .unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let pinyin_split = Self::pinyin_split_of(&py, input);
@@ -690,11 +711,7 @@ impl MixedEngine {
             // `pinyin_claims_overflow` / `pinyin_has_any`）**刻意仍走 `convert`**：它们问的是
             // 「拼音够不够格接管这一串 / 这串还算不算中文」，与「哪些候选该显示」正交。
             let py = sec
-                .convert_requiring_full_match(
-                    input,
-                    max_candidates,
-                    !self.pinyin_partial_candidates_overflow,
-                )
+                .convert_with_opts(input, max_candidates, self.overflow_opts())
                 .unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let pinyin_split = Self::pinyin_split_of(&py, input);
@@ -788,15 +805,11 @@ impl Engine for MixedEngine {
         let mut pinyin_preedit: Option<String> = None;
         // 高亮跟随用的拆分形态：判据比上面宽（见 `pinyin_split_of`），单音节 + 残码也提供。
         let mut pinyin_split: Option<String> = None;
-        // ⚠️ 走 `convert_requiring_full_match` 而非 `convert`：过滤必须在拼音引擎**内部**、
-        // 排序截断之前发生，在这里拿到结果再 `retain` 会漏掉被截断挤掉的候选（见 trait 文档）。
+        // ⚠️ 走 `convert_with_opts` 而非 `convert`：两项覆写都必须在拼音引擎**内部**生效
+        // （半截过滤要在截断之前，残码整句是生成期的事），在这里拿结果再加工都来不及。
         if input_len >= self.min_pinyin_length
             && let Some(sec) = &self.secondary
-            && let Ok(py) = sec.convert_requiring_full_match(
-                input,
-                max_candidates,
-                !self.pinyin_partial_candidates,
-            )
+            && let Ok(py) = sec.convert_with_opts(input, max_candidates, self.in_code_len_opts())
         {
             pinyin_preedit = Self::pinyin_preedit_of(&py);
             pinyin_split = Self::pinyin_split_of(&py, input);

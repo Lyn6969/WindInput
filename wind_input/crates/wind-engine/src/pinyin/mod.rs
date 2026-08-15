@@ -23,7 +23,7 @@ pub mod shuangpin;
 pub mod syllable;
 pub mod viterbi;
 
-use crate::engine::{ConvertResult, Engine, EngineType};
+use crate::engine::{ConvertOptions, ConvertResult, Engine, EngineType};
 use dag::{Dag, SegGraph};
 use fuzzy::FuzzyConfig;
 use generate::CharPinyinIndex;
@@ -446,9 +446,14 @@ pub struct Config {
     /// 是否让**尾部残码**参与整句解码（step 2c，`buzhidaok`→「不知道看」）。
     /// 默认 true = 纯拼音方案的行为。
     ///
-    /// **混输关闭它**：混输的击键串同时是码表码，把它整串当拼音组句是过度解读。真机现象
-    /// 是打五笔 `aaw`（本意 `aawt`→「工作」）时首选变成拼音「啊啊我」——残码 `w` 被补成
-    /// 「我」后整句消费满 3/3 键，于是跨过「消费整串」这道闸门抢走首位。
+    /// **混输的码长内关闭它**：那一段的击键串同时是码表码，把它整串当拼音组句是过度解读。
+    /// 真机现象是打五笔 `aaw`（本意 `aawt`→「工作」）时首选变成拼音「啊啊我」——残码 `w`
+    /// 被补成「我」后整句消费满 3/3 键，于是跨过「消费整串」这道闸门抢走首位。
+    ///
+    /// ⚠️ **本字段在混输下恒 false，超码长那一侧由调用方经
+    /// [`crate::engine::ConvertOptions::allow_partial_final`] 覆写为放行**：判据是「这串还可能
+    /// 是码表码吗」而非「是不是混输」，定长码表之外的串不可能是码。整体关掉的代价是
+    /// `zaiyebuj` 的尾字母 `j` 不参与组句、打不出「在也不就」（纯拼音一直打得出）。
     ///
     /// ⚠️ **不要复用 [`Self::enable_abbrev`] 当判据**（两者恰好都是「混输时关掉」）：
     /// 一个问「要不要把整串按声母读成简拼」，一个问「要不要把最后半个音节猜完」，
@@ -947,8 +952,9 @@ impl PinyinEngine {
     /// 配置在两条流下表现不一致，本身就是缺陷。
     ///
     /// - **不含简拼**：简拼判据本就走 `abbr_query`（击键域），主路径已覆盖，再来一遍纯属重复；
-    /// - **不含残码补全整句**（主路径 step 2c）：那条路径连混输都要关（`enable_partial_final`），
-    ///   它让整句消费满整串从而跨过若干「消费整串」闸门，副作用面大于收益。
+    /// - **不含残码补全整句**（主路径 step 2c）：它让整句消费满整串从而跨过若干「消费整串」
+    ///   闸门，副作用面大于收益（同一顾虑使混输的**码长内**也关着它，见
+    ///   [`crate::engine::ConvertOptions::allow_partial_final`]）。
     ///
     /// ## 为什么消费长度可以直接取字节数
     ///
@@ -1099,8 +1105,8 @@ impl PinyinEngine {
         //    否则「完整的全拼也能工作」只兑现了一半——词典里没有的搭配全部落空。
         //
         //    在 `completed`（完整音节覆盖段）上建图，对应主路径的 step 2；**不做 step 2c 的
-        //    残码补全**：那条路径连混输都要关掉（`enable_partial_final`），它让整句消费满整串
-        //    从而跨过若干「消费整串」闸门，副作用面比收益大，降级通道不值得冒这个险。
+        //    残码补全**：它让整句消费满整串从而跨过若干「消费整串」闸门，副作用面比收益大，
+        //    降级通道不值得冒这个险（同一顾虑使混输的码长内也关着它，见 `ConvertOptions`）。
         //
         //    切分图走 `from_dag`（多路径）而非 `from_syllables`：全拼的切分是**猜的**，词图该
         //    看到全部切法——这正是它与双拼主路径 `fixed_segmentation` 的分野，也是当初判定
@@ -1467,17 +1473,23 @@ impl Engine for PinyinEngine {
     }
 
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
-        self.convert_requiring_full_match(input, max_candidates, false)
+        self.convert_with_opts(input, max_candidates, ConvertOptions::default())
     }
 
-    /// 拼音引擎的**唯一**转换实现（`convert` 转发至此）。`require_full_match=true` 时在
-    /// 排序截断**之前**丢弃「未消费整串」的候选，见 trait 侧文档的两条 ⚠️。
-    fn convert_requiring_full_match(
+    /// 拼音引擎的**唯一**转换实现（`convert` 转发至此，传全默认的 [`ConvertOptions`]）。
+    /// 两项覆写各自的落点：`require_full_match` 在排序截断**之前**丢弃未消费整串的候选；
+    /// `allow_partial_final` 覆写 step 2c 的入口条件。判据说明见 [`ConvertOptions`]。
+    fn convert_with_opts(
         &self,
         input: &str,
         max_candidates: usize,
-        require_full_match: bool,
+        opts: ConvertOptions,
     ) -> anyhow::Result<ConvertResult> {
+        let require_full_match = opts.require_full_match;
+        // 未覆写时用引擎自身配置（纯拼音方案即走这条）。
+        let allow_partial_final = opts
+            .allow_partial_final
+            .unwrap_or(self.config.enable_partial_final);
         if input.is_empty() {
             return Ok(ConvertResult::default());
         }
@@ -1801,13 +1813,18 @@ impl Engine for PinyinEngine {
         //     残码的字节位在两个域里对不上。分隔符跳过（`!has_sep`）：`completed` 由音节
         //     `join` 得出，`completed_len` 与 `query` 的字节位不同源。
         //
-        //     **混输跳过**（`enable_partial_final`，见该字段文档）：混输的击键串同时是码表码，
-        //     整串当拼音组句会抢走码表首位——真机 `aaw`（本意五笔 `aawt`→工作）首选变成
-        //     「啊啊我」。★ 注意这不是「防线被绕过」而是**防线的前提被改掉**：`is_pinyin_exact_tier`
-        //     靠「拼音整句解释不了全部输入」把它挡在精确档外，step 2c 让它真的消费满整串，
-        //     那道判据便合法地放行了。加新的生成路径时，要回头查有哪些判据隐含假设了它不存在。
+        //     **混输的码长内跳过**（`allow_partial_final`，见 [`ConvertOptions`]）：那里的击键串
+        //     同时是码表码，整串当拼音组句会抢走码表首位——真机 `aaw`（本意五笔 `aawt`→工作）
+        //     首选变成「啊啊我」。★ 注意这不是「防线被绕过」而是**防线的前提被改掉**：
+        //     `is_pinyin_exact_tier` 靠「拼音整句解释不了全部输入」把它挡在精确档外，step 2c
+        //     让它真的消费满整串，那道判据便合法地放行了。加新的生成路径时，要回头查有哪些
+        //     判据隐含假设了它不存在。
+        //
+        //     ⚠️ 判据是**「这串还可能是码表码吗」，不是「是不是混输」**：混输超码长（>码表最大
+        //     码长）的串不可能是码，那里由调用方覆写为放行，否则 `zaiyebuj` 的尾字母 `j` 不参与
+        //     组句、打不出「在也不就」，而纯拼音方案一直打得出。
         if self.config.use_smart_compose
-            && self.config.enable_partial_final
+            && allow_partial_final
             && syllables.len() >= 2
             && completed_len < query.len()
             && sp_result.is_none()
