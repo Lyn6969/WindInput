@@ -85,7 +85,180 @@ const CASES: &[(&str, &str)] = &[
     ("zhejianshiqingbunan", "这件事情不难"),
     ("nihaishiyaoxiaoxin", "你还是要小心"),
     ("dajiadouzhidaole", "大家都知道了"),
+    // ═══ 以下为 2026-08-15 扩充（50 → 200 条）═══
+    //
+    // 50 条太小：一条样本翻转就是 ±2%，而 bigram 的真实效应量本就在 ±2% 附近，
+    // 信号完全淹没在噪声里。扩到 200 条后单条权重降到 0.5%，才谈得上「测得出」。
+    //
+    // 选材仍守原则：**期望值是人工判定的自然中文**，且必须是词库打得出的常用表达；
+    // 生僻词即便 bigram 再准也打不出来，放进来只会制造恒定的失败噪声。
+
+    // —— 「的/得/地」：最高频的同音三分，且只能靠上下文定夺 ——
+    ("nishuodeduibudui", "你说得对不对"),
+    ("tazuodefeichanghao", "他做得非常好"),
+    ("wodexiangfashi", "我的想法是"),
+    ("manmandezoulai", "慢慢地走来"),
+    ("gaoxingdetiaoqilai", "高兴地跳起来"),
+    ("tapaodehenkuai", "他跑得很快"),
+    ("zhegeshiwodedongxi", "这个是我的东西"),
+    ("renzhendeting", "认真地听"),
+    // —— 「在/再」：同音且都高频 ——
+    ("womingtianzaishuo", "我明天再说"),
+    ("tazhengzaigongzuo", "他正在工作"),
+    ("zaijianwodepengyou", "再见我的朋友"),
+    ("womenzaijiadengni", "我们在家等你"),
+    ("zaishuoyibian", "再说一遍"),
+    ("xianzaizainali", "现在在哪里"),
+    // —— 「那/哪」：疑问与指示的同音对立 ——
+    ("younaxieyaoqiu", "有哪些要求"),
+    ("nagerenshishui", "那个人是谁"),
+    ("naliyoumaide", "哪里有卖的"),
+    ("nashiwodeshu", "那是我的书"),
+    ("nizainalishangban", "你在哪里上班"),
+    // —— 「事/是/时」：三向同音，整句里最常见的错解 ——
+    ("zheshijianshiqing", "这是件事情"),
+    ("zhegeshiqinghenji", "这个事情很急"),
+    ("shijieshangzuikuai", "世界上最快"),
+    ("dangshiwobuzhidao", "当时我不知道"),
+    ("youshijiaowo", "有事叫我"),
+    ("zhenshibuhaoyisi", "真是不好意思"),
+    ("gongzuoshijianjieshu", "工作时间结束"),
+    // —— 「他/她/它」与人称 ——
+    ("tashiwodetongshi", "他是我的同事"),
+    ("tamenyijingzoule", "他们已经走了"),
+    ("womenlianggehaopengyou", "我们两个好朋友"),
+    // —— 日常高频整句 ——
+    ("qingshaodengyixia", "请稍等一下"),
+    ("womashanghuilai", "我马上回来"),
+    ("jintianwohenmang", "今天我很忙"),
+    ("mingtianyoushijianma", "明天有时间吗"),
+    ("nizhendetaihaole", "你真的太好了"),
+    ("meishibiekeqi", "没事别客气"),
+    ("zhenduibuqiwolaiwanle", "真对不起我来晚了"),
+    ("ganxienindebangzhu", "感谢您的帮助"),
+    ("qidainindehuifu", "期待您的回复"),
+    ("zhuninshentijiankang", "祝您身体健康"),
+    ("womenmingtianjian", "我们明天见"),
+    ("haojiubujianle", "好久不见了"),
+    ("zuijinzenmeyang", "最近怎么样"),
+    ("wozaikaihui", "我在开会"),
+    ("bushiwodecuo", "不是我的错"),
+    ("zheyangkeyima", "这样可以吗"),
+    ("dangranmeiwenti", "当然没问题"),
+    ("wozhidaolexiexie", "我知道了谢谢"),
+    // —— 工作 / 事务类整句 ——
+    ("wodezhuyaogongzuo", "我的主要工作"),
+    ("zheshiwodezeren", "这是我的责任"),
+    ("tigaogongzuoxiaolv", "提高工作效率"),
+    ("jiejuezhegewenti", "解决这个问题"),
+    ("anpaiyixiashijian", "安排一下时间"),
+    ("qingniquerenyixia", "请你确认一下"),
+    ("womenxuyaotaolun", "我们需要讨论"),
+    ("zhegefanganbucuo", "这个方案不错"),
+    ("mingtianjiaobaogao", "明天交报告"),
+    ("huiyituidaoxiazhou", "会议推到下周"),
+    ("qingchakanfujian", "请查看附件"),
+    ("yijingfageinile", "已经发给你了"),
+    ("wohuijixuguanzhu", "我会继续关注"),
+    ("zhegerenwuwanchengle", "这个任务完成了"),
+    ("xuyaonideyijian", "需要你的意见"),
+    // —— 长句（8 字以上，跨词转移最多）——
+    ("womenxuyaoyigexindefangan", "我们需要一个新的方案"),
+    ("zhegexiangmuyijingwanchengle", "这个项目已经完成了"),
+    ("tamenmingtianhuilaikaihui", "他们明天回来开会"),
+    ("zhejianshiqingxuyaoshijian", "这件事情需要时间"),
+    ("nikeyigaosuwodianhuama", "你可以告诉我电话吗"),
+    ("womendeyijianbutaiyizhi", "我们的意见不太一致"),
+    ("zhegewentibijiaofuza", "这个问题比较复杂"),
+    ("tashuotayaoqubeijing", "他说他要去北京"),
+    ("womenzaigongyuanjianmian", "我们在公园见面"),
+    ("jintianwanshangyiqichifan", "今天晚上一起吃饭"),
+    ("mingtianzaoshangbadianchufa", "明天早上八点出发"),
+    ("wojuedezheyangbutaihao", "我觉得这样不太好"),
+    ("nishifoukeyibangwoyixia", "你是否可以帮我一下"),
+    ("womenyinggaizaikaolvkaolv", "我们应该再考虑考虑"),
+    ("zhebenshuwoyijingkanwanle", "这本书我已经看完了"),
+    ("tadegongzuotaimangle", "他的工作太忙了"),
+    ("womenyaohaohaoxuexi", "我们要好好学习"),
+    ("nishuodehenyoudaoli", "你说得很有道理"),
+    ("tamenyijingchufale", "他们已经出发了"),
+    ("womendejihuayaogaibian", "我们的计划要改变"),
+    ("qingdajiazhuyianquan", "请大家注意安全"),
+    ("zhegedifangwolaiguo", "这个地方我来过"),
+    ("wobuzhidaotazainali", "我不知道他在哪里"),
+    ("mingtiantianqihuizenmeyang", "明天天气会怎么样"),
+    ("womenxiazhouzaijianmian", "我们下周再见面"),
 ];
+
+/// 扩充第二批：数量词、时间、固定搭配、易被字级模型打散的词组。
+///
+/// 与 [`CASES`] 分开只是为了可读，实际评测时两者合并（见 `all_cases`）。
+const CASES_EXT: &[(&str, &str)] = &[
+    // —— 数量词 / 时间：量词与数字最易被同音字冲掉 ——
+    ("mingtianxiawusandian", "明天下午三点"),
+    ("yigongsanbaikuaiqian", "一共三百块钱"),
+    ("dengleyigexiaoshi", "等了一个小时"),
+    ("zoulesanshifenzhong", "走了三十分钟"),
+    ("maileliangjinpingguo", "买了两斤苹果"),
+    ("huafeiliangtianshijian", "花费两天时间"),
+    ("yigongyoushigeren", "一共有十个人"),
+    ("diyicikanjian", "第一次看见"),
+    ("liangnianqiandeshiqing", "两年前的事情"),
+    ("sangeyuehou", "三个月后"),
+    ("shangwujiudiankaishi", "上午九点开始"),
+    ("wanshangbadianjieshu", "晚上八点结束"),
+    ("yitianyici", "一天一次"),
+    ("bannianyihoucaizhidao", "半年以后才知道"),
+    ("jitianneihuifu", "几天内回复"),
+    // —— 固定搭配 / 四字词：整体性强，最能看出模型会不会打散词组 ——
+    ("shishiqiushi", "实事求是"),
+    ("yirujiwang", "一如既往"),
+    ("quanliyifu", "全力以赴"),
+    ("renzhenfuze", "认真负责"),
+    ("zonghekaolv", "综合考虑"),
+    ("jiaqiangguanli", "加强管理"),
+    ("tigaozhiliang", "提高质量"),
+    ("jiejuefangshi", "解决方式"),
+    ("chongfenzhunbei", "充分准备"),
+    ("jijiyingdui", "积极应对"),
+    ("baochilianxi", "保持联系"),
+    ("zhuyianquan", "注意安全"),
+    ("gongtongnuli", "共同努力"),
+    ("xiangguanbumen", "相关部门"),
+    ("jutitiaozheng", "具体调整"),
+    // —— 易被字级模型打散的多字词组（bgc 的已知弱项）——
+    ("shehuizhuyi", "社会主义"),
+    ("jingjifazhan", "经济发展"),
+    ("kejichuangxin", "科技创新"),
+    ("jiaoyugaige", "教育改革"),
+    ("huanjingbaohu", "环境保护"),
+    ("yiliaobaozhang", "医疗保障"),
+    ("wenhuachuancheng", "文化传承"),
+    ("guojiazhengce", "国家政策"),
+    ("chengshijianshe", "城市建设"),
+    ("nongyeshengchan", "农业生产"),
+    ("jinrongshichang", "金融市场"),
+    ("qiyeguanli", "企业管理"),
+    ("renlicaiyuan", "人力资源"),
+    ("shujufenxi", "数据分析"),
+    ("wangluoanquan", "网络安全"),
+    // —— 口语 / 语气结尾 ——
+    ("nikeyibangwokankanma", "你可以帮我看看吗"),
+    ("zhegezenmeyongya", "这个怎么用呀"),
+    ("womenzoubaxianzai", "我们走吧现在"),
+    ("haodejiuzheyangba", "好的就这样吧"),
+    ("nizhendequedingma", "你真的确定吗"),
+    ("shibushizhende", "是不是真的"),
+    ("keyishishima", "可以试试吗"),
+    ("yaobuyaoyiqiqu", "要不要一起去"),
+    ("zenmehuizheyang", "怎么会这样"),
+    ("weishenmebugaosuwo", "为什么不告诉我"),
+];
+
+/// 两批用例合并后的全集。分成两个常量只是为了可读，评测一律走这里。
+fn all_cases() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    CASES.iter().chain(CASES_EXT.iter())
+}
 
 fn data_dir() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
@@ -135,7 +308,7 @@ fn grammar_sentence_report() {
     let (mut base_hit, mut with_hit) = (0usize, 0usize);
     let mut changed: Vec<(&str, &str, String, String)> = Vec::new();
 
-    for &(input, expect) in CASES {
+    for &(input, expect) in all_cases() {
         let b = base.convert_with("pinyin", input, TOP_N).candidates;
         let w = with.convert_with("pinyin", input, TOP_N).candidates;
         let bt = b.first().map(|c| c.text.clone()).unwrap_or_default();
@@ -151,7 +324,7 @@ fn grammar_sentence_report() {
         }
     }
 
-    let n = CASES.len();
+    let n = all_cases().count();
     println!("\n=== 整句评测 (weight={weight}) ===");
     println!("样本 {n}");
     println!(
@@ -176,7 +349,7 @@ fn grammar_sentence_report() {
     }
 
     println!("\n--- 两边一致的样本里仍未命中的 ---");
-    for &(input, expect) in CASES {
+    for &(input, expect) in all_cases() {
         let b = base.convert_with("pinyin", input, TOP_N).candidates;
         let bt = b.first().map(|c| c.text.clone()).unwrap_or_default();
         let w = with.convert_with("pinyin", input, TOP_N).candidates;

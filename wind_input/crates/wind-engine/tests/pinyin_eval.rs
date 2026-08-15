@@ -82,6 +82,11 @@ fn manager(dir: &Path) -> EngineManager {
     {
         cfg.schema.pinyin.grammar.weight = w;
     }
+    // 换模型：bgc（10MB 字级）/ bgw（41MB 词级）/ wanxiang-lts（420MB）的
+    // 质量与开销差别都很大，标定时要能一键切换。
+    if let Ok(m) = std::env::var("WIND_GRAM_MODEL") {
+        cfg.schema.pinyin.grammar.model = m;
+    }
     EngineManager::new(&cfg, Some(dir))
 }
 
