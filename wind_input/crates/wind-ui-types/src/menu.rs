@@ -129,6 +129,10 @@ pub enum MenuCmd {
     /// 语言栏图标（Dev 调试）：在各尺寸档位图左上角烧尺寸标记，
     /// 用于真机确认系统实际取用了哪一档、有没有被二次缩放。
     IconToggleSizeMarks,
+    /// 语言栏图标：全角状态的右上角标记开关。
+    ///
+    /// 与标点角标形状是**两个正交的量**，故单列而非并进那个单选组——它不是"第七种形状"。
+    IconToggleWidthMark,
     /// 语言栏图标（Dev 调试）：外圈跑马灯演示动画。
     ///
     /// 与上面三项不同，它**不持久化**——那三项是「图标长什么样」的偏好，它是一段持续
@@ -206,6 +210,7 @@ impl MenuKind {
                 MenuCmd::IconToggleColors => 127,
                 MenuCmd::IconToggleSizeMarks => 128,
                 MenuCmd::IconToggleDemoAnim => 129,
+                MenuCmd::IconToggleWidthMark => 130,
                 MenuCmd::IconBadgeShape(i) => 10000 + i as i32,
                 MenuCmd::InputDiagToggleSection(i) => 8000 + i as i32,
                 MenuCmd::FirstShowMode(m) => 5000 + m as i32,
@@ -260,6 +265,7 @@ impl MenuKind {
             127 => MenuCmd::IconToggleColors,
             128 => MenuCmd::IconToggleSizeMarks,
             129 => MenuCmd::IconToggleDemoAnim,
+            130 => MenuCmd::IconToggleWidthMark,
             10000..=10099 => MenuCmd::IconBadgeShape((id - 10000) as u8),
             8000..=8999 => MenuCmd::InputDiagToggleSection((id - 8000) as u8),
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),

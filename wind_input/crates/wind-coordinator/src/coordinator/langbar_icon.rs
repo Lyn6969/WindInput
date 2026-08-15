@@ -39,6 +39,10 @@ impl Coordinator {
     ///
     /// 非 Windows 桌面形态下是空操作，故调用方无需自己加 cfg。
     pub fn publish_initial_langbar_icon(&self) {
+        // 先套配置再发布：反过来会先发一张按代码默认渲染的图，随后又被配置版覆盖——
+        // 开机瞬间图标闪一下的来源。apply 内部无变化时不重发，故这里由它兜住首发。
+        #[cfg(all(feature = "desktop-ui", windows))]
+        self.apply_langbar_config();
         self.publish_langbar_icon_now();
     }
 
@@ -72,16 +76,11 @@ impl Coordinator {
             match LangBarIconPublisher::new(suffix, BadgeShape::default()) {
                 Ok(mut p) => {
                     tracing::info!(shm = p.shm_name(), "语言栏图标共享内存已就绪");
-                    // 恢复上次选定的呈现参数。`None`（从未设过）一律不动，保留构造函数
-                    // 给的代码默认——state.toml 侧刻意不重复声明默认值，见其字段注释。
+                    // 纯调试项（不进用户配置）从 state.toml 恢复；呈现参数走 config，
+                    // 由 apply_langbar_config 在构造后与每次配置重载时套用。
+                    // `None`（从未设过）一律不动，保留构造函数给的代码默认。
                     if let Some(dir) = Config::state_dir() {
                         let rs = wind_config::RuntimeState::load(&dir);
-                        if let Some(id) = rs.langbar_icon_shape.as_deref() {
-                            p.set_shape(BadgeShape::from_id(id));
-                        }
-                        if let Some(on) = rs.langbar_icon_colored {
-                            p.set_colored(on);
-                        }
                         if let Some(on) = rs.langbar_icon_size_marks {
                             p.set_size_marks(on);
                         }
@@ -102,8 +101,9 @@ impl Coordinator {
     /// 的症状是「点了菜单毫无变化」、漏掉落盘那步是「重启就忘」，而调试菜单存在的意义
     /// 恰恰是反复比选——两种症状都直接毁掉它。
     ///
-    /// 三项一起写回而不是各写各的：读回时也是三项一起读，写入侧按项分散的话，
-    /// 某一项忘了落盘会表现为「另外两项记住了、这项没有」，比整体失效更难注意到。
+    /// ⚠ **只用于纯调试项**（烧尺寸档标记）。会影响用户可见呈现的那些参数（形状、配色、
+    /// 大小、透明度）一律走 `[ui.langbar]` 配置，由 [`Self::apply_langbar_config`] 落地——
+    /// 两处都能改同一个量就等于有两个真相源，重启后谁赢取决于加载顺序。
     #[cfg(all(feature = "desktop-ui", windows))]
     pub(crate) fn tweak_langbar_icon(
         &self,
@@ -117,8 +117,6 @@ impl Coordinator {
             // state.toml 是多方共用的文件，整体覆盖会抹掉别人的字段。
             if let Some(dir) = Config::state_dir() {
                 let mut rs = wind_config::RuntimeState::load(&dir);
-                rs.langbar_icon_shape = Some(p.shape().as_id().to_string());
-                rs.langbar_icon_colored = Some(p.colored());
                 rs.langbar_icon_size_marks = Some(p.size_marks());
                 if let Err(e) = rs.save(&dir) {
                     tracing::warn!(error = %e, "语言栏图标偏好落盘失败");
@@ -127,6 +125,25 @@ impl Coordinator {
         }
         // 锁已在上面的块尾释放——发布内部还要再取一次同一把锁，留在块内会自锁。
         self.publish_langbar_icon_now();
+    }
+
+    /// 调试菜单改呈现参数：写进**用户配置**并热重载。
+    ///
+    /// 走 `Config::set_user_value` 而不是像纯调试项那样写 state.toml——这些量本就是
+    /// 用户可配的，菜单只是个更顺手的入口。同一个落点也就不存在「菜单改了、配置文件
+    /// 还是旧值」的分裂，以及随之而来的「重启后谁赢取决于加载顺序」。
+    ///
+    /// 顺带白拿一条：`set_user_value` 会把等于出厂默认的值**删掉而非写入**，所以点回
+    /// 默认位不会在用户层留下钉死的显式值（那正是 `auto_commit_block_on_pinyin` 那颗雷）。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    pub(crate) fn set_langbar_config(&self, key: &str, value: toml::Value) {
+        if let Err(e) = Config::set_user_value(&["ui", "langbar", key], value) {
+            tracing::warn!(error = %e, key, "语言栏图标配置落盘失败");
+            return;
+        }
+        // 走完整热重载而不是只改内存：配置的真相在文件里，重载才能保证内存与文件一致。
+        // 重载内部会调 apply_langbar_config 完成重渲重发。
+        self.reload_user_config();
     }
 
     /// 取当前状态，并在**返回之前**把对应的图标位图投进共享内存。
@@ -147,6 +164,72 @@ impl Coordinator {
         #[cfg(all(feature = "desktop-ui", windows))]
         self.publish_langbar_icon(&s);
         s
+    }
+
+    /// 把 `[ui.langbar]` 的呈现参数套到发布器上，有变化就重渲重发。
+    ///
+    /// 构造后与**每次配置重载**都要调一次：配置改了却不重新发布，症状是「改了没反应、
+    /// 重启才生效」——本仓已按这个形态栽过（见运行时镜像态回灌那条）。
+    ///
+    /// 颜色解析失败只记警告并回落内置默认：配置文件是手写的，写错一个色值不该让图标
+    /// 消失或让服务起不来。回落的是**那一项**，不是整段——否则改错一个颜色会连带把
+    /// 形状、大小一起打回默认，用户根本对不上因果。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    pub(crate) fn apply_langbar_config(&self) {
+        use wind_ui::langbar_icon::{BadgeShape, IconRenderer};
+
+        let cfg = { self.rt().config.ui.langbar.clone() };
+
+        // "#RRGGBB" → BGR（渲染器的存储序）。失败记警告并回落内置默认。
+        // 回落的是**那一项**而不是整段：改错一个色值若连带把形状、大小一起打回默认，
+        // 用户根本对不上因果。
+        let parse = |raw: &str, fallback: [u8; 3], what: &str| -> [u8; 3] {
+            match wind_theme::palette::parse_hex(raw) {
+                Some([r, g, b, _]) => [b, g, r],
+                None => {
+                    tracing::warn!(value = raw, item = what, "语言栏图标配色无法解析，沿用默认");
+                    fallback
+                }
+            }
+        };
+
+        // 彩色开关与具体色值的关系：关掉时一律交 None（与主字同色）；开着时用配置色。
+        // 两个标记由同一个开关控制，见 set_colored。
+        let (badge_colors, width_mark_color) = if cfg.colored {
+            let (dcn, den) = IconRenderer::DEFAULT_BADGE_COLORS;
+            let cn = parse(&cfg.punct_color_cn, dcn, "punct_color_cn");
+            let en = parse(&cfg.punct_color_en, den, "punct_color_en");
+            let fw = parse(
+                &cfg.full_width_color,
+                IconRenderer::DEFAULT_WIDTH_MARK_COLOR,
+                "full_width_color",
+            );
+            (Some((cn, en)), Some(fw))
+        } else {
+            (None, None)
+        };
+
+        let changed = {
+            let Ok(mut guard) = Self::icon_publisher().lock() else {
+                return;
+            };
+            let Some(p) = guard.as_mut() else {
+                return;
+            };
+            p.apply_appearance(
+                Some(BadgeShape::from_id(&cfg.punct_badge)),
+                Some(cfg.punct_badge_scale),
+                Some(cfg.full_width_mark),
+                Some(cfg.full_width_mark_scale),
+                Some(cfg.badge_alpha),
+                Some(badge_colors),
+                Some(width_mark_color),
+            )
+        };
+        // 锁已释放——发布内部还要取同一把锁。
+        if changed {
+            self.publish_langbar_icon_now();
+        }
     }
 
     /// 翻转演示动画（外圈跑马灯）开关，并起停驱动线程。
@@ -262,6 +345,9 @@ impl Coordinator {
             } else {
                 PunctBadge::English
             },
+            // 全角标记（右上角小方点）。与标点角标不同，它**不看 effective_chinese**：
+            // 全半角在英文模式下同样生效（英文全角是真实可用的状态），所以只要是全角就画。
+            full_width: s.full_width,
             // 密码框 / 无编辑上下文 / 键盘禁用都是 **DLL 本地判定**的状态，服务端无从得知；
             // 那几种情况下 DLL 根本不读 SHM，直接本地绘制。故这里恒为 false。
             dimmed: false,
@@ -292,5 +378,65 @@ impl Coordinator {
                 false
             }
         }
+    }
+}
+
+/// 配置层与渲染层各存了一份默认值，这里把它们钉在一起。
+///
+/// 起因是一处不可消除的重复：`wind-config` 不能反向依赖 `wind-ui`（层次颠倒），
+/// 而本仓的配置约定要求每个可配置项都有具体默认值并在 `data/config.toml` 里完整列出
+/// （守门测试强制）。于是同一个默认值必然写两遍。
+///
+/// 本 crate 同时依赖两边，是唯一能做这个比对的地方。漂移的症状——「设置页显示的默认
+/// 与图标实际长的样子不一致」——不会自己暴露，只能靠测试拦。
+#[cfg(all(test, feature = "desktop-ui", windows))]
+mod default_parity_tests {
+    use wind_config::LangBarConfig;
+    use wind_ui::langbar_icon::{BadgeShape, IconRenderer};
+
+    /// `#RRGGBB` → BGR，与 `apply_langbar_config` 的换序保持一致。
+    fn hex_to_bgr(s: &str) -> [u8; 3] {
+        let [r, g, b, _] = wind_theme::palette::parse_hex(s).expect("默认色必须能解析");
+        [b, g, r]
+    }
+
+    #[test]
+    fn langbar_config_defaults_match_renderer() {
+        let cfg = LangBarConfig::default();
+
+        assert_eq!(
+            BadgeShape::from_id(&cfg.punct_badge),
+            BadgeShape::default(),
+            "配置默认形状与 BadgeShape::default() 不一致"
+        );
+        assert_eq!(
+            cfg.badge_alpha,
+            IconRenderer::DEFAULT_BADGE_ALPHA,
+            "配置默认不透明度与渲染器不一致"
+        );
+
+        let (cn, en) = IconRenderer::DEFAULT_BADGE_COLORS;
+        assert_eq!(hex_to_bgr(&cfg.punct_color_cn), cn, "中文标点默认色不一致");
+        assert_eq!(hex_to_bgr(&cfg.punct_color_en), en, "英文标点默认色不一致");
+        assert_eq!(
+            hex_to_bgr(&cfg.full_width_color),
+            IconRenderer::DEFAULT_WIDTH_MARK_COLOR,
+            "全角标记默认色不一致"
+        );
+    }
+
+    /// 两个标记默认都关：它们是加在系统图标上的新东西，默认改变所有人的任务栏是过界的。
+    ///
+    /// 单独钉一条而不是并进上面：上面那条防的是「两处默认值漂移」，这条防的是
+    /// 「有人把默认改成开」——后者不是不一致，而是一个产品决定被悄悄推翻。
+    #[test]
+    fn both_markers_are_off_by_default() {
+        let cfg = LangBarConfig::default();
+        assert_eq!(
+            BadgeShape::from_id(&cfg.punct_badge),
+            BadgeShape::None,
+            "标点角标默认必须是关"
+        );
+        assert!(!cfg.full_width_mark, "全角标记默认必须是关");
     }
 }

@@ -57,6 +57,11 @@ impl Coordinator {
             .clone();
         let dark = self.resolve_theme_dark();
         self.push_theme(&name, dark);
+        // 语言栏图标的呈现参数也在配置里（[ui.langbar]）。少了这一步，改了角标形状/配色
+        // 要重启才生效——「改了没反应、重启就好」正是本仓反复出现的那类缺陷（运行时镜像态
+        // 没回灌）。内部自带"无变化则不重发"，故白调一次的成本是零。
+        #[cfg(all(feature = "desktop-ui", windows))]
+        self.apply_langbar_config();
         // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }
 

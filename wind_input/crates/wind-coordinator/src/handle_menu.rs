@@ -217,16 +217,23 @@ impl Coordinator {
                     });
                 }
             }
-            // 语言栏图标调试项：改呈现参数后立即重渲重发。
+            // 语言栏图标：呈现类的三项写用户配置（`[ui.langbar]`，热重载后重渲重发），
+            // 纯调试的两项走 state.toml / 内存。两类落点不同，见 set_langbar_config 的说明。
             // 非 Windows 桌面形态下压根没有发布器，菜单项也不会被构建出来，故是空操作。
             #[cfg(all(feature = "desktop-ui", windows))]
-            MenuCmd::IconBadgeShape(i) => self.tweak_langbar_icon(|p| {
-                p.set_shape(wind_ui::langbar_icon::BadgeShape::from_index(i))
-            }),
+            MenuCmd::IconBadgeShape(i) => {
+                let id = wind_ui::langbar_icon::BadgeShape::from_index(i).as_id();
+                self.set_langbar_config("punct_badge", toml::Value::String(id.to_string()));
+            }
             #[cfg(all(feature = "desktop-ui", windows))]
             MenuCmd::IconToggleColors => {
                 let on = !self.icon_debug_state().map(|s| s.1).unwrap_or(false);
-                self.tweak_langbar_icon(|p| p.set_colored(on));
+                self.set_langbar_config("colored", toml::Value::Boolean(on));
+            }
+            #[cfg(all(feature = "desktop-ui", windows))]
+            MenuCmd::IconToggleWidthMark => {
+                let on = !self.icon_debug_state().map(|s| s.3).unwrap_or(false);
+                self.set_langbar_config("full_width_mark", toml::Value::Boolean(on));
             }
             #[cfg(all(feature = "desktop-ui", windows))]
             MenuCmd::IconToggleSizeMarks => {
@@ -238,19 +245,28 @@ impl Coordinator {
             #[cfg(not(all(feature = "desktop-ui", windows)))]
             MenuCmd::IconBadgeShape(_)
             | MenuCmd::IconToggleColors
+            | MenuCmd::IconToggleWidthMark
             | MenuCmd::IconToggleSizeMarks
             | MenuCmd::IconToggleDemoAnim => {}
         }
     }
 
-    /// 图标发布器当前的呈现参数 `(形状下标, 是否彩色, 是否烧尺寸标记)`；
-    /// 发布器不可用时返回 `None`。菜单勾选态与翻转开关共用它，避免两处各记一份状态
-    /// ——菜单勾选与实际行为不同步会让用户反复点同一项。
+    /// 图标发布器当前的呈现参数 `(形状下标, 是否彩色, 是否烧尺寸标记, 是否显示全角标记)`；
+    /// 发布器不可用时返回 `None`。
+    ///
+    /// 勾选态一律读**渲染器实际生效的值**而不是配置文件：配置写入到生效之间隔着一次
+    /// 热重载，读配置会在重载失败时显示一个并未生效的勾。菜单勾选与实际行为不同步，
+    /// 用户的反应是反复点同一项。
     #[cfg(all(feature = "desktop-ui", windows))]
-    pub(crate) fn icon_debug_state(&self) -> Option<(u8, bool, bool)> {
+    pub(crate) fn icon_debug_state(&self) -> Option<(u8, bool, bool, bool)> {
         let guard = Coordinator::icon_publisher().lock().ok()?;
         let p = guard.as_ref()?;
-        Some((p.shape().index(), p.colored(), p.size_marks()))
+        Some((
+            p.shape().index(),
+            p.colored(),
+            p.size_marks(),
+            p.width_mark(),
+        ))
     }
 
     /// Dev 变体专属的语言栏图标调试子菜单。
@@ -259,14 +275,15 @@ impl Coordinator {
     /// 输入法，成本高到根本比不动。渲染搬到服务端后形状本就是运行时参数，接上菜单后
     /// 比选退化成点几下——这正是当初把渲染从 DLL 挪到服务端换来的东西。
     ///
-    /// 选择记在 state.toml（见 `RuntimeState::langbar_icon_*`）：比选往往跨越好几次
-    /// 部署，而部署必然重启服务——不记住的话每次都被打回默认，等于没得比。
+    /// 呈现类三项（形状 / 彩色 / 全角标记）写用户配置 `[ui.langbar]`，纯调试的
+    /// 两项（尺寸档标记 / 演示动画）走 state.toml 与内存。分两个落点是因为前者本就是
+    /// 用户可配的量，菜单只是个更顺手的入口；两处都能改同一个量就等于有两个真相源。
     #[cfg(all(feature = "desktop-ui", windows))]
     fn build_icon_debug_menu(&self) -> Vec<wind_ui_types::MenuItemSpec> {
         use wind_ui::langbar_icon::BadgeShape;
         use wind_ui_types::MenuItemSpec as M;
         let cmd = |c: MenuCmd| MenuKind::Command(c);
-        let Some((cur_shape, colored, marks)) = self.icon_debug_state() else {
+        let Some((cur_shape, colored, marks, width_mark)) = self.icon_debug_state() else {
             return vec![M::label("图标共享内存不可用")];
         };
         let off = BadgeShape::None;
@@ -289,12 +306,20 @@ impl Coordinator {
             )
         }));
         items.push(M::separator());
-        // 关掉角标时配色无处可施，置灰而非隐藏——菜单项忽隐忽现比置灰更难理解，
-        // 用户会以为功能没了（与状态气泡菜单同一处理）。尺寸标记画在主字上，不受影响。
+        // 全角标记是独立的一个标记（右上角），与上面那组标点角标形状互不相干，
+        // 故单列一项而不是并进形状单选组——它不是"第七种形状"。
         items.push(M::leaf(
-            "彩色角标",
+            "全角标记（右上角）",
+            cmd(MenuCmd::IconToggleWidthMark),
+            true,
+            width_mark,
+        ));
+        // 配色开关同时管两个标记。两者都关掉时它无处可施，置灰而非隐藏——菜单项忽隐忽现
+        // 比置灰更难理解，用户会以为功能没了（与状态气泡菜单同一处理）。
+        items.push(M::leaf(
+            "彩色标记",
             cmd(MenuCmd::IconToggleColors),
-            off.index() != cur_shape,
+            off.index() != cur_shape || width_mark,
             colored,
         ));
         items.push(M::leaf(

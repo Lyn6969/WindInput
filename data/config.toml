@@ -663,6 +663,31 @@ auto_hide_delay = 5
 # 纵向排列：竖着摆放工具栏（默认横条）。几何仍取主题 [toolbar]，条宽=height、每格高=button_width。
 vertical = false
 
+# 语言栏图标 = Windows 任务栏上那个「中/英/拼/五」的输入指示器（仅 Windows）。
+# 这里配的是叠在主字上的两个状态标记：右下角=标点中英，右上角=全角。
+# 两者默认都关——它们是加在系统图标上的新东西，默认改变所有人的任务栏是过界的。
+[ui.langbar]
+# 标点角标形状。none=不显示（默认）｜corner_triangle=右下三角（推荐）
+# 以下三种仅供尝试，设置页不列出：outer_ring=最外圈边框｜bottom_bar=底部横条
+# circle_square / ring_dot 已真机否决（任务栏上像个污点），留着只为兼容旧配置。
+punct_badge = "none"
+# 角标大小倍率（1.0 = 形状自带的基准尺寸）。
+punct_badge_scale = 1.0
+# 全角标记：全角时在右上角画一个三角（半角不画——常态无信息量，画了只是常驻一个点）。
+full_width_mark = false
+full_width_mark_scale = 1.0
+# 两个标记共用的不透明度，同时是档位开关：
+#   = 1.0  实心 + 在标记周围挖掉一圈主字（靠留白分离，字会被切掉一角）
+#   < 1.0  半透明 + 保留主字，笔画从标记里透出来（半遮，默认）
+# 两者是互斥的分离手段，不要指望"挖空 + 调淡"叠加——那样调这个值会看起来毫无效果。
+badge_alpha = 0.88
+# 标记是否用配色。false = 一律与主字同色并跟随明暗主题（两个标记一起切）。
+colored = true
+# 配色（#RRGGBB）。三色的色相互相拉开，16px 下靠色相区分远比靠形状可靠。
+punct_color_cn = "#2288E0"
+punct_color_en = "#EE9922"
+full_width_color = "#E0447A"
+
 [stats]
 enabled = true
 track_english = true

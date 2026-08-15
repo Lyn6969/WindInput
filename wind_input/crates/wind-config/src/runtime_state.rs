@@ -24,21 +24,16 @@ pub struct RuntimeState {
     /// 上次中/英标点。缺字段（旧 state.toml）默认 true（中文标点，与配置默认一致）。
     #[serde(default = "default_true")]
     pub last_chinese_punct: bool,
-    /// 语言栏图标：标点角标的编码方式（`BadgeShape` 的稳定 id，如 `"corner_triangle"`；
-    /// `"none"` = 不显示角标）。
-    ///
-    /// ⚠ **三个 langbar_icon_* 字段一律用 `Option`，`None` 表示「用代码默认」。**
-    /// 本 crate 不重复声明这些默认值：它们的唯一出处是 `wind_ui::langbar_icon` 里的
-    /// 构造函数与 `#[default]`，在这里再写一份，改默认时必然漏掉一处，
-    /// 而症状是「新装的机器和用过的机器表现不一样」——极难联想到是两份默认值对不上。
-    ///
-    /// 存 id 而不是下标：下标是位置身份，会被枚举的声明顺序绑架，见 `BadgeShape::as_id`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub langbar_icon_shape: Option<String>,
-    /// 语言栏图标：角标是否彩色（关 = 与主字同色、跟随明暗主题）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub langbar_icon_colored: Option<bool>,
     /// 语言栏图标：是否在各尺寸档位图上烧尺寸标记（调试用，见设计文档「验证设计」）。
+    ///
+    /// ⚠ **只剩这一项留在 state.toml。** 形状、配色、大小、透明度等会影响用户可见呈现的
+    /// 参数已全部移到 `[ui.langbar]` 配置段——两处都能改同一个量就等于有两个真相源，
+    /// 重启后谁赢取决于加载顺序。留在这里的判据是「它是不是纯调试项」：烧尺寸档标记
+    /// 只为回答"系统实际取用了哪一档"，不是任何人想长期看到的样子。
+    ///
+    /// `Option` 且 `None` = 用代码默认：本 crate 不重复声明默认值，唯一出处是
+    /// `wind_ui::langbar_icon`。在这里再写一份，改默认时必然漏掉一处，
+    /// 而症状是「新装的机器和用过的机器表现不一样」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub langbar_icon_size_marks: Option<bool>,
     /// 工具栏位置，按显示器 key（"workRight,workBottom"）独立记录。
@@ -56,8 +51,6 @@ impl Default for RuntimeState {
             last_chinese_mode: true,
             last_full_width: false,
             last_chinese_punct: true,
-            langbar_icon_shape: None,
-            langbar_icon_colored: None,
             langbar_icon_size_marks: None,
             toolbar_positions: HashMap::new(),
             candidate_pin_positions: HashMap::new(),
@@ -123,16 +116,38 @@ mod tests {
         );
 
         let rs = RuntimeState {
-            langbar_icon_shape: Some("outer_ring".into()),
-            langbar_icon_colored: Some(false),
             langbar_icon_size_marks: Some(true),
             ..Default::default()
         };
         let s = toml::to_string_pretty(&rs).unwrap();
         let back: RuntimeState = toml::from_str(&s).unwrap();
-        assert_eq!(back.langbar_icon_shape.as_deref(), Some("outer_ring"));
-        assert_eq!(back.langbar_icon_colored, Some(false));
         assert_eq!(back.langbar_icon_size_marks, Some(true));
+    }
+
+    /// 已移到 `[ui.langbar]` 的那几项**不能**再被 state.toml 读回。
+    ///
+    /// 老机器的 state.toml 里还留着 `langbar_icon_shape` 等键。serde 默认忽略未知字段，
+    /// 所以它们只是被静默丢弃——这正是想要的（配置段才是真相源）。本条钉住这个行为：
+    /// 若哪天有人"顺手"把字段加回来，两个真相源就复活了，而症状（重启后形状变回旧值）
+    /// 要等到下次重启才看得见。
+    #[test]
+    fn migrated_keys_are_ignored_not_resurrected() {
+        let legacy = r#"
+last_chinese_mode = true
+langbar_icon_shape = "outer_ring"
+langbar_icon_colored = false
+langbar_icon_size_marks = true
+"#;
+        let back: RuntimeState = toml::from_str(legacy).expect("旧文件必须仍能解析");
+        // 未知键被忽略，且不影响其余字段的读回。
+        assert_eq!(back.langbar_icon_size_marks, Some(true));
+        assert!(back.last_chinese_mode);
+        // 再写出去时不该把它们带回来。
+        let out = toml::to_string_pretty(&back).unwrap();
+        assert!(
+            !out.contains("langbar_icon_shape") && !out.contains("langbar_icon_colored"),
+            "已迁移的键又被写回 state.toml:\n{out}"
+        );
     }
 
     /// 三字段 roundtrip。

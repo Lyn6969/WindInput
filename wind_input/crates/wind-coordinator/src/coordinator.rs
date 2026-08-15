@@ -2105,6 +2105,11 @@ impl Coordinator {
                 // 改动本身不会把 schema 标脏，放进那个分支等于「改了挂载列表没反应，
                 // 直到下次切方案才生效」。自身按路径序列做变更检测，未变即空操作。
                 self.sync_comment_dicts();
+                // 语言栏图标的呈现参数同理跟随全局配置（`[ui.langbar]`），也不属 schema。
+                // 少了这一步，改角标形状/配色要重启才生效——「改了没反应、重启就好」正是
+                // 本仓反复出现的那类缺陷（运行时镜像态没回灌）。自带变更检测，未变即空操作。
+                #[cfg(all(feature = "desktop-ui", windows))]
+                self.apply_langbar_config();
 
                 if schema_dirty {
                     // 热重建方案集：清输入缓冲、刷新工具栏/状态，免重启切换方案。

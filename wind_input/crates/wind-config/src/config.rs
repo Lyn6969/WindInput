@@ -2503,6 +2503,9 @@ pub struct UiConfig {
     pub status: StatusIndicatorConfig,
     #[serde(default)]
     pub toolbar: ToolbarConfig,
+    /// 语言栏图标（Windows 任务栏输入指示器）的呈现参数。
+    #[serde(default)]
+    pub langbar: LangBarConfig,
     /// 注释词库挂载列表（`[[ui.comment_dicts]]`），供候选注释模板的 `${dict}` 变量查询。
     ///
     /// **数组顺序即优先级**：同一个词在多个库里都有注释时，取靠前那个库的。
@@ -2589,6 +2592,99 @@ impl Default for ToolbarConfig {
 
 fn default_toolbar_auto_hide_delay() -> u32 {
     5
+}
+
+/// 语言栏图标（Windows 任务栏输入指示器）的呈现参数（`[ui.langbar]`）。
+///
+/// # 默认值在这里也写了一份，靠测试防漂移
+///
+/// 渲染侧（`wind_ui::langbar_icon::IconRenderer`）本来就有一套默认常量，理想情况下
+/// 默认值只该有一个出处。但 wind-config 不能反向依赖 wind-ui（层次颠倒），而本仓的
+/// 配置约定又要求**每个可配置项都有具体默认值并在 `data/config.toml` 里完整列出**
+/// （那份预置文件同时是出厂默认与说明书，有守门测试强制）。
+///
+/// 于是两处各存一份，用 `wind-coordinator` 的 `langbar_config_defaults_match_renderer`
+/// 把它们钉在一起——那个 crate 同时依赖两边，是唯一能做这件比对的地方。漂移的症状
+/// （「装设置页看到的默认值与实际渲染不一致」）不会自己暴露，必须靠测试拦。
+///
+/// 颜色只存字符串，解析与回退发生在协调器侧（同样是因为不能依赖渲染侧的类型）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LangBarConfig {
+    /// 标点角标形状。取值见 `wind_ui::langbar_icon::BadgeShape::as_id()`：
+    /// `none`（默认，不显示）/ `corner_triangle` / `outer_ring` / `bottom_bar` /
+    /// `circle_square` / `ring_dot`。
+    ///
+    /// 设置页只列前两项；其余靠改本文件——它们要么已被真机否决（圆方、环点），
+    /// 要么仍待评估（外圈、底部横条），放进设置页等于把已知的坏选择交给用户。
+    /// 无法识别的取值一律回落默认，不报错：配置文件是手写的，写错一个词不该让图标消失。
+    #[serde(default = "default_langbar_punct_badge")]
+    pub punct_badge: String,
+    /// 标点角标大小倍率（1.0 = 形状自带的基准尺寸）。
+    #[serde(default = "default_one")]
+    pub punct_badge_scale: f32,
+    /// 全角标记（右上角三角）总开关。默认关。
+    #[serde(default)]
+    pub full_width_mark: bool,
+    /// 全角标记大小倍率。
+    #[serde(default = "default_one")]
+    pub full_width_mark_scale: f32,
+    /// 两个标记**共用**的不透明度（0~1）。
+    ///
+    /// 它同时是档位开关：`= 1.0` 走「实心 + 挖空」（标记周围切掉一圈主字），
+    /// `< 1.0` 走「半透明 + 保留主字」（笔画从标记里透出来）。两者是互斥的分离手段，
+    /// 详见 `wind_ui::langbar_icon::IconRenderer::badge_alpha`。
+    #[serde(default = "default_langbar_badge_alpha")]
+    pub badge_alpha: f32,
+    /// 标记是否用配色。`false` = 一律与主字同色并跟随明暗主题。
+    ///
+    /// 一个开关同时管两个标记：分开切会出现「关了彩色但右上角还是玫红」，
+    /// 而这个开关在用户看来只有一个意思。
+    #[serde(default = "default_true")]
+    pub colored: bool,
+    /// 中文标点角标色，`#RRGGBB`。解析失败回落内置默认并记一条警告。
+    #[serde(default = "default_langbar_color_cn")]
+    pub punct_color_cn: String,
+    /// 英文标点角标色，`#RRGGBB`。
+    #[serde(default = "default_langbar_color_en")]
+    pub punct_color_en: String,
+    /// 全角标记色，`#RRGGBB`。
+    #[serde(default = "default_langbar_color_fw")]
+    pub full_width_color: String,
+}
+
+fn default_one() -> f32 {
+    1.0
+}
+fn default_langbar_punct_badge() -> String {
+    "none".to_string()
+}
+fn default_langbar_badge_alpha() -> f32 {
+    0.88
+}
+fn default_langbar_color_cn() -> String {
+    "#2288E0".to_string()
+}
+fn default_langbar_color_en() -> String {
+    "#EE9922".to_string()
+}
+fn default_langbar_color_fw() -> String {
+    "#E0447A".to_string()
+}
+
+impl Default for LangBarConfig {
+    fn default() -> Self {
+        Self {
+            punct_badge: default_langbar_punct_badge(),
+            punct_badge_scale: 1.0,
+            full_width_mark: false,
+            full_width_mark_scale: 1.0,
+            badge_alpha: default_langbar_badge_alpha(),
+            colored: true,
+            punct_color_cn: default_langbar_color_cn(),
+            punct_color_en: default_langbar_color_en(),
+            full_width_color: default_langbar_color_fw(),
+        }
+    }
 }
 
 /// 状态提示气泡配置（[ui.status]，对齐 Go）：中英/标点/全半角/方案切换的瞬时气泡。

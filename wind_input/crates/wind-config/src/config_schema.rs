@@ -359,6 +359,28 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.toolbar.auto_hide", Bool),
     f("ui.toolbar.auto_hide_delay", Int),
     f("ui.toolbar.vertical", Bool),
+    // -- ui.langbar（Windows 任务栏输入指示器图标）--
+    // punct_badge 用 Enum 而非 Str：写错一个词只会静默回落默认形状，而"配了没反应"
+    // 是最难自查的一类；登记成员后 `config set` 与设置页都能先一步挡下。
+    f(
+        "ui.langbar.punct_badge",
+        Enum(&[
+            "none",
+            "corner_triangle",
+            "outer_ring",
+            "bottom_bar",
+            "circle_square",
+            "ring_dot",
+        ]),
+    ),
+    f("ui.langbar.punct_badge_scale", Float),
+    f("ui.langbar.full_width_mark", Bool),
+    f("ui.langbar.full_width_mark_scale", Float),
+    f("ui.langbar.badge_alpha", Float),
+    f("ui.langbar.colored", Bool),
+    f("ui.langbar.punct_color_cn", Str),
+    f("ui.langbar.punct_color_en", Str),
+    f("ui.langbar.full_width_color", Str),
     // -- stats（统计，原 features.stats 升顶级）--
     f("stats.enabled", Bool),
     f("stats.track_english", Bool),
