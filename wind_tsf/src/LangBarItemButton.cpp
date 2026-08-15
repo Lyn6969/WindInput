@@ -125,6 +125,7 @@ const UINT CLangBarItemButton::WM_SERVICE_READY = WM_USER + 104;
 const UINT CLangBarItemButton::WM_ACTIVATION_STATUS = WM_USER + 105;
 const UINT CLangBarItemButton::WM_REPLACE_BACKWARD = WM_USER + 106;
 const UINT CLangBarItemButton::WM_PAIR_COMMIT = WM_USER + 107;
+const UINT CLangBarItemButton::WM_REFRESH_ICON = WM_USER + 108;
 
 static const UINT_PTR TIMER_ID_CARET_RETRY    = 0xC401;
 static const UINT_PTR TIMER_ID_SERVICE_READY  = 0xC402;
@@ -1097,6 +1098,27 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
         }
         return 0;
     }
+    else if (msg == WM_REFRESH_ICON)
+    {
+        // 合并积压：演示动画以固定帧率持续投递，宿主 UI 线程一旦卡顿，队列里会攒下一串
+        // 同类消息，恢复后连着重绘（表现为动画"追帧"）。它们彼此完全等价——图标内容的
+        // 真相在共享内存里而不在消息里——所以只处理最后一条即可。
+        // 可以在这里 Peek 是因为本函数就跑在拥有该队列的 TSF 线程上；投递侧（AsyncReader
+        // 线程）做不到这件事。
+        MSG discarded;
+        while (PeekMessageW(&discarded, hwnd, WM_REFRESH_ICON, WM_REFRESH_ICON, PM_REMOVE))
+        {
+        }
+
+        CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (pThis != nullptr && pThis->_pLangBarItemSink != nullptr)
+        {
+            // 只报 TF_LBI_ICON。别顺手带上 TEXT/TOOLTIP：那两项没变，一起报只会让系统
+            // 多查几次，而本命令的调用频率可以很高（演示动画每帧一次）。
+            pThis->_pLangBarItemSink->OnUpdate(TF_LBI_ICON);
+        }
+        return 0;
+    }
     else if (msg == WM_TIMER)
     {
         if (wParam == TIMER_ID_SERVICE_READY)
@@ -1559,6 +1581,20 @@ void CLangBarItemButton::PostUpdateComposition(const std::wstring& text, int car
         WIND_LOG_DEBUG_FMT(L"PostUpdateComposition: Message posted to UI thread, textLen=%zu, caret=%d\n",
                            text.length(), caretPos);
     }
+}
+
+void CLangBarItemButton::PostRefreshIcon()
+{
+    if (_hMsgWnd == NULL)
+    {
+        // 不退回直接调用（对比 PostUpdateFullStatus 的兜底）：OnUpdate 是 COM 调用，
+        // 必须在 TSF 线程上发，而本函数跑在 AsyncReader 线程。没有消息窗口就只能放弃
+        // 这次刷新——代价仅仅是图标晚一步更新，而跨线程碰 COM 的代价是未定义行为。
+        WIND_LOG_WARN(L"PostRefreshIcon: No message window, skipping\n");
+        return;
+    }
+    if (!PostMessageW(_hMsgWnd, WM_REFRESH_ICON, 0, 0))
+        WIND_LOG_WARN(L"PostRefreshIcon: PostMessage failed\n");
 }
 
 void CLangBarItemButton::PostServiceReady()

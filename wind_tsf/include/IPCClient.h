@@ -291,6 +291,11 @@ public:
     // Callback type for service-ready notification (Go service connected push pipe)
     using ServiceReadyCallback = std::function<void()>;
 
+    // Callback type for icon-refresh push (CMD_REFRESH_ICON), no payload.
+    // 「共享内存里的位图换了，但状态没变」时由服务端发来。实现必须只做 PostMessage 跳到
+    // TSF 线程再发 OnUpdate——本回调在 AsyncReader 线程上调用，那里碰 COM 是未定义行为。
+    using RefreshIconCallback = std::function<void()>;
+
     // Callback type for mode-only push (CMD_MODE_PUSH).
     // 仅携带 chineseMode + fullWidth，用于 FocusGained 竞态窗口优化。
     // 回调在 AsyncReader 线程上调用；实现必须用 InterlockedExchange 写 _bChineseMode/_bFullWidth，
@@ -338,6 +343,9 @@ public:
 
     // Set callback for mode-only push (CMD_MODE_PUSH, FocusGained 竞态优化)
     void SetModePushCallback(ModePushCallback callback);
+
+    // Set callback for icon-refresh push (CMD_REFRESH_ICON, 位图变而状态未变)
+    void SetRefreshIconCallback(RefreshIconCallback callback);
 
     // Set callback for shell exec push (CMD_SHELL_EXEC)
     void SetShellExecCallback(ShellExecCallback callback);
@@ -448,6 +456,7 @@ private:
     SyncConfigCallback _syncConfigCallback;
     ServiceReadyCallback _serviceReadyCallback;
     ModePushCallback _modePushCallback;
+    RefreshIconCallback _refreshIconCallback;
     ShellExecCallback _shellExecCallback;
     CRITICAL_SECTION _asyncLock;         // Lock for thread-safe access
     volatile BOOL _asyncReaderRunning = FALSE;

@@ -274,6 +274,20 @@ pub const CMD_MODE_PUSH: u16 = 0x020D;
 /// TSF 侧在前台应用进程中执行 ShellExecute（打开 URL / 启动程序），解决 Service 进程无前台权限的问题。
 /// 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
 pub const CMD_SHELL_EXEC: u16 = 0x020E;
+/// 「只重取语言栏图标」的下行推送，无载荷。
+///
+/// 存在的理由是 `GetIcon` 是**被动回调**：服务端把新位图写进共享内存后，DLL 不会自己
+/// 察觉，必须由 `OnUpdate(TF_LBI_ICON)` 让系统再来取一次。此前这件事完全寄生在状态推送
+/// 上——而 `UpdateFullStatus` 的 `needUpdate` 去重会挡掉「状态没变、只有位图变了」的情形，
+/// 于是调试菜单改角标形状要等下一次焦点切换才生效，演示动画更是根本动不起来。
+///
+/// 刻意**不带载荷**：本命令只回答「去重取一次」，图标内容的唯一真相在共享内存里。
+/// 若把状态塞进载荷，就等于开了第二条真相通路，两者不一致时无从判定谁对。
+///
+/// 与状态推送的分工：状态变化走 `CMD_STATE_PUSH` / `CMD_ACTIVATION_STATUS_PUSH`
+/// （它们本就会触发 `OnUpdate`），**不要**再叠一条本命令，否则每次切换都会让每个宿主
+/// 多做一次无谓的 `GetIcon` 重绘。本命令只用于「位图变了但状态没变」的路径。
+pub const CMD_REFRESH_ICON: u16 = 0x0216;
 pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 
 /// 配置同步键名（对齐 C++ BinaryProtocol.h CONFIG_KEY_*）

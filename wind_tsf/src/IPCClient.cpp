@@ -2048,6 +2048,13 @@ void CIPCClient::SetModePushCallback(ModePushCallback callback)
     LeaveCriticalSection(&_asyncLock);
 }
 
+void CIPCClient::SetRefreshIconCallback(RefreshIconCallback callback)
+{
+    EnterCriticalSection(&_asyncLock);
+    _refreshIconCallback = callback;
+    LeaveCriticalSection(&_asyncLock);
+}
+
 void CIPCClient::SetShellExecCallback(ShellExecCallback callback)
 {
     EnterCriticalSection(&_asyncLock);
@@ -2482,6 +2489,17 @@ void CIPCClient::_AsyncReaderLoop()
                         mpCallback(chineseMode, fullWidth);
                     }
                 }
+            }
+            else if (header.command == CMD_REFRESH_ICON)
+            {
+                // 无载荷：只是「共享内存里的图换了，去重取一次」。载荷长度一律不校验，
+                // 将来若给它加了字段，旧 DLL 也应当照常刷新而不是丢掉整条消息。
+                _LogDebug(L"Async reader: CMD_REFRESH_ICON received");
+                EnterCriticalSection(&_asyncLock);
+                RefreshIconCallback riCallback = _refreshIconCallback;
+                LeaveCriticalSection(&_asyncLock);
+                if (riCallback)
+                    riCallback();
             }
             else if (header.command == CMD_SHELL_EXEC)
             {

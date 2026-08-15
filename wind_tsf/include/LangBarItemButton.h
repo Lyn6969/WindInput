@@ -110,6 +110,11 @@ public:
     // _SyncStateFromResponse + _EnsureHostRenderSetup。
     void PostActivationStatus(const ServiceResponse& response);
 
+    // Thread-safe icon-refresh request from async reader thread (CMD_REFRESH_ICON)。
+    // 只发 OnUpdate(TF_LBI_ICON) 让系统重取图标，不碰任何状态字段——服务端换的是
+    // 共享内存里的位图，DLL 这边没有任何东西需要跟着变。
+    void PostRefreshIcon();
+
     // Schedule a 50ms fallback caret retry on the TSF thread.
     // Used as a safety net when an app does not fire OnLayoutChange promptly.
     void PostDelayedCaretPositionUpdate();
@@ -136,6 +141,7 @@ private:
     static const UINT WM_ACTIVATION_STATUS;
     static const UINT WM_REPLACE_BACKWARD;
     static const UINT WM_PAIR_COMMIT;
+    static const UINT WM_REFRESH_ICON;
 
     // Packed status for message passing
     struct StatusUpdateData {

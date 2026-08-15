@@ -233,10 +233,13 @@ impl Coordinator {
                 let on = !self.icon_debug_state().map(|s| s.2).unwrap_or(false);
                 self.tweak_langbar_icon(|p| p.set_size_marks(on));
             }
+            #[cfg(all(feature = "desktop-ui", windows))]
+            MenuCmd::IconToggleDemoAnim => self.toggle_icon_demo_animation(),
             #[cfg(not(all(feature = "desktop-ui", windows)))]
             MenuCmd::IconBadgeShape(_)
             | MenuCmd::IconToggleColors
-            | MenuCmd::IconToggleSizeMarks => {}
+            | MenuCmd::IconToggleSizeMarks
+            | MenuCmd::IconToggleDemoAnim => {}
         }
     }
 
@@ -299,6 +302,15 @@ impl Coordinator {
             cmd(MenuCmd::IconToggleSizeMarks),
             true,
             marks,
+        ));
+        // 演示动画单独隔一段：前面几项都是「图标长什么样」的偏好并会被记住，它却是一段
+        // 持续跑的演示、且重启不保留，混在一起会让人以为它也是个呈现选项。
+        items.push(M::separator());
+        items.push(M::leaf(
+            "演示动画（外圈跑马灯）",
+            cmd(MenuCmd::IconToggleDemoAnim),
+            true,
+            self.icon_demo_animation(),
         ));
         items
     }

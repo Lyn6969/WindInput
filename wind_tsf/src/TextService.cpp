@@ -3527,6 +3527,16 @@ BOOL CTextService::_InitIPCClient()
                               fullWidth ? TRUE : FALSE);
     });
 
+    // 图标刷新推送（CMD_REFRESH_ICON）：服务端换了共享内存里的位图但状态没变
+    // （调试菜单改角标形状、演示动画每帧）。此处只把请求转到 TSF 线程，
+    // 不动任何状态字段——需要变的东西全在 SHM 里，DLL 侧无副本。
+    _pIPCClient->SetRefreshIconCallback([pThis]() {
+        if (pThis->_pLangBarItemButton != nullptr)
+        {
+            pThis->_pLangBarItemButton->PostRefreshIcon();
+        }
+    });
+
     // Set up shell exec callback (CMD_SHELL_EXEC)
     // 在前台应用进程中调用 ShellExecuteW，拥有前台权限，打开的窗口可正确置顶。
     // 回调在 AsyncReader 线程执行，ShellExecuteW 是线程安全的，无需切换到 TSF 主线程。

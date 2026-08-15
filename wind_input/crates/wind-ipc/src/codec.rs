@@ -386,6 +386,12 @@ pub fn encode_shell_exec(target: &str, params: &str, dir: &str, verb: &str, show
     buf
 }
 
+/// 编码「只重取语言栏图标」推送（无载荷，见 [`CMD_REFRESH_ICON`]）。
+pub fn encode_refresh_icon() -> Vec<u8> {
+    let ipc = IpcHeader::new(CMD_REFRESH_ICON, 0);
+    ipc.to_bytes().to_vec()
+}
+
 /// 编码 PassThrough 响应
 pub fn encode_pass_through() -> Vec<u8> {
     let ipc = IpcHeader::new(CMD_PASS_THROUGH, 0);
@@ -731,6 +737,35 @@ pub fn encode_host_render_setup(
     buf.extend_from_slice(&ipc.to_bytes());
     buf.extend_from_slice(&payload);
     buf
+}
+
+#[cfg(test)]
+mod refresh_icon_tests {
+    use super::*;
+
+    /// 命令号在两个仓里各硬编码一份（本处与 `wind_tsf/include/BinaryProtocol.h` 的
+    /// `CMD_REFRESH_ICON`），没有任何编译期约束把它们绑在一起。写死期望值是为了让
+    /// **单侧改动**在这里失败——两侧漂移的症状是「推了没反应」：DLL 收到一个不认识的
+    /// 命令直接走完 else 链丢弃，两边日志都不会有错误。本仓已按同一形态栽过
+    /// （触发键名两仓拼写不一致，静默不匹配）。
+    #[test]
+    fn refresh_icon_command_id_is_frozen_at_0x0216() {
+        assert_eq!(
+            CMD_REFRESH_ICON, 0x0216,
+            "改了命令号必须同步 wind_tsf/include/BinaryProtocol.h 的 CMD_REFRESH_ICON"
+        );
+    }
+
+    /// 无载荷是本命令的设计要点而非省事：图标内容的唯一真相在共享内存里，
+    /// 载荷里再放一份就是第二条真相通路。这条测试把「不许带载荷」钉住。
+    #[test]
+    fn refresh_icon_frame_is_header_only() {
+        let f = encode_refresh_icon();
+        assert_eq!(f.len(), IpcHeader::SIZE, "刷新图标帧应当只有 header");
+        assert_eq!(u16::from_le_bytes([f[2], f[3]]), CMD_REFRESH_ICON);
+        // header 里声明的载荷长度也必须是 0——DLL 按它推进读指针，非零会让下一帧错位。
+        assert_eq!(u32::from_le_bytes(f[4..8].try_into().unwrap()), 0);
+    }
 }
 
 #[cfg(test)]

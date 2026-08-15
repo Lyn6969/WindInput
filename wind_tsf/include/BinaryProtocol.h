@@ -108,6 +108,12 @@ constexpr uint16_t CMD_MODE_PUSH              = 0x020D;
 // CMD_SHELL_EXEC：在 TSF 侧（前台应用进程）执行 ShellExecuteW，解决 Service 进程无前台权限问题。
 // 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
 constexpr uint16_t CMD_SHELL_EXEC             = 0x020E;
+// CMD_REFRESH_ICON：只让语言栏重取图标，**无载荷**。
+// GetIcon 是被动回调，服务端写完共享内存后 DLL 不会自己察觉，须由 OnUpdate(TF_LBI_ICON)
+// 让系统再取一次。此前这件事寄生在状态推送上，而 UpdateFullStatus 的 needUpdate 去重会挡掉
+// 「状态没变、只有位图变了」的情形（调试菜单改形状、演示动画都属此类）。
+// 不带载荷是刻意的：图标内容的唯一真相在 SHM 里，载荷里再放一份就是第二条真相通路。
+constexpr uint16_t CMD_REFRESH_ICON           = 0x0216;
 constexpr uint16_t CMD_SYNC_HOTKEYS       = 0x0301; // Sync hotkey whitelist
 constexpr uint16_t CMD_SYNC_CONFIG        = 0x0303; // Sync config key/value (generic)
 constexpr uint16_t CMD_CONSUMED           = 0x0401; // Key consumed

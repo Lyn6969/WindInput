@@ -786,6 +786,12 @@ pub struct LangBarIconPublisher {
     /// 上次发布的状态。图标更新是用户操作级频率，但状态推送比它频繁得多
     /// （焦点切换等也会推），没必要每次都重渲十张位图。
     last: Option<IconSpec>,
+    /// 演示动画的当前相位。
+    ///
+    /// 归发布器所有而不是由调用方每次传入：普通状态推送与动画定时器都会走到 `publish`，
+    /// 若相位由调用方给，状态推送那条路必须知道「现在动画转到哪了」才能不打断它——
+    /// 那等于把动画状态复制到每个调用点。放在这里，状态推送只管状态，相位自然延续。
+    demo_frame: u32,
 }
 
 #[cfg(windows)]
@@ -799,7 +805,35 @@ impl LangBarIconPublisher {
             renderer,
             shm,
             last: None,
+            demo_frame: 0,
         })
+    }
+
+    /// 演示动画（外圈跑马灯）开关。关掉时相位归零，下次开启从起点转起。
+    ///
+    /// 只切开关不会让画面动起来——还需要有人按帧调 [`Self::advance_demo_frame`] 并重新
+    /// 发布。渲染端只按相位画，不持有时间。
+    pub fn set_demo_animation(&mut self, on: bool) {
+        if self.renderer.demo_animation != on {
+            self.renderer.demo_animation = on;
+            self.demo_frame = 0;
+            self.last = None; // 呈现变了，下次必须重发
+        }
+    }
+
+    pub fn demo_animation(&self) -> bool {
+        self.renderer.demo_animation
+    }
+
+    /// 当前相位。
+    pub fn demo_frame(&self) -> u32 {
+        self.demo_frame
+    }
+
+    /// 推进一帧并返回新相位。按周期取模，避免长时间运行后溢出。
+    pub fn advance_demo_frame(&mut self) -> u32 {
+        self.demo_frame = (self.demo_frame + 1) % IconRenderer::DEMO_FRAMES_PER_CYCLE;
+        self.demo_frame
     }
 
     /// 调试开关：在各档位图上烧尺寸标记，用于真机确认系统实际取用了哪一档。

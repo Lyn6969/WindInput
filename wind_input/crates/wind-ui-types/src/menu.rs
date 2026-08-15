@@ -129,6 +129,11 @@ pub enum MenuCmd {
     /// 语言栏图标（Dev 调试）：在各尺寸档位图左上角烧尺寸标记，
     /// 用于真机确认系统实际取用了哪一档、有没有被二次缩放。
     IconToggleSizeMarks,
+    /// 语言栏图标（Dev 调试）：外圈跑马灯演示动画。
+    ///
+    /// 与上面三项不同，它**不持久化**——那三项是「图标长什么样」的偏好，它是一段持续
+    /// 占用 CPU 与 IPC 的演示，重启后自己关掉才是对的默认。
+    IconToggleDemoAnim,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -200,6 +205,7 @@ impl MenuKind {
                 MenuCmd::InputDiagToggleTopmost => 126,
                 MenuCmd::IconToggleColors => 127,
                 MenuCmd::IconToggleSizeMarks => 128,
+                MenuCmd::IconToggleDemoAnim => 129,
                 MenuCmd::IconBadgeShape(i) => 10000 + i as i32,
                 MenuCmd::InputDiagToggleSection(i) => 8000 + i as i32,
                 MenuCmd::FirstShowMode(m) => 5000 + m as i32,
@@ -253,6 +259,7 @@ impl MenuKind {
             126 => MenuCmd::InputDiagToggleTopmost,
             127 => MenuCmd::IconToggleColors,
             128 => MenuCmd::IconToggleSizeMarks,
+            129 => MenuCmd::IconToggleDemoAnim,
             10000..=10099 => MenuCmd::IconBadgeShape((id - 10000) as u8),
             8000..=8999 => MenuCmd::InputDiagToggleSection((id - 8000) as u8),
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),

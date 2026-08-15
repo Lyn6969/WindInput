@@ -269,6 +269,24 @@ impl Coordinator {
         self.push_server.push_commit_to_active(&encoded);
     }
 
+    /// 让语言栏重取一次图标（无载荷，见 [`CMD_REFRESH_ICON`]）。
+    ///
+    /// **只投前台宿主，token 为 0 时干脆不投。** 任务栏的语言指示器只显示前台窗口的输入法
+    /// 状态，别的宿主收到也只是白重绘一次；而本命令的调用频率可以很高（演示动画每帧一次），
+    /// 广播出去就是几十个进程 × 每秒十几次的无谓唤醒。丢掉一次刷新的代价则很小——图标晚
+    /// 一步更新，且下一次状态推送或焦点切换必然把它带上。
+    ///
+    /// [`CMD_REFRESH_ICON`]: wind_ipc::protocol::CMD_REFRESH_ICON
+    #[cfg(windows)]
+    pub(crate) fn push_refresh_icon(&self) {
+        let token = self.push_server.active_token();
+        if token == 0 {
+            return;
+        }
+        let encoded = wind_ipc::codec::encode_refresh_icon();
+        self.push_server.push_to_token(token, &encoded);
+    }
+
     pub(crate) fn push_state_update(&self) {
         // 图标位图与状态推送同源同时机，且**发布必须先于推送**——顺序的理由与保证方式
         // 见 status_with_icon_published。
