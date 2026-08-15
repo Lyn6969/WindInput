@@ -87,6 +87,90 @@ impl Default for OctagramConfig {
     }
 }
 
+/// context 逐级缩短后在 trie 中的一个落点。
+///
+/// `ctx_ptr` 必须一并记住：`whole` 判据（整串匹配豁免 weak 罚）问的是
+/// 「**这一级是不是最长的那一级**」，而最长级可能 traverse 失败被跳过，
+/// 此时数组下标 0 已经不是最长级了。用 `ctx_ptr == 0` 判才是对的。
+#[derive(Clone, Copy)]
+struct CtxLevel {
+    node: usize,
+    /// 该级 context 的字符数，参与 `collocation_len` 计算。
+    ctx_len: usize,
+    /// 该级在编码串中的起始字节偏移，`0` 即最长级。
+    ctx_ptr: usize,
+}
+
+/// 每线程的搭配查询缓存。
+///
+/// ## 为什么会有重复劳动
+///
+/// `decode_beam` 的循环是 `for node { for src } }`，而 [`OctagramGrammar::best_collocation`]
+/// 内部天然分成互不相干的两半：
+///
+/// - **context 半**（取尾部 n 字 → 编码 → 逐级 traverse）只依赖 context，
+///   却在该起点下的**每个 node** 上被重算一遍；
+/// - **word 半**（取首部 n 字 → 编码）只依赖 `node.word`，
+///   却在 beam 的**每条线**上被重算一遍。
+///
+/// 两者都是纯函数的结果，缓存起来**不改变任何打分**——所以本优化的验收判据是硬的：
+/// 评测指标逐位不变，只有耗时下降。
+///
+/// ## 容量与失效
+///
+/// context 侧取 `BEAM_WIDTH + 1 = 8` 格：内层一轮最多轮询 beam 宽度条不同的
+/// context，多一格避免边界上整轮失效。word 侧只需**单格**——内层循环里 word 恒定，
+/// 命中率天然是 `(线数−1)/线数`。
+///
+/// `db_id` 是 [`GramDb`] 的地址：同进程可能同时活着多个 grammar 实例（不同方案），
+/// 换实例时整体清空，宁可重算也不能跨模型串用落点。
+struct QueryCache {
+    db_id: usize,
+    ctx_keys: Vec<String>,
+    ctx_levels: Vec<Vec<CtxLevel>>,
+    ctx_next: usize,
+    word_key: String,
+    word_buf: EncodeBuf,
+    /// word 首部 n 字是否就是整个 word（`is_rear` 分支要用）。
+    word_full: bool,
+    word_valid: bool,
+}
+
+/// context 缓存格数：beam 宽度 7 + 1。与 `viterbi::BEAM_WIDTH` 无编译期耦合
+/// （那是解码器的参数、这是缓存的容量），改那边不必改这边，只是命中率会变。
+const CTX_SLOTS: usize = 8;
+
+impl QueryCache {
+    fn new() -> Self {
+        Self {
+            db_id: 0,
+            ctx_keys: Vec::with_capacity(CTX_SLOTS),
+            ctx_levels: Vec::with_capacity(CTX_SLOTS),
+            ctx_next: 0,
+            word_key: String::new(),
+            word_buf: EncodeBuf::default(),
+            word_full: false,
+            word_valid: false,
+        }
+    }
+
+    /// 换了 `GramDb` 实例就整体作废——落点是相对某棵 trie 的，跨模型复用会给出错误分数。
+    fn bind(&mut self, db_id: usize) {
+        if self.db_id != db_id {
+            self.db_id = db_id;
+            self.ctx_keys.clear();
+            self.ctx_levels.clear();
+            self.ctx_next = 0;
+            self.word_valid = false;
+        }
+    }
+}
+
+thread_local! {
+    static QUERY_CACHE: std::cell::RefCell<QueryCache> =
+        std::cell::RefCell::new(QueryCache::new());
+}
+
 /// 挂载 `.gram` 的上下文打分器。
 pub struct OctagramGrammar {
     db: GramDb,
@@ -105,16 +189,14 @@ impl OctagramGrammar {
         self.db.unit_count()
     }
 
-    /// 查出「`context` 之后接 `word`」的最佳搭配分（自然对数域的 `ln(频次)`）。
-    /// 没有任何命中时返回 0.0。
-    fn best_collocation(&self, context: &str, word: &str, is_rear: bool) -> f64 {
-        let n = self
-            .config
-            .collocation_max_length
-            .saturating_sub(1)
-            .min(MAX_ENCODED_UNICODE);
-        if n == 0 || context.is_empty() {
-            return 0.0;
+    /// 把 context 的尾部 n 字编码并逐级 traverse，结果写进缓存槽并返回槽下标。
+    ///
+    /// 这一半只依赖 `context`，与 word 无关——分出来正是为了跨 node 复用。
+    /// 逐级缩短、每级各 traverse 一次的语义原样保留（对齐 octagram.cc:125-148）；
+    /// **traverse 失败的级直接不入表**，与改造前「失败则跳过该级」等价。
+    fn fill_ctx_levels(&self, cache: &mut QueryCache, context: &str, n: usize) -> usize {
+        if let Some(i) = cache.ctx_keys.iter().position(|k| k == context) {
+            return i;
         }
 
         // context 取**尾部** n 字：用 char_indices().rev() 定位起点，避免收集 Vec<char>。
@@ -126,36 +208,100 @@ impl OctagramGrammar {
             .map_or(0, |(i, _)| i);
         let ctx_tail = &context[ctx_start..];
 
-        // word 取**首部** n 字。
+        let mut buf = EncodeBuf::default();
+        let mut ctx_len = encode_chars(ctx_tail.chars(), n, &mut buf);
+        let mut levels = Vec::with_capacity(n);
+        let key_all = buf.as_slice();
+        let mut ctx_ptr = 0usize;
+        while ctx_len > 0 {
+            if let Some(node) = self.db.traverse(&key_all[ctx_ptr..], 0) {
+                levels.push(CtxLevel {
+                    node,
+                    ctx_len,
+                    ctx_ptr,
+                });
+            }
+            ctx_ptr += gramdb::encoded_char_len(key_all[ctx_ptr]);
+            ctx_len -= 1;
+        }
+
+        // 环形替换：内层一轮的 context 集合是稳定的，先进先出即可维持整轮命中。
+        if cache.ctx_keys.len() < CTX_SLOTS {
+            cache.ctx_keys.push(context.to_string());
+            cache.ctx_levels.push(levels);
+            cache.ctx_keys.len() - 1
+        } else {
+            let i = cache.ctx_next;
+            cache.ctx_keys[i].clear();
+            cache.ctx_keys[i].push_str(context);
+            cache.ctx_levels[i] = levels;
+            cache.ctx_next = (cache.ctx_next + 1) % CTX_SLOTS;
+            i
+        }
+    }
+
+    /// 把 word 的首部 n 字编码进缓存的单格。这一半只依赖 `word`，与 context 无关。
+    fn fill_word_key(&self, cache: &mut QueryCache, word: &str, n: usize) {
+        if cache.word_valid && cache.word_key == word {
+            return;
+        }
         let word_end = word.char_indices().nth(n).map_or(word.len(), |(i, _)| i);
         let word_head = &word[..word_end];
-        let word_full = word_end == word.len();
+        cache.word_full = word_end == word.len();
+        let len = encode_chars(word_head.chars(), n, &mut cache.word_buf);
+        cache.word_key.clear();
+        cache.word_key.push_str(word);
+        cache.word_valid = len > 0;
+    }
 
-        let mut ctx_buf = EncodeBuf::default();
-        let mut word_buf = EncodeBuf::default();
-        let mut ctx_len = encode_chars(ctx_tail.chars(), n, &mut ctx_buf);
-        let word_len = encode_chars(word_head.chars(), n, &mut word_buf);
-        if ctx_len == 0 || word_len == 0 {
+    /// 查出「`context` 之后接 `word`」的最佳搭配分（自然对数域的 `ln(频次)`）。
+    /// 没有任何命中时返回 0.0。
+    ///
+    /// 打分逻辑与改造前逐条对应，差别只在 context/word 两侧的编码与 trie 定位
+    /// 改为走 [`QueryCache`]（纯函数结果的复用，不影响分数）。
+    fn best_collocation(&self, context: &str, word: &str, is_rear: bool) -> f64 {
+        let n = self
+            .config
+            .collocation_max_length
+            .saturating_sub(1)
+            .min(MAX_ENCODED_UNICODE);
+        if n == 0 || context.is_empty() {
             return 0.0;
         }
-        let word_key = word_buf.as_slice();
 
-        let mut best = 0.0f64;
-        let mut results = [(0i32, 0usize); MAX_RESULTS];
+        QUERY_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            cache.bind(std::ptr::from_ref(&self.db) as usize);
 
-        // context 从最长逐字缩短，每轮查一次，取最大分（对齐 octagram.cc:125-148）。
-        let mut ctx_ptr = 0usize;
-        let ctx_key_all = ctx_buf.as_slice();
-        while ctx_len > 0 {
-            let ctx_key = &ctx_key_all[ctx_ptr..];
-            if let Some(node) = self.db.traverse(ctx_key, 0) {
-                let found = self.db.common_prefix_search(word_key, node, &mut results);
+            self.fill_word_key(&mut cache, word, n);
+            if !cache.word_valid {
+                return 0.0;
+            }
+            let slot = self.fill_ctx_levels(&mut cache, context, n);
+            if cache.ctx_levels[slot].is_empty() {
+                // 一级都没走通 ⇒ 与改造前「while 循环全程 traverse 失败」同义。
+                // 但 is_rear 那一查只依赖 word，仍须照做。
+                //
+                // ★ 必须再 `max(0.0)`：句末分是 `ln(频次) − rear_penalty`，**可能为负**，
+                // 而改造前它是在初值为 0 的 `best` 上做 max 的，负值取不走。
+                // 这里直接 return 会把负分泄出去——两处都得保住那个 0 下界。
+                return 0.0f64.max(self.rear_only(&cache, is_rear));
+            }
+
+            let mut best = 0.0f64;
+            let mut results = [(0i32, 0usize); MAX_RESULTS];
+            let word_key = cache.word_buf.as_slice();
+
+            for lvl in &cache.ctx_levels[slot] {
+                let found = self
+                    .db
+                    .common_prefix_search(word_key, lvl.node, &mut results);
                 for &(val, byte_len) in results.iter().take(found) {
                     let match_chars = GramDb::encoded_unicode_len(word_key, byte_len);
-                    let collocation_len = ctx_len + match_chars;
+                    let collocation_len = lvl.ctx_len + match_chars;
                     // 整串匹配（context 用满 + word 全中）豁免 weak 罚，
                     // 对齐 `matches_whole_query`（octagram.cc:99-105）。
-                    let whole = ctx_ptr == 0 && byte_len == word_key.len();
+                    let whole = lvl.ctx_ptr == 0 && byte_len == word_key.len();
                     let penalty = if collocation_len >= self.config.collocation_min_length || whole
                     {
                         0.0
@@ -165,23 +311,31 @@ impl OctagramGrammar {
                     best = best.max(val as f64 / VALUE_SCALE + penalty);
                 }
             }
-            ctx_ptr += gramdb::encoded_char_len(ctx_key_all[ctx_ptr]);
-            ctx_len -= 1;
-        }
 
-        // 句末：额外查一次 `word + "$"`（`$` 是 octagram 的句末标记）。
-        // 仅在 word 未被截断时进行，对齐 octagram.cc:149-158。
-        if is_rear
-            && word_full
-            && let Some(node) = self.db.traverse(word_key, 0)
-        {
-            let found = self.db.common_prefix_search(b"$", node, &mut results);
-            if found > 0 {
-                best = best.max(results[0].0 as f64 / VALUE_SCALE - self.config.rear_extra_penalty);
-            }
-        }
+            best.max(self.rear_only(&cache, is_rear))
+        })
+    }
 
-        best
+    /// 句末追加查一次 `word + "$"`（`$` 是 octagram 的句末标记）。
+    /// 仅在 word 未被截断时进行，对齐 octagram.cc:149-158。
+    ///
+    /// 只依赖 word，故与 context 各级的结果取 max 即可——与改造前
+    /// 「在同一个 `best` 上继续 max」等价。
+    fn rear_only(&self, cache: &QueryCache, is_rear: bool) -> f64 {
+        if !is_rear || !cache.word_full {
+            return 0.0;
+        }
+        let word_key = cache.word_buf.as_slice();
+        let Some(node) = self.db.traverse(word_key, 0) else {
+            return 0.0;
+        };
+        let mut results = [(0i32, 0usize); MAX_RESULTS];
+        let found = self.db.common_prefix_search(b"$", node, &mut results);
+        if found > 0 {
+            results[0].0 as f64 / VALUE_SCALE - self.config.rear_extra_penalty
+        } else {
+            0.0
+        }
     }
 }
 
