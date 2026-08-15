@@ -118,6 +118,28 @@ pub struct SchemaEntry {
     pub active: bool,
 }
 
+/// 一个可选主题。
+#[derive(Debug, Clone)]
+pub struct ThemeEntry {
+    /// 主题 id（目录名），即写回 [`MobileCore::set_theme`] 的值
+    pub id: String,
+    /// 显示名（`[meta] name`），如「清风·蓝」
+    pub name: String,
+    pub active: bool,
+}
+
+/// 一个求值后的语义色。
+///
+/// `${var}` 递归与 `{light, dark}` 变体都已在核心侧展开完毕，这里是**终值**——
+/// 宿主不该也不需要自己存两套色表，切明暗时重新取一次即可。
+#[derive(Debug, Clone)]
+pub struct PaletteColor {
+    /// 语义名：`bg` / `surface` / `text` / `accent_soft` / `toolbar_background` …
+    pub name: String,
+    /// `0xAARRGGBB`（Android `Color` 与 iOS `UIColor(rgb:)` 都吃这个布局）
+    pub argb: u32,
+}
+
 /// 一个双拼布局（`schemas` 目录下 `shuangpin` 子目录里的 toml）。
 #[derive(Debug, Clone)]
 pub struct LayoutEntry {
@@ -347,6 +369,58 @@ impl MobileCore {
     /// 永远点不到。
     pub fn select_candidate(&self, index: usize) -> KeyOutcome {
         self.coord.select_candidate(index)
+    }
+
+    /// 可选主题。`_` 前缀的基底主题不在其中（它们只供继承）。
+    pub fn themes(&self) -> Vec<ThemeEntry> {
+        let active = self.coord.active_theme_id();
+        self.coord
+            .theme_entries()
+            .into_iter()
+            .map(|(id, name)| ThemeEntry {
+                active: id == active,
+                id,
+                name,
+            })
+            .collect()
+    }
+
+    /// 按 id 切主题并持久化。返回是否命中。
+    ///
+    /// 按 id 而不是按下标：下标随主题目录增删漂移，宿主存下来下次会指向另一个主题。
+    pub fn set_theme(&self, id: &str) -> bool {
+        self.coord.select_theme_by_id(id)
+    }
+
+    /// 明暗设置：`"system"`（跟随系统）/ `"light"` / `"dark"`。
+    pub fn theme_style(&self) -> String {
+        self.coord.theme_style_name().to_string()
+    }
+
+    /// 设置明暗并持久化；未知值按跟随系统。
+    pub fn set_theme_style(&self, style: &str) {
+        self.coord.set_theme_style_name(style);
+    }
+
+    /// 求值后的语义色表。
+    ///
+    /// ⚠ `system_dark` **必须由宿主给**：核心的系统明暗探测只实现了 Windows 与 macOS，
+    /// 其余平台恒 false，移动端若指望核心自己探测，「跟随系统」会静默变成恒亮色。
+    /// Android 传 `Configuration.uiMode` 的 `UI_MODE_NIGHT_YES`，iOS 传
+    /// `traitCollection.userInterfaceStyle == .dark`。
+    ///
+    /// 明暗或主题变化后重新调本方法取新表即可，不要在宿主侧缓存两套。
+    pub fn palette(&self, system_dark: bool) -> Vec<PaletteColor> {
+        self.coord
+            .theme_palette(system_dark)
+            .into_iter()
+            .map(|(name, argb)| PaletteColor { name, argb })
+            .collect()
+    }
+
+    /// 本次该用暗色吗（宿主要据此决定状态栏图标明暗等自身事务时用）。
+    pub fn is_dark(&self, system_dark: bool) -> bool {
+        self.coord.theme_dark_with(system_dark)
     }
 
     /// 可选双拼布局。清单由核心扫描目录得出，**宿主不要硬编码**——

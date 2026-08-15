@@ -65,10 +65,23 @@ impl ThemeStyle {
     /// 「切了系统主题但输入法没跟上」重新出现。探测本身是一次注册表读，量级远低于
     /// 随后的主题解析与重绘，不必优化。
     pub fn resolve_dark(self) -> bool {
+        self.resolve_dark_with(system_prefers_dark())
+    }
+
+    /// 同 [`Self::resolve_dark`]，但由宿主告知系统明暗。
+    ///
+    /// **移动端必须走这一个**：[`system_prefers_dark`] 在非 Windows/macOS 上恒 false
+    /// （见其文档），Android 若走 [`Self::resolve_dark`]，`System` 会静默退化成恒亮色
+    /// ——不报错、不崩溃，只是「跟随系统」这个选项永远不生效。系统明暗在 Android 上
+    /// 只有 Java 层的 `Configuration.uiMode` 知道，拿不到就只能由宿主传进来。
+    ///
+    /// 明暗判定的 `match` 仍然只有这一处，`resolve_dark` 委托给它——新增分支照旧
+    /// 必须在此显式回答。
+    pub fn resolve_dark_with(self, system_dark: bool) -> bool {
         match self {
             Self::Light => false,
             Self::Dark => true,
-            Self::System => system_prefers_dark(),
+            Self::System => system_dark,
         }
     }
 
