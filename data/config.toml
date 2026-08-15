@@ -192,8 +192,10 @@ max_extra_syllables = 3
 [schema.pinyin.grammar]
 # 0 = 关闭（默认）。关闭时不读模型文件、不占内存，整句结果与没有该功能时逐位相同。
 weight = 0.0
-# 模型文件名，相对 data/schemas/pinyin/grammar/。缺失时自动降级为关闭。
-model = "zh-hans-bgw.gram"
+# 模型文件名，相对 data/schemas/pinyin/grammar/。**空串（默认）= 不启用**。
+# weight 与 model 两个都要显式配置才生效——只调 weight 不会静默启用某个默认模型。
+# 模型需自行获取，不随安装包分发（许可与体积，见设计文档 §5、§8）。
+model = ""
 
 # 拼音自动造词。
 

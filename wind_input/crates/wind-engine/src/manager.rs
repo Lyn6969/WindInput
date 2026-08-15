@@ -2714,10 +2714,17 @@ impl EngineManager {
                 allow_full_pinyin: pg.shuangpin.allow_full_pinyin && mix_pinyin.is_none(),
             };
             let mut engine = PinyinEngine::new(pcfg, dict).with_fuzzy(fuzzy.clone());
-            // 上下文语言模型：weight=0（默认）时**根本不读文件**——既省内存，
-            // 也让「没配就等于没这功能」在字节层面成立。
+            // 上下文语言模型：**两个开关都得显式打开才启用**——
+            // `weight != 0` 且 `model` 非空。任一为默认值都**根本不读文件**，
+            // 既省内存，也让「没配就等于没这功能」在字节层面成立。
+            //
+            // ★ 为什么模型名也要参与判据：默认模型名一度是 `zh-hans-bgw.gram`，
+            // 于是「只把 weight 调成非 0」就会静默启用它——而该模型实测在 192 条
+            // 整句评测上是 **−4**（见设计文档 §8）。现在默认空串，用户必须两个字段
+            // 都写过一遍才会生效，不存在「不知道自己开了什么」。
+            //
             // 模型数据不随安装包分发，缺失时降级为关闭而非报错（见设计文档 §5）。
-            if pinyin_cfg.grammar.weight != 0.0 {
+            if pinyin_cfg.grammar.weight != 0.0 && !pinyin_cfg.grammar.model.trim().is_empty() {
                 let gram_path = schemas
                     .join("pinyin")
                     .join("grammar")

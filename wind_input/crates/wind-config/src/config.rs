@@ -420,11 +420,25 @@ pub struct PinyinGrammar {
     /// 相关常数需要整套重新标定后才谈得上默认开启。
     #[serde(default = "default_grammar_weight")]
     pub weight: f64,
-    /// 模型文件名，相对 `data/schemas/pinyin/grammar/`。
+    /// 模型文件名，相对 `data/schemas/pinyin/grammar/`。**默认空串 = 不启用**。
     ///
     /// 格式是 librime-octagram 的 `.gram`（darts-clone double-array）。
-    /// 模型数据**不随安装包分发**（许可与体积，见设计文档 §5），缺失时自动降级为关闭。
-    #[serde(default = "default_grammar_model")]
+    /// 模型数据**不随安装包分发**（许可与体积，见设计文档 §5），需用户自行获取。
+    ///
+    /// ## ★ 为什么默认是空串而不是某个具体模型名
+    ///
+    /// 默认值必须是「什么都不发生」。填任何具体文件名都意味着：一旦用户
+    /// **只**把 `weight` 调成非 0（很自然的做法——文档就是这么写的），
+    /// 就会静默启用那个默认模型。而我们实测过的三个模型里：
+    ///
+    /// - `zh-hans-bgc`（字级）在 192 条整句评测上是 **−6**
+    /// - `zh-hans-bgw`（词级）是 **−4**——它曾长期是本字段的默认值
+    /// - 只有 `wanxiang-lts-zh-hans`（万象，420MB）是正的（+5）
+    ///
+    /// 也就是说，旧的默认值会把用户静默导向一个**质量为负**的模型。
+    /// 空串则让「没配模型」直接落到不启用，用户必须**同时**显式给出 weight 与 model
+    /// 才会生效——两个字段都写过一遍，就不存在「不知道自己开了什么」。
+    #[serde(default)]
     pub model: String,
 }
 
@@ -432,17 +446,11 @@ fn default_grammar_weight() -> f64 {
     0.0
 }
 
-fn default_grammar_model() -> String {
-    // 词级（bgw）比字级（bgc）稳健：后者只看字对频次、不理解词边界，实测会把
-    // 「明天再见」改成「明天在建」。标定细节见设计文档 §7 P3。
-    "zh-hans-bgw.gram".to_string()
-}
-
 impl Default for PinyinGrammar {
     fn default() -> Self {
         Self {
             weight: default_grammar_weight(),
-            model: default_grammar_model(),
+            model: String::new(),
         }
     }
 }
@@ -4079,6 +4087,28 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ 语法模型的默认值必须是「什么都不发生」：`weight = 0` **且** `model` 为空。
+    ///
+    /// 守的是一个真实发生过的隐患：`model` 的默认值一度是 `zh-hans-bgw.gram`，
+    /// 于是用户「只把 weight 调成非 0」就会静默启用它——而该模型在 192 条整句
+    /// 评测上实测为 **−4**（设计文档 §8）。默认值把人导向一个质量为负的模型，
+    /// 且当事人完全不知情。
+    ///
+    /// 谁要改回某个具体模型名，先解释清楚为什么默认开启它是安全的。
+    #[test]
+    fn grammar_defaults_to_disabled_and_no_model() {
+        let g = PinyinGrammar::default();
+        assert_eq!(g.weight, 0.0, "默认必须关闭");
+        assert!(
+            g.model.is_empty(),
+            "默认模型必须为空，否则只调 weight 就会静默启用它，实得 {:?}",
+            g.model
+        );
+        // 从空配置反序列化（用户没写这一段）也要落到同一处
+        let from_empty: PinyinGrammar = toml::from_str("").expect("空表可反序列化");
+        assert_eq!(from_empty, g, "缺省反序列化须与 Default 一致");
+    }
 
     /// 注释库的方案限定：`schemas` 留空适用于全部方案，非空则只在列出的方案下加载。
     ///
