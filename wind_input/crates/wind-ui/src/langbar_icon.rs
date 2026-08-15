@@ -839,10 +839,15 @@ impl LangBarIconPublisher {
         self.renderer.badge_colors.is_some()
     }
 
-    /// 渲染并发布。返回 `true` 表示确实写了新内容，`false` 表示状态未变已跳过。
-    pub fn publish(&mut self, spec: &IconSpec) -> Result<bool, String> {
+    /// 渲染并发布。返回新的发布序号；`None` 表示状态未变、已跳过。
+    ///
+    /// 返回序号而非布尔，是为了让服务端日志记下「这是第几版位图」。排查「图标落后一帧」
+    /// 一类问题时，服务端只能看到自己发布了什么、DLL 只能看到自己读到了什么，两边日志
+    /// 唯一能对上号的量就是这个序号——它同时是读端 seqlock 的判据（SHM header 的
+    /// `sequence`），不是为日志另造的计数器。
+    pub fn publish(&mut self, spec: &IconSpec) -> Result<Option<u32>, String> {
         if self.last.as_ref() == Some(spec) {
-            return Ok(false);
+            return Ok(None);
         }
 
         // 用变体表驱动渲染，而不是另写一遍嵌套循环——两处循环各写一遍时，
@@ -855,11 +860,12 @@ impl LangBarIconPublisher {
             bitmaps.push(self.renderer.render(v.size_px, dark, spec));
         }
 
-        self.shm
+        let seq = self
+            .shm
             .publish(&bitmaps)
             .map_err(|e| format!("发布图标共享内存失败: {e}"))?;
         self.last = Some(spec.clone());
-        Ok(true)
+        Ok(Some(seq))
     }
 
     /// SHM 名（日志与排查用）。

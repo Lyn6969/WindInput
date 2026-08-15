@@ -11,7 +11,25 @@ impl Coordinator {
     /// 其激活事件若污染全局槽，推给 SearchHost 的 avail 位会错置 0，触发 DLL
     /// 「flag missing after reconnect」销毁重建循环（真机踩坑）。
     pub(super) fn push_activation_status(&self, client_token: u64) {
-        let s = self.build_status();
+        // ★ 这里同样要发布图标，理由与 push_state_update 不同、且更要命：**焦点切入正是
+        // 中英态最可能变化的时刻**——handle_focus_gained 会按 compat.toml 规则与 per-app
+        // 记忆重算模式（apply_initial_mode），「某应用默认英文」就是在那里生效的。而这条
+        // 路径此前不发布图标，于是服务端状态、推给 DLL 的 status、DLL 本地的 _bChineseMode
+        // 全都正确变成了「英」，唯独 SHM 里还是上一个应用留下的「中」；GetIcon 在非本地态
+        // 时无条件信任 SHM，本地 label 根本不参与选择，结果就是**图标恒落后真实状态一步**
+        // （用户表现：切进配了默认英文的应用显示「中」，切换一次状态仍显示「中」）。
+        //
+        // SHM 的变体表只按 (尺寸, 明暗) 索引、不含状态，全系统共用唯一一张当前图，故整套
+        // 设计依赖一条不变量：**SHM 内容 ≡ 当前前台宿主的状态**。任何改变前台状态、或改变
+        // 前台宿主是谁的路径，都必须重发一次——activation 恰好是后一种。
+        //
+        // 补一条让本修复得以成立的前提：focus_gained 的**同步**回传（CMD_MODE_PUSH）虽然
+        // 也带权威模式，但 DLL 侧只把它 InterlockedExchange 进 `CTextService::_bChineseMode`，
+        // 不碰语言栏按钮——`CLangBarItemButton` 有**自己那一份**同名字段，只由本推送经
+        // `_SyncStateFromResponse` 更新。两份分开是关键：若同步段就把按钮那份改掉，
+        // `UpdateFullStatus` 的 needUpdate 去重会判定"状态没变"而不发 OnUpdate，本推送
+        // 便再也触发不了 GetIcon，图标将永远停在旧图——发布得再及时也没用。
+        let s = self.status_with_icon_published();
         debug!(
             "push_activation_status: chinese={} key_down={:?} key_up={:?}",
             s.chinese_mode, s.key_down_hotkeys, s.key_up_hotkeys
@@ -252,7 +270,9 @@ impl Coordinator {
     }
 
     pub(crate) fn push_state_update(&self) {
-        let s = self.build_status();
+        // 图标位图与状态推送同源同时机，且**发布必须先于推送**——顺序的理由与保证方式
+        // 见 status_with_icon_published。
+        let s = self.status_with_icon_published();
         let encoded = wind_ipc::codec::encode_state_push(
             s.chinese_mode,
             s.full_width,
@@ -262,10 +282,5 @@ impl Coordinator {
             &s.icon_label,
         );
         self.push_server.push_to_active(&encoded);
-
-        // 图标位图与状态推送同源同时机：DLL 收到本次推送后会 OnUpdate(TF_LBI_ICON)，
-        // 系统随即回调 GetIcon 去读 SHM——那时新位图必须已经在里面。
-        #[cfg(all(feature = "desktop-ui", windows))]
-        self.publish_langbar_icon(&s);
     }
 }

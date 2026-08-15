@@ -96,9 +96,40 @@ P0 阶段应当**先验证这件事**，方法见「验证设计」一节。
                             └─ CreateIconIndirect
 ```
 
-关键点：**通知复用现有的 `push_state_update`**。状态变化本来就在推送，
+关键点：**通知复用现有的状态推送**。状态变化本来就在推送，
 DLL 的 `UpdateFullStatus` 也本来就会因 `_bChinesePunct` 变化触发
 `OnUpdate(TF_LBI_ICON)`——这条链是现成的，不需要新增命令。
+
+#### 发布时序：两条不变量（2026-08-15 各栽过一次）
+
+复用现成通知链的代价，是发布必须自己对齐两件事。两条都栽过，症状分别是
+「切换偶尔不生效」和「图标恒落后一步」。
+
+**其一：SHM 内容 ≡ 当前前台宿主的状态。** 变体表只按 (尺寸, 明暗) 索引、
+不含任何状态维度，全系统共用唯一一张当前图；而中英态是 per-host 的。
+所以凡是**改变前台状态**、或**改变前台宿主是谁**的路径，都必须重发一次。
+初版只在 `push_state_update` 里发布，漏掉了 `push_activation_status`——
+而焦点切入恰恰会按 `compat.toml` 规则与 per-app 记忆重算模式
+（`apply_initial_mode`），「某应用默认英文」正是在那里生效的。于是服务端状态、
+推给 DLL 的 status、DLL 本地的 `_bChineseMode` 全都对，唯独 SHM 里还是上一个
+应用留下的图，而 `GetIcon` 在非本地态时**无条件信任 SHM**，本地 label
+根本不参与选择。
+
+**其二：发布必须先于推送。** DLL 收到推送后会 `OnUpdate(TF_LBI_ICON)`，
+系统随即回调 `GetIcon` 去读 SHM——那时新位图必须已经在里面。反过来就是一个
+跨进程竞态：发布要重渲全部尺寸档 × 明暗两档，而「推送 → DLL 读线程 →
+PostMessage → OnUpdate → GetIcon」同样是毫秒级，谁先到取决于调度。
+初版这里注释写对了、代码却是反的，可见靠注释约束顺序不够——现已把发布收进
+`status_with_icon_published()`：调用方拿到 status 时位图必然已经在 SHM 里，
+顺序由**数据依赖**保证，而不是靠每个推送函数各自记得先发布一次。
+
+附一条让「其一」的修复得以成立、但极易被忽略的前提：`focus_gained` 的**同步**
+回传（`CMD_MODE_PUSH`）也带权威模式，但 DLL 只把它 `InterlockedExchange` 进
+`CTextService::_bChineseMode`，**不碰语言栏按钮**——`CLangBarItemButton` 有自己
+那一份同名字段，只由 activation 推送经 `_SyncStateFromResponse` 更新。两份分开
+是关键：若同步段就把按钮那份改掉，`UpdateFullStatus` 的 `needUpdate` 去重会判定
+「状态没变」而不发 `OnUpdate`，activation 推送便再也触发不了 `GetIcon`，
+图标将永远停在旧图——发布得再及时也没用。
 
 ### SHM 布局
 
@@ -318,6 +349,9 @@ RGB 变了的按缓冲区原 alpha 预乘。
 ## 风险与遗留
 
 - **缺一条「仅刷新图标」的下行推送。** 这是当前唯一还必须改 DLL 的一处。
+  补记：它同时是上面两条发布时序不变量的**兜底缺失**——现在「让 DLL 重取」这件事
+  完全寄生在状态推送的 `needUpdate` 上，一旦某条路径位图变了而状态没变，就只能
+  等下一次焦点/模式切换。已知会踩到的两处正是调试菜单与演示动画。
   服务端能随时重渲重发，但 `GetIcon` 是被动回调，DLL 收不到通知就不会重取；
   而既有状态推送在内容没变时会被 `needUpdate` 挡掉。补上后有两处收益：
   Dev 调试菜单改完即时生效，以及外圈跑马灯**演示动画**才真的能动起来

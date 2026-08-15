@@ -109,7 +109,30 @@ impl Coordinator {
         self.publish_langbar_icon_now();
     }
 
+    /// 取当前状态，并在**返回之前**把对应的图标位图投进共享内存。
+    ///
+    /// 存在的唯一理由是强制两件事的先后：DLL 收到状态推送后会 `OnUpdate(TF_LBI_ICON)`，
+    /// 系统随即回调 `GetIcon` 去读 SHM——那时新位图必须已经在里面。反过来（先推送、后发布）
+    /// 是一个跨进程竞态：发布要重渲全部尺寸档 × 明暗两档，是毫秒级工作，而「推送 → DLL 读线程
+    /// → PostMessage → OnUpdate → GetIcon」同样是毫秒级，谁先到取决于调度，表现为
+    /// **切换偶尔不生效**（图标停在上一个状态，下次切换才追上）。
+    ///
+    /// 把发布藏进「取状态」这一步，是为了让调用方**拿不到**一个尚未发布的 status——
+    /// 顺序由数据依赖保证，而不是靠每个推送函数各自记得先调一次发布。此前
+    /// `push_state_update` 里的注释就写对了这条要求、代码却是反的，正是这个原因。
+    ///
+    /// 非 Windows 桌面形态下退化为纯粹的 [`Self::build_status`]，故调用方无需自己加 cfg。
+    pub(crate) fn status_with_icon_published(&self) -> StatusUpdateData {
+        let s = self.build_status();
+        #[cfg(all(feature = "desktop-ui", windows))]
+        self.publish_langbar_icon(&s);
+        s
+    }
+
     /// 把当前状态渲染成语言栏图标并投送共享内存。
+    ///
+    /// ⚠ **不要直接调用**：状态推送路径一律走 [`Self::status_with_icon_published`]，
+    /// 那里保证了发布先于推送。直接调用的只有初始补发与调试菜单——它们不伴随状态推送。
     ///
     /// 失败一律只记日志：DLL 侧在读不到 SHM 时会退回本地 DirectWrite 绘制，
     /// 图标不会消失，只是不跟随标点状态——不值得为此中断状态推送。
@@ -142,9 +165,22 @@ impl Coordinator {
 
         if let Ok(mut guard) = cell.lock()
             && let Some(p) = guard.as_mut()
-            && let Err(e) = p.publish(&spec)
         {
-            tracing::warn!(error = %e, "发布语言栏图标失败");
+            match p.publish(&spec) {
+                // 记序号是排查「图标落后一帧」的唯一抓手：本行的时刻与 DLL 日志里
+                // `GetIcon: from SHM` 的时刻一对，就能判断那次 GetIcon 取到的是第几版。
+                // label / punct 都是模式状态（「中」「拼」这类短称），不含输入内容。
+                Ok(Some(seq)) => tracing::debug!(
+                    seq,
+                    label = %spec.label,
+                    punct = ?spec.punct,
+                    "语言栏图标已发布"
+                ),
+                // 状态未变，SHM 里已经是这张图，跳过重渲。不记日志：状态推送远比状态
+                // 变化频繁，每次都记会把这条日志变成噪声。
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "发布语言栏图标失败"),
+            }
         }
     }
 }
