@@ -136,27 +136,33 @@ PostMessage → OnUpdate → GetIcon」同样是毫秒级，谁先到取决于�
 双缓冲 + seqlock 校验。总大小 64 KB（实际用量约 48.8 KB）。
 
 ```
-┌─ Header (64 B) ────────────────────────────┐
-│ magic        u32   'WICO'                   │
-│ version      u16                            │
-│ variant_count u16                           │
-│ active_slot  u32   0 或 1                   │
-│ sequence     u32   每次更新递增              │
-│ slot_stride  u32   单 slot 字节数            │
-│ reserved     …                              │
-├─ Variant table (16 B × N) ─────────────────┤
-│ size_px      u16   16 / 20 / 24 / 28 / 32   │
-│ theme        u8    0=light 1=dark           │
-│ flags        u8                             │
-│ offset       u32   相对 slot 起点            │
-│ byte_len     u32                            │
-│ reserved     u32                            │
-├─ Slot 0 : 全部变体的 BGRA 数据 ─────────────┤
-├─ Slot 1 : 同上 ─────────────────────────────┤
-└─────────────────────────────────────────────┘
+┌─ Header (64 B) ─────────────────────────────────┐   偏移
+│ magic         u32   'WICO'                       │    0
+│ version       u32   当前 2                       │    4
+│ sequence      u32   每次发布递增，0 = 尚未发布过   │    8
+│ active_slot   u32   0 或 1                       │   12
+│ variant_count u32                                │   16
+│ slot_stride   u32   单 slot 字节数                │   20
+│ slot0_offset  u32   SHM 基址 → slot 0 的偏移      │   24
+│ table_offset  u32   SHM 基址 → 变体表的偏移       │   28
+│ reserved      u32 × 8                            │   32
+├─ Variant table (16 B × N) ──────────────────────┤
+│ size_px       u16   16/20/24/28/32/40/48         │
+│ theme         u8    0=light 1=dark               │
+│ flags         u8                                 │
+│ offset        u32   相对**所在 slot 起点**        │
+│ byte_len      u32                                │
+│ reserved      u32                                │
+├─ Slot 0 : 全部变体的 BGRA 数据 ──────────────────┤
+├─ Slot 1 : 同上 ──────────────────────────────────┤
+└──────────────────────────────────────────────────┘
 ```
 
-变体矩阵：5 个尺寸档 × 2 个主题 = 10 个变体。
+两处容易读错的地方：`sequence` 排在 `active_slot` **之前**（偏移 8），但写端必须**最后**
+写它——布局顺序与写入顺序无关，见「并发正确性」。变体表的 `offset` 是相对所在 slot 的
+起点而非 SHM 基址，读端取数据的地址是 `slot0_offset + slot × slot_stride + offset`。
+
+变体矩阵：**7 个尺寸档 × 2 个主题 = 14 个变体**。
 
 | 尺寸 | 对应 DPI | 单变体字节 |
 |---:|---:|---:|
@@ -165,8 +171,21 @@ PostMessage → OnUpdate → GetIcon」同样是毫秒级，谁先到取决于�
 | 24 | 150% | 2 304 |
 | 28 | 175% | 3 136 |
 | 32 | 200% | 4 096 |
+| 40 | 250% | 6 400 |
+| 48 | 300% | 9 216 |
 
-单 slot = 12 160 × 2 主题 = 24 320 B；双 slot ≈ 48.6 KB。
+单主题 27 776 B → 单 slot = 55 552 B（× 2 主题）→ 双 slot = 111 104 B；
+加上 `slot0_offset`（512 B，容得下 14 × 16 B 的变体表）共约 109 KiB，落在 128 KiB 的
+`ICON_SHM_SIZE` 内。
+
+⚠ **改这里的任何数字都要同步三处**：`wind-ipc/protocol.rs`（权威）、
+`wind_tsf/include/BinaryProtocol.h`（`ICON_SHM_VERSION` / `ICON_SHM_SIZE` 各硬编码一份）、
+以及本表。版本号不一致时读端直接判失败退回本地绘制（图标还在、只是没角标）。
+
+`ICON_SHM_VERSION` 当前为 **1**：本功能尚未随任何版本发布，开发期内改布局（补 40/48
+两档、放大 SHM）不占版本号——外面没有任何一代在跑，留着历史编号只会让人误以为存在
+兼容包袱。发布之后再改布局才 bump，而 bump 会连带改掉共享内存名（版本在名字里，
+见下节），这正是想要的。
 
 ### 并发正确性
 
@@ -208,10 +227,23 @@ PostMessage → OnUpdate → GetIcon」同样是毫秒级，谁先到取决于�
 （`HostRenderSetupEntry { window_kind, max_buffer_size, shm_name, event_name }`），
 DLL 侧 `HostWindow.cpp` 用 `OpenFileMappingW(FILE_MAP_READ)` 打开。
 
-**图标 SHM 不走握手，用固定命名**：`Local\WindIconShm{变体后缀}`。
+**图标 SHM 不走握手，用规则命名**：`Local\WindInput_IconShm_v{版本}{变体后缀}`
+（当前 `Local\WindInput_IconShm_v1` / `..._v1_dev`）。
 
-理由：这个名字一旦定下就不会再变，握手带来的动态性没有用武之地；而固定命名
-省掉了「DLL 必须先握上手才能画图标」这层依赖——图标在服务连接建立之前就可能被请求。
+理由：两端各按同一条规则拼得出来，握手带来的动态性没有用武之地；而免握手省掉了
+「DLL 必须先握上手才能画图标」这层依赖——图标在服务连接建立之前就可能被请求。
+
+★ **名字里必须带版本**（`ICON_SHM_VERSION`，Rust 侧直接拼进去、C++ 侧字面量 +
+`static_assert` 守着）。这不是为了美观：Windows 的命名 section **名字一旦存在，尺寸也
+就被钉死了**——只要还有一个进程持着映射，内核对象就活着，此时以更大的 view 去
+`MapViewOfFile` 会返回 `ACCESS_DENIED`，一个指向权限、完全不指向真正原因的错误码。
+开发期把 SHM 从 64 KiB 提到 128 KiB 时就被这个卡住过：几十个宿主进程里的旧 DLL 各持
+一份 64 KiB 映射，新服务怎么也建不出 128 KiB，而持有者名单里有 `explorer.exe` 与
+`SearchHost.exe`，腾干净约等于注销一次。
+
+版本进名字后，新旧两代用的是不同的内核对象，各自活到自己最后一个持有者退出为止，
+互不阻塞。代价是跨版本的新服务 + 旧 DLL 互相看不见 SHM——那正是想要的结果：退回本地
+绘制（图标照常显示、只是没角标），而不是按旧布局解释出一张花屏。
 
 不复用 `CMD_HOST_RENDER_SETUP` 的原因另有一条：HostRender 有进程级白名单门控，
 只在特定宿主启用，而图标是所有宿主都要的，不能把生命周期绑在那个门控上。
@@ -383,6 +415,11 @@ RGB 变了的按缓冲区原 alpha 预乘。
   留一句作为教训：这条缺口的本质是「让 DLL 重取」完全寄生在状态推送的 `needUpdate`
   上，凡是**位图变了而状态没变**的路径都会静默失效。将来再往图标上加任何「不表达
   状态的呈现」（第二种动画、临时高亮之类），都要先回答它靠什么通知 DLL。
+- ~~**共享内存名不含版本，改尺寸会把自己锁在门外。**~~ **已做**（2026-08-14 实际踩到，
+  次日修复）。名字改为 `Local\WindInput_IconShm_v{版本}{_dev}`，设计与踩坑经过见
+  「命名」一节。记一条给以后：`ACCESS_DENIED` 出现在 `MapViewOfFile` 上时，**先怀疑
+  尺寸而不是权限**——命名 section 的名字把尺寸也钉死了，而错误码完全不提这件事。
+
 - **fallback 必须真正被测到。** 「SHM 打不开时退回本地绘制」这类兜底路径最容易
   写了但从不执行，等真出问题时才发现兜底本身是坏的。需要有意构造 SHM 缺失场景验证。
 - **HICON 所有权。** `GetIcon` 返回的 HICON 由调用方销毁（现有代码每次

@@ -6,6 +6,15 @@
 #include <cstdlib>
 #include <cstring>
 
+// SHM 名里的 `_v1`（Globals.h 的 WIND_ICON_SHM_NAME）与 ICON_SHM_VERSION 是同一个
+// 版本，但一个在宽字符串字面量里、一个是整数，没法直接比对。退而求其次把当前值钉死：
+// 改版本号时这里编译失败，强制回去同步那个名字。
+//
+// 漏改的后果无声——Rust 侧的 icon_shm_name 会自动带上新版本，本端还在开旧名字，
+// OpenFileMappingW 恒失败，图标退回本地绘制照常显示、只是永远不跟随标点变化。
+static_assert(ICON_SHM_VERSION == 1,
+              "改了 ICON_SHM_VERSION 必须同步 Globals.h 里 WIND_ICON_SHM_NAME 的 _v1");
+
 // 从映射里读一个 4 字节小端量。
 //
 // volatile 是必需的：seqlock 依赖「先读 sequence、拷贝、再读 sequence」这个顺序，

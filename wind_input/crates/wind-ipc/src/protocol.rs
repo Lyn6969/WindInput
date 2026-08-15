@@ -959,12 +959,14 @@ impl SharedRenderHeader {
 
 /// 图标 SHM 魔数 `'WICO'`（字节序 W,I,C,O，小端读作 `0x4F43_4957`）。
 pub const ICON_SHM_MAGIC: u32 = 0x4F43_4957;
-/// 布局版本。v2 加了 40/48 两档并放大了 SHM（见 [`ICON_SIZES`]）。
+/// 布局版本。**本功能尚未随任何版本发布**，故开发期内改布局（补 40/48 两档、放大
+/// SHM）不占版本号——外面没有任何一代在跑，留着历史编号只会让人误以为存在兼容包袱。
+/// 首个发布版本即 1；发布之后再改布局才 bump。
 ///
 /// 版本不匹配时读端直接判失败、退回本地绘制，而不是硬读——DLL 与服务分属两个
 /// 部署单元，先更新哪个都可能。降级的表现是「图标还在、只是没有角标」，可接受；
 /// 硬读的表现是任务栏上出现一张错位的花屏。
-pub const ICON_SHM_VERSION: u32 = 2;
+pub const ICON_SHM_VERSION: u32 = 1;
 
 /// 图标 SHM 名（不走握手，两端各自按固定规则拼）。
 ///
@@ -977,8 +979,22 @@ pub const ICON_SHM_VERSION: u32 = 2;
 /// macOS 侧曾因两种后缀风格混用，导致 dev 变体的 bridge/SHM 全程握不上手。
 ///
 /// `Local\` 前缀提供终端服务会话级隔离，与 HostRender 的 SHM 同策略（不含 SID）。
+///
+/// ★ **名字里必须带版本，且要随 [`ICON_SHM_VERSION`] 走。** 命名 section 的名字一旦
+/// 存在，**尺寸也就被钉死了**：只要还有一个进程持着映射，内核对象就活着，此时以更大的
+/// view 大小去 `MapViewOfFile` 会返回 `ACCESS_DENIED`——一个指向权限、完全不指向真正
+/// 原因的错误码。开发期把 SHM 从 64 KiB 提到 128 KiB 时就是这样卡住的：几十个宿主
+/// 进程里的旧 DLL 各持一份 64 KiB 映射，新服务怎么也建不出 128 KiB，而持有者名单里有
+/// `explorer.exe` 与 `SearchHost.exe`，腾干净约等于注销一次。
+///
+/// 版本进名字之后，新旧两代用的是不同的内核对象，各自活到自己最后一个持有者退出为止，
+/// 互不阻塞。代价是跨版本的新服务 + 旧 DLL 会互相看不见 SHM——那正是想要的结果：
+/// 退回本地绘制（图标照常显示，只是没角标），而不是读出一张按旧布局解释的花屏。
+///
+/// 直接拼 [`ICON_SHM_VERSION`] 而不是写死 `_v1`，是为了让「改版本号」与「改名字」
+/// 变成同一个动作——两者分开写就一定会有一次只改其中一个。
 pub fn icon_shm_name(suffix: &str) -> String {
-    format!("Local\\WindInput_IconShm{suffix}")
+    format!("Local\\WindInput_IconShm_v{ICON_SHM_VERSION}{suffix}")
 }
 
 /// 预渲染的尺寸档，对应 100/125/150/175/200/250/300% DPI。
@@ -1384,8 +1400,23 @@ mod tests {
     /// 全程握不上手且无任何报错。C++ 侧 `Globals.h` 的 `WIND_ICON_SHM_NAME` 必须逐字一致。
     #[test]
     fn icon_shm_name_uses_pipe_style_suffix() {
-        assert_eq!(icon_shm_name(""), "Local\\WindInput_IconShm");
-        assert_eq!(icon_shm_name("_dev"), "Local\\WindInput_IconShm_dev");
+        assert_eq!(icon_shm_name(""), "Local\\WindInput_IconShm_v1");
+        assert_eq!(icon_shm_name("_dev"), "Local\\WindInput_IconShm_v1_dev");
+    }
+
+    /// 版本号进了名字，所以 bump `ICON_SHM_VERSION` 会静默改掉 SHM 名——而 C++ 侧的
+    /// `WIND_ICON_SHM_NAME` 是写死的字面量，跟不上就是「DLL 永远打不开 SHM」。
+    /// 本测试让 bump 在这里先失败一次，逼着改的人去同步 `Globals.h`。
+    #[test]
+    fn icon_shm_name_carries_current_version() {
+        assert_eq!(
+            ICON_SHM_VERSION, 1,
+            "改版本号必须同步 Globals.h 的 WIND_ICON_SHM_NAME"
+        );
+        assert!(
+            icon_shm_name("").contains(&format!("_v{ICON_SHM_VERSION}")),
+            "SHM 名必须带版本，否则改尺寸会被旧进程持有的同名 section 锁死"
+        );
     }
 
     #[test]

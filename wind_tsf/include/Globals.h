@@ -197,10 +197,17 @@ const wchar_t* WindPushPipeName();
 // 与管道名不同，这里**不含 SID**：`Local\` 前缀已提供终端服务会话级隔离，
 // 与 host-render 的 SHM 同策略（见 wind-bridge 的 shm_name_for）。
 // 故可编译期常量，无需运行时求值。
+// ★ 名字里的 `_v1` 是 ICON_SHM_VERSION，**必须跟着它一起改**。命名 section 的名字
+// 一旦存在，尺寸也被钉死：还有进程持着映射时，以更大的 view 去映射会返回
+// ACCESS_DENIED（指向权限，完全不指向真正的原因）。开发期把 SHM 提到 128 KiB 时就是
+// 这样卡住的，而持有者名单里有 explorer.exe 与 SearchHost.exe，腾干净约等于注销一次。
+// 版本进名字后新旧两代各用各的内核对象，互不阻塞。
+// 漏改的后果是良性的（打不开 → 退回本地绘制，图标在、没角标），但同样无声。
+// IconShmReader.cpp 有一条 static_assert 会在 ICON_SHM_VERSION 变动时编译失败。
 #ifdef WIND_DEV_VARIANT
-#define WIND_ICON_SHM_NAME      L"Local\\WindInput_IconShm_dev"
+#define WIND_ICON_SHM_NAME      L"Local\\WindInput_IconShm_v1_dev"
 #else
-#define WIND_ICON_SHM_NAME      L"Local\\WindInput_IconShm"
+#define WIND_ICON_SHM_NAME      L"Local\\WindInput_IconShm_v1"
 #endif
 
 // Modifier key flags (using KEY_ prefix to avoid Windows macro conflicts)
