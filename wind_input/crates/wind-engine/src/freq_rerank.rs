@@ -281,6 +281,7 @@ pub fn rerank_pinyin_positional(
     now: i64,
     profile: FreqProfile,
     promote_prefix: PromotePrefix,
+    input_len: usize,
 ) {
     rerank_positional(
         candidates,
@@ -308,8 +309,23 @@ pub fn rerank_pinyin_positional(
         // 竞争者，于是整句保持锚定、用户选中再多次也翻不过。守门测试
         // `pinyin_fuzzy_peer_can_overtake_sentence`。
         |c| c.is_phrase && c.is_exact_code,
-        // 匹配层级：简拼 / 前缀补全 / 子短语。词频不得跨层提拔。
-        wind_candidate::cmp_match_layers,
+        // 消费长度 → 匹配层级（简拼 / 前缀补全 / 子短语）。词频不得跨层提拔。
+        //
+        // ## ⚠️ `cmp_by_consumed` 必须在前，且不能省
+        //
+        // 本函数是**最后一道整体排序**，会推翻 `candidate_display_order` 的结果；而它只在
+        // 本次输入**有词频记录**时才被调用（`recs.is_empty()` 直接 return）。两处排序键不
+        // 一致 ⇒ 同一批候选存在两种次序，且切换开关是「这个词有没有被上过屏」——用户看到的
+        // 是候选忽隐忽现。实测：「冰冻三尺非一日之寒」打 `bingdongsanchi`（整音节边界，
+        // 拿不到残码上浮 ⇒ 停在前缀补全层）首次在第 1 位，上屏一次后掉到第 24 位，
+        // 从词频表删除又恢复。判据与完整事故记录见 `wind_candidate::cmp_by_consumed`。
+        //
+        // 词频**只在同一消费长度组内**起作用，这也正是「上过屏与否，召回体验应当一致」的
+        // 形式化表述。
+        |a, b| {
+            wind_candidate::cmp_by_consumed(a, b, input_len)
+                .then_with(|| wind_candidate::cmp_match_layers(a, b))
+        },
     );
 }
 
@@ -499,6 +515,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text, "你好",
@@ -536,6 +553,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text, "事实",
@@ -559,6 +577,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(cands[0].text, "你好世界", "无词频时整句仍是最优解读");
     }
@@ -597,6 +616,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(cands[0].text, "廉政提醒", "精确整词须在降级整句之前");
         assert_eq!(cands[1].text, "连整体性", "降级整句仍须在普通候选之前");
@@ -621,6 +641,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text, "廉政提醒",
@@ -646,6 +667,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text, "降级整句",
@@ -670,6 +692,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text,
@@ -694,6 +717,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text, "寺院",
@@ -716,6 +740,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text, "近用低权",
@@ -746,6 +771,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(cands[0].text, "我的邮箱", "精确码短语须与整句同享锚定");
     }
@@ -773,6 +799,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text,
@@ -794,6 +821,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(cands[0].text, "近用低权", "近期使用应软置前");
     }
@@ -827,6 +855,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             cands[0].text,
@@ -849,6 +878,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(cands[0].text, "高权未用", "褪色词应落回权重序，高权在前");
     }
@@ -1252,7 +1282,14 @@ mod tests {
         for (label, secs) in [("1 分钟", 60i64), ("1 小时", 3600), ("1 天", 86_400)] {
             let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
             let r = recs(&[("思源", 1, NOW - secs)]);
-            rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+            rerank_pinyin_positional(
+                &mut c,
+                &r,
+                NOW,
+                FreqProfile::default(),
+                PromotePrefix::All,
+                0,
+            );
             assert_eq!(
                 c[0].text, "思源",
                 "选过一次、{label}后再打，仍应居首（decay 略小于 1 不得被截断成 0）"
@@ -1268,7 +1305,14 @@ mod tests {
         let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
         // 30 天 ≈ 10 个半衰期，decay ≈ 0.001
         let r = recs(&[("思源", 1, NOW - 30 * 86_400)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(
             c[0].text, "寺院",
             "一个月前用过一次不应再影响排序——否则位次的 floor 会让任何残余强度都置顶第 2 位"
@@ -1297,6 +1341,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(week[0].text, "思源", "用过 50 次的词一周后仍应保持提升");
 
@@ -1309,6 +1354,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(
             month[0].text, "寺院",
@@ -1325,7 +1371,14 @@ mod tests {
     fn top_candidate_with_freq_is_not_pushed_down() {
         let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
         let r = recs(&[("寺院", 8, NOW), ("思源", 6, NOW)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(
             c[0].text, "寺院",
             "首位候选用得更多，不该因为「没法再往前」而掉位"
@@ -1339,7 +1392,14 @@ mod tests {
     fn top_candidate_yields_to_stronger_peer() {
         let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
         let r = recs(&[("寺院", 3, NOW), ("思源", 10, NOW)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(
             c[0].text, "思源",
             "同目标位次时按有效强度排序，用得多的在前"
@@ -1377,6 +1437,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::None,
+            0,
         );
         assert_eq!(
             off.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
@@ -1386,7 +1447,14 @@ mod tests {
 
         // **对照**：开启后同样的记录能把它提到首位——否则本用例只是在测「提升从未工作」
         let mut on = build();
-        rerank_pinyin_positional(&mut on, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut on,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(on[0].text, "东西", "开关开启时应恢复提升");
     }
 
@@ -1399,7 +1467,14 @@ mod tests {
         promoted.is_promoted_completion = true;
         let mut c = vec![pin("每", 90_000), promoted];
         let r = recs(&[("没有", 1, NOW)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::None);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::None,
+            0,
+        );
         assert_eq!(
             c[0].text, "没有",
             "已提升进完整匹配层的候选不受 promote_prefix 影响"
@@ -1425,6 +1500,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::Single,
+            0,
         );
         assert_eq!(chars[0].text, "得", "Single 档下单字补全应可提升");
 
@@ -1440,6 +1516,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::Single,
+            0,
         );
         assert_eq!(
             words.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
@@ -1471,6 +1548,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::Single,
+            0,
         );
         assert_eq!(
             c[0].text, "hello",
@@ -1485,6 +1563,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::Single,
+            0,
         );
         assert_eq!(
             phrase[0].text, "thanks",
@@ -1616,7 +1695,14 @@ mod tests {
         // ① 486 倍落差
         let mut de = vec![pin("的", W_DE), pin("得", W_DEI), pin("地", W_DI)];
         let r = recs(&[("得", 1, NOW)]);
-        rerank_pinyin_positional(&mut de, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut de,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(de[0].text, "得", "第 2 位用一次即到首位（486 倍落差）");
 
         // ② 2 倍落差——同样一次
@@ -1628,6 +1714,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(sy[0].text, "思源", "第 2 位用一次即到首位（2 倍落差）");
     }
@@ -1649,7 +1736,14 @@ mod tests {
         for (count, want) in [(1u32, 4usize), (2, 2), (3, 1), (4, 0)] {
             let mut c = build();
             let r = recs(&[("i", count, NOW)]);
-            rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+            rerank_pinyin_positional(
+                &mut c,
+                &r,
+                NOW,
+                FreqProfile::default(),
+                PromotePrefix::All,
+                0,
+            );
             let got = c.iter().position(|x| x.text == "i").unwrap();
             assert_eq!(got, want, "用 {count} 次后应在第 {want} 位，实际 {got}");
         }
@@ -1668,6 +1762,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         let after: Vec<String> = c.iter().map(|x| x.text.clone()).collect();
         assert_eq!(before, after, "无词频记录时顺序必须原样保持");
@@ -1681,7 +1776,14 @@ mod tests {
     fn contested_sentence_can_be_overtaken_by_promoted_peer() {
         let mut c = vec![pin_contested("寺院"), pin("思源", W_SIYUAN_PRODUCT)];
         let r = recs(&[("思源", 1, NOW)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(c[0].text, "思源", "选过一次的同码词应反超 contested 整句");
         assert_eq!(c[1].text, "寺院", "整句退居第二，不是被赶出列表");
     }
@@ -1696,6 +1798,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(c[0].text, "寺院", "无词频记录时整句解仍是最优解读");
     }
@@ -1714,7 +1817,14 @@ mod tests {
         };
         let mut c = vec![phrase, pin("普通词", 5000)];
         let r = recs(&[("普通词", 50, NOW)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(c[0].text, "我的邮箱", "锚定的精确码短语不受位置提升影响");
     }
 
@@ -1724,7 +1834,14 @@ mod tests {
         let long_ago = NOW - 365 * 24 * 3600;
         let mut c = vec![pin("的", W_DE), pin("得", W_DEI), pin("地", W_DI)];
         let r = recs(&[("得", 1, long_ago)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(c[0].text, "的", "一年前用过一次 → 衰减殆尽 → 不再提升");
 
         // 对照：同样的记录、刚用过则生效——否则上面可能只是「提升从未工作」
@@ -1736,6 +1853,7 @@ mod tests {
             NOW,
             FreqProfile::default(),
             PromotePrefix::All,
+            0,
         );
         assert_eq!(fresh[0].text, "得", "刚用过必须生效");
     }
@@ -1759,7 +1877,14 @@ mod tests {
             completion("思路", 800_000),
         ];
         let r = recs(&[("思路", 50, NOW)]);
-        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
+        rerank_pinyin_positional(
+            &mut c,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
         assert_eq!(c[0].text, "四", "补全用 50 次也不得跨层压过精确候选");
         assert_eq!(
             c[1].text, "思路",

@@ -129,14 +129,10 @@ pub(crate) fn candidate_display_order(
     //
     // 当初那个动机本身也已消失：`zhonghuar` 的「种花人」(w=0) 能登顶是因为当时没有候选
     // 消费到第 9 字节，残码补全整句（step 2c）落地后它自然被压下去。
-    let eff_consumed = |c: &Candidate| {
-        if c.consumed_length == 0 {
-            input_len
-        } else {
-            c.consumed_length
-        }
-    };
-    let by_consumed = eff_consumed(b).cmp(&eff_consumed(a));
+    //
+    // ⚠️ 本键与 `cmp_match_layers` 必须成对出现（判据抽在 `wind_candidate::cmp_by_consumed`，
+    // 那里记着「只有一处带上本键」时长词在词频表里进出会导致候选忽隐忽现的事故）。
+    let by_consumed = wind_candidate::cmp_by_consumed(a, b, input_len);
 
     by_consumed
         .then_with(|| wind_candidate::cmp_match_layers(a, b))
@@ -410,6 +406,7 @@ impl Coordinator {
                 now_unix_secs(),
                 profile,
                 settings.promote_prefix,
+                input_len,
             );
         } else {
             // `strategy = position` 时走与拼音同一套位置提升（档位仍是硬约束，只在档内

@@ -394,6 +394,41 @@ impl Candidate {
     }
 }
 
+/// 候选**实际消费的输入长度**：`0` 是「引擎未标注 ⇒ 按整串算」的全仓约定（码表候选恒为 0）。
+///
+/// 不归一化就直接比较会把码表候选整体甩到最后，见 [`cmp_by_consumed`]。
+pub fn effective_consumed(c: &Candidate, input_len: usize) -> usize {
+    if c.consumed_length == 0 {
+        input_len
+    } else {
+        c.consumed_length
+    }
+}
+
+/// 「消费输入更多者优先」比较——对齐 librime：其候选容器
+/// `DictEntryCollector = map<size_t, DictEntryIterator>` 以「消费的输入长度」为 key，
+/// `phrase_->rbegin()` 从最长开始遍历 ⇒ 消费更多输入者恒优先，**先于词频、先于任何层级**。
+///
+/// ## ⚠️ 必须与 [`cmp_match_layers`] 成对出现，且恒在其**之前**
+///
+/// 本键与层级键分居两处、只有一处带上本键时，会出现「同一批候选两种次序」——而下游那处
+/// 又只在某个条件下才跑，于是**功能表现为「时灵时不灵」**。实际发生过：
+/// 协调器 `candidate_display_order` 以本键开头，而最后一道整体排序
+/// `freq_rerank::rerank_positional` 的层级比较器只有 `cmp_match_layers`；后者**仅在本次输入
+/// 有词频记录时才被调用**（`recs.is_empty()` 直接 return）。真机现象是：
+/// 「冰冻三尺非一日之寒」打到 `bingdongsanchi` 首次能出（第 1 位），**一旦上过屏进了词频表
+/// 就再也出不来**（掉到第 24 位），从词频表删掉又恢复。
+///
+/// 根因是该候选在整音节边界上拿不到残码上浮（`is_promoted_completion=false`）⇒ 落进
+/// `cmp_match_layers` 的前缀补全层 ⇒ 被 `bing` 的几十个同音单字整层压住；而它消费了整串、
+/// 本该由本键把它顶在最前。**词频记录本身一格都没提升它**（`promote_prefix=single` 判假），
+/// 记录的唯一作用是让那道用错键的重排被触发。
+///
+/// ⇒ 凡是会整体重排候选的地方，本键与层级键要一起用、顺序一致。
+pub fn cmp_by_consumed(a: &Candidate, b: &Candidate, input_len: usize) -> std::cmp::Ordering {
+    effective_consumed(b, input_len).cmp(&effective_consumed(a, input_len))
+}
+
 /// 候选「匹配层级」比较——`Exact >> 子短语 >> 前缀补全 >> 简拼 >> 全拼降级` 的**唯一真相**。
 ///
 /// ⓪ 本方案编码的候选优先于**全拼降级**候选（双拼下打 `nihao`，双拼解读先于全拼解读）；
