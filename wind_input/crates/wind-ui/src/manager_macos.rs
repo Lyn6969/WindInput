@@ -195,6 +195,7 @@ impl Forwarder {
             UiCommand::UpdateCandidates {
                 preedit,
                 preedit_caret,
+                preedit_host_owned,
                 mode_label,
                 candidates,
                 selected,
@@ -226,6 +227,13 @@ impl Forwarder {
                         .filter(|s| !s.is_empty())
                 } else {
                     None
+                };
+                // 编码区归宿主自绘时（`preedit_display = app_inline`），候选窗不重复画一遍
+                // ——数据恒下发、显示与否看这个标志，与 Windows 侧 `manager.rs` 同一判据。
+                let preedit = if preedit_host_owned {
+                    String::new()
+                } else {
+                    preedit
                 };
                 self.win.update(
                     &preedit,
@@ -696,6 +704,7 @@ mod tests {
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
             preedit_caret: 1,
+            preedit_host_owned: false,
             mode_label: "".into(),
             candidates: vec![item("中"), item("国")],
             selected: 0,
@@ -741,6 +750,7 @@ mod tests {
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
             preedit_caret: 1,
+            preedit_host_owned: false,
             mode_label: "".into(),
             candidates: vec![item("中"), item("国")],
             selected: 0,
@@ -830,6 +840,7 @@ mod tests {
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
             preedit_caret: 1,
+            preedit_host_owned: false,
             mode_label: "".into(),
             candidates: vec![item("中"), item("国")],
             selected: 0,
@@ -1011,6 +1022,7 @@ mod tests {
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
             preedit_caret: 1,
+            preedit_host_owned: false,
             mode_label: "".into(),
             candidates: vec![item("中")],
             selected: 0,

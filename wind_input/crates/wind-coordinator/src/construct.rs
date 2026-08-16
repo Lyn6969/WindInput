@@ -15,6 +15,9 @@ use wind_bridge::push::{PushConfig, PushServer};
 use wind_config::Config;
 use wind_store::Store;
 use wind_ui_types::UiCommand;
+// UiEvent 仅 macOS forwarder 路径显式命名（其余平台由 UiManager 的通道类型推断）。
+#[cfg(all(feature = "desktop-ui", target_os = "macos"))]
+use wind_ui_types::UiEvent;
 // UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
 #[cfg(all(feature = "desktop-ui", not(target_os = "macos")))]
 use wind_ui::manager::UiManager;
