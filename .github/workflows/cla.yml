@@ -20,7 +20,8 @@ jobs:
       (github.event_name == 'issue_comment' && github.event.comment.body == 'recheck')
     steps:
       - name: CLA Assistant
-        uses: contributor-assistant/github-action@v2
+        # 上游仓库已归档，浮动 tag v2 随之删除，只能钉死具体版本
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_TOKEN }}

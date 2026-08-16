@@ -43,7 +43,7 @@
 
 ### 签署记录
 
-所有签署记录由 [CLA Assistant](https://cla-assistant.io/) 管理，可在项目仓库的 CLA 配置中查看。
+所有签署记录存放在本仓库的 `signatures/cla.json` 文件中，由 CLA Assistant 机器人在您签署后自动提交。
 
 ---
 
