@@ -56,31 +56,31 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
         // unix 无连接身份语义（host-render 仅 Windows），传 {0,0} 占位。
         let ctx = ClientCtx { conn_id: 0, pid: 0 };
         let response = dispatch_command(&handler, header.command, header.is_async(), &payload, ctx);
-        if let Some(resp) = response {
-            if stream.write_all(&resp).is_err() {
-                break;
-            }
+        if let Some(resp) = response
+            && stream.write_all(&resp).is_err()
+        {
+            break;
         }
         // FOCUS_GAINED 重型段延后到响应写出之后（对齐 server.rs handle_client）
-        if header.command == CMD_FOCUS_GAINED {
-            if let Ok(fg) = decode_focus_gained(&payload) {
-                handler.handle_focus_gained(&FocusData {
-                    x: fg.caret.x,
-                    y: fg.caret.y,
-                    height: fg.caret.height,
-                    composition_start_x: fg.caret.composition_start_x,
-                    composition_start_y: fg.caret.composition_start_y,
-                    client_token: fg.client_token,
-                    input_scope_mask: fg.input_scope_mask,
-                    disabled: fg.disabled != 0,
-                    reason: fg.reason,
-                    // macOS `.app` 的 caret 段恒为 0（含 height），服务端 apply_focus_caret
-                    // 见 height==0 即返回；坐标另经 CmdCaretUpdate 上报。来源恒落 UNKNOWN
-                    // ——那边没有 TSF，不适用 CARET_SRC_* 的分级。
-                    caret_source: fg.caret_source,
-                    bundle_id: wind_ipc::codec::decode_focus_gained_bundle_id(&payload).to_string(),
-                });
-            }
+        if header.command == CMD_FOCUS_GAINED
+            && let Ok(fg) = decode_focus_gained(&payload)
+        {
+            handler.handle_focus_gained(&FocusData {
+                x: fg.caret.x,
+                y: fg.caret.y,
+                height: fg.caret.height,
+                composition_start_x: fg.caret.composition_start_x,
+                composition_start_y: fg.caret.composition_start_y,
+                client_token: fg.client_token,
+                input_scope_mask: fg.input_scope_mask,
+                disabled: fg.disabled != 0,
+                reason: fg.reason,
+                // macOS `.app` 的 caret 段恒为 0（含 height），服务端 apply_focus_caret
+                // 见 height==0 即返回；坐标另经 CmdCaretUpdate 上报。来源恒落 UNKNOWN
+                // ——那边没有 TSF，不适用 CARET_SRC_* 的分级。
+                caret_source: fg.caret_source,
+                bundle_id: wind_ipc::codec::decode_focus_gained_bundle_id(&payload).to_string(),
+            });
         }
     }
 }

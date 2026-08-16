@@ -264,6 +264,7 @@ impl UiManager {
                 && let Some(t) = &mut status_tip
             {
                 // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
+                #[cfg_attr(not(windows), allow(unused_mut))] // 仅 Windows 分支会改写它
                 let mut host_ok = false;
                 #[cfg(windows)]
                 if let Some(hr) = &host_render

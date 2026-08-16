@@ -1707,6 +1707,7 @@ impl Coordinator {
             (s.ime_active, s.has_edit_context)
         };
         // 窗口快照独立取（锁序：last_input_diag → state → last_window_diag，全程不嵌套）。
+        #[cfg_attr(not(windows), allow(unused_mut))] // host-render 现算段仅 Windows 有
         let mut window = self
             .last_window_diag
             .lock()
@@ -3444,7 +3445,7 @@ impl Coordinator {
             if !deletable {
                 f |= 0x08;
             }
-            let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
+            let cand_id = (!cand.id.is_empty()).then_some(cand.id.as_str());
             if !self.shadow_has_rule(&schema, &code, word, cand_id) {
                 f |= 0x10; // 无 shadow 规则：禁恢复默认
             }

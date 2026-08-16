@@ -429,6 +429,9 @@ fn initial_bottom_right(w: u32, h: u32, scale: f32) -> (i32, i32) {
 /// 用"可见余量"而非"任意相交"：只露极少（如 1px）也视为屏外，保证用户能重新抓到窗口。
 /// 参数是两个矩形加一个阈值，展开成标量便于逐项单测，不包成 Rect 对象。
 #[allow(clippy::too_many_arguments)]
+/// 非 Windows 下唯一的调用者是本文件的测试（生产调用点在 `cfg(windows)` 内），
+/// 故 lib 单独编译时它无人使用——测试本身仍跨平台跑，不能删。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn rect_visible(
     x: i32,
     y: i32,

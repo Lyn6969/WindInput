@@ -1327,8 +1327,10 @@ mod tests {
         let mut r = IconRenderer::new(BadgeShape::None).expect("renderer");
         r.width_mark = true; // 默认关；本测试验的是开启后半角仍不留痕
         let plain = r.render(32, false, &IconSpec::default());
-        let mut with_mark = IconSpec::default();
-        with_mark.full_width = true;
+        let with_mark = IconSpec {
+            full_width: true,
+            ..Default::default()
+        };
         let marked = r.render(32, false, &with_mark);
         assert_ne!(plain, marked, "全角与半角渲染结果相同，标记没画出来");
 

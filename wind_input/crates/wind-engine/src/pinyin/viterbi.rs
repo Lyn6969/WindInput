@@ -283,7 +283,7 @@ impl ViterbiDecoder {
         self.perf.max_us.fetch_max(us, Ordering::Relaxed);
         // fetch_add 返回旧值，故 `+1` 后才是本次序号。
         let n = self.perf.count.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % PERF_LOG_EVERY != 0 {
+        if !n.is_multiple_of(PERF_LOG_EVERY) {
             return;
         }
         // 取完即清零，让每条汇总覆盖独立的一段窗口（累计均值会把变化抹平）。

@@ -426,7 +426,7 @@ mod tests {
         let seq_before = shm.sequence();
 
         // 数量不对
-        let err = shm.publish(&full_set(0x22)[..3].to_vec()).unwrap_err();
+        let err = shm.publish(&full_set(0x22)[..3]).unwrap_err();
         assert!(matches!(err, IconPublishError::VariantCount { .. }));
 
         // 某一档长度不对

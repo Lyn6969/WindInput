@@ -80,8 +80,8 @@ fn ratio_under_grammar() {
         let mgr = EngineManager::new(&cfg_with(g), Some(&dir));
         println!("\n════════ {label} ════════");
         println!(
-            "{:<10} {:<10} {:>9}  {:<10} {:>9} {:>9}  {}",
-            "输入", "残码整句", "整句w", "最强d=1补全", "补全w", "倍数", "整句该赢?"
+            "{:<10} {:<10} {:>9}  {:<10} {:>9} {:>9}  整句该赢?",
+            "输入", "残码整句", "整句w", "最强d=1补全", "补全w", "倍数"
         );
         for (input, _want, sentence_should_win) in CASES {
             let res = mgr.convert(input, 500);

@@ -31,6 +31,7 @@
 //! ★ **只有用户在 `keys.session_actions` 里真的配了 `capslock` 才安装**（协调器侧判定）。
 //! 没配的用户进程里根本不存在全局键盘钩子——这是本功能唯一的风险控制手段，不可省。
 
+#[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,6 +44,7 @@ static SHOULD_EAT: AtomicBool = AtomicBool::new(false);
 
 /// 按下 CapsLock 时的通知回调。在钩子线程里执行，实现方必须只做非阻塞投递。
 type PressCallback = Box<dyn Fn() + Send + Sync + 'static>;
+#[cfg(windows)]
 static CALLBACK: OnceLock<PressCallback> = OnceLock::new();
 
 /// 设置「当前是否拦截 CapsLock」。协调器在会话状态变化时调用，钩子未安装时也可安全调用。

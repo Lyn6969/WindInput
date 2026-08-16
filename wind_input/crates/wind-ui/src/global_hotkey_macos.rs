@@ -185,8 +185,10 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 static WAKE_SOURCE: OnceLock<SendPtr<c_void>> = OnceLock::new();
 /// 已注册热键：(Carbon ref, 热键 id)。只在主线程读写。
 static REGISTERED: Mutex<Vec<(SendPtr<c_void>, i32)>> = Mutex::new(Vec::new());
+/// 热键 id → 动作名，外加回送事件的通道。
+type HotkeyActions = (HashMap<u32, String>, Sender<UiEvent>);
 /// 热键 id → 动作名 + 事件通道。handler 回调（主线程）查它决定发什么事件。
-static ACTIONS: Mutex<Option<(HashMap<u32, String>, Sender<UiEvent>)>> = Mutex::new(None);
+static ACTIONS: Mutex<Option<HotkeyActions>> = Mutex::new(None);
 /// 主循环退出标志（服务重启时置位）。
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -410,8 +412,8 @@ unsafe fn drain_pending() {
         }
         actions.insert(e.id as u32, e.action.clone());
         match REGISTERED.lock() {
-            Ok(mut g) => g.push((SendPtr(r as *mut c_void), e.id)),
-            Err(p) => p.into_inner().push((SendPtr(r as *mut c_void), e.id)),
+            Ok(mut g) => g.push((SendPtr(r), e.id)),
+            Err(p) => p.into_inner().push((SendPtr(r), e.id)),
         }
         ok += 1;
         tracing::debug!(

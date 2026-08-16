@@ -18,6 +18,8 @@ use crate::window::{LayeredWindow, WindowMouse};
 /// 鼠标跟踪器：检测鼠标是否悬停在 tooltip 上（WM_MOUSELEAVE 触发时直接隐藏窗口）；
 /// 右键弹出反查菜单（复制内容/截图此窗口）。
 struct TooltipMouse {
+    /// 仅 Windows 读取（TrackMouseEvent / ShowWindow）；其它平台无 Win32 消息泵。
+    #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: HWND,
     mouse_over: Rc<Cell<bool>>,
     tracking: bool,
@@ -433,7 +435,7 @@ fn dpi_scale() -> f32 {
 
 /// 竖排模式：tooltip 显示在候选窗**右侧**（空间不足时改左侧），纵向对齐悬停候选行。
 /// `win_left`/`win_right` 为候选窗左右边界（含阴影）；`row_top`/`row_bottom` 为候选行上下边界。
-#[cfg_attr(not(windows), allow(unused_variables))]
+#[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
 fn clamp_beside(
     win_left: i32,
     win_right: i32,
@@ -487,7 +489,7 @@ fn clamp_beside(
 
 /// 钳位 tooltip 到工作区：默认候选行下方（anchor_bottom + gap）；下方放不下则上翻到候选行
 /// **上方**（anchor_top − gap − h，让出整行高度避免遮挡候选）；左右越界贴边。
-#[cfg_attr(not(windows), allow(unused_variables))]
+#[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
 fn clamp_to_work_area(x: i32, anchor_top: i32, anchor_bottom: i32, w: u32, h: u32) -> (i32, i32) {
     let gap = 2;
     let (mut nx, mut ny) = (x, anchor_bottom + gap);

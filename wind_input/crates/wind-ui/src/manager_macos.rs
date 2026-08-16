@@ -522,7 +522,7 @@ impl Forwarder {
             return None;
         }
         let f = self.win.render_frame()?;
-        Some((f.buf, f.width as u32, f.height as u32))
+        Some((f.buf, f.width, f.height))
     }
 
     /// 请 `.app` 截某个原生浮窗存盘。文件名在此定（与 Windows 侧同一格式），

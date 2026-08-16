@@ -72,14 +72,9 @@ fn handle_push_conn(mut stream: UnixStream, clients: Arc<Mutex<Vec<PushClient>>>
     }
     // 4. writer loop
     let mut writer = stream;
-    loop {
-        match rx.recv() {
-            Ok(data) => {
-                if writer.write_all(&data).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
+    while let Ok(data) = rx.recv() {
+        if writer.write_all(&data).is_err() {
+            break;
         }
     }
     let mut c = clients.lock().unwrap();

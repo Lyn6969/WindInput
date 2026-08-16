@@ -1323,6 +1323,10 @@ impl CandidateWindow {
     /// ⚠️ 偏移**必须在此函数内、锚点计算处注入**，不能在调用方给返回值加：
     /// 下方那段 `rcWork` 越界兜底要在偏移之后跑，否则偏移能把窗口推出屏幕且再也钳不回来。
     /// 上方锚点用**减号**——`off_y` 正值语义恒为「远离光标」，上翻时是向上推。
+    ///
+    /// 翻转/钳制整段在 `cfg(windows)` 内（靠 `GetMonitorInfoW` 取显示器边界），非 Windows
+    /// 直接返回下方锚点，于是那几个只服务于翻转的局部量在此平台无人读写。
+    #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
     fn place_window(
         caret_x: i32,
         caret_y: i32,

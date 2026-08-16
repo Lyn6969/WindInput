@@ -725,8 +725,11 @@ mod tests {
     /// 用出厂基线配置喂一条汉字上文，断言标点源一条也没出来。
     #[test]
     fn desktop_smart_yields_no_punct_by_default() {
-        let mut base = wind_config::AssociationConfig::default();
-        base.kind = "smart".into(); // 用户显式开了智能联想，但没动 punct
+        // 用户显式开了智能联想，但没动 punct
+        let base = wind_config::AssociationConfig {
+            kind: "smart".into(),
+            ..Default::default()
+        };
         let cfg = AssocConfig::from_config(&base, None);
         assert!(!cfg.punct, "前提：桌面基线 punct 关");
 

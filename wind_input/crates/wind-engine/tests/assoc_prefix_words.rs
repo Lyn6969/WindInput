@@ -60,8 +60,8 @@ fn which_schema_actually_has_words() {
     };
     println!("\n=== 各方案的词语联想取数能力 ===");
     println!(
-        "{:<16} {:>16} {:>4}  {}",
-        "活跃方案", "解析出的词源", "条数", "样例"
+        "{:<16} {:>16} {:>4}  样例",
+        "活跃方案", "解析出的词源", "条数"
     );
     for schema in ["wubi86_pinyin", "wubi86", "pinyin", "shuangpin"] {
         let m = mgr(&dir, schema);

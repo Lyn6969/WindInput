@@ -911,7 +911,6 @@ impl Coordinator {
                 body.as_bytes(),
             );
             self.push_server.push_to_active(&encoded);
-            return;
         }
         #[cfg(not(target_os = "macos"))]
         if let Some(app) = crate::coordinator::settings_app_path() {
@@ -1863,6 +1862,7 @@ fn cursor_pos() -> (i32, i32) {
 /// 失败语义要与 `focus_monitor` 对称——它同样在查不到时返回 None。此前这里回落到
 /// `"0,0"`，于是保存侧会把坐标写进一个**读取侧永远问不出来的 key**（`focus_monitor`
 /// 不可能产出 `"0,0"`），位置静默丢失。存取共用一张表，两侧的失败也得共用一套语义。
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))] // 显示器查询仅 Windows 有
 fn monitor_key_from_point(x: i32, y: i32) -> Option<String> {
     #[cfg(target_os = "windows")]
     {

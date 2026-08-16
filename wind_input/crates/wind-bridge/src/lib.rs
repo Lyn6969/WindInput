@@ -8,7 +8,6 @@ pub mod handler;
 pub mod host_render_sink;
 pub mod pipe_scope;
 pub mod push;
-pub mod security;
 pub mod server;
 pub mod shared_render_frame;
 
@@ -33,6 +32,9 @@ pub mod host_render_windows;
 pub mod icon_shm_windows;
 #[cfg(windows)]
 pub mod named_event;
+// 管道安全描述符（SDDL）纯属 Windows 概念，消费者也全在 cfg(windows) 内。
+#[cfg(windows)]
+pub mod security;
 #[cfg(windows)]
 pub mod shared_memory_windows;
 

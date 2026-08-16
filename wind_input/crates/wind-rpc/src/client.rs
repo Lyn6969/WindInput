@@ -24,7 +24,7 @@ pub fn call(suffix: &str, method: &str, params: Value) -> anyhow::Result<Value> 
         use std::os::unix::net::UnixStream;
         let mut stream = UnixStream::connect(&endpoint)?;
         stream.write_all(&frame)?;
-        return finish(read_response(&mut stream)?);
+        finish(read_response(&mut stream)?)
     }
     #[cfg(windows)]
     {

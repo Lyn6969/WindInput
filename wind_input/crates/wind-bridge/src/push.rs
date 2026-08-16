@@ -5,7 +5,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, warn};
+#[cfg(windows)]
+use tracing::{debug, error};
+use tracing::{info, warn};
+#[cfg(windows)]
 use wind_ipc::protocol::*;
 
 #[cfg(windows)]
@@ -48,6 +51,9 @@ pub(crate) struct PushClient {
 /// 连接线程与 `set_client_connected_hook` 的补跑可能同时盯上同一个客户端
 /// （客户端已注册进表、但尚未走到自己的 hook 调用点），认领保证恰好触发一次。
 /// 客户端若已断开出表则返回 `false`——不给死连接推帧。
+///
+/// 触发点在 `cfg(windows)` 的连接线程里；unix 侧不走这条通路，故非 Windows 只在测试中编译。
+#[cfg(any(windows, test))]
 fn claim_connected_hook(clients: &Mutex<Vec<PushClient>>, token: u64) -> bool {
     let mut guard = clients.lock().unwrap();
     match guard.iter_mut().find(|c| c.token == token) {

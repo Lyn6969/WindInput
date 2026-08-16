@@ -23,8 +23,15 @@ mod imp {
     pub const WM_MOUSELEAVE: u32 = 0x02A3;
 }
 
+// 下面四条 allow 同源：本模块的 mock 是**照抄 `windows` crate 的形状**的——PascalCase 函数名、
+// `VIRTUAL_KEY` 这类全大写类型名、`unsafe fn` 不写 `# Safety`（它不解引用任何指针）、错误类型
+// 用 `Result<_, ()>`。把它们改成「更 Rust」的写法，本模块就失去了存在的意义：调用点在两个
+// 平台上必须一字不差，否则 UI 层每个鼠标处理函数都要再分叉一次 cfg。
 #[cfg(not(windows))]
-#[allow(non_snake_case)] // mock 故意沿用 Win32 PascalCase 函数名，保持调用点与 Windows 一致
+#[allow(non_snake_case)]
+#[allow(non_camel_case_types)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::result_unit_err)]
 mod imp {
     //! 非 Windows mock。类型/常量值尽量贴近 Win32 语义，但仅用于编译占位。
 
@@ -193,6 +200,10 @@ pub fn clamp_content_to_monitor(
 /// 溢出屏幕。旧的按窗口矩形钳制永远算不出负值，那正是「拖不到边」的直接原因。
 ///
 /// `bounds` = (left, top, right, bottom)；`content` = (宽, 高)。
+///
+/// 非 Windows 下唯一的调用者是本模块的测试（生产调用点在 `cfg(windows)` 内），
+/// 故 lib 单独编译时它无人使用——测试本身仍跨平台跑，不能删。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn clamp_content_in_bounds(
     x: i32,
     y: i32,
@@ -215,6 +226,9 @@ fn clamp_content_in_bounds(
 /// `bounds` = 工作区 (left, top, right, bottom)。抽出来是为了可测——真正要锁住的性质是
 /// **钳制有损且不可逆**：拿错误的 `w/h` 钳一次，正确坐标就再也回不来了（见本模块测试
 /// `stale_size_destroys_a_flush_corner_position`）。
+///
+/// 非 Windows 下唯一的调用者是本模块的测试，理由同 [`clamp_content_in_bounds`]。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn clamp_rect_in_bounds(
     x: i32,
     y: i32,

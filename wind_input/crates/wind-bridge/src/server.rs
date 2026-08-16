@@ -7,7 +7,9 @@ use crate::handler::*;
 #[cfg(windows)]
 use crate::host_render_windows::HostRenderManager;
 use std::sync::Arc;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, warn};
+#[cfg(windows)]
+use tracing::{error, trace};
 
 /// 单条客户端连接的身份（每连接唯一）。
 ///
@@ -1089,9 +1091,11 @@ fn encode_status_update_from_data(status: &StatusUpdateData) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use wind_ipc::protocol::{CMD_ACK, CMD_CANDIDATE_SELECT, CMD_HOST_RENDER_FAILED, IpcHeader};
+    // host-render 与按键投递是 Windows 专属通路，相应用例也只在 Windows 编译。
+    #[cfg(windows)]
     use wind_ipc::protocol::{
-        CMD_ACK, CMD_CANDIDATE_SCROLL, CMD_CANDIDATE_SELECT, CMD_HOST_RENDER_FAILED,
-        CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, CMD_KEY_EVENT, IpcHeader,
+        CMD_CANDIDATE_SCROLL, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, CMD_KEY_EVENT,
     };
 
     /// 最小测试 handler：记录 host_render_failed 的 reason 与鼠标 select/scroll 值，
