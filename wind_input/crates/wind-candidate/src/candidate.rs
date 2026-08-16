@@ -253,6 +253,30 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_promoted_completion: bool,
+    /// 前缀补全比**输入自身表达的音节数**多出几个音节（`0` = 音节数恰好对齐 / 非补全候选）。
+    ///
+    /// 「输入自身表达的音节数」= 完整音节数 + (有尾部残码 ? 1 : 0)，即 `pinyin` 引擎里的
+    /// `started_syllables`。⚠️ **不是**「输入在这条候选的切分下占了几个音节」——后者对
+    /// `xia` 会因为存在 `xi|an`（西安）的切分而算成 2，整批放行词组，见
+    /// `wind_engine::pinyin::completion_syllable_cap` 的文档。
+    ///
+    /// ## 为什么必须是字段而不是排序闭包里的局部量
+    ///
+    /// 协调器算不出音节数（它只有击键串，不持有 `SyllableTrie`），而**显示序在协调器**。
+    /// 同款教训见 `is_promoted_completion` 与整句等效权重：任何只活在引擎闭包里的排序信息，
+    /// 都会被协调器的重排静默推翻。
+    ///
+    /// ## 只服务显示序，**不参与引擎内部排序**
+    ///
+    /// 引擎的 `sort_by` 紧跟 `truncate`，排序键在那里同时决定**去留**；把本字段加进去等于
+    /// 「音节数超出即被截断」——那是销毁，而本字段的语义是降级。分工与 `consumed_length`
+    /// 完全一致（见 `cmp_by_consumed`），两者都只在协调器侧生效。
+    ///
+    /// 生产方：拼音引擎 step4（系统词库前缀补全）/ step6（用户·临时词前缀补全）。
+    /// `boundary == 0`（无边界信息）算 0，与全仓「无边界信息一律降级放行」一致。
+    /// 引擎内部用，不推送 UI。
+    #[serde(skip)]
+    pub completion_extra_syllables: u8,
     pub consumed_length: usize,
     /// 该候选 `code` 的**音节边界**（各音节起始字节位 bitmask），见
     /// `wind_dict::binformat::DictEntry::boundary`。`0` = 无边界信息 → 消费方降级回 DAG 猜切分。
@@ -338,6 +362,7 @@ impl Default for Candidate {
             is_sentence: false,
             is_sentence_demoted: false,
             is_promoted_completion: false,
+            completion_extra_syllables: 0,
             consumed_length: 0,
             boundary: 0,
             s2t_override: None,
@@ -480,6 +505,54 @@ pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
         .then(a.is_abbrev.cmp(&b.is_abbrev))
         .then(eff_prefix(a).cmp(&eff_prefix(b)))
         .then(a.is_partial.cmp(&b.is_partial))
+}
+
+/// 「音节数对齐者优先」比较（[`Candidate::completion_extra_syllables`] 升序）。
+///
+/// 输入表达了几个音节，就先给几个音节的候选；预测了更多未输入音节的补全排在其后。
+/// 位置：`candidate_display_order` 里 `cmp_match_layers` **之后**、权重之前 —— 层内分档，
+/// 不跨层提拔。
+///
+/// ## ⚠️ 只在显示序施加一次，**不要**再写进 `freq_rerank` 的层级比较器
+///
+/// 那里的 `base_pos` 就是显示序的下标，档位已随之传入；重复施加会把它从「默认序」升级成
+/// **词频也翻不过的硬约束**。实测代价：`jisuanjik` 下选过 30 次的「计算机科学」(extra=1)
+/// 再也压不过残码整句「计算机看」(extra=0)。
+///
+/// ★ 判据：音节数对齐是**先验**（用户还没表态时的合理猜测），词频是**实证**（他已经选过
+/// 30 次）。实证该能推翻先验。真正不容词频跨越的是 [`cmp_match_layers`] 那种结构性质量
+/// 差异（模糊命中 vs 精确匹配）。
+///
+/// ## 为什么权重折扣替代不了它
+///
+/// 引擎侧本已有 `COMPLETION_WEIGHT_DISCOUNT`（每多一个音节权重打对折，`0.5^extra`），
+/// 但**折扣量级压不过词频跨度**：真实词库实测 `zaij` 下 3 音节的「再加上」(w 21112，折后
+/// 5278) 稳压 2 音节的「再加」(2922，折后 1461)、「再见」(1419)；`zaim` 下「在美国」(3699)
+/// 压过「再买」(819)。0.5 在对数域只有 0.69，而中文词频跨 5 个数量级。
+/// 同款现象见 `wind_engine::pinyin` 里模糊音「折扣对付不了跨数量级的同音词频」那条。
+///
+/// ## 参考实现为什么用 0.5 就够
+///
+/// 因为**它们的音节图从结构上不产生这种候选**，0.5 只需区分「补全的最后一个音节」一档：
+/// - librime（`algo/syllabifier.cc:190`）的 completion 只在 `[farthest, input.length())`
+///   这一条边上展开 ⇒ 音节图的音节位数恒 = 完整音节 + (有残码?1:0)，而 `Table::Query`
+///   严格沿图逐音节 `Advance` ⇒ 「在美国」需要第 3 个音节位，图上没有，**匹配不到**。
+///   其词级预测（`predict_word` / `extra_code`）只对 >3 音节（`kIndexCodeMaxLength`）的长词
+///   尾部生效，用户词典侧还有 `kNumSyllablesToPredictWord = 4` 的硬门槛。
+/// - fcitx5/libime（`pinyin/pinyindictionary.cpp:519`）的超长词匹配要求
+///   `max(minimumLongWordLength=3, LongWordLengthLimit) + 1 <= path.size()`，
+///   而 `LongWordLengthLimit` 默认 **4** ⇒ 2 音节输入下压根不匹配超长词。
+///
+/// 我们把 0.5 借来当 `extra ∈ 0..4` 的通用惩罚，超出了它被标定的范围；补上本档位即可。
+///
+/// ## 逐级 vs 两档
+///
+/// 现为**严格逐级**（extra 升序）。若真机嫌 `beijingd` 下「北京大学」(extra=1) 掉得太深，
+/// 收成 `min(extra, 1)` 两档是一行改动 —— 但收之前先确认不是 `max_extra_syllables`
+/// 那个召回旋钮该调。
+pub fn cmp_completion_extra(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.completion_extra_syllables
+        .cmp(&b.completion_extra_syllables)
 }
 
 /// 候选「精确匹配档优先」比较（`is_exact_code` 降序）。

@@ -136,6 +136,9 @@ pub(crate) fn candidate_display_order(
 
     by_consumed
         .then_with(|| wind_candidate::cmp_match_layers(a, b))
+        // 音节数对齐者优先（`zaim` 先给 2 音节的「在吗/再买」，3 音节的「在美国」排其后）。
+        // 置于层级之后、权重之前：层内分档，不跨层提拔。见 `cmp_completion_extra`。
+        .then_with(|| wind_candidate::cmp_completion_extra(a, b))
         .then_with(|| wind_candidate::cmp_exact_first(a, b))
         .then(by_source_tier)
         .then(by_weight)

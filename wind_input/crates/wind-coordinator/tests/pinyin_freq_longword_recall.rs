@@ -17,8 +17,12 @@
 //!
 //! ## 两条断言的分工
 //!
-//! 只测「位次不变」会被「把词频整个关掉」这种假修复骗过，故配一条**反向对照**：残码输入
-//! `bingdongsanchif` 下该词**确实**因词频记录而前移。两条一起才说明「重排跑了，且没有越权」。
+//! 只测「位次不变」会被「把词频整个关掉」这种假修复骗过，故配一条**反向对照**：`zaim` 下
+//! 给「在卖」记一次词频，它必须真的前移。两条一起才说明「重排跑了，且没有越权」。
+//!
+//! 对照取**同档内**的竞争（`zaim` 下「在卖」与「再买」同为 `extra = 0`），与音节数档位
+//! （`cmp_completion_extra`）解耦：档位只在显示序施加一次、经 `base_pos` 传入本重排，
+//! 拿跨档样本做对照会把两件事的回归绑在一起，任一侧调整都要重写这条。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,8 +62,13 @@ fn config() -> Config {
     cfg
 }
 
-/// 敲入整串，返回长词在候选中的位次（不在则 `None`）。
+/// 敲入整串，返回长词 [`WORD`] 在候选中的位次（不在则 `None`）。
 fn rank_of_word(store: Arc<Store>, input: &str) -> Option<usize> {
+    rank_of(store, input, WORD)
+}
+
+/// 敲入整串，返回指定文本在候选中的位次（不在则 `None`）。
+fn rank_of(store: Arc<Store>, input: &str, want: &str) -> Option<usize> {
     let coord = Coordinator::new_headless_with_store(config(), Some(&data_dir()), store);
     for c in input.chars() {
         let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
@@ -76,7 +85,7 @@ fn rank_of_word(store: Arc<Store>, input: &str) -> Option<usize> {
     coord
         .debug_all_candidate_texts()
         .iter()
-        .position(|t| t == WORD)
+        .position(|t| t == want)
 }
 
 fn fresh_store(tag: &str) -> Arc<Store> {
@@ -111,25 +120,28 @@ fn freq_record_does_not_sink_long_word_at_syllable_boundary() {
     );
 }
 
-/// 反向对照：残码位（`...chif`）上词频记录**确实**在起作用（证明重排真的跑了）。
+/// 反向对照：**同档内**的词频提升确实在起作用（证明那道重排真的被调用了）。
 ///
 /// 缺了这条，「把词频整个关掉」也能让上面那条通过。
+///
+/// 取 `zaim` 的「在卖」：它与「再买」同为 `extra = 0`（2 音节，对齐 started=2），
+/// 档位一致 ⇒ 词频可以在档内调整先后。
 #[test]
-fn freq_record_still_promotes_long_word_at_trailing_partial() {
+fn freq_record_still_promotes_within_same_syllable_tier() {
     if !has_pinyin() {
         eprintln!("跳过：拼音词库不存在");
         return;
     }
-    let store = fresh_store("partial");
-    let before = rank_of_word(store.clone(), "bingdongsanchif").expect("首次输入时长词应在候选中");
+    let store = fresh_store("same_tier");
+    let before = rank_of(store.clone(), "zaim", "在卖").expect("「在卖」应在 zaim 的候选中");
 
-    store.record_freq("pinyin", CODE, WORD).expect("写词频");
-    let after =
-        rank_of_word(store.clone(), "bingdongsanchif").expect("有词频记录后长词仍应在候选中");
+    store
+        .record_freq("pinyin", "zaimai", "在卖")
+        .expect("写词频");
+    let after = rank_of(store.clone(), "zaim", "在卖").expect("有词频记录后仍应在候选中");
 
     assert!(
         after < before,
-        "残码位上该词有残码上浮（is_promoted_completion）⇒ 与精确候选同层，\
-         词频应把它前移；实际 {before} → {after}（重排没跑？）"
+        "同档候选应能被词频前移；实际 {before} → {after}（重排没跑？）"
     );
 }

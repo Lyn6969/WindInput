@@ -2216,7 +2216,16 @@ impl Engine for PinyinEngine {
             };
             // is_prefix 恒表结构事实（search_prefix_with_boundary 返回的都是码更长的补全）；
             // 「是否沉到非精确层」的排序决策由 is_promoted_completion 承接（残码上浮即提升）；
-            // **层内**的远近之别由 completion_penalized 的连续折扣承接（见该常量文档）。
+            // **层内**的远近之别由两件事共同承接：`completion_penalized` 的连续折扣（本层内
+            // 的权重打折）与 `completion_extra_syllables` 的显示序档位（协调器侧，见该字段）。
+            //
+            // ⚠️ 两者口径不同，别把 `distance` 直接当档位用：`distance` 是「比**已完成**音节
+            // 多几个」，档位要的是「比**输入自身表达的**音节数多几个」——残码位上用户已经
+            // 起头了一个音节，`meiy` 的「没有」(2 音节) 对 started=2 是**恰好对齐**、不该降档，
+            // 而它的 distance 是 1。折扣那边用 distance 是对的（它衡量的是权重可信度衰减，
+            // 残码位那个音节确实还没打完）。
+            let extra = distance.saturating_sub(u32::from(trailing_partial));
+            let before = candidates.len();
             push_unique(
                 &mut candidates,
                 h.text,
@@ -2228,6 +2237,11 @@ impl Engine for PinyinEngine {
                 h.boundary,
                 !demote_to_prefix_layer,
             );
+            // 同文已存在时 push_unique 不添加（如整句已 insert(0) 过），此时**不置位**——
+            // 那条候选不是补全，档位保持 0 才对。
+            if candidates.len() > before {
+                candidates[before].completion_extra_syllables = extra.min(u8::MAX as u32) as u8;
+            }
         }
 
         // 简拼族（纯简拼 step5 / 混合 step5b / 用户词 step6）是否命中了**整串**击键。
@@ -2457,6 +2471,15 @@ impl Engine for PinyinEngine {
                     if let Some(cap) = promotion_cap {
                         c.weight = c.weight.min(cap);
                     }
+                }
+                // 显示序档位，口径同 step4（`boundary == 0` ⇒ count_ones() 为 0 ⇒ 档位 0，
+                // 即手输码用户词不降档 —— 与全仓「无边界信息一律降级放行」一致）。
+                if c.is_prefix {
+                    c.completion_extra_syllables =
+                        c.boundary
+                            .count_ones()
+                            .saturating_sub(started_syllables)
+                            .min(u8::MAX as u32) as u8;
                 }
                 candidates.push(c);
             }

@@ -322,6 +322,18 @@ pub fn rerank_pinyin_positional(
         //
         // 词频**只在同一消费长度组内**起作用，这也正是「上过屏与否，召回体验应当一致」的
         // 形式化表述。
+        // ⚠️ **不要在这里加 `cmp_completion_extra`**（音节数档位）。它已经由协调器的
+        // `candidate_display_order` 施加过，并经 `base_pos`（入参下标）原样传进本函数 ——
+        // 无词频记录的候选 `target_pos == base_pos`，档位序自然保持。
+        //
+        // 把它写进本比较器等于**把默认序升级成词频也翻不过的硬约束**，代价实测：
+        // `jisuanjik` 下选过 30 次的「计算机科学」(5 音节，extra=1) 再也压不过残码整句
+        // 「计算机看」(4 音节，extra=0)，`pinyin_sentence_flag` 当场抓到。
+        //
+        // ★ 判据：音节数对齐是**先验**（用户还没告诉我们他要哪个时的合理猜测），
+        // 而词频是**实证**（他已经选过 30 次了）。实证该能推翻先验 —— 这也是
+        // librime/fcitx5 把 `overLengthCost` 与用户历史放在同一根轴上相加的道理。
+        // 真正不容词频跨越的是 `cmp_match_layers` 那种结构性质量差异（模糊 vs 精确）。
         |a, b| {
             wind_candidate::cmp_by_consumed(a, b, input_len)
                 .then_with(|| wind_candidate::cmp_match_layers(a, b))
