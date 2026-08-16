@@ -655,6 +655,9 @@ fn spawn_log_health_watch(dropped: tracing_appender::non_blocking::ErrorCounter)
 /// 与*另一实例存在*根本是两回事。2026-07-23 客户日志里 10 个被挡实例有 8 个
 /// 走的是空句柄分支，日志却异口同声说「另一实例已在运行」，
 /// 于是"服务到底起没起来"这个最基本的问题反而查不出来。
+/// 后两个分支只有 `cfg(windows)` 的 `check_singleton` 会构造（非 Windows 暂不做单例检查，
+/// 恒返回 `Acquired`），但消费侧的 match 是跨平台的，不能删。
+#[cfg_attr(not(windows), allow(dead_code))]
 enum SingletonCheck {
     /// 拿到所有权，本实例可以继续启动。
     Acquired(SingletonGuard),
@@ -906,6 +909,14 @@ impl Drop for SingletonGuard {
 
 #[cfg(not(windows))]
 struct SingletonGuard {}
+
+/// 非 Windows 没有 Named Mutex，guard 是空壳；这里仍显式实现 `Drop`，是为了让调用点的
+/// `drop(_singleton_guard)`（重启前先释放单例，让新实例能拿到所有权）在两个平台上表达
+/// 同一件事——否则那两行在非 Windows 下会被判成「drop 一个没有 Drop 的值」。
+#[cfg(not(windows))]
+impl Drop for SingletonGuard {
+    fn drop(&mut self) {}
+}
 
 /// 设置进程 DPI 感知（与 Go 版 setDPIAwareness 对齐）
 ///
