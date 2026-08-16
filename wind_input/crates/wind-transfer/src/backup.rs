@@ -1,4 +1,5 @@
-//! 整机备份：config + 逐表用户数据（文本）+ 用户方案/主题目录 + 可选 state，
+//! 整机备份：config、compat 兼容规则、逐表用户数据（文本）、
+//! 用户方案/方案覆盖层/主题目录、可选 state，
 //! 组合 bundle/merge/store 导出原语打成 kind=backup 的自描述 zip。
 use crate::bundle::{BundleKind, BundleWriter, Manifest};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,12 @@ pub struct BackupOptions {
 
 pub struct BackupSources<'a> {
     pub user_config_file: Option<&'a Path>,
+    /// 用户层应用兼容规则（`{user_config_dir}/compat.toml`，右键菜单管理）。
+    pub compat_file: Option<&'a Path>,
     pub user_schemas_dir: Option<&'a Path>,
+    /// 方案配置覆盖层目录（`{user_config_dir}/schema_overrides/<id>.toml`），
+    /// 与 `user_schemas_dir`（方案文件本体）是不同目录，须分别打包。
+    pub user_schema_overrides_dir: Option<&'a Path>,
     pub user_themes_dir: Option<&'a Path>,
     pub state_file: Option<&'a Path>,
 }
@@ -79,6 +85,17 @@ pub fn create_backup(
             "config/config.toml".into(),
             &std::fs::read(cfg)?,
             "config",
+            serde_json::Value::Null,
+        )?;
+    }
+    if let Some(compat) = src.compat_file
+        && compat.is_file()
+    {
+        add(
+            &mut w,
+            "config/compat.toml".into(),
+            &std::fs::read(compat)?,
+            "compat",
             serde_json::Value::Null,
         )?;
     }
@@ -160,13 +177,27 @@ pub fn create_backup(
         )?;
     }
 
-    // 文件域：用户方案 / 主题整目录
+    // 文件域：用户方案 / 方案覆盖层 / 主题整目录
     if let Some(dir) = src.user_schemas_dir
         && dir.is_dir()
     {
         for (name, path) in walk_dir(dir, "schemas/")? {
             let data = std::fs::read(&path)?;
             add(&mut w, name, &data, "schema_file", serde_json::Value::Null)?;
+        }
+    }
+    if let Some(dir) = src.user_schema_overrides_dir
+        && dir.is_dir()
+    {
+        for (name, path) in walk_dir(dir, "schema_overrides/")? {
+            let data = std::fs::read(&path)?;
+            add(
+                &mut w,
+                name,
+                &data,
+                "schema_override_file",
+                serde_json::Value::Null,
+            )?;
         }
     }
     if let Some(dir) = src.user_themes_dir
@@ -187,7 +218,9 @@ pub fn create_backup(
 
 pub struct RestoreTargets<'a> {
     pub user_config_file: Option<&'a Path>,
+    pub compat_file: Option<&'a Path>,
     pub user_schemas_dir: Option<&'a Path>,
+    pub user_schema_overrides_dir: Option<&'a Path>,
     pub user_themes_dir: Option<&'a Path>,
     pub state_file: Option<&'a Path>,
 }
@@ -201,9 +234,10 @@ pub struct RestoreResult {
 /// 条目 type → section 名（sections 过滤用）。
 fn section_of(ty: &str) -> &str {
     match ty {
-        "schema_file" => "schemas",
+        "schema_file" | "schema_override_file" => "schemas",
         "theme_file" => "themes",
         "stats_meta" => "stats",
+        "compat" => "config",
         other => other,
     }
 }
@@ -264,6 +298,15 @@ pub fn restore_backup(
         match e.r#type.as_str() {
             "config" => {
                 if let Some(target) = targets.user_config_file {
+                    if write_file(target, &bytes, strategy)? {
+                        restored.push(e.path.clone());
+                    } else {
+                        conflicts.push(e.path.clone());
+                    }
+                }
+            }
+            "compat" => {
+                if let Some(target) = targets.compat_file {
                     if write_file(target, &bytes, strategy)? {
                         restored.push(e.path.clone());
                     } else {
@@ -344,6 +387,16 @@ pub fn restore_backup(
                     }
                 }
             }
+            "schema_override_file" => {
+                if let Some(dir) = targets.user_schema_overrides_dir {
+                    let rel = crate::bundle::validate_entry_rel(&e.path, "schema_overrides/")?;
+                    if write_file(&dir.join(rel), &bytes, strategy)? {
+                        restored.push(e.path.clone());
+                    } else {
+                        conflicts.push(e.path.clone());
+                    }
+                }
+            }
             "theme_file" => {
                 if let Some(dir) = targets.user_themes_dir {
                     let rel = crate::bundle::validate_entry_rel(&e.path, "themes/")?;
@@ -386,10 +439,15 @@ mod tests {
         // 文件域 fixtures
         let cfg = t.path().join("config.toml");
         fs::write(&cfg, "[ui]\n").unwrap();
+        let compat = t.path().join("compat.toml");
+        fs::write(&compat, "[[apps]]\nprocess = \"Weixin.exe\"\n").unwrap();
         let schemas = t.path().join("schemas");
         fs::create_dir_all(schemas.join("my")).unwrap();
         fs::write(schemas.join("my.schema.toml"), "[schema]\nid=\"my\"\n").unwrap();
         fs::write(schemas.join("my/d.yaml"), "d").unwrap();
+        let overrides = t.path().join("schema_overrides");
+        fs::create_dir_all(&overrides).unwrap();
+        fs::write(overrides.join("my.toml"), "auto_pair = false\n").unwrap();
         let themes = t.path().join("themes");
         fs::create_dir_all(themes.join("dark")).unwrap();
         fs::write(themes.join("dark/theme.toml"), "[meta]\nname=\"dark\"\n").unwrap();
@@ -399,7 +457,9 @@ mod tests {
         let out = t.path().join("backup.zip");
         let src = BackupSources {
             user_config_file: Some(&cfg),
+            compat_file: Some(&compat),
             user_schemas_dir: Some(&schemas),
+            user_schema_overrides_dir: Some(&overrides),
             user_themes_dir: Some(&themes),
             state_file: Some(&state),
         };
@@ -430,8 +490,10 @@ mod tests {
             "stats",
             "stats_meta",
             "schema_file",
+            "schema_override_file",
             "theme_file",
             "state",
+            "compat",
         ] {
             assert!(types.contains(&ty), "缺 {ty} 条目; got {types:?}");
         }
@@ -441,9 +503,17 @@ mod tests {
         assert_eq!(dict.meta.get("schema").and_then(|v| v.as_str()), Some("wb"));
         // schema_file 递归含子目录文件
         assert!(m.contents.iter().any(|e| e.path == "schemas/my/d.yaml"));
+        // schema_override_file 路径前缀正确
+        assert!(
+            m.contents
+                .iter()
+                .any(|e| e.path == "schema_overrides/my.toml")
+        );
         // 载荷可取
         let bytes = crate::bundle::extract_entry(&out, "config/config.toml").unwrap();
         assert_eq!(bytes, b"[ui]\n");
+        let compat_bytes = crate::bundle::extract_entry(&out, "config/compat.toml").unwrap();
+        assert_eq!(compat_bytes, b"[[apps]]\nprocess = \"Weixin.exe\"\n");
         assert!(!r.entries.is_empty());
     }
 
@@ -453,10 +523,17 @@ mod tests {
         let s = seed_store(t.path());
         let cfg = t.path().join("config.toml");
         std::fs::write(&cfg, "[ui]\n").unwrap();
+        let compat = t.path().join("compat.toml");
+        std::fs::write(&compat, "[[apps]]\nprocess = \"Weixin.exe\"\n").unwrap();
+        let overrides = t.path().join("schema_overrides");
+        std::fs::create_dir_all(&overrides).unwrap();
+        std::fs::write(overrides.join("my.toml"), "auto_pair = false\n").unwrap();
         let out = t.path().join("b.zip");
         let src = BackupSources {
             user_config_file: Some(&cfg),
+            compat_file: Some(&compat),
             user_schemas_dir: None,
+            user_schema_overrides_dir: Some(&overrides),
             user_themes_dir: None,
             state_file: None,
         };
@@ -478,9 +555,13 @@ mod tests {
         let t2 = tempfile::tempdir().unwrap();
         let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
         let cfg2 = t2.path().join("config.toml");
+        let compat2 = t2.path().join("compat.toml");
+        let overrides2 = t2.path().join("schema_overrides");
         let targets = RestoreTargets {
             user_config_file: Some(&cfg2),
+            compat_file: Some(&compat2),
             user_schemas_dir: None,
+            user_schema_overrides_dir: Some(&overrides2),
             user_themes_dir: None,
             state_file: None,
         };
@@ -488,6 +569,14 @@ mod tests {
         assert!(r.conflicts.is_empty());
         assert!(r.schemas_touched.contains(&"wb".to_string()));
         assert_eq!(std::fs::read(&cfg2).unwrap(), b"[ui]\n");
+        assert_eq!(
+            std::fs::read(&compat2).unwrap(),
+            b"[[apps]]\nprocess = \"Weixin.exe\"\n"
+        );
+        assert_eq!(
+            std::fs::read(overrides2.join("my.toml")).unwrap(),
+            b"auto_pair = false\n"
+        );
         assert_eq!(s2.get_user_words("wb", "a").unwrap()[0].weight, 100);
         assert_eq!(s2.get_temp_word("wb", "ab", "临").unwrap(), Some(1));
         assert_eq!(s2.get_freq("wb", "a", "工").unwrap().unwrap().count, 1);
@@ -504,7 +593,9 @@ mod tests {
         let out = t.path().join("b.zip");
         let src = BackupSources {
             user_config_file: Some(&cfg),
+            compat_file: None,
             user_schemas_dir: None,
+            user_schema_overrides_dir: None,
             user_themes_dir: None,
             state_file: None,
         };
@@ -528,7 +619,9 @@ mod tests {
         std::fs::write(&cfg2, "LOCAL").unwrap();
         let targets = RestoreTargets {
             user_config_file: Some(&cfg2),
+            compat_file: None,
             user_schemas_dir: None,
+            user_schema_overrides_dir: None,
             user_themes_dir: None,
             state_file: None,
         };
@@ -568,7 +661,9 @@ mod tests {
         let out = t.path().join("b.zip");
         let src = BackupSources {
             user_config_file: None,
+            compat_file: None,
             user_schemas_dir: None,
+            user_schema_overrides_dir: None,
             user_themes_dir: None,
             state_file: None,
         };
@@ -591,7 +686,9 @@ mod tests {
         s2.add_user_word("wb", "zz", "杂", 1, 0).unwrap(); // 本地杂词
         let targets = RestoreTargets {
             user_config_file: None,
+            compat_file: None,
             user_schemas_dir: None,
+            user_schema_overrides_dir: None,
             user_themes_dir: None,
             state_file: None,
         };
@@ -616,7 +713,9 @@ mod tests {
         let out = t.path().join("b2.zip");
         let src = BackupSources {
             user_config_file: None,
+            compat_file: None,
             user_schemas_dir: None,
+            user_schema_overrides_dir: None,
             user_themes_dir: None,
             state_file: None,
         };
@@ -638,6 +737,15 @@ mod tests {
         assert!(!types.contains(&"stats"), "include_stats=false 不含 stats");
         assert!(!types.contains(&"state"));
         assert!(!types.contains(&"config"), "无 config 源则无 config 条目");
+        assert!(!types.contains(&"compat"), "无 compat 源则无 compat 条目");
         assert!(types.contains(&"dict"), "store 数据域始终导出");
+    }
+
+    #[test]
+    fn section_of_maps_compat_and_schema_override_under_existing_sections() {
+        // compat/schema_override_file 不是独立的还原范围勾选项，而是并入既有的
+        // 「配置」「用户方案」段——否则设置页勾了「配置」却漏还原 compat.toml。
+        assert_eq!(section_of("compat"), "config");
+        assert_eq!(section_of("schema_override_file"), "schemas");
     }
 }

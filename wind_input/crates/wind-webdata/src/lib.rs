@@ -1068,12 +1068,16 @@ pub trait WebDataRpc: WebDataHost {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let user_dir = wind_config::Config::user_config_dir();
         let cfg_file = user_dir.as_ref().map(|d| d.join("config.toml"));
+        let compat_file = user_dir.as_ref().map(|d| d.join("compat.toml"));
         let schemas_dir = user_dir.as_ref().map(|d| d.join("schemas"));
+        let schema_overrides_dir = user_dir.as_ref().map(|d| d.join("schema_overrides"));
         let themes_dir = user_dir.as_ref().map(|d| d.join("themes"));
         let state_file = wind_config::Config::local_dir().map(|d| d.join("state.toml"));
         let src = BackupSources {
             user_config_file: cfg_file.as_deref(),
+            compat_file: compat_file.as_deref(),
             user_schemas_dir: schemas_dir.as_deref(),
+            user_schema_overrides_dir: schema_overrides_dir.as_deref(),
             user_themes_dir: themes_dir.as_deref(),
             state_file: state_file.as_deref(),
         };
@@ -1124,12 +1128,16 @@ pub trait WebDataRpc: WebDataHost {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let user_dir = wind_config::Config::user_config_dir();
         let cfg_file = user_dir.as_ref().map(|d| d.join("config.toml"));
+        let compat_file = user_dir.as_ref().map(|d| d.join("compat.toml"));
         let schemas_dir = user_dir.as_ref().map(|d| d.join("schemas"));
+        let schema_overrides_dir = user_dir.as_ref().map(|d| d.join("schema_overrides"));
         let themes_dir = user_dir.as_ref().map(|d| d.join("themes"));
         let state_file = wind_config::Config::local_dir().map(|d| d.join("state.toml"));
         let targets = RestoreTargets {
             user_config_file: cfg_file.as_deref(),
+            compat_file: compat_file.as_deref(),
             user_schemas_dir: schemas_dir.as_deref(),
+            user_schema_overrides_dir: schema_overrides_dir.as_deref(),
             user_themes_dir: themes_dir.as_deref(),
             state_file: state_file.as_deref(),
         };
@@ -1149,6 +1157,14 @@ pub trait WebDataRpc: WebDataHost {
         for p in &r.restored {
             if let Some(rel) = p.strip_prefix("schemas/")
                 && let Some(id) = rel.strip_suffix(".schema.toml")
+                && !id.contains('/')
+            {
+                self.engine_mgr().invalidate_schema(id);
+            }
+            // schema_overrides/<id>.toml 同样是「方案配置合并层」的一部分，改动后
+            // 必须失效该方案引擎缓存，否则还原后仍沿用还原前的旧 override 跑。
+            if let Some(rel) = p.strip_prefix("schema_overrides/")
+                && let Some(id) = rel.strip_suffix(".toml")
                 && !id.contains('/')
             {
                 self.engine_mgr().invalidate_schema(id);
