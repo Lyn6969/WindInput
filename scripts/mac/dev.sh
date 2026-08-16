@@ -548,8 +548,11 @@ build_setting() {
     <string>$ver</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <!-- 与 IME app 的 Info.plist、Package.swift 的 platforms 对齐到 12.0: 整套产品的下限
+         由 IME (Swift, .macOS(.v12) 编译期强制) 决定, 设置 app 单独声明更低没有意义 ——
+         pkg 把两者一起装, 系统只会放行一个装得上却用不了的组合。原值 11.0 无实测依据。 -->
     <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
+    <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>
