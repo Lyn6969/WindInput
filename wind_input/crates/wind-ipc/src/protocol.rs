@@ -1152,6 +1152,16 @@ pub const MOD_LCTRL: u32 = 0x0040;
 pub const MOD_RCTRL: u32 = 0x0080;
 pub const MOD_CAPSLOCK: u32 = 0x0100;
 
+/// **宿主快捷键修饰位**：带上其中任意一位的键，未命中热键白名单就归宿主，输入法一概不碰。
+///
+/// 含 `MOD_WIN` 是 macOS 的刚需：那边 `MOD_WIN` 承载的是 **Command 键**（见
+/// `KeyHandler.toModifiers`），⌘C/⌘V/⌘A 全靠这条判据交还宿主。此前判据只掩
+/// `MOD_CTRL | MOD_ALT`（Win 键上没有快捷键语义，是 Windows 血统的遗留），于是中文模式下
+/// ⌘+字母一路走到字母臂被当成码元吃掉 —— 表现为「开着输入法就复制粘贴不了」（issue #64）。
+///
+/// Windows 侧无回归：Win+键由系统抢先处理，本就到不了 TSF。
+pub const MOD_SHORTCUT: u32 = MOD_CTRL | MOD_ALT | MOD_WIN;
+
 /// 计算热键哈希值：(modifiers << 16) | (keyCode & 0xFFFF)
 pub fn calc_key_hash(modifiers: u32, key_code: u32) -> u32 {
     (modifiers << 16) | (key_code & 0xFFFF)

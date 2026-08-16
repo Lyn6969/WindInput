@@ -95,7 +95,14 @@ public final class BridgeResponseRouter {
     /// 路由一个 bridge 响应帧到 client. 返回值同 IMKInputController.handle 的
     /// Bool 语义: true 表示按键已被 IME 消费, IMKit 不再传给系统; false 表示
     /// PassThrough.
-    public func apply(_ frame: Frame, to client: TextInputClient?) -> Bool {
+    ///
+    /// `hostShortcut`: 触发本帧的按键是**宿主快捷键组合** (⌘/⌃/⌥ + 键)。此时
+    /// `ClearComposition` 只表示「把组合清掉」, **不表示这个键归输入法** —— 宿主仍须
+    /// 收到它去执行复制/粘贴。Windows 靠 TSF `OnTestKeyDown` 根本不转发这类键来保证
+    /// 这点; macOS 没有那层前置闸门 (IMKit 把每个 keyDown 都给我们), 判据只能落在这里。
+    /// 不这么做的现象: 组字过程中按 ⌘C/⌃C, 组合清了、键也被吞, 网页里复制粘贴失灵
+    /// (issue #64)。命中热键的组合走 Consumed/StatusUpdate/InsertText, 不受影响。
+    public func apply(_ frame: Frame, to client: TextInputClient?, hostShortcut: Bool = false) -> Bool {
         switch frame.cmd {
         case DownstreamCmd.passThrough:
             // 按键要交回系统 → 待定标点必须**先真上屏**, 否则它挂在 marked text 里没人再管:
@@ -127,7 +134,8 @@ public final class BridgeResponseRouter {
 
         case DownstreamCmd.clearComposition:
             applyClearComposition(client: client)
-            return true
+            // 快捷键组合触发的清组合: 组合已清, 但按键交还宿主 (见方法头 hostShortcut)。
+            return !hostShortcut
 
         case DownstreamCmd.keyType:
             // 命令直通车 key.type / clip.paste 文本上屏: 整段 UTF-8, 直接 insertText

@@ -8480,3 +8480,45 @@ fn shuangpin_full_pinyin_does_not_break_native_path() {
         &all[..all.len().min(10)]
     );
 }
+
+/// issue #64：macOS 的 ⌘（Command）走 `MOD_WIN` 位，未命中热键时必须归宿主。
+///
+/// 回归前的行为：判据只掩 `MOD_CTRL | MOD_ALT`，于是中文模式下 ⌘+字母一路走到字母臂，
+/// 被当成码元累积（⌘C → 组合区出现 "c"）且响应为 `UpdateComposition` = 吃键，
+/// 宿主再也收不到这一键 —— 网页版 WPS/GitHub 里表现为复制粘贴失灵。
+///
+/// 不依赖词库：只断言「键去了哪条分支」，与候选内容无关。
+#[test]
+fn cmd_combo_goes_to_host_issue64() {
+    const MOD_WIN: u32 = 0x0008;
+    let mut cfg = Config::default();
+    cfg.input.default.chinese_mode = true;
+    let coord = Coordinator::new_headless(cfg, None);
+
+    // 空缓冲：⌘C / ⌘V / ⌘A 一律透传，且**不得**污染输入缓冲。
+    for (vk, name) in [(0x43u32, "⌘C"), (0x56, "⌘V"), (0x41, "⌘A")] {
+        let act = coord.handle_key_event(&key_event_mods(vk, EVENT_KEY_DOWN, MOD_WIN));
+        assert!(
+            matches!(act, KeyAction::PassThrough),
+            "{name} 应透传给宿主，实际: {act:?}"
+        );
+    }
+
+    // 组码中：⌘C 清掉组合但**不算输入**（不得再返回 UpdateComposition）。
+    // 注：`ClearComposition` 在 macOS 侧不等于吃键，由 BridgeResponseRouter 的
+    // hostShortcut 判为「组合已清、按键交还宿主」。
+    press_letter(&coord, 'n');
+    press_letter(&coord, 'i');
+    let act = coord.handle_key_event(&key_event_mods(0x43, EVENT_KEY_DOWN, MOD_WIN));
+    assert!(
+        matches!(act, KeyAction::ClearComposition),
+        "组码中 ⌘C 应清组合而非当码元，实际: {act:?}"
+    );
+
+    // Ctrl 组合的既有行为不变（回归保护）。
+    let ctrl_c = coord.handle_key_event(&key_event_mods(0x43, EVENT_KEY_DOWN, 0x0002));
+    assert!(
+        matches!(ctrl_c, KeyAction::PassThrough),
+        "空缓冲 Ctrl+C 应照旧透传，实际: {ctrl_c:?}"
+    );
+}

@@ -40,9 +40,7 @@ use wind_config::Config;
 use wind_config::PreeditDisplay;
 use wind_config::hotkey;
 use wind_engine::EngineManager;
-use wind_ipc::protocol::{
-    EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
-};
+use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_SHIFT, MOD_SHORTCUT, calc_key_hash};
 use wind_store::Store;
 use wind_store::stat_collector::{StatCollector, StatEvent};
 use wind_store::stats::CommitSource;
@@ -2704,7 +2702,7 @@ impl Coordinator {
         data: &KeyEventData,
     ) -> Option<KeyAction> {
         // Ctrl/Alt 组合不是码元输入。上游已拦截，此处为纵深防御。
-        if data.modifiers & (MOD_CTRL | MOD_ALT) != 0 {
+        if data.modifiers & MOD_SHORTCUT != 0 {
             return None;
         }
         let shift = data.modifiers & MOD_SHIFT != 0;

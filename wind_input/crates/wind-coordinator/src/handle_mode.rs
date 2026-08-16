@@ -22,7 +22,7 @@ pub(crate) const FALLBACK_THEME: &str = "default";
 
 use wind_candidate::Candidate;
 use wind_config::config::FreeInputMode;
-use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+use wind_ipc::protocol::{MOD_SHIFT, MOD_SHORTCUT};
 use wind_keys::keymap;
 
 /// mix 模式的**输入透镜**：同一个融合模式里，按键语义由当前缓冲内容决定。
@@ -1523,11 +1523,11 @@ impl Coordinator {
         }
     }
 
-    /// overlay 模式的 **Ctrl/Alt 组合守卫**。
+    /// overlay 模式的 **快捷键组合守卫**（Ctrl/Alt/Cmd，见 `MOD_SHORTCUT`）。
     ///
-    /// 走到模式处理器的 Ctrl/Alt 组合**必定不是热键**——全局热键与 Ctrl+数字 候选操作
+    /// 走到模式处理器的快捷键组合**必定不是热键**——全局热键与 Ctrl+数字 候选操作
     /// （置顶/删除）都在单点分派之前就匹配完了（见 `handle_key_event` 的顺序）。剩下的
-    /// 只可能是宿主自己的快捷键（Ctrl+A / Ctrl+C / Ctrl+V…）。
+    /// 只可能是宿主自己的快捷键（Ctrl+A / Ctrl+C / macOS 上的 ⌘C ⌘V…）。
     ///
     /// mix 此前没有这道守卫：`Ctrl+E` 会被 ① 的字母臂当成字面 `e` 插进缓冲——用户想按
     /// 宿主快捷键，实得组合区凭空多一个字符。自由输入让 ① 收下的键更多（一切可打印键），
@@ -1537,7 +1537,7 @@ impl Coordinator {
     ///
     /// # ⚠️ 想加「候选窗显示时生效的快捷键」，加在上游、不要加在这里
     ///
-    /// 本守卫是**兜底**，只处理没人认领的 Ctrl/Alt 组合。要新增在候选窗显示期间生效的
+    /// 本守卫是**兜底**，只处理没人认领的快捷键组合。要新增在候选窗显示期间生效的
     /// 快捷键，正确落点是 `handle_key_event` 里 `handle_candidate_action_hotkey` 那一段
     /// （Ctrl+数字 置顶/删除就在那儿），它在单点分派**之前**，因此天然优先于本守卫，
     /// 且五个模式一次接通。把这类键塞进各模式处理器则要写五遍，还会漏。
@@ -1552,7 +1552,7 @@ impl Coordinator {
         has_pending: bool,
         exit: impl Fn(&Self, &mut State),
     ) -> Option<KeyAction> {
-        if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 {
+        if data.modifiers & MOD_SHORTCUT == 0 {
             return None;
         }
         if has_pending {

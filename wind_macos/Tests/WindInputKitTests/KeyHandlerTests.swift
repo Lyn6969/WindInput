@@ -48,4 +48,27 @@ final class KeyHandlerTests: XCTestCase {
         XCTAssertEqual(KeyHandler.toWindowsVK(0x12), 0x31) // 1
         XCTAssertEqual(KeyHandler.toWindowsVK(0x19), 0x39) // 9
     }
+
+    // MARK: - 宿主快捷键判据 (issue #64)
+
+    /// ⌘/⌃/⌥ 组合归宿主：macOS 上 ⌘C/⌘V 是复制粘贴，输入法不能把这一键吞掉。
+    func testIsHostShortcut_ModifierKeys() {
+        XCTAssertTrue(KeyHandler.isHostShortcut(.command))
+        XCTAssertTrue(KeyHandler.isHostShortcut(.control))
+        XCTAssertTrue(KeyHandler.isHostShortcut(.option))
+        XCTAssertTrue(KeyHandler.isHostShortcut([.command, .shift]))
+    }
+
+    /// Shift / CapsLock 是正经输入修饰，不算快捷键组合。
+    func testIsHostShortcut_ShiftIsNotAShortcut() {
+        XCTAssertFalse(KeyHandler.isHostShortcut(.shift))
+        XCTAssertFalse(KeyHandler.isHostShortcut(.capsLock))
+        XCTAssertFalse(KeyHandler.isHostShortcut([]))
+    }
+
+    /// Command 编成 Win 位（0x0008）——协调器的 `MOD_SHORTCUT` 靠这一位认出 ⌘。
+    func testToModifiers_CommandMapsToWinBit() {
+        XCTAssertEqual(KeyHandler.toModifiers(.command), 0x0008)
+        XCTAssertEqual(KeyHandler.toModifiers([.command, .shift]), 0x0009)
+    }
 }

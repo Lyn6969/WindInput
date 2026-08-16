@@ -12,7 +12,7 @@ use crate::preedit_cursor;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
-use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+use wind_ipc::protocol::{MOD_SHIFT, MOD_SHORTCUT};
 use wind_keys::keymap;
 use wind_transform::fullwidth::to_full_width;
 
@@ -670,7 +670,7 @@ impl Coordinator {
             }
             // 守卫条件在入口的 `overlay_ctrl_alt_guard` 之后已恒真（Ctrl/Alt 组合到不了这里），
             // 保留作纵深防御。它曾是**全仓唯一**一处模式内 Ctrl 判定，而且只护住了这一条臂。
-            keymap::VK_A..=keymap::VK_Z if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
+            keymap::VK_A..=keymap::VK_Z if data.modifiers & MOD_SHORTCUT == 0 => {
                 // 字母累积拼音
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 preedit_cursor::BufEdit::new(

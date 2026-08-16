@@ -720,7 +720,7 @@ impl MessageHandler for Coordinator {
             // 否则 PassThrough 会形成「吃了再吐」→ 严格 TSF 宿主丢键（见 handle_english_full_width）。
             // Ctrl/Alt 组合不参与：C++ 的 ClassifyInputKey 对其返回 None，本就不吃。
             if state.full_width
-                && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+                && data.modifiers & MOD_SHORTCUT == 0
                 && let Some(act) = self.handle_english_full_width(&mut state, data)
             {
                 return act;
@@ -728,7 +728,7 @@ impl MessageHandler for Coordinator {
             // 半角英文 + 该标点键配了「英半」列：DLL 已按 core 推送的字符集合吃下此键
             // （`english_custom_punct` 分支），此处必须出字，否则同样「吃了再吐」丢键。
             // 未配的键 handle 返回 None → 落到下方透传，行为与历史完全一致。
-            if data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+            if data.modifiers & MOD_SHORTCUT == 0
                 && let Some(act) = self.handle_english_custom_punct(&mut state, data)
             {
                 return act;
@@ -741,7 +741,7 @@ impl MessageHandler for Coordinator {
         // 全角开：将按键转为正确大小写的英文字符再做全角转换后上屏。
         // 全角关：TSF 层在无 session 时已透传；有 session（切换前残留）时由此兜底 PassThrough。
         // Ctrl/Alt 组合不拦截（让下方热键/清空逻辑处理）。
-        if state.caps_lock && data.modifiers & (MOD_CTRL | MOD_ALT) == 0 {
+        if state.caps_lock && data.modifiers & MOD_SHORTCUT == 0 {
             if state.full_width {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
@@ -805,9 +805,14 @@ impl MessageHandler for Coordinator {
             return act;
         }
 
-        // Ctrl/Alt 组合（非热键）：有输入则清空并隐藏候选窗，否则透传。
+        // Ctrl/Alt/Cmd 组合（非热键）：有输入则清空并隐藏候选窗，否则透传。
         // 必须 notify_ui_hide：否则候选窗残留（如 Ctrl+A 时卡死，需再输入才复位）。
-        if data.modifiers & (MOD_CTRL | MOD_ALT) != 0 {
+        //
+        // ⚠ 这里返回 `ClearComposition` 的语义是「清掉组合」，**不是**「这个键归我了」。
+        // 宿主必须照旧执行它的快捷键——TSF 靠 `OnTestKeyDown` 压根不转发这类键来保证，
+        // macOS 无那层前置闸门，故由 `BridgeResponseRouter` 对快捷键组合把这一帧判为
+        // 「不消费」（见 Swift 侧 `hostShortcut` 参数）。改动本分支的返回值前先读那里。
+        if data.modifiers & MOD_SHORTCUT != 0 {
             if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
                 self.reset_pinyin_composition(&mut state);
                 self.notify_ui_hide();
@@ -904,7 +909,7 @@ impl MessageHandler for Coordinator {
         //
         // 单点而非三处各接一次：这仓已多次栽在「N 条通路只接了 N-1 条」上
         // （见 project_mixed_overflow_vs_topcode）。
-        if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 {
+        if data.modifiers & MOD_SHORTCUT == 0 {
             let probe = if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
                 Some((b'a' + (data.key_code - keymap::VK_A) as u8) as char)
             } else if (keymap::VK_0..=keymap::VK_9).contains(&data.key_code) {

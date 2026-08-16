@@ -9,7 +9,7 @@ use crate::pipeline::ModeKind;
 use tracing::{debug, info, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_config::BoundAction;
-use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+use wind_ipc::protocol::{MOD_SHIFT, MOD_SHORTCUT};
 use wind_keys::keymap;
 use wind_ui_types::UiCommand;
 
@@ -150,7 +150,7 @@ impl Coordinator {
         if state.input_buffer.is_empty()
             && state.committed_text.is_empty()
             && state.candidates.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+            && data.modifiers & MOD_SHORTCUT == 0
             && self.is_any_mode_trigger(data.key_code)
             && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
             && let Some(act) = self.try_smart_symbol_press2_only(state, ch, data.prev_char)
@@ -163,7 +163,7 @@ impl Coordinator {
             && state.candidates.is_empty()
             && self.rt().config.input.temp_english.enabled
             && data.modifiers & MOD_SHIFT != 0
-            && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+            && data.modifiers & MOD_SHORTCUT == 0
             && (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code)
         {
             let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
@@ -202,7 +202,7 @@ impl Coordinator {
         //
         // 命中即执行并跳过下方全局引导键链；显式 `none` 则两边都不走（return None 落普通
         // 输入）；未声明的键才落全局链——这是「未配置者行为逐字节不变」的保证。
-        if state.input_buffer.is_empty() && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0 {
+        if state.input_buffer.is_empty() && data.modifiers & (MOD_SHORTCUT | MOD_SHIFT) == 0 {
             match self.bound_key_decision(data.key_code) {
                 BoundKeyDecision::Act(action) => {
                     if let Some(act) = self.enter_bound_action(state, &action, data.key_code) {
@@ -561,8 +561,7 @@ impl Coordinator {
         state: &State,
         data: &KeyEventData,
     ) -> Option<BoundAction> {
-        if !state.input_buffer.is_empty() || data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) != 0
-        {
+        if !state.input_buffer.is_empty() || data.modifiers & (MOD_SHORTCUT | MOD_SHIFT) != 0 {
             return None;
         }
         let BoundKeyDecision::Act(action) = self.bound_key_decision(data.key_code) else {

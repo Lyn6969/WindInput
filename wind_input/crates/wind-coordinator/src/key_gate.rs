@@ -22,6 +22,11 @@
 //! - Android：已切到本模块，FFI 层的手写谓词已删除。
 //! - C++ TSF：**尚未迁移**（保持现状，桌面零风险）。迁移时 C++ 只需保留
 //!   TSF 特有的前置/后置，中间整段替换为一次 IPC 查询或本地镜像调用。
+//! - macOS IMKit：**没有前置闸门**——`InputController.handle` 把每个 keyDown 都发给协调器，
+//!   再照 `KeyAction` 决定吃不吃。于是本模块第 3 条（快捷键组合归宿主）在那边完全不生效，
+//!   全靠协调器返回 `PassThrough`；而「有组合时按 ⌘C」这条返回的是 `ClearComposition`，
+//!   Swift 侧一度按「已消费」处理 → 键被吞（issue #64）。现由
+//!   `BridgeResponseRouter.apply(hostShortcut:)` 顶住，迁移本模块后可撤掉那个参数。
 
 use wind_config::hotkey::KeyDownPolicy;
 use wind_host::KeyProbe;
@@ -31,8 +36,9 @@ use crate::coordinator::Coordinator;
 
 /// 修饰位：本模块内部用的规范化形式（与 `wind_ipc::protocol` 的通用位对齐）。
 const MOD_SHIFT: u32 = 0x0001;
-const MOD_CTRL: u32 = 0x0002;
-const MOD_ALT: u32 = 0x0004;
+/// 宿主快捷键修饰位（Ctrl/Alt/Win，macOS 的 Command 走 Win 位）。见
+/// `wind_ipc::protocol::MOD_SHORTCUT` 的说明。
+const MOD_SHORTCUT: u32 = wind_ipc::protocol::MOD_SHORTCUT;
 
 /// 与 `wind_config::hotkey` 的 `key_hash` 同构（高 16 位修饰、低 16 位键码）。
 fn key_hash(modifiers: u32, vk: u32) -> u32 {
@@ -93,7 +99,7 @@ impl Coordinator {
     /// 判定顺序镜像 TSF `OnTestKeyDown`（顺序本身有语义，热键优先于常规分类）：
     /// 1. 宿主只读 → 一律放行
     /// 2. key_down 热键白名单（四种策略）
-    /// 3. Ctrl/Alt 组合 → 归宿主快捷键
+    /// 3. Ctrl/Alt/Cmd 组合 → 归宿主快捷键
     /// 4. 配对跳出：配对栈非空时吃跳出键（跨中英模式统一闸门）
     /// 5. 英文模式 → 字母/数字/标点全放行（配对由上一条兜住）
     /// 6. 中文模式 → 字母、标点吃；会话键有会话才吃
@@ -102,7 +108,7 @@ impl Coordinator {
             return false;
         }
 
-        let mods = probe.modifiers.0 & (MOD_SHIFT | MOD_CTRL | MOD_ALT);
+        let mods = probe.modifiers.0 & (MOD_SHIFT | MOD_SHORTCUT);
         let hash = key_hash(mods, probe.vk);
         let chinese = self.is_chinese_mode();
         let session = self.has_active_session();
@@ -123,9 +129,9 @@ impl Coordinator {
             }
         }
 
-        // ── 3. Ctrl/Alt 组合归宿主 ──
-        // 未命中热键白名单的 Ctrl/Alt 组合一律不碰，否则会吃掉宿主的 Ctrl+C 之类。
-        if mods & (MOD_CTRL | MOD_ALT) != 0 {
+        // ── 3. Ctrl/Alt/Cmd 组合归宿主 ──
+        // 未命中热键白名单的快捷键组合一律不碰，否则会吃掉宿主的 Ctrl+C / ⌘C 之类。
+        if mods & MOD_SHORTCUT != 0 {
             return false;
         }
 

@@ -8,7 +8,7 @@ use crate::coordinator::{Coordinator, State, full_width_source_char, numpad_char
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::config::SmartMethod;
-use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+use wind_ipc::protocol::{MOD_SHIFT, MOD_SHORTCUT};
 use wind_keys::keymap;
 
 /// 恰好单字符则返回之，否则 None（自定义映射可为多字符串，不能充当配对符）。
@@ -818,7 +818,7 @@ impl Coordinator {
         if state.active.is_some()
             || !state.input_buffer.is_empty()
             || !state.candidates.is_empty()
-            || data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) != 0
+            || data.modifiers & (MOD_SHORTCUT | MOD_SHIFT) != 0
             || !self.rt().jump_out_keys.contains(&data.key_code)
         {
             return None;

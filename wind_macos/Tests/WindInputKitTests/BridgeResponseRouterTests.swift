@@ -159,6 +159,37 @@ final class BridgeResponseRouterTests: XCTestCase {
         XCTAssertEqual(mock.setMarkedCalls.last?.text, "")
     }
 
+    /// issue #64: 宿主快捷键 (⌘C/⌃C…) 触发的清组合 —— 组合要清, 但按键必须交还宿主,
+    /// 否则网页版 WPS/GitHub 里组字期间复制粘贴失灵。
+    func testApply_ClearComposition_HostShortcut_ReturnsFalseButStillClears() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        r.applyUpdateComposition(.init(caretPos: 0, text: "ni"), client: mock)
+        XCTAssertFalse(r.composition.isEmpty)
+
+        let frame = Frame(cmd: DownstreamCmd.clearComposition, isAsync: false, payload: Data())
+        XCTAssertFalse(r.apply(frame, to: mock, hostShortcut: true), "快捷键组合不得吃键")
+        XCTAssertTrue(r.composition.isEmpty, "组合仍须清干净")
+        XCTAssertEqual(mock.setMarkedCalls.last?.text, "")
+    }
+
+    /// 同一帧在**非**快捷键路径 (Esc 取消) 下仍是消费, 不受上一条影响。
+    func testApply_ClearComposition_NotShortcut_StillConsumes() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        r.applyUpdateComposition(.init(caretPos: 0, text: "ni"), client: mock)
+        let frame = Frame(cmd: DownstreamCmd.clearComposition, isAsync: false, payload: Data())
+        XCTAssertTrue(r.apply(frame, to: mock, hostShortcut: false))
+    }
+
+    /// 命中热键的组合走 Consumed/StatusUpdate 一路, hostShortcut 不该把它们降级。
+    func testApply_Consumed_HostShortcut_StillConsumes() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        let frame = Frame(cmd: DownstreamCmd.consumed, isAsync: false, payload: Data())
+        XCTAssertTrue(r.apply(frame, to: mock, hostShortcut: true))
+    }
+
     // MARK: - CommitTextWithCursor
 
     func testApply_CommitTextWithCursor_CallsInsert() {

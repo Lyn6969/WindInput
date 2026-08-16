@@ -463,8 +463,12 @@ public class InputController: IMKInputController {
             sendCaretUpdateIfAvailable(client: sender as? IMKTextInput)
         }
 
+        // 宿主快捷键组合 (⌘/⌃/⌥ + 键): 照常问服务 (热键表在那边), 但服务回「清组合」时
+        // 这一键仍要交还宿主, 否则 ⌘C/⌘V 在组字期间被吞 —— 见 KeyHandler.isHostShortcut。
+        let hostShortcut = KeyHandler.isHostShortcut(event.modifierFlags)
+
         do {
-            return try sendAndApply(frame, on: bridge, sender: sender)
+            return try sendAndApply(frame, on: bridge, sender: sender, hostShortcut: hostShortcut)
         } catch {
             // 服务重启/卡死后这条连接已死 (write→EPIPE 或 read→EOF/超时)。重连到新服务
             // 并**用新连接重试当前键一次**, 让服务重启后第一个键就自愈, 不丢字、不需手动
@@ -474,7 +478,7 @@ public class InputController: IMKInputController {
             // 注意: 上方 guard 把属性 bridge 遮蔽为非可选局部量, 这里须取重连后的 self.bridge。
             guard let fresh = self.bridge else { return false }
             do {
-                return try sendAndApply(frame, on: fresh, sender: sender)
+                return try sendAndApply(frame, on: fresh, sender: sender, hostShortcut: hostShortcut)
             } catch {
                 NSLog("WindInput[handle] 重连后重试仍失败: \(error)")
                 return false
@@ -484,10 +488,11 @@ public class InputController: IMKInputController {
 
     /// 在指定连接上发一帧、读响应并应用; composition 非空时上报 caret。
     /// 抽出供 handle 的「首发 + 重连重试」两条路径共用。
-    private func sendAndApply(_ frame: Data, on bridge: BridgeClient, sender: Any?) throws -> Bool {
+    private func sendAndApply(_ frame: Data, on bridge: BridgeClient, sender: Any?,
+                              hostShortcut: Bool = false) throws -> Bool {
         try bridge.send(frame)
         let resp = try bridge.readFrame()
-        let consumed = applyResponse(resp, sender: sender)
+        let consumed = applyResponse(resp, sender: sender, hostShortcut: hostShortcut)
         // M2.2-E: composition 启动/更新后, 上报当前 caret 屏幕位置给 Go,
         // 让候选框/Toast/光标跟随有正确锚点. 仅在 marked text 非空时发。
         if !composition.isEmpty {
@@ -546,10 +551,10 @@ public class InputController: IMKInputController {
 
     /// 把 Go 返回的 bridge 帧路由到 IMKTextInput 协议方法. 委托给 BridgeResponseRouter
     /// (在 WindInputKit 里, 不依赖 IMKit, 便于 swift test 用 mock 驱动).
-    internal func applyResponse(_ frame: Frame, sender: Any?) -> Bool {
+    internal func applyResponse(_ frame: Frame, sender: Any?, hostShortcut: Bool = false) -> Bool {
         let imkClient = sender as? IMKTextInput
         let adapter = imkClient.map { IMKClientAdapter(imkClient: $0) }
-        return router.apply(frame, to: adapter)
+        return router.apply(frame, to: adapter, hostShortcut: hostShortcut)
     }
 
     /// 应用 push 通道帧 (鼠标选词的 commit/composition 异步到达, 非 KeyEvent 同步响应)。

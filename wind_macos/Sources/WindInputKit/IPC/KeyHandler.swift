@@ -132,6 +132,17 @@ public enum KeyHandler {
         return m
     }
 
+    /// 这一键是否带**宿主快捷键修饰键** (⌘ Command / ⌃ Control / ⌥ Option)。
+    ///
+    /// 这类键一律先问服务 (热键表在那边: ctrl+shift+e 切方案、ctrl+数字 置顶候选…),
+    /// 但**未命中热键时必须交还宿主** —— macOS 上 ⌘C/⌘V 是复制粘贴, ⌃/⌥ 组合也归宿主。
+    /// 判定在 `BridgeResponseRouter.apply(hostShortcut:)` 落地; 见那里的说明与 issue #64。
+    ///
+    /// Shift 不算: Shift+字母是大写、Shift+标点是另一个标点, 都是正经输入。
+    public static func isHostShortcut(_ flags: NSEvent.ModifierFlags) -> Bool {
+        return flags.contains(.command) || flags.contains(.control) || flags.contains(.option)
+    }
+
     /// 把 NSEvent 编码成可发送的 KeyEvent 帧字节 (含 header).
     /// `seq` 由调用方维护自增, 用于服务端 stale 检测.
     public static func encodeKeyEvent(_ event: NSEvent, seq: UInt16) -> Data? {
