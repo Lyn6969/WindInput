@@ -88,6 +88,24 @@ fn rank_of(store: Arc<Store>, input: &str, want: &str) -> Option<usize> {
         .position(|t| t == want)
 }
 
+/// 敲入整串，返回首候选。
+fn top_of(store: Arc<Store>, input: &str) -> Option<String> {
+    let coord = Coordinator::new_headless_with_store(config(), Some(&data_dir()), store);
+    for c in input.chars() {
+        let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
+        coord.handle_key_event(&KeyEventData {
+            key_code: vk,
+            scan_code: 0,
+            modifiers: 0,
+            event_type: EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        });
+    }
+    coord.debug_all_candidate_texts().first().cloned()
+}
+
 fn fresh_store(tag: &str) -> Arc<Store> {
     let root = std::env::temp_dir().join(format!("wind_freq_longword_{tag}"));
     let _ = std::fs::remove_dir_all(&root);
@@ -117,6 +135,42 @@ fn freq_record_does_not_sink_long_word_at_syllable_boundary() {
     assert!(
         before <= 2,
         "长词消费了整串，应由 cmp_by_consumed 顶在最前，实际第 {before} 位"
+    );
+}
+
+/// 残码位（`...chif`）：词频记录也不得让**远距离预测**的长词抢走首位。
+///
+/// 与上一条是同一个诉求（「上过屏与否体验一致」）的另一半，但根因不同，故分开测：
+/// 上一条是排序键缺 `by_consumed`，这条是 `promotion_power` 的豁免范围过宽 ——
+/// 残码位上该词 `is_promoted_completion=true`，白拿了「免受 `promote_prefix` 限制」这份
+/// 豁免（那份豁免本是给「补完手头这个音节」的近距离补全设的），于是**选过一次**就靠
+/// `power=1` 把 `base_pos` 减半到 0，压过音节数恰好对齐的「冰冻三尺分」。
+/// 判据见 `freq_rerank::PROMOTED_COMPLETION_FREQ_EXEMPT_EXTRA`。
+#[test]
+fn freq_record_does_not_let_far_completion_take_top_at_trailing_partial() {
+    if !has_pinyin() {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    let store = fresh_store("far_partial");
+    let before = top_of(store.clone(), "bingdongsanchif");
+
+    store.record_freq("pinyin", CODE, WORD).expect("写词频");
+    let after = top_of(store.clone(), "bingdongsanchif");
+
+    assert_eq!(
+        after, before,
+        "词频记录不得改变首候选（修复前：「冰冻三尺分」→「{WORD}」）"
+    );
+    assert_ne!(
+        after.as_deref(),
+        Some(WORD),
+        "首候选应是音节数对齐的候选，不是还差 4 个音节的远距离预测词"
+    );
+    // 降级不销毁：长词仍要在候选里（这是用户的另一条诉求——打到每个字的声母都该看得到它）。
+    assert!(
+        rank_of(store, "bingdongsanchif", WORD).is_some(),
+        "长词应仍在候选中"
     );
 }
 
