@@ -1406,6 +1406,12 @@ mod tests {
     /// 这是第一版的实际缺陷——挖空与透明同时用，主字先被切掉一圈，角标底下根本没有
     /// 笔画可透，于是调低不透明度看起来毫无效果。判据取"同一处像素在半透明档下比
     /// 全不透明档**更接近主字**"：不挖空时该处是 主字⊕角标 的混合，挖空时只有角标。
+    ///
+    /// ⚠️ **判据依赖主字真有墨迹，故 gate 到 Windows**（同 `text/dwrite.rs` 里三处
+    /// `cfg(all(test, windows))` 的理由）。Linux 的文本后端是空操作 mock（`draw` 直接
+    /// 返回 `Ok(())`，见 `text/dwrite.rs` 的非 Windows/非 macOS 分支），那里主字恒全
+    /// 透明——"被挖掉的笔画"无从谈起，`translucent_denser` 恒为 0，断言必然不成立。
+    #[cfg(windows)]
     #[test]
     fn translucent_badge_lets_the_glyph_show_through() {
         let n = 32usize;
