@@ -925,6 +925,16 @@ impl MessageHandler for Coordinator {
             // 行为必然一致。
             keymap::VK_ESCAPE => self.cancel_session(&mut state),
             keymap::VK_BACK => {
+                // 联想态：收掉候选并结束占位组合（吞键）。**必须先于下面的既有分支**——
+                // 那些分支在「缓冲空 + 无已转换段」时给 `PassThrough`，而联想态挂着占位
+                // 组合（见 `handle_assoc::ASSOC_COMPOSITION`），透传会把组合悬在宿主里。
+                //
+                // 这是联想唯一需要单独接的键：其余（翻页/上下移高亮/二三候选/数字选词/
+                // 空格选高亮/Esc 取消/鼠标点选）的既有分支门槛都只是「候选非空」，
+                // 联想候选就住在 `candidates` 里，天然全部适用。
+                if state.assoc_active() {
+                    return self.assoc_dismiss(&mut state);
+                }
                 // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
                 // 缓冲前部、重转），否则删光标前一个字符。
                 // 段回退**优先于光标**（不看光标位置，对齐 Go handleBackspace 的分支顺序）。
@@ -961,6 +971,18 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_SPACE => {
+                // 联想态 + `space_commits = false`：空格不选联想，收窗后照常出空格。
+                //
+                // 联想态下「高亮」是输入法猜的，不是用户选的——有人希望空格顺手选中
+                // （主流做法，故默认开），也有人希望空格就是空格。这一项没有更对的答案，
+                // 所以是个配置；但**它只在联想态有意义**，正常输入的空格恒是选高亮。
+                if state.assoc_active() && !self.assoc_config().space_commits {
+                    self.exit_assoc(&mut state, crate::handle_assoc::AssocExit::NonSelectKey);
+                    self.notify_ui_hide();
+                    let text = self.convert_punct(&state, ' ', data.prev_char);
+                    self.record_commit(&text, 0, -1, CommitSource::Punctuation);
+                    return Self::commit_action(text, true);
+                }
                 // Space：选当前高亮候选 / 上屏编码
                 if !state.candidates.is_empty() {
                     let (start, _) = self.page_range(&state);
@@ -1023,6 +1045,16 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_RETURN => {
+                // 联想态：收窗并结束占位组合（吞键）。
+                //
+                // 下方各分支的门槛都是「缓冲或已转换前缀非空」，联想两者皆空 ⇒ 会落到最后的
+                // `PassThrough`，而那会把占位组合悬在宿主里（同退格，见 `assoc_dismiss`）。
+                //
+                // 刻意**不**上屏高亮联想：回车是终结性动作，用户按它是要换行/发送，
+                // 不是「就选高亮那条吧」。
+                if state.assoc_active() {
+                    return self.assoc_dismiss(&mut state);
+                }
                 // Enter：按 enter_behavior 配置（对齐 Go handleEnter）——"clear" 清空编码
                 // (不上屏)；否则(commit)上屏「已转换前缀 + 剩余原码」。
                 if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
@@ -1438,7 +1470,17 @@ impl MessageHandler for Coordinator {
                     if let Some(ref held) = pre_held_text {
                         out = format!("{}{}", held, out);
                     }
-                    if !state.candidates.is_empty() {
+                    // ★ 联想态**不顶屏**（见 `commit_highlight_then_char` 里的同款守卫）。
+                    //
+                    // 顶屏的语义前提是「用户打了码、还没选词，按标点意味着『就选高亮那条吧』」。
+                    // 联想态没有码——高亮那条是输入法猜的，此刻按「。」的意图就是打个句号。
+                    //
+                    // 真机现象（2026-08-16）：打「我」上屏、联想首条「我们」、按「。」得到
+                    // 「我我们。」——既顶了不该顶的，又用了整词而非该补的那半截。
+                    //
+                    // ⚠️ 注意这一段**不受上面 `has_input` 守卫**：那个只挡住了「顶码上屏开关」
+                    // 那条分支，本段是标点的通用出口，联想态照样走得到。判据必须自己带。
+                    if !state.candidates.is_empty() && !state.assoc_active() {
                         let (start, _) = self.page_range(&state);
                         let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                         let cand = state.candidates[idx].clone();
@@ -1717,6 +1759,8 @@ impl MessageHandler for Coordinator {
                 // 焦点切换后旧 composition 上下文已失效，清理输入态，避免候选残留到新焦点。
                 s.input_buffer.clear();
                 s.preedit.clear();
+                // 联想候选就住在 `candidates` 里，故上面那句已经把它一并清掉了——
+                // 联想的依据是「刚上屏的那段文本就在光标前面」，焦点一走这个前提就不成立。
                 s.candidates.clear();
                 // 复位菜单态，否则下一个键被 forward_menu_key 吞掉。
                 // **本处刻意不受 MENU_FOCUS_GUARD 保护**：下面的 notify_ui_hide 会经

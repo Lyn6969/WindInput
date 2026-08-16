@@ -1,0 +1,12 @@
+[package]
+name = "wind-assoc"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# 配置段 [input.association] 与标点规则表的默认值同源。
+wind-config = { path = "../wind-config" }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

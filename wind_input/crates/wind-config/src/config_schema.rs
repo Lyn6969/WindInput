@@ -264,6 +264,18 @@ static REGISTRY: &[ConfigField] = &[
         "input.top_commit_mode",
         Enum(&["pre_confirm", "direct_commit"]),
     ),
+    // 联想。kind 兼任开关与类型（"off" 即关）。本段是**桌面基线**，移动端的差异走
+    // [mobile.association]——值域里不留平台哨兵。
+    f("input.association.kind", Enum(&["off", "word", "smart"])),
+    f("input.association.mode", Enum(&["one_shot", "continuous"])),
+    f("input.association.max_count", Int),
+    f("input.association.space_commits", Bool),
+    f("input.association.hide_after_ms", Int),
+    f("input.association.hint", Str),
+    f("input.association.history", Bool),
+    f("input.association.bigram", Bool),
+    f("input.association.prefix", Bool),
+    f("input.association.punct", Bool),
     // -- keys（全部按键，扁平；overflow 保留一层）--
     f("keys.toggle_mode_keys", StrList),
     f("keys.commit_on_switch", Bool),
@@ -391,6 +403,12 @@ static REGISTRY: &[ConfigField] = &[
     ),
     f("debug.log_max_size_mb", Int),
     f("debug.log_max_files", Int),
+    // -- mobile（移动端对上面各域的覆盖；桌面构建完全无视）--
+    // 只登记**当前真有平台差异**的键，别提前铺一排永远等于基线的键——每个都要在这里、
+    // 预置文件、capability 快照、设置页豁免名单各占一行。详见 MobileConfig 的文档。
+    f("mobile.association.kind", Enum(&["off", "word", "smart"])),
+    f("mobile.association.mode", Enum(&["one_shot", "continuous"])),
+    f("mobile.association.punct", Bool),
 ];
 
 /// 返回配置字段注册表。

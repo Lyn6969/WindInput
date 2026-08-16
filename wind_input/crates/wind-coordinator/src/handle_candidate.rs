@@ -2073,6 +2073,11 @@ impl Coordinator {
         if cand.is_command {
             return self.commit_command(state, cand);
         }
+        // 联想候选**没有编码**（它是上屏之后按上文给的），凡以「输入码」为 key 的加工
+        // 都不适用：词频会记进一条空码行（读端 `apply_freq_rerank` 要求码非空，永远查不到，
+        // 只是逐日累积垃圾），自动造词会拿它去凑一个用户从没打过的词。
+        // 判据统一是来源，与短语「有文本无码位、恒不记词频」同一先例。
+        let from_assoc = cand.source == CandidateSource::Assoc;
         let total = state.input_buffer.len();
         let consumed = cand.consumed_length;
         let code = Self::cand_code(&state.input_buffer, cand);
@@ -2081,11 +2086,13 @@ impl Coordinator {
         // 词频记账走 `freq_code` 而非上面的 `code`：码表按**输入码**（码位独立），
         // 拼音/英文按候选码（分段时为前缀码，如「ni」而非整串「nihao」）。
         // 上面的 `code` 仍供 `record_commit` 统计码长使用，那是另一套语义。
-        self.record_selection(
-            &self.freq_code(&state.input_buffer, cand),
-            &cand.text,
-            cand.source,
-        );
+        if !from_assoc {
+            self.record_selection(
+                &self.freq_code(&state.input_buffer, cand),
+                &cand.text,
+                cand.source,
+            );
+        }
         // 输入统计：每次选词记一段（分段逐字选各段各记一次，不重复整串）；
         // 在 partial 分支之前，两分支都经此处一次。
         self.record_commit(
@@ -2118,15 +2125,27 @@ impl Coordinator {
                 text: display,
             }
         } else {
-            state.committed_segs.push((
-                raw_code,
-                code.clone(),
-                cand.text.clone(),
-                cand.source,
-                cand.boundary,
-            ));
-            let final_simplified = format!("{}{}", state.committed_text, cand.text);
-            self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
+            // 联想候选不进已转换段、不喂造词：那两者都以「这一段是用什么码打出来的」为
+            // 前提，而联想没有码。
+            if !from_assoc {
+                state.committed_segs.push((
+                    raw_code,
+                    code.clone(),
+                    cand.text.clone(),
+                    cand.source,
+                    cand.boundary,
+                ));
+            }
+            // 上屏文本：联想的**显示文本是整词**（「中国」），而屏幕上已经有「中」了，
+            // 真正要补出去的只有 `commit_override` 里那半截。见 `Candidate::commit_override`。
+            let final_simplified = format!(
+                "{}{}",
+                state.committed_text,
+                cand.commit_override.as_deref().unwrap_or(&cand.text)
+            );
+            if !from_assoc {
+                self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
+            }
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
             // 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。
             // is_group/is_command 已在 commit_selected 入口提前返回；is_phrase 由本条件显式过滤
@@ -2186,7 +2205,43 @@ impl Coordinator {
             if self.english_appends_space(cand.source) {
                 out.push(' ');
             }
+            // 下一轮联想的**上文**：取简体域的完整文本，而不是上屏的 `out`。
+            //
+            // ★ 两处差别都要紧：
+            //   ① **简体**——词库前缀检索是简体域的；开着简繁时 `out` 是「中國」，
+            //      拿它去查一条也查不到。（标点联想两种都行，但没理由分叉。）
+            //   ② **完整词**——选中联想「中国」时 `out` 只是补出去的「国」，而屏幕上
+            //      是「中国」。拿「国」当上文，续联想会从错误的前缀接下去。
+            let assoc_ctx = if from_assoc {
+                cand.text.clone()
+            } else {
+                final_simplified.clone()
+            };
             self.reset_pinyin_composition(state);
+            // 联想入口。**位置即契约**：`reset_pinyin_composition` 刚把缓冲与候选清空，
+            // 正是 `maybe_enter_assoc` 往 `candidates` 里填之前要的状态；再往后就只剩返回。
+            //
+            // 六类选词触发（空格/数字键/次三选键/修饰键选词/鼠标点选/数字键越界）全部汇于
+            // 本分支——与紧邻上方英文补空格的收口理由完全相同，一处接线即覆盖。
+            //
+            // `assoc_may_chain`：一次性档下，选中联想候选后**不再续**（否则联想会一直
+            // 接龙下去，那是持续档的语义）。
+            if self.assoc_may_chain(from_assoc) && self.maybe_enter_assoc(state, &assoc_ctx) {
+                self.notify_ui_update(state);
+                // ★ 上屏后**重开一个占位组合**——这是联想态能收到后续按键的唯一可靠手段。
+                // 宿主的会话判据里，只有 `HasActiveComposition()` 是同步的；靠应答异步
+                // 回填的 `_hasCandidates` 赢不了下一次 OnTestKeyDown 的竞速（见
+                // `handle_assoc::ASSOC_COMPOSITION` 里的真机日志铁证）。
+                //
+                // 走 `commit_then_new_composition` 而不是自己拼 `InsertText`：它按
+                // `top_commit_mode` 分流，direct_commit 下把新组合延到 keyup 才开，
+                // 躲开「真提交 + 同位置重开」被 diff 式宿主误读成替换。进特殊模式走的
+                // 也是这一条。
+                return self.commit_then_new_composition(
+                    out,
+                    crate::handle_assoc::ASSOC_COMPOSITION.to_string(),
+                );
+            }
             self.notify_ui_hide();
             Self::commit_action(out, true)
         }
@@ -2953,6 +3008,8 @@ impl Coordinator {
     /// @return 主输入路实际产生的 KeyAction（overlay / `$CC` 命令 / 越界返回 None）
     pub(crate) fn select_candidate_at(&self, idx: usize) -> Option<KeyAction> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 联想候选就住在 `candidates` 里，故本函数**原样适用**——鼠标点选联想词与点选
+        // 普通候选走的是同一条 `commit_selected`，无需分支。移动端的候选栏全靠这条通路。
         if idx >= state.candidates.len() {
             return None;
         }

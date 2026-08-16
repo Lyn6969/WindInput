@@ -5,13 +5,18 @@
 use crate::candidate::{Candidate, CandidateSource};
 
 /// 过滤模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` 取 `Smart`，**与 [`from_config`](Self::from_config) 的未知值回退同源**
+/// ——那里拼错的配置值也落到 Smart。两处若给出不同的「默认」，会出现
+/// 「没配过滤模式」与「配错了过滤模式」表现不一致，而这种差异极难被想到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
     /// 不过滤
     Gb18030,
     /// 只保留常用词
     General,
     /// 智能过滤（同编码下有常用词则过滤非常用词）
+    #[default]
     Smart,
 }
 

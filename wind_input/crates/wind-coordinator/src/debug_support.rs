@@ -18,6 +18,22 @@ impl Coordinator {
         self.engine_mgr.available_schemas()
     }
 
+    /// 当前联想候选的文本（测试/诊断用）。空 = 这批候选不是联想来的。
+    ///
+    /// 集成测试（`tests/` 下、crate 外）够不着 `state`，而联想的端到端验证恰恰必须从
+    /// 真实按键入口进——headless 无词库时词语联想恒空，验不出真机行为。
+    ///
+    /// ★ 判据走 `assoc_active()`（候选来源）而非「候选非空」：联想候选与普通候选住在
+    /// 同一个 `candidates` 里，不看来源就会把正常输入的候选也当成联想报出去，
+    /// 于是「联想出来了吗」这个断言恒真。
+    pub fn debug_assoc_texts(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.assoc_active() {
+            return Vec::new();
+        }
+        s.candidates.iter().map(|c| c.text.clone()).collect()
+    }
+
     /// 推给 TSF 的 key_up 热键白名单（测试/诊断用）。
     ///
     /// 这正是 `push_activation_status` 发出去的那份，不是另算一遍——修饰键类绑定

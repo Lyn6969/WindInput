@@ -13,6 +13,7 @@ wind-dict = { path = "../wind-dict" }
 # ⚠ 勿加 wind-transfer/fontdb：它们随 webdata 独立进了 wind-webdata（依赖方向
 # webdata → coordinator），是 Android 闭包免 C 依赖（check-android 免 NDK）的关键。
 wind-engine = { path = "../wind-engine" }
+wind-assoc = { path = "../wind-assoc" }
 wind-candidate = { path = "../wind-candidate" }
 wind-transform = { path = "../wind-transform" }
 wind-theme = { path = "../wind-theme" }

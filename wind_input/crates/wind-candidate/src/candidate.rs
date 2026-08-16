@@ -18,6 +18,14 @@ pub enum CandidateSource {
     English,
     #[serde(rename = "phrase")]
     Phrase,
+    /// 联想候选：**上屏之后**按刚上屏的内容给出的下一批候选，没有编码。
+    ///
+    /// 它与其余来源的区别不在「哪本词库」而在「有没有输入」——正因如此，凡是以
+    /// 「输入码」为 key 的加工（词频记账、自动造词、码表调序）都必须跳过它，
+    /// 判据就是这个来源值。对齐 [`CandidateSource::Phrase`] 的既有先例：那个也是
+    /// 「有文本无码位」故恒不记词频。
+    #[serde(rename = "assoc")]
+    Assoc,
 }
 
 /// 候选词元数据
@@ -267,6 +275,19 @@ pub struct Candidate {
     /// 协调器展开/消费，不推送 UI（UI 收到的 CandidateItem.text 已是覆盖后的显示文本）。
     #[serde(skip)]
     pub s2t_override: Option<String>,
+    /// **上屏时实际写出的文本**；`None` = 就用 `text`（绝大多数候选）。
+    ///
+    /// 目前唯一的用户是**词语联想**：候选栏显示整词「中国」（用户才看得懂自己在选什么），
+    /// 而「中」已经在屏幕上了，真正要补出去的只有「国」。
+    ///
+    /// ⚠️ 与紧邻上方的 `s2t_override` **不是一回事**，别互相顶替：那个是「这条候选的简繁
+    /// 变体形态」，会绕过出口的 `maybe_s2t`；本字段只换上屏文本，简繁转换照常发生。
+    /// 拿 `s2t_override` 装联想后缀，会让开着简繁的用户补出来的那半截不转换。
+    ///
+    /// 只由联想的提交路径（`handle_assoc::commit_assoc_at`）消费——常规选词路径不读它，
+    /// 因为常规候选恒为 `None`，读了也是白读。
+    #[serde(skip)]
+    pub commit_override: Option<String>,
     pub source: CandidateSource,
     pub phrase_template: String,
     pub is_group: bool,
@@ -320,6 +341,7 @@ impl Default for Candidate {
             consumed_length: 0,
             boundary: 0,
             s2t_override: None,
+            commit_override: None,
             source: CandidateSource::None,
             phrase_template: String::new(),
             is_group: false,

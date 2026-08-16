@@ -16,9 +16,9 @@ pub mod variant;
 
 pub use code_charset::{CodeCharSet, CodeCharSetError};
 pub use config::{
-    BoundAction, CodetableGlobal, Config, LangBarConfig, LayoutIntent, MixGlobal,
-    ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig, PreeditDisplay, SessionAction,
-    TopCommitMode,
+    AssociationConfig, BoundAction, CodetableGlobal, Config, LangBarConfig, LayoutIntent,
+    MixGlobal, MobileAssociationConfig, MobileConfig, ModeIndicatorStyle, PinyinFuzzy,
+    PinyinGlobalConfig, PreeditDisplay, SessionAction, TopCommitMode,
 };
 pub use dir_var::{dir_var, dir_var_help, dir_var_names, dir_var_str, is_dir_var};
 pub use runtime_state::RuntimeState;

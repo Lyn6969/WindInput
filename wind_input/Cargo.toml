@@ -21,6 +21,7 @@ members = [
     "crates/wind-quick-input",
     "crates/wind-reverse",
     "crates/wind-punct",
+    "crates/wind-assoc",
     "crates/wind-coordinator",
     "crates/wind-webdata",
     "crates/wind-rpc",

@@ -214,6 +214,13 @@ pub(crate) fn settings_app_path() -> Option<String> {
     path.exists().then(|| path.display().to_string())
 }
 
+/// ⚠️ `Default` **只在测试构建下存在**（`cfg_attr(test, ...)`）。
+///
+/// 生产侧一律走 `Coordinator::new` 里的显式构造：那里每个字段的初值都有来历
+/// （`chinese_mode` 取配置、`toolbar_visible` 取配置、`ime_active` 必须为 false 等），
+/// 而 `Default` 会把它们全给成零值。放开给生产用，早晚有人用它造出一个
+/// 「中文模式关着、工具栏不显示」的状态，且完全不报错。
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct State {
     pub(crate) chinese_mode: bool,
     pub(crate) full_width: bool,
@@ -620,6 +627,9 @@ pub struct Coordinator {
     pending_first_show: Mutex<bool>,
     /// 上述兜底 timer 的代际令牌：每次 arm 自增，超时回调比对以作废被新按键取代的旧 timer。
     pending_first_show_token: Mutex<u64>,
+    /// 联想窗自动隐藏 timer 的代际令牌（同上，见 `handle_assoc::arm_assoc_hide`）。
+    /// **进入与退出联想态都要自增**——退出时不加，旧计时会在下一轮联想里提前把窗收掉。
+    pub(crate) assoc_hide_token: Mutex<u64>,
     /// 本次组合候选窗是否已首次显示过（true=后续刷新可立即下发；false=首帧需延迟）。
     candidate_shown: Mutex<bool>,
     /// 显示授权：handle_caret_update / 兜底 timer 在调 notify_ui_update 前置位以放行首帧显示；
@@ -1334,6 +1344,7 @@ impl Coordinator {
             readiness_state: std::sync::atomic::AtomicU8::new(0),
             pending_first_show: Mutex::new(false),
             pending_first_show_token: Mutex::new(0),
+            assoc_hide_token: Mutex::new(0),
             candidate_shown: Mutex::new(false),
             show_authorized: std::sync::atomic::AtomicBool::new(false),
             candidate_flipped: std::sync::atomic::AtomicBool::new(false),
@@ -2824,7 +2835,16 @@ impl Coordinator {
     ) -> KeyAction {
         let committed = self.take_committed(state);
         let mut out = self.maybe_s2t(state, &committed);
-        if !state.candidates.is_empty() {
+        // ★ 联想态**不顶屏**。
+        //
+        // 顶屏的语义前提是「用户打了码、还没选词，按这个字符意味着『就选高亮那条吧』」。
+        // 联想态**没有码**——高亮那条是输入法猜的，不是用户在选。此刻按「。」的意图
+        // 就是打个句号，顶屏等于替用户做了个他没做的选择。
+        //
+        // 不修的后果真机上很刺眼（2026-08-16 反馈）：打「我」上屏、联想首条「我们」、
+        // 按「。」得到「我我们。」——既顶了不该顶的，又用了整词而非该补的那半截「们」。
+        // 两个错叠在一起，看起来像凭空多出一个字。
+        if !state.candidates.is_empty() && !state.assoc_active() {
             let idx = self
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
@@ -2868,6 +2888,26 @@ impl Coordinator {
     }
 
     /// 清空拼音逐步转换的组合态（已转换前缀 + 缓冲 + 候选）。
+    /// 把首显闸门要等的坐标预置成「已就绪」（**仅 crate 内单元测试用**）。
+    ///
+    /// headless 下没有宿主上报 caret，于是每一帧都是「首帧且坐标未就绪」，
+    /// `notify_ui_update` 会在闸门处 return，候选压根不下发——任何断言「UI 收到了什么」
+    /// 的测试都会拿到空通道，看着像功能没接上，其实是被闸门拦了。
+    ///
+    /// 放在本文件是因为它要写的两个字段是 `coordinator` 模块私有的；
+    /// 兄弟模块（如 `handle_assoc`）的测试够不着，只能经这个入口。
+    #[cfg(test)]
+    pub(crate) fn debug_mark_coords_ready(&self) {
+        *self
+            .last_valid_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (100, 200, 20);
+        *self
+            .composition_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (100, 200, true);
+    }
+
     pub(crate) fn reset_pinyin_composition(&self, state: &mut State) {
         state.committed_text.clear();
         state.committed_segs.clear();
@@ -3049,6 +3089,10 @@ impl Coordinator {
         // 模式指示标记（拼/双/快/英/符）：仅在候选为空时显示（进入模式/无候选阶段），
         // 一旦有候选即隐藏，减少干扰。必须纳入下方"空则隐藏"守卫——否则进入模式时
         // 缓冲为空会直接隐藏，标记发不出。
+        // 联想候选就住在 `candidates` 里，故「有候选即隐藏模式标记」这条**原样适用**
+        // ——不必也不该为联想加判据。曾经加过一条 `|| assoc_active()`，那会让下面的
+        // 「空则隐藏」守卫在联想态成立，候选窗直接被收掉：本该只影响标记的改动，
+        // 顺手把整个窗关了。
         let mode_label = if state.candidates.is_empty() {
             self.mode_indicator_text(state).unwrap_or_default()
         } else {
@@ -3297,6 +3341,9 @@ impl Coordinator {
         // preedit 是否嵌入宿主（app_inline）：嵌入时编码插入宿主、光标随输入右移，候选窗须锚在
         // 组合起点（缓冲头部）而非跟随光标末尾；非嵌入时 preedit 在候选窗、宿主光标不动，用当前光标。
         // 该标志同时门控下方 preedit 是否下发候选窗渲染（嵌入时候选窗不重复显示 preedit）。
+        // 联想态**不再强制非嵌入**：宿主侧此刻挂着占位组合（见 `ASSOC_COMPOSITION`），
+        // 归属如实按配置走即可。嵌入模式下 `maybe_enter_assoc` 干脆不给标识
+        // （`state.preedit` 为空），候选窗因此没有编码栏、高度不跳。
         let in_app = self
             .preedit_display
             .lock()
@@ -4309,6 +4356,9 @@ impl Coordinator {
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
     /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
     fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
+        // 切中英 / CapsLock / 系统切换三条路径全部经此。语境变了，上一句中文后面的联想
+        // 已无意义。三个调用方随后都会 `notify_ui_hide`，故此处只清状态不动 UI。
+        self.exit_assoc(state, crate::handle_assoc::AssocExit::ModeSwitch);
         // 独占模式的「模式切换上屏」策略：
         // - 临时英文：残留缓冲按模式切换语义无条件提交（英文原文，可全角）。
         // - 临时拼音 / mix（含快捷输入）：与下方普通组合一致，遵循 keys.commit_on_switch——
@@ -4691,6 +4741,7 @@ impl Coordinator {
                 Self::schema_display_name(&self.debug_schema_id_for(c, ctx))
             ),
             S::English => "码表·英文".to_string(),
+            S::Assoc => "联想".to_string(),
             S::Pinyin => {
                 let sid = self.debug_schema_id_for(c, ctx);
                 if sid.is_empty() || sid == "pinyin" {

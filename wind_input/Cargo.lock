@@ -2320,6 +2320,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
+name = "wind-assoc"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "wind-config",
+]
+
+[[package]]
 name = "wind-bridge"
 version = "0.1.0"
 dependencies = [
@@ -2379,6 +2387,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "tracing",
+ "wind-assoc",
  "wind-bridge",
  "wind-candidate",
  "wind-cmdbar",

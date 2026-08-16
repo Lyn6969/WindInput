@@ -191,6 +191,9 @@ pub struct Config {
     pub stats: StatsConfig,
     #[serde(default)]
     pub debug: DebugConfig,
+    /// 移动端对上面各域的覆盖；桌面构建完全无视。见 [`MobileConfig`]。
+    #[serde(default)]
+    pub mobile: MobileConfig,
 }
 
 // ──────────────── input.default（启动默认状态，原 general 域）────────────────
@@ -1599,6 +1602,183 @@ fn default_scope_relax_prefix() -> String {
     "·".to_string()
 }
 
+/// 联想（`[input.association]`）：上屏之后按**上文**推荐下一个词或标点。
+///
+/// 与普通候选的根本差别在输入源——普通候选的输入是编码缓冲，联想的输入是刚上屏的文本。
+/// 候选生成在 `wind-assoc`，何时展示/退出在协调器 `handle_assoc.rs`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssociationConfig {
+    /// 哪一种联想：`"off"`（默认）/ `"word"` / `"smart"`。
+    ///
+    /// - `word` **词语联想**：上文当**前缀**，出词库里以它开头的更长的词。打完「中」给
+    ///   「中国」「中间」，选中只补出「国」「间」。PC 输入法说的「联想」就是这个，
+    ///   **不含标点**。
+    /// - `smart` **智能联想**：上文当**上下文**，出下一个可能的词与标点。移动端刚需
+    ///   ——软键盘上每多打一个字都很贵。
+    ///
+    /// ★ **开关与类型合并成这一个字段**。拆成 `enabled` + `kind` 会立刻产生「开着但类型
+    /// 没配」的歧义状态，而那个状态没有正确答案。
+    ///
+    /// ⚠️ **本段是桌面基线，移动端的差异走 [`MobileAssociationConfig`]**，不要在这里加
+    /// `"auto"` 之类的平台哨兵——那会把平台知识塞进值域，设置界面被迫列一个语义空洞的
+    /// 选项，用户看不出选了会得到什么。
+    #[serde(default = "default_assoc_kind")]
+    pub kind: String,
+    /// `"one_shot"`（默认）/ `"continuous"`。
+    ///
+    /// `one_shot` = 只出一次，任何非选词动作即退出；`continuous` = 选中之后拿它当新上文
+    /// 接着给。桌面默认一次性：候选窗是浮层，常驻会挡住正文。
+    #[serde(default = "default_assoc_mode")]
+    pub mode: String,
+    /// 候选总数上限。各源的配额由它按优先级分配，**配额本身不开放给用户**——那是调参项，
+    /// 而用户没有评测手段。
+    #[serde(default = "default_assoc_max_count")]
+    pub max_count: usize,
+    /// 空格是否上屏当前高亮的联想候选。
+    ///
+    /// 主流输入法多数如此，故默认开。关掉则空格照常出空格（联想窗同时收起）。
+    /// 这一项没有「更对」的答案——它取决于用户把联想当「顺手就选」还是「别挡我打字」。
+    #[serde(default = "default_true")]
+    pub space_commits: bool,
+    /// 联想窗自动隐藏的毫秒数；`0` = 不自动隐藏。
+    ///
+    /// 联想态下候选窗几乎一直挂着，长时间停留会挡住正文。主流输入法的做法是显示几秒后
+    /// 自行淡出，用户若要用就在这几秒内按数字。
+    #[serde(default = "default_assoc_hide_after_ms")]
+    pub hide_after_ms: u64,
+    /// 联想态在**编码栏**显示的标识；空串 = 不显示。
+    ///
+    /// 只在「编码不嵌入宿主」（候选窗自绘编码栏）时可见——嵌入模式下编码栏本身不存在。
+    /// 它回答的是「候选窗为什么还开着、这批候选是哪来的」：联想候选与普通候选长得一样，
+    /// 没有标识时用户分不清自己是不是还在打字。
+    #[serde(default = "default_assoc_hint")]
+    pub hint: String,
+    /// 个人上屏历史学到的搭配。
+    #[serde(default = "default_true")]
+    pub history: bool,
+    /// 词→后继表（离线从 n-gram 模型蒸馏）。
+    #[serde(default = "default_true")]
+    pub bigram: bool,
+    /// 码表词的文本前缀延伸（「北京」→「大学」）。
+    #[serde(default = "default_true")]
+    pub prefix: bool,
+    /// 标点与符号（静态规则表打底）。
+    ///
+    /// ⚠️ **桌面默认关**（移动端在 [`MobileAssociationConfig::punct`] 里开）。桌面上打完
+    /// 一个字就弹一串标点，干扰远大于收益——标点在实体键盘上本来就一键可达，而候选窗是
+    /// 浮层、还占着数字键。移动端相反：软键盘上打标点要切键盘层，从候选里点走省事得多。
+    #[serde(default)]
+    pub punct: bool,
+}
+
+impl Default for AssociationConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_assoc_kind(),
+            mode: default_assoc_mode(),
+            max_count: default_assoc_max_count(),
+            space_commits: true,
+            hide_after_ms: default_assoc_hide_after_ms(),
+            hint: default_assoc_hint(),
+            history: true,
+            bigram: true,
+            prefix: true,
+            punct: false,
+        }
+    }
+}
+
+// ──────────────── mobile（移动端覆盖域）────────────────
+
+/// `[mobile]`：**移动端对桌面基线的覆盖**。桌面构建完全无视本域。
+///
+/// # 为什么单独开一个顶层域
+///
+/// 少数配置项的最优值在两个平台上就是不同的（联想是第一例：PC 上候选窗是浮层、会占用
+/// 数字键，移动端软键盘本就常驻、每多打一个字都很贵）。表达这种差异有三条路，前两条都
+/// 试过并被否决：
+///
+/// 1. ⛔ **值域哨兵**（`kind = "auto"` 由宿主按 `cfg!(target_os)` 解释）——把平台知识塞进
+///    了值里。后果是设置界面被迫列一个语义空洞的「自动」选项，用户看不出选了会得到什么
+///    （2026-08-16 用户否决）。
+/// 2. ⛔ **两份预置文件各写各的**——`data/config.toml` 与安卓仓 `assets/data/config.toml`
+///    确实是两份，但后者是**手工副本且无守门测试**（实测已滞后 89 行）。把平台差异寄托在
+///    「两份文件恰好不一样」上，下次同步就被无脑覆盖回去了。
+/// 3. ✅ **本域**：一份文件同时说清两个平台，差异是显式的、可读的、同步不会丢。
+///
+/// # 只登记真有平台差异的键
+///
+/// 本域里出现的键，移动端就用这里的值；**没出现的键沿用基线**。所以「移动端与基线相同」
+/// 的键根本不该被登记进来——每登记一个都要在 REGISTRY、预置文件、capability 快照、设置页
+/// 豁免名单里各占一行，改基线时还得记得改另一边。
+///
+/// ⚠️ 字段用 `String` 而不是 `Option<String>`：`Option` 看着更贴「覆盖」的字面意思，但
+/// `None` + `skip_serializing_if` 会让本段在默认配置里序列化成**空表**，于是
+/// `mobile.association` 自己成了叶子键，三道注册表守门测试全都要为它开特例
+/// （2026-08-16 实测撞上）。而那份「稀疏」能力本就是多余的——见上一段。
+///
+/// ⚠️ 覆盖**不在 [`Config::load`] 里合并**，而是在消费点由宿主决定是否取用
+/// （协调器 `handle_assoc.rs`）。理由：合并进 `input.*` 之后，移动端设置页读到的是合并
+/// 后的值，一保存就把移动端的值写进了桌面基线。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MobileConfig {
+    #[serde(default)]
+    pub association: MobileAssociationConfig,
+}
+
+/// `[mobile.association]`：联想的移动端取值。字段语义见 [`AssociationConfig`] 同名字段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileAssociationConfig {
+    /// 移动端 `"smart"`：软键盘上每多打一个字都很贵，连标点带下一个词一起猜才划算。
+    #[serde(default = "default_mobile_assoc_kind")]
+    pub kind: String,
+    /// 移动端 `"continuous"`：软键盘上方的联想栏本就常驻，多显示一行没有额外遮挡成本。
+    #[serde(default = "default_mobile_assoc_mode")]
+    pub mode: String,
+    /// 移动端**开**标点联想：软键盘上打标点要切键盘层，从候选里点走省事得多。
+    /// 桌面相反（见 [`AssociationConfig::punct`]）——实体键盘上标点一键可达。
+    #[serde(default = "default_true")]
+    pub punct: bool,
+}
+
+impl Default for MobileAssociationConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_mobile_assoc_kind(),
+            mode: default_mobile_assoc_mode(),
+            punct: true,
+        }
+    }
+}
+
+fn default_mobile_assoc_kind() -> String {
+    "smart".to_string()
+}
+
+fn default_mobile_assoc_mode() -> String {
+    "continuous".to_string()
+}
+
+fn default_assoc_kind() -> String {
+    "off".to_string()
+}
+
+fn default_assoc_mode() -> String {
+    "one_shot".to_string()
+}
+
+fn default_assoc_max_count() -> usize {
+    9
+}
+
+fn default_assoc_hide_after_ms() -> u64 {
+    5000
+}
+
+fn default_assoc_hint() -> String {
+    "联想输入".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     #[serde(default = "default_filter_mode")]
@@ -1650,6 +1830,9 @@ pub struct InputConfig {
     /// 顶码上屏策略（内部/实验，默认 direct_commit 真提交时序，躲开 diff 合并与整段下划线）。
     #[serde(default)]
     pub top_commit_mode: TopCommitMode,
+    /// 联想（上屏后按上文推荐下一个词/标点）。默认关。
+    #[serde(default)]
+    pub association: AssociationConfig,
 }
 
 impl Default for InputConfig {
@@ -1673,6 +1856,7 @@ impl Default for InputConfig {
             cmdbar: CmdbarConfig::default(),
             phrase: PhraseConfig::default(),
             top_commit_mode: TopCommitMode::default(),
+            association: AssociationConfig::default(),
         }
     }
 }
