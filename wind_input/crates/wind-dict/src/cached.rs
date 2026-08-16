@@ -362,9 +362,9 @@ impl CachedDict {
     /// 供悬停 [编码] 段显示完整打法列表(如 `a/ab/abc`)与拼音编码提示(取末位=最长码,
     /// 全码最稳——简码可能被一级简码等占用)。取词库实际码,避免按字生成码却打不出的错配。
     pub fn build_reverse_index(&self) -> ReverseIndex {
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        self.for_each_entry(&mut |code, text, _weight| {
-            pairs.push((text.to_string(), code.to_string()));
+        let mut pairs: Vec<(String, String, i32)> = Vec::new();
+        self.for_each_entry(&mut |code, text, weight| {
+            pairs.push((text.to_string(), code.to_string(), weight));
         });
         ReverseIndex::build(pairs)
     }
@@ -458,37 +458,52 @@ struct ReverseEntry {
     text_end: u32,
     /// 本词编码在 `code_ends` 中的结束下标;起点 = 前一条目的 `code_end_idx`(首条为 0)。
     code_end_idx: u32,
+    /// 该词在词库中的**最大**权重(同词多码时取最高)。
+    ///
+    /// 反查本身用不到它——加它是为了 [`ReverseIndex::texts_with_prefix`]:词语联想要的是
+    /// 「以『中』开头的**最常用**的几个词」,而 `entries` 是按字典序排的,不带权重就只能给出
+    /// 字典序前几个(「中一」「中丁」…),那不是任何人想要的。
+    ///
+    /// 每词 4 字节。十万词级码表约 400 KB,相对本结构 2.4 MB 的量级可以接受。
+    weight: i32,
 }
 
 impl ReverseIndex {
-    /// 从 (词, 编码) 对构建。同一 (词, 编码) 重复只留一份;每词的编码按「码长升序→字典序」排。
-    fn build(mut pairs: Vec<(String, String)>) -> Self {
+    /// 从 (词, 编码, 权重) 三元组构建。同一 (词, 编码) 重复只留一份;
+    /// 每词的编码按「码长升序→字典序」排,权重取该词全部条目中的最大值。
+    fn build(mut pairs: Vec<(String, String, i32)>) -> Self {
         // 全局一次排序即同时满足:词分组相邻、组内码长升序、同长按字典序。
+        // 权重不参与排序——它是分组内的聚合量,不影响条目次序。
         pairs.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| a.1.len().cmp(&b.1.len()))
                 .then_with(|| a.1.cmp(&b.1))
         });
-        pairs.dedup(); // 相邻且完全相同的 (词, 码) 即重复条目
+        // 去重按 (词, 码) 而非整个三元组:同一 (词, 码) 在扩展库里可能带不同权重,
+        // 用整元组去重会让它们都留下,同一个码在候选里出现两次。
+        pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         let mut entries = Vec::new();
         let mut code_ends = Vec::with_capacity(pairs.len());
         let mut texts = String::new();
         let mut codes = String::with_capacity(pairs.iter().map(|p| p.1.len()).sum());
         let mut i = 0;
         while i < pairs.len() {
-            let text = pairs[i].0.as_str();
+            let text = pairs[i].0.clone();
             let text_start = texts.len() as u32;
-            texts.push_str(text);
+            texts.push_str(&text);
             let mut j = i;
+            let mut weight = i32::MIN;
             while j < pairs.len() && pairs[j].0 == text {
                 codes.push_str(&pairs[j].1);
                 code_ends.push(codes.len() as u32);
+                weight = weight.max(pairs[j].2);
                 j += 1;
             }
             entries.push(ReverseEntry {
                 text_start,
                 text_end: texts.len() as u32,
                 code_end_idx: code_ends.len() as u32,
+                weight,
             });
             i = j;
         }
@@ -520,6 +535,47 @@ impl ReverseIndex {
             start,
             end: self.entries[i].code_end_idx as usize,
         })
+    }
+
+    /// **词语联想的取数口**：以 `prefix` 开头、且**严格更长**的词，按权重降序取前 `limit` 条。
+    ///
+    /// 返回 (整词, 权重)。上屏时补的是整词去掉 `prefix` 之后的部分——那一步在调用方做，
+    /// 因为「显示整词、只上屏剩余」是展示层的决定，本层只负责把词捞出来。
+    ///
+    /// # 为什么能这么便宜
+    ///
+    /// `entries` 本就按 `text` 字节序升序（反查用二分的前提）。字节序下同前缀的词必然连续，
+    /// 于是二分找到下界后顺序走到第一个不匹配即止——**无需任何额外索引**。
+    ///
+    /// ⚠️ 前缀本身要排除（`e_text.len() > prefix.len()`）：「中」的联想不该包含「中」自己。
+    ///
+    /// 扫描长度是该前缀下的词数（「中」约数千），每次上屏一次，微秒级。刻意不做提前截断
+    /// ——按权重取 top-N **必须看完全部候选**，扫到一半就停会退化成「字典序前 N 里权重
+    /// 最高的那几个」，那是个看起来对、实则完全不对的结果。
+    pub fn texts_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(&str, i32)> {
+        if prefix.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        // 下界：第一个 >= prefix 的条目。prefix 自身若在库中会落在这里，靠下面的长度判据排除。
+        let lo = self.entries.partition_point(|e| self.text_of(e) < prefix);
+        let mut hits: Vec<(&str, i32)> = Vec::new();
+        for e in &self.entries[lo..] {
+            let t = self.text_of(e);
+            if !t.starts_with(prefix) {
+                break; // 字节序保证同前缀连续，第一个不匹配即到头
+            }
+            if t.len() > prefix.len() {
+                hits.push((t, e.weight));
+            }
+        }
+        // 权重降序；同权按词短优先（「中国」比「中国人民」更常用作联想），再按字典序定序。
+        hits.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.len().cmp(&b.0.len()))
+                .then_with(|| a.0.cmp(b.0))
+        });
+        hits.truncate(limit);
+        hits
     }
 
     fn text_of(&self, e: &ReverseEntry) -> &str {
@@ -577,6 +633,108 @@ impl<'a> CodeList<'a> {
     /// 以 `sep` 连接全部编码(如 `a/ab/abc`)。
     pub fn join(self, sep: &str) -> String {
         self.iter().collect::<Vec<_>>().join(sep)
+    }
+}
+
+#[cfg(test)]
+mod reverse_prefix_tests {
+    //! `texts_with_prefix`：词语联想的取数口。
+    use super::*;
+
+    fn idx() -> ReverseIndex {
+        // (词, 码, 权重)。刻意让**字典序**与**权重序**相反——两者一致的话，
+        // 「按权重排」和「按字典序排」会得出同样的结果，本组测试就什么都没验到。
+        ReverseIndex::build(vec![
+            ("中".into(), "a".into(), 1000),
+            ("中一".into(), "aa".into(), 1),
+            ("中丁".into(), "ab".into(), 2),
+            ("中国".into(), "ac".into(), 900),
+            ("中国人".into(), "acd".into(), 800),
+            ("中间".into(), "ad".into(), 700),
+            ("丰".into(), "b".into(), 500),
+            ("串".into(), "c".into(), 400),
+        ])
+    }
+
+    #[test]
+    fn ranks_by_weight_not_dictionary_order() {
+        let i = idx();
+        let out = i.texts_with_prefix("中", 3);
+        let texts: Vec<_> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            texts,
+            ["中国", "中国人", "中间"],
+            "取的是最常用的三个，不是字典序前三（那会是 中一/中丁/中国）"
+        );
+    }
+
+    /// ★ 前缀词**自己**必须排除：「中」的联想不该包含「中」。
+    ///
+    /// 它的权重恰恰常常是全场最高（单字比词常用），不排除就会稳定占据首位，
+    /// 而选中它等于上屏一个空串。
+    #[test]
+    fn excludes_the_prefix_itself() {
+        let i = idx();
+        let out = i.texts_with_prefix("中", 9);
+        assert!(
+            !out.iter().any(|(t, _)| *t == "中"),
+            "前缀本身不是它自己的联想"
+        );
+        assert_eq!(out.len(), 5, "中一/中丁/中国/中国人/中间");
+    }
+
+    /// 扫描必须在第一个不匹配处停下，且不越界到相邻前缀。
+    #[test]
+    fn does_not_leak_into_neighbouring_prefixes() {
+        let i = idx();
+        let out = i.texts_with_prefix("丰", 9);
+        assert!(out.is_empty(), "「丰」没有更长的词");
+        let out = i.texts_with_prefix("串", 9);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn empty_prefix_or_zero_limit_yields_nothing() {
+        assert!(idx().texts_with_prefix("", 9).is_empty());
+        assert!(idx().texts_with_prefix("中", 0).is_empty());
+    }
+
+    #[test]
+    fn unknown_prefix_yields_nothing() {
+        assert!(idx().texts_with_prefix("龘", 9).is_empty());
+    }
+
+    /// 同权时短词优先——「中国」比「中国人民」更适合当联想。
+    #[test]
+    fn same_weight_prefers_shorter() {
+        let i = ReverseIndex::build(vec![
+            ("中国人民".into(), "a".into(), 5),
+            ("中国".into(), "b".into(), 5),
+        ]);
+        let out = i.texts_with_prefix("中", 2);
+        assert_eq!(out[0].0, "中国");
+    }
+
+    /// 权重取该词全部条目里的**最大**值——同一个词在主库与扩展库各有一条时，
+    /// 取到低的那个会让它在联想里莫名靠后。
+    #[test]
+    fn weight_is_max_across_codes() {
+        let i = ReverseIndex::build(vec![
+            ("中国".into(), "a".into(), 1),
+            ("中国".into(), "bb".into(), 900),
+            ("中间".into(), "c".into(), 500),
+        ]);
+        let out = i.texts_with_prefix("中", 2);
+        assert_eq!(out[0].0, "中国", "取 900 而不是 1");
+    }
+
+    /// 反查本身（`codes_of`）不能被权重改动破坏。
+    #[test]
+    fn codes_of_still_works() {
+        let i = idx();
+        let codes: Vec<_> = i.codes_of("中国").unwrap().iter().collect();
+        assert_eq!(codes, ["ac"]);
+        assert!(i.codes_of("不存在").is_none());
     }
 }
 

@@ -686,6 +686,55 @@ impl EngineManager {
             .unwrap_or_default()
     }
 
+    /// **词语联想的词源方案**：从哪本词库里捞「以上文为前缀的更长的词」。
+    ///
+    /// # 混输必须解析到成员方案
+    ///
+    /// 混输方案**自己没有词库**（它引用两个成员），拿它的 id 去建反查索引会得到一张空表
+    /// ——词语联想一条也出不来，且**完全静默**。真机实测（2026-08-16）活跃方案
+    /// `wubi86_pinyin` 取到 0 条，而它的主码表成员 `wubi86` 取到正常结果。
+    ///
+    /// 这正是本仓反复出现的那个形状：功能在开发者的测试方案上好好的，在用户实际用的
+    /// 方案上是死的。
+    ///
+    /// # 为什么不复用 `code_source_schema`
+    ///
+    /// 那个函数回答的是「编码提示该显示哪本码表的码」，其**拼音分支返回全局主码表**
+    /// ——对编码提示是对的（拼音候选要显示对应的五笔码），对词语联想却完全错位：
+    /// 用户在纯拼音方案下打字，联想词却从五笔码表里捞。两个问题只是碰巧在码表方案上
+    /// 答案相同。
+    pub fn assoc_word_schema(&self) -> String {
+        let active = self.active_schema_id();
+        match self.active_engine().map(|e| e.engine_type()) {
+            Some(EngineType::Mixed) => self
+                .mixed_primary_schema(&active)
+                .unwrap_or_else(|| active.clone()),
+            _ => active,
+        }
+    }
+
+    /// **词语联想**取数：`schema_id` 词库里以 `prefix` 开头、且严格更长的词，
+    /// 按词库权重降序取前 `limit` 条。返回 (整词, 权重)。
+    ///
+    /// 复用悬停 [编码] 段那份反查索引（词 → 编码，按词字节序排），前缀扫描是二分 + 顺序走。
+    /// 索引本身懒构建、最多缓存两份——首次联想会触发一次全量构建（十万词级约几十毫秒），
+    /// 之后常驻。
+    pub fn assoc_prefix_words(
+        &self,
+        schema_id: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<(String, i32)> {
+        if schema_id.is_empty() || prefix.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        self.reverse_index_for(schema_id)
+            .texts_with_prefix(prefix, limit)
+            .into_iter()
+            .map(|(t, w)| (t.to_string(), w))
+            .collect()
+    }
+
     /// 取 `schema_id` 的反查索引,缺则全量构建并缓存。
     /// 内存护栏:最多保留两份——本次请求方 + 全局主码表(悬停查活跃码表、拼音提示查主码表,
     /// 两者常为同一方案;方案切换的残留索引随下次构建清退)。
