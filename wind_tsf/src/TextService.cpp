@@ -6097,6 +6097,24 @@ void CTextService::ResetComposingState(BOOL keepPairState)
 }
 
 // Insert text and start new composition (for top code commit)
+// 新开组合时插入点该放哪。
+//
+// 常规：放在末尾（余码/引导符都是「用户还要接着打」的内容，插入点自然跟在后面）。
+//
+// ★ 例外是**占位组合**（内容恰为一个空格，见 Rust 侧 `COMPOSITION_PLACEHOLDER`）：
+// 它不是给用户看的内容，只是因为 TSF 不接受空组合、而输入法又需要一个活着的组合
+// （非嵌入模式下编码由候选窗自绘；联想态压根没有编码）。此时插入点必须落在**它前面**，
+// 否则用户看到光标凭空右移一格——正是「空格很突兀」的由来（2026-08-16 用户反馈）。
+//
+// 正常打字时下一键的 UpdateComposition 会立刻把插入点拉回 0，所以这个缺陷长期被掩盖；
+// 联想态没有「下一键」，组合就那么挂着，才暴露出来。
+//
+// ⚠️ 取值必须与 Rust 侧 `COMPOSITION_PLACEHOLDER` 一致，改一处要同步改另一处。
+int CTextService::_CompositionCaretFor(const std::wstring& composition)
+{
+    return composition == L" " ? 0 : static_cast<int>(composition.length());
+}
+
 BOOL CTextService::InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition)
 {
     WIND_LOG_DEBUG_FMT(L"InsertTextAndStartComposition: insert='%s', newComp='%s', prefixLen=%zu, _pComposition=%p\n",
@@ -6112,7 +6130,7 @@ BOOL CTextService::InsertTextAndStartComposition(const std::wstring& insertText,
     // 有活动组合：纯组合内容更新（'skce' → '可能y'）；无活动组合（罕见）：
     // UpdateComposition 会新建组合并显示 前缀+余码。
     _pendingCommitPrefix += insertText;
-    return UpdateComposition(newComposition, (int)newComposition.length());
+    return UpdateComposition(newComposition, _CompositionCaretFor(newComposition));
 }
 
 // ============================================================================
@@ -6332,7 +6350,7 @@ void CTextService::StartDeferredCompositionIfPending()
     WIND_LOG_DEBUG_FMT(L"StartDeferredComposition: opening new composition text=%s\n", text.c_str());
     // 此刻 CommitText 已结束旧组合、_pComposition 为空 → UpdateComposition 新建组合并显示余码
     //（有下划线的正常编码态）。对齐真实输入法 compositionstart@keyup。
-    UpdateComposition(text, static_cast<int>(text.length()));
+    UpdateComposition(text, _CompositionCaretFor(text));
 }
 
 void CTextService::CancelDeferredComposition()

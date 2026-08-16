@@ -207,6 +207,9 @@ public:
     // keep it INSIDE the composition (Microsoft IME behavior — the real document
     // commit is deferred to the final CommitText). See _pendingCommitPrefix.
     BOOL InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition);
+    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格）放 0**。
+    // 与 Rust 侧 COMPOSITION_PLACEHOLDER 成对，见实现处的说明。
+    static int _CompositionCaretFor(const std::wstring& composition);
 
     // Length (in wchars) of the pending top-code commit prefix shown at the head
     // of the composition. Used to segment display attributes and to offset the

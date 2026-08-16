@@ -70,6 +70,25 @@ pub struct CommitResultData {
     pub chinese_mode: bool,
 }
 
+/// 宿主 composition 的**占位内容**：一个空格。
+///
+/// # 它是一条跨语言的约定，不是随便挑的字符
+///
+/// 用在两种「输入法有会话、但没有可见编码要放进宿主」的场合：
+///   - 非嵌入模式（编码由候选窗自绘，宿主里不该重复显示一遍）
+///   - 联想态（压根没有编码，只是要让宿主继续转发按键）
+///
+/// TSF 不接受空组合，故必须放点什么；一个空格是最不打扰的选择。
+///
+/// ★ **约定的另一半是「光标落在它前面」**（`caret_pos = 0`）。少了这一半，用户看到的
+/// 插入点会跳到那个空格**之后**——在兼容良好的宿主里表现为光标凭空右移一格，很突兀。
+/// 正常打字时下一键的 `UpdateComposition` 会立刻把光标拉回 0，所以这个缺陷长期被掩盖；
+/// 联想态没有「下一键」，组合就那么挂着，才把它暴露出来（2026-08-16 用户反馈）。
+///
+/// C++ 侧据此把「组合内容恰为本值」的情形一律按 `caret_pos = 0` 开组合，见
+/// `TextService.cpp` 的 `_CompositionCaretFor`。**两侧取值必须一致**，改这里要同步改那里。
+pub const COMPOSITION_PLACEHOLDER: &str = " ";
+
 /// 按键事件结果类型
 #[derive(Debug, Clone)]
 pub enum KeyAction {
@@ -139,7 +158,7 @@ impl KeyAction {
         match self {
             KeyAction::UpdateComposition { text, .. } if !text.is_empty() => {
                 KeyAction::UpdateComposition {
-                    text: " ".to_string(),
+                    text: COMPOSITION_PLACEHOLDER.to_string(),
                     caret_pos: 0,
                 }
             }
@@ -151,7 +170,7 @@ impl KeyAction {
                 has_new_composition,
             } if !c.is_empty() => KeyAction::InsertText {
                 text,
-                new_composition: Some(" ".to_string()),
+                new_composition: Some(COMPOSITION_PLACEHOLDER.to_string()),
                 mode_changed,
                 chinese_mode,
                 has_new_composition,
@@ -166,7 +185,7 @@ impl KeyAction {
                 timeout_ms,
             } if !deferred_composition.is_empty() => KeyAction::CommitThenDeferComposition {
                 commit_text,
-                deferred_composition: " ".to_string(),
+                deferred_composition: COMPOSITION_PLACEHOLDER.to_string(),
                 timeout_ms,
             },
             // CommitAndHoldComposition / HoldComposition 刻意不在此列：它们的组合内容是中文符号

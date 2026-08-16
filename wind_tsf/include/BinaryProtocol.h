@@ -345,6 +345,10 @@ constexpr uint32_t COMMIT_FLAG_CHINESE_MODE       = 0x0004;
 // 本次提交要**替换**掉 HoldComposition 里待定的中文符号（智能符号 press2：「。」→「.」），
 // 而非追加在它后面。只有 press2 会置位；其余提交路径一律追加（见 CTextService::CommitText）。
 constexpr uint32_t COMMIT_FLAG_REPLACING_HELD     = 0x0008;
+// bit4 曾用于「上屏后候选窗仍有内容」（联想态保住 _hasCandidates），**已废弃勿复用**：
+// 那条路要靠服务端应答异步回填标志，赢不了下一次 OnTestKeyDown 的同步判定
+// （真机日志同一行里 composing=0 candidates=1 inputSession=0）。联想改为挂一个占位组合，
+// 走 HasActiveComposition() 这条同步判据。见 handle_assoc.rs 的 ASSOC_COMPOSITION。
 
 // Commit request payload (for barrier mechanism)
 // Sent from C++ to Go when Space/Enter/number key is pressed during composition
