@@ -128,9 +128,24 @@ pub(crate) fn apply(
     }) else {
         return false;
     };
-    // 把接位者转到首位，字降一位，其余相对次序不动：
-    //   路 | 昤 | 路上 | 路口  →  路上 | 路 | 昤 | 路口
+    // 让位的字**沉到本码所有候选之后**，不是降一位——用户已经能用简码一键打出它，
+    // 它在这个码位上就该彻底靠后，而不是继续占着第二位。同码的其它全码字（`踟` 这类
+    // 没有简码的）都排在它前面：那些字**只能**在这个码位打出来，它不能挡着。
+    //
+    //   路 | 昤 | 路上 | 路口  →  路上 | 昤 | 路口 | 路
+    //
+    // 沉底的边界是**正常候选段**而非整个列表：`is_scope_filtered` 是检索范围临时放宽才
+    // 补进来的，「追加在末尾、原有顺序纹丝不动」是它的硬约束，让位的字不能沉到它们后面。
+    let normal_len = candidates
+        .iter()
+        .take_while(|c| !c.is_scope_filtered)
+        .count();
+    // 两步：接位者转到首位（字随之落到下标 1），再把字从下标 1 沉到正常段末尾。
+    //
+    // ⚠️ 不能只做沉底那一步——`路 | 昤 | 路上` 直接沉底会得到 `昤 | 路上 | 路`，
+    // 首选成了生僻字。「让给词语」和「沉到最后」是两件事，必须都做。
     candidates[..=pos].rotate_right(1);
+    candidates[1..normal_len].rotate_left(1);
     true
 }
 
@@ -166,15 +181,29 @@ mod tests {
     fn yields_full_code_top_to_the_first_word() {
         let mut c = vec![ct("路"), ct("路上"), ct("路口")];
         assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
-        assert_eq!(texts(&c), ["路上", "路", "路口"]);
+        assert_eq!(texts(&c), ["路上", "路口", "路"], "字沉到本码所有候选之后");
     }
 
-    /// 接位者不是紧邻的第二条时，中间的候选跟着后移，相对次序不变。
+    /// 让位的字要沉到**所有**同码候选之后，包括没有简码的全码字——那些字只能在这个
+    /// 码位打出来，有简码的字不该挡着它们。其余候选相对次序不变。
     #[test]
-    fn intervening_single_chars_keep_their_relative_order() {
+    fn the_yielding_char_sinks_below_other_full_code_chars() {
         let mut c = vec![ct("路"), ct("昤"), ct("路上"), ct("路口")];
         assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
-        assert_eq!(texts(&c), ["路上", "路", "昤", "路口"]);
+        assert_eq!(texts(&c), ["路上", "昤", "路口", "路"]);
+    }
+
+    /// 只沉底而不提词，首选会变成生僻字——两步缺一不可。
+    #[test]
+    fn word_is_promoted_even_when_a_rare_char_sits_between() {
+        let mut c = vec![ct("路"), ct("昤"), ct("路上")];
+        assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert_eq!(
+            c.first().map(|c| c.text.as_str()),
+            Some("路上"),
+            "首选须是词，不能是被沉底顺带顶上来的生僻字"
+        );
+        assert_eq!(texts(&c), ["路上", "昤", "路"]);
     }
 
     /// 最隐蔽的一条：二简位已是首选 ⇒ 三简位会让位 ⇒ 三简位首选不再是该字。
@@ -273,6 +302,17 @@ mod tests {
         let mut c = vec![ct("路"), relaxed];
         assert!(!apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
         assert_eq!(texts(&c), ["路", "路上"]);
+    }
+
+    /// 沉底的边界是**正常候选段**：让位的字沉到放宽候选之前，不能沉到整个列表最后。
+    /// 否则「放宽候选恒在末尾」这条硬约束就被这个功能破掉了。
+    #[test]
+    fn the_yielding_char_sinks_above_scope_relaxed_candidates() {
+        let mut relaxed = ct("踟");
+        relaxed.is_scope_filtered = true;
+        let mut c = vec![ct("路"), ct("路上"), relaxed];
+        assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert_eq!(texts(&c), ["路上", "路", "踟"]);
     }
 
     #[test]

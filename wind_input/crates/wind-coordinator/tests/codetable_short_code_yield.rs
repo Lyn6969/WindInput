@@ -89,10 +89,41 @@ fn full_code_yields_to_word() {
         all.iter().any(|t| t == "你"),
         "让的只是位次，字不得被赶出列表，实际候选: {head:?}"
     );
+}
+
+/// 让位的字沉到**本码所有候选之后**，不是降一位。
+///
+/// `dddd` 是现成的多候选现场：大 / 大厦 / 硕大 / 磕磕碰碰。若实现写成「与第一个词交换」，
+/// 「大」会停在第 2 位而本用例会红。
+#[test]
+fn the_yielding_char_sinks_to_the_bottom() {
+    let Some(all) = candidates_for(3, "dddd") else {
+        return;
+    };
+    let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();
     assert_eq!(
-        all.iter().position(|t| t == "你"),
-        Some(1),
-        "字只降一位，其余候选相对次序不动，实际候选: {head:?}"
+        all.first().map(|s| s.as_str()),
+        Some("大厦"),
+        "首选让给词，实际候选: {head:?}"
+    );
+    assert_eq!(
+        all.iter().position(|t| t == "大"),
+        Some(all.len() - 1),
+        "有简码的字须沉到本码所有候选之后，实际候选: {head:?}"
+    );
+}
+
+/// 沉底前的对照：档位 0 时「大」是首选、且列表里排在其余候选之前。
+#[test]
+fn disabled_keeps_the_char_on_top_for_a_multi_candidate_code() {
+    let Some(all) = candidates_for(0, "dddd") else {
+        return;
+    };
+    let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("大"),
+        "档位 0 须完全按词库原序，实际候选: {head:?}"
     );
 }
 
