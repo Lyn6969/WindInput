@@ -554,6 +554,28 @@ impl crate::coordinator::Coordinator {
                     String::new()
                 }
             }
+            // `code_all` —— 全部码位（`我` → `q/trn/trnt`），`code` 只给最长的那个全码。
+            //
+            // 门控与 `code` **完全一致**（同为拼音来源候选才出）：理由也一样 ——
+            // 码表方案下候选的码就是用户自己打的，反查是冗余信息。
+            //
+            // 与 [`Self::eval_text_var`] 的同名变量同义，两处必须一起改：用户在注释模板里
+            // 学会的写法要能原样用在 `dict.rev(format=…)` 里，反之亦然。
+            //
+            // 出厂注释模板不含它 —— 三个码位会把候选行推得很宽，横排尤甚。它是给愿意
+            // 用竖排、想一眼看全简码的用户的选项，不是默认。
+            "code_all" => {
+                if pinyin_hint && c.source == CandidateSource::Pinyin {
+                    let sid = self.engine_mgr.code_source_schema();
+                    let codes = self.engine_mgr.word_codes_in(&sid, &c.text);
+                    match arg {
+                        Some(sep) if !codes.is_empty() => codes.replace('/', sep),
+                        _ => codes,
+                    }
+                } else {
+                    String::new()
+                }
+            }
             "pinyin" => pinyin_text(
                 c,
                 |t| self.engine_mgr.word_pinyin_syllables(t),
