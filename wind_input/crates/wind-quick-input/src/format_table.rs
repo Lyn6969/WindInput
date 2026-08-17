@@ -30,6 +30,19 @@ pub enum FormatKind {
 }
 
 impl FormatKind {
+    /// 全部类别，**按 [`Self::group_order`] 升序**。
+    ///
+    /// 设置页要列出全部类别（含一条候选都没有的），穷尽性测试也要它。此前枚举列表在三处
+    /// 各手写一遍，加 `MonthDay` 时漏掉了其中一处（`kind_parse_and_as_str_roundtrip`
+    /// 因此一直没覆盖新类别，且测试照绿）——单一真相源就是防这个。
+    pub const ALL: &'static [Self] = &[
+        Self::Date,
+        Self::MonthDay,
+        Self::YearMonth,
+        Self::Number,
+        Self::Calc,
+    ];
+
     /// 配置文件里的写法 → 类别。也用于候选 id（`quick:{kind}:{格式 id}`）的反解析，
     /// 故与 [`Self::as_str`] 必须严格互逆。
     pub fn parse(s: &str) -> Option<Self> {
@@ -179,6 +192,29 @@ impl FormatAdjust {
     pub fn is_empty(&self) -> bool {
         self.moved.is_empty() && self.disabled.is_empty()
     }
+
+    /// 这条格式是否被用户调整过（移动或停用）。
+    ///
+    /// 语义是「有没有用户规则」，不是「位置是否与出厂不同」——把某条移回原位也算调整过，
+    /// 因为那条规则确实在库里（将来出厂顺序变了它就会生效）。设置页据此决定
+    /// 「恢复此条」能不能点，与 `wind_store::QuickFormatRecord::has_rule` 同一口径。
+    pub fn has_rule(&self, id: &str) -> bool {
+        self.moved.iter().any(|(i, _)| i == id) || self.disabled.iter().any(|d| d == id)
+    }
+}
+
+/// 设置页列表里的一行：条目 + 它当前的状态。
+///
+/// 与候选生成的 [`FormatTable::entries_of_adjusted`] 是**两种口径**，刻意分开：
+/// 候选要的是「用户现在能看到什么」（停用项必须消失），设置页要的是「用户能管理什么」
+/// （停用项必须还在，否则再也开不回来——正是这个缺口让右键菜单只能提供「整类重置」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatEntryView<'a> {
+    pub entry: &'a FormatEntry,
+    /// 是否启用（停用项照样出现在本列表里，只是这里为 false）。
+    pub enabled: bool,
+    /// 用户是否调整过它（见 [`FormatAdjust::has_rule`]）。
+    pub adjusted: bool,
 }
 
 /// 格式表。条目已按 kind 分组、组内按 position 稳定排序。
@@ -227,7 +263,7 @@ impl FormatTable {
                 );
                 continue;
             };
-            if let Err(e) = validate_text(kind, &r.text) {
+            if let Err(e) = validate_format_text(kind, &r.text) {
                 warn!("快捷输入格式表: 跳过 id={} —— {}", r.id, e);
                 continue;
             }
@@ -344,13 +380,54 @@ impl FormatTable {
     pub fn entries(&self) -> &[FormatEntry] {
         &self.entries
     }
+
+    /// 某类的条目，**设置页口径**：启用项按候选实际顺序，停用项列在其后。
+    ///
+    /// ★ 启用项的顺序直接取 [`Self::entries_of_adjusted`] 的结果，**不重算**。同一个
+    /// 「第几位」由两段代码各算一遍，迟早漂移，而症状是「设置页显示的顺序与实际候选不符」
+    /// ——用户点了上移，列表动了、候选没动，且两边都没有报错。
+    ///
+    /// 停用项**沉底**而不是按基表位置插回：它们不在候选里，本就没有「正确位置」。
+    /// 硬要插回去的话，用户重新启用它时还会再跳一次（那次跳才是真实位置），
+    /// 反而像是「启用这个动作把顺序弄乱了」。
+    pub fn entries_of_view<'a>(
+        &'a self,
+        kind: FormatKind,
+        adjust: &FormatAdjust,
+    ) -> Vec<FormatEntryView<'a>> {
+        let mut out: Vec<FormatEntryView<'a>> = self
+            .entries_of_adjusted(kind, adjust)
+            .into_iter()
+            .map(|entry| FormatEntryView {
+                enabled: true,
+                adjusted: adjust.has_rule(&entry.id),
+                entry,
+            })
+            .collect();
+        out.extend(
+            self.entries_of(kind)
+                .filter(|e| adjust.disabled.iter().any(|d| d == &e.id))
+                .map(|entry| FormatEntryView {
+                    entry,
+                    enabled: false,
+                    // 在 disabled 里即已被调整过，无需再查。
+                    adjusted: true,
+                }),
+        );
+        out
+    }
 }
 
 /// 模板静态校验：变量名必须在本 kind 的白名单内。
 ///
 /// 在**加载期**做而不是渲染期：渲染是每次按键都走的热路径，把告警放那里会刷屏，
 /// 且用户改错一个变量名应当在启动日志里一次性看到。
-fn validate_text(kind: FormatKind, text: &str) -> Result<(), String> {
+///
+/// 对外公开是给设置页用的：那里的容错策略与文件加载**相反**——加载遇到坏条目
+/// 「剔除该条 + 一条 warn」（坏文件也得能打字），而设置页必须在保存前**拒绝**并把
+/// 原因给用户看。同一份判据两处共用，否则设置页放行的模板会在下次启动时被静默剔除，
+/// 用户只看到「我加的格式没了」。
+pub fn validate_format_text(kind: FormatKind, text: &str) -> Result<(), String> {
     if text.is_empty() {
         return Err("模板为空".into());
     }
@@ -406,27 +483,28 @@ mod tests {
     /// 一侧改了名字另一侧没改，右键就会认不出这条候选（且没有任何报错）。
     #[test]
     fn kind_parse_and_as_str_roundtrip() {
-        for k in [
-            FormatKind::Date,
-            FormatKind::YearMonth,
-            FormatKind::Number,
-            FormatKind::Calc,
-        ] {
+        for &k in FormatKind::ALL {
             assert_eq!(FormatKind::parse(k.as_str()), Some(k));
         }
         assert!(FormatKind::parse("weather").is_none());
     }
 
+    /// `ALL` 是「全部类别」的单一真相源，它自己漏一项就会让所有依赖它的穷尽性测试
+    /// 一起失效（而且全都照绿）。故这里独立钉住两件事：条数，以及与 `group_order` 同序。
+    #[test]
+    fn all_kinds_is_exhaustive_and_ordered() {
+        assert_eq!(FormatKind::ALL.len(), 5, "新增类别必须同步 ALL");
+        let orders: Vec<u8> = FormatKind::ALL.iter().map(|k| k.group_order()).collect();
+        let mut sorted = orders.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(orders, sorted, "ALL 必须按 group_order 升序且无重复");
+    }
+
     #[test]
     fn builtin_covers_every_kind() {
         let t = FormatTable::builtin();
-        for k in [
-            FormatKind::Date,
-            FormatKind::MonthDay,
-            FormatKind::YearMonth,
-            FormatKind::Number,
-            FormatKind::Calc,
-        ] {
+        for &k in FormatKind::ALL {
             assert!(
                 t.entries_of(k).next().is_some(),
                 "内置表缺 kind={}",
@@ -440,10 +518,10 @@ mod tests {
         // 内置表自身必须过校验——写错变量名会静默丢条目
         for e in FormatTable::builtin().entries() {
             assert!(
-                validate_text(e.kind, &e.text).is_ok(),
+                validate_format_text(e.kind, &e.text).is_ok(),
                 "内置条目 {} 校验失败: {:?}",
                 e.id,
-                validate_text(e.kind, &e.text)
+                validate_format_text(e.kind, &e.text)
             );
         }
     }
@@ -558,8 +636,8 @@ text = "{no_such_func()}"
         assert_eq!(t.entries().len(), 1, "未知函数留到求值期报，加载期放行");
         assert!(t.entries()[0].is_expression());
 
-        assert!(validate_text(FormatKind::Date, "${Y}年{month()}月").is_err());
-        assert!(validate_text(FormatKind::Date, "$Y年{month()}月").is_err());
+        assert!(validate_format_text(FormatKind::Date, "${Y}年{month()}月").is_err());
+        assert!(validate_format_text(FormatKind::Date, "$Y年{month()}月").is_err());
     }
 
     #[test]
@@ -613,6 +691,96 @@ text = "$RESULT"
             .iter()
             .map(|e| e.id.clone())
             .collect()
+    }
+
+    // ───────── 设置页口径（entries_of_view）─────────
+
+    /// ★★ 设置页里**启用项的顺序必须与候选完全一致**。
+    ///
+    /// 这是本函数存在的全部风险所在：两处各算一遍「第几位」，漂移后的症状是
+    /// 「用户在设置页点上移，列表动了、实际候选没动」，两边都不报错。故这里直接拿
+    /// `entries_of_adjusted`（候选那条路径）的输出做基准，而不是另写一份期望顺序——
+    /// 后者只能证明「视图等于我以为的顺序」，证明不了「视图等于候选」。
+    #[test]
+    fn view_enabled_order_equals_candidate_order() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.iso".into(), 0), ("date.lunar".into(), 2)],
+            disabled: vec!["date.basic".into()],
+        };
+        let candidate: Vec<&str> = t
+            .entries_of_adjusted(FormatKind::Date, &a)
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        let view_enabled: Vec<&str> = t
+            .entries_of_view(FormatKind::Date, &a)
+            .iter()
+            .filter(|v| v.enabled)
+            .map(|v| v.entry.id.as_str())
+            .collect();
+        assert_eq!(view_enabled, candidate);
+    }
+
+    /// 停用项**留在列表里**（这正是设置页存在的理由）且沉底。
+    #[test]
+    fn view_keeps_disabled_entries_at_bottom() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            disabled: vec!["date.cn".into(), "date.basic".into()],
+            ..Default::default()
+        };
+        let view = t.entries_of_view(FormatKind::Date, &a);
+        // 条数不减：候选里少了两条，管理列表里一条不少。
+        assert_eq!(view.len(), t.entries_of(FormatKind::Date).count());
+        let disabled_at: Vec<usize> = view
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !v.enabled)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            disabled_at,
+            vec![view.len() - 2, view.len() - 1],
+            "停用项沉底"
+        );
+        // 沉底后的相对顺序仍是基表序（date.cn 在 date.basic 之前）。
+        assert_eq!(view[view.len() - 2].entry.id, "date.cn");
+        assert_eq!(view[view.len() - 1].entry.id, "date.basic");
+    }
+
+    /// `adjusted` 标记决定设置页「恢复此条」能不能点：移动过、停用过都算，
+    /// 没碰过的条目为 false。
+    #[test]
+    fn view_marks_adjusted_entries() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            moved: vec![("date.lunar".into(), 0)],
+            disabled: vec!["date.basic".into()],
+        };
+        let view = t.entries_of_view(FormatKind::Date, &a);
+        let flag = |id: &str| {
+            view.iter()
+                .find(|v| v.entry.id == id)
+                .map(|v| v.adjusted)
+                .unwrap()
+        };
+        assert!(flag("date.lunar"), "移动过");
+        assert!(flag("date.basic"), "停用过");
+        assert!(!flag("date.cn"), "没碰过的不该显示成已调整");
+    }
+
+    /// 空调整下，视图 == 基表原序、全部启用、全部未调整。
+    #[test]
+    fn view_without_adjust_is_base_table() {
+        let t = FormatTable::builtin();
+        for &k in FormatKind::ALL {
+            let view = t.entries_of_view(k, &FormatAdjust::default());
+            let base: Vec<&str> = t.entries_of(k).map(|e| e.id.as_str()).collect();
+            let got: Vec<&str> = view.iter().map(|v| v.entry.id.as_str()).collect();
+            assert_eq!(got, base, "kind={}", k.as_str());
+            assert!(view.iter().all(|v| v.enabled && !v.adjusted));
+        }
     }
 
     /// 空调整 == 基表原序。

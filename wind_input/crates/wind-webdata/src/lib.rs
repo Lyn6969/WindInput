@@ -14,6 +14,7 @@
 //! 把 wind-transfer/fontdb 等重依赖挡在 Android 闭包之外。
 
 use serde_json::{Value, json};
+use wind_coordinator::handle_quick_format::QuickFormatEdit;
 use wind_coordinator::web_host::WebDataHost;
 
 /// 解析方案的权威引擎类型（schema.toml 的 engine.type 可能为空，
@@ -273,6 +274,18 @@ pub trait WebDataRpc: WebDataHost {
             "phrase.export" => self.web_phrase_export(),
             "phrase.import" => self.web_phrase_import(params),
             "phrase.resetSystem" => self.web_phrase_reset_system(),
+
+            // ── quick.*（快捷输入格式表的用户调整，全局，redb 持久化）──
+            // 基表（模板与出厂顺序）在 system.quick.toml，**RPC 一律不写它**：
+            // 那会抢走高级用户手写文件的所有权，见 handle_quick_format 模块文档。
+            "quick.list" => self.web_quick_list(),
+            "quick.move" => self.web_quick_move(params),
+            "quick.setEnabled" => self.web_quick_set_enabled(params),
+            "quick.resetEntry" => self.web_quick_reset_entry(params),
+            "quick.resetKind" => self.web_quick_reset_kind(params),
+            "quick.export" => self.web_quick_export(),
+            "quick.import" => self.web_quick_import(params),
+            "quick.previewImport" => self.web_quick_preview_import(params),
 
             // ── stats.*（输入统计，redb 每日聚合）────────────────
             "stats.summary" => self.web_stats_summary(),
@@ -1769,6 +1782,94 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({ "ok": true, "changed": n }))
     }
 
+    // ───────── quick.*（快捷输入格式表）─────────
+
+    /// 全部格式条目，**含被停用的**。
+    ///
+    /// `displayPos` 与 `moveIndex` 是两个不同的下标，别混用：前者是列表行号（停用项也占
+    /// 一行，只给人看），后者是这条在候选里的位置、也是 `quick.move` 唯一认的口径。
+    /// 停用项 `moveIndex` 为 null——它不在候选里，移动没有意义。
+    fn web_quick_list(&self) -> anyhow::Result<Value> {
+        let rows: Vec<Value> = self
+            .quick_format_rows()
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "kind": r.kind,
+                    "id": r.id,
+                    "text": r.text,
+                    "displayPos": r.display_pos,
+                    "moveIndex": r.move_index,
+                    "enabled": r.enabled,
+                    "adjusted": r.adjusted,
+                    "sample": r.sample,
+                })
+            })
+            .collect();
+        Ok(json!(rows))
+    }
+
+    fn web_quick_move(&self, params: &Value) -> anyhow::Result<Value> {
+        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        let index = usize_param(params, "index", 0);
+        self.quick_format_edit(kind, id, QuickFormatEdit::MoveTo(index))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_quick_set_enabled(&self, params: &Value) -> anyhow::Result<Value> {
+        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| anyhow::anyhow!("缺少参数 enabled"))?;
+        self.quick_format_edit(kind, id, QuickFormatEdit::SetEnabled(enabled))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_quick_reset_entry(&self, params: &Value) -> anyhow::Result<Value> {
+        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        self.quick_format_edit(kind, id, QuickFormatEdit::ResetEntry)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_quick_reset_kind(&self, params: &Value) -> anyhow::Result<Value> {
+        let kind = str_param(params, "kind")?;
+        // 整类操作没有单条归属，id 传空串（`QuickFormatEdit::ResetKind` 忽略它）。
+        self.quick_format_edit(kind, "", QuickFormatEdit::ResetKind)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_quick_export(&self) -> anyhow::Result<Value> {
+        Ok(json!({ "content": self.quick_format_export()? }))
+    }
+
+    fn web_quick_preview_import(&self, params: &Value) -> anyhow::Result<Value> {
+        let p = self.quick_format_preview_import(str_param(params, "content")?)?;
+        Ok(json!({
+            "moved": p.moved,
+            "disabled": p.disabled,
+            "ignoredFormats": p.ignored_formats,
+            "skipped": p.skipped,
+            "kinds": p.kinds,
+        }))
+    }
+
+    fn web_quick_import(&self, params: &Value) -> anyhow::Result<Value> {
+        let content = str_param(params, "content")?;
+        // 与词库/短语导入同一套参数名：`strategy = "replace"` 先清空，其余为合并。
+        let replace = params
+            .get("strategy")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("replace"));
+        let o = self.quick_format_import(content, replace)?;
+        Ok(json!({
+            "moved": o.moved,
+            "disabled": o.disabled,
+            "ignoredFormats": o.ignored_formats,
+            "skipped": o.skipped,
+        }))
+    }
+
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
         use chrono::Datelike;
         let (collector, store) = match (self.stat_collector(), self.user_store()) {
@@ -3199,6 +3300,324 @@ mod tests {
         // 用户短语应为 0
         let user = c.web_data_rpc("phrase.listUser", &json!({})).unwrap();
         assert_eq!(user["total"], json!(0), "用户短语应被 resetDefault 清空");
+    }
+
+    // ───────── quick.*（快捷输入格式表）─────────
+
+    /// headless coordinator + 独立 redb（redb 是单写者，共用文件会让并发测试互相阻塞）。
+    /// 格式表走 `FormatTable::load(None)` → 内置出厂表。
+    fn quick_coord(tag: &str) -> (Arc<Coordinator>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("wind_webdata_quick_{tag}.redb"));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+        (
+            Coordinator::new_headless_with_store(Config::default(), None, store),
+            path,
+        )
+    }
+
+    fn quick_rows(c: &Coordinator) -> Vec<Value> {
+        c.web_data_rpc("quick.list", &json!({}))
+            .unwrap()
+            .as_array()
+            .expect("quick.list 应返回数组")
+            .clone()
+    }
+
+    fn quick_row(rows: &[Value], id: &str) -> Value {
+        rows.iter()
+            .find(|r| r["id"] == json!(id))
+            .unwrap_or_else(|| panic!("列表里找不到 {id}"))
+            .clone()
+    }
+
+    /// 某类**启用**条目的 id 序（= 候选顺序）。
+    fn quick_enabled_ids(c: &Coordinator, kind: &str) -> Vec<String> {
+        quick_rows(c)
+            .iter()
+            .filter(|r| r["kind"] == json!(kind) && r["enabled"] == json!(true))
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn quick_list_covers_every_entry_with_samples() {
+        let (c, p) = quick_coord("list");
+        let rows = quick_rows(&c);
+        // 出厂表全部条目都在（含各类别）。
+        assert_eq!(rows.len(), 25, "出厂表 25 条，实际 {}", rows.len());
+        for kind in ["date", "month_day", "year_month", "number", "calc"] {
+            assert!(
+                rows.iter().any(|r| r["kind"] == json!(kind)),
+                "缺类别 {kind}"
+            );
+        }
+        // 示例是「用示例输入跑真实候选生成」得到的，故出厂条目必须都有示例——
+        // 空示例说明那条渲染不出来，对出厂表而言就是缺陷。
+        let cn = quick_row(&rows, "date.cn");
+        let sample = cn["sample"].as_str().unwrap();
+        assert!(!sample.is_empty(), "date.cn 应有示例");
+        assert!(sample.ends_with('日'), "示例应是完整日期: {sample}");
+        // 金额示例用 1234.5 渲染，必然带「元」。
+        let amt = quick_row(&rows, "number.amount");
+        assert!(
+            amt["sample"].as_str().unwrap().contains('元'),
+            "金额示例: {}",
+            amt["sample"]
+        );
+        // 未调整时的初始状态
+        assert_eq!(cn["enabled"], json!(true));
+        assert_eq!(cn["adjusted"], json!(false));
+        assert_eq!(cn["moveIndex"], json!(0), "date.cn 是 date 组首条");
+        assert_eq!(cn["displayPos"], json!(1));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★★ 停用后条目**留在列表里**（否则用户再也开不回来），且 `moveIndex` 为 null
+    /// ——它不在候选里，移动没有意义。这正是设置页要补的那个缺口。
+    #[test]
+    fn quick_disabled_entry_stays_listed_and_unmovable() {
+        let (c, p) = quick_coord("disable");
+        let before = quick_rows(&c).len();
+        c.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "date", "id": "date.basic", "enabled": false }),
+        )
+        .unwrap();
+        let rows = quick_rows(&c);
+        assert_eq!(rows.len(), before, "管理列表条数不减");
+        let row = quick_row(&rows, "date.basic");
+        assert_eq!(row["enabled"], json!(false));
+        assert_eq!(row["adjusted"], json!(true));
+        assert_eq!(row["moveIndex"], Value::Null, "停用项不可移动");
+        // 候选那边确实少了一条
+        assert!(!quick_enabled_ids(&c, "date").contains(&"date.basic".to_string()));
+
+        // 双向：再开回来，且恢复原位（记录清空 → 回到基表位置）
+        c.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "date", "id": "date.basic", "enabled": true }),
+        )
+        .unwrap();
+        let row = quick_row(&quick_rows(&c), "date.basic");
+        assert_eq!(row["enabled"], json!(true));
+        assert_eq!(row["adjusted"], json!(false), "开回来即无残留规则");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 移动落到候选顺序上，并被 `moveIndex` 如实反映（UI 的上/下移就是 ±1 这个值）。
+    #[test]
+    fn quick_move_changes_candidate_order() {
+        let (c, p) = quick_coord("move");
+        assert_ne!(quick_enabled_ids(&c, "date")[0], "date.lunar");
+        c.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.lunar", "index": 0 }),
+        )
+        .unwrap();
+        assert_eq!(quick_enabled_ids(&c, "date")[0], "date.lunar");
+        assert_eq!(
+            quick_row(&quick_rows(&c), "date.lunar")["moveIndex"],
+            json!(0)
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 单条恢复只清这一条（store 的 `reset_quick_format_entry` 此前无调用点，
+    /// 注释写着「单条恢复要等设置页」——就是这个 RPC）。
+    #[test]
+    fn quick_reset_entry_only_clears_that_entry() {
+        let (c, p) = quick_coord("reset_entry");
+        c.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.lunar", "index": 0 }),
+        )
+        .unwrap();
+        c.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "date", "id": "date.basic", "enabled": false }),
+        )
+        .unwrap();
+        c.web_data_rpc(
+            "quick.resetEntry",
+            &json!({ "kind": "date", "id": "date.lunar" }),
+        )
+        .unwrap();
+        let rows = quick_rows(&c);
+        assert_eq!(quick_row(&rows, "date.lunar")["adjusted"], json!(false));
+        assert_eq!(
+            quick_row(&rows, "date.basic")["enabled"],
+            json!(false),
+            "不该连累别的条目"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn quick_reset_kind_clears_whole_kind_only() {
+        let (c, p) = quick_coord("reset_kind");
+        c.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.lunar", "index": 0 }),
+        )
+        .unwrap();
+        c.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "number", "id": "number.digits", "enabled": false }),
+        )
+        .unwrap();
+        c.web_data_rpc("quick.resetKind", &json!({ "kind": "date" }))
+            .unwrap();
+        let rows = quick_rows(&c);
+        assert!(
+            rows.iter()
+                .filter(|r| r["kind"] == json!("date"))
+                .all(|r| r["adjusted"] == json!(false)),
+            "date 全类恢复"
+        );
+        assert_eq!(
+            quick_row(&rows, "number.digits")["enabled"],
+            json!(false),
+            "别的类别不动"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★★ 端到端往返：导出 → 到一台干净的机器上导入 → 状态必须一致。
+    ///
+    /// 这是导入导出唯一真正要保证的事，也是最容易在"部分字段没写出去"时静默失守的地方。
+    #[test]
+    fn quick_export_import_roundtrip_restores_state() {
+        let (a, pa) = quick_coord("export_src");
+        // 造一组有代表性的改动：移动两条（含 LIFO 关系）+ 停用一条 + 跨类别
+        a.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.iso", "index": 1 }),
+        )
+        .unwrap();
+        a.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.lunar", "index": 0 }),
+        )
+        .unwrap();
+        a.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "number", "id": "number.digits", "enabled": false }),
+        )
+        .unwrap();
+        let content = a.web_data_rpc("quick.export", &json!({})).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expect_date = quick_enabled_ids(&a, "date");
+
+        let (b, pb) = quick_coord("export_dst");
+        let out = b
+            .web_data_rpc("quick.import", &json!({ "content": content }))
+            .unwrap();
+        assert_eq!(out["moved"], json!(2));
+        assert_eq!(out["disabled"], json!(1));
+        assert_eq!(out["skipped"].as_array().unwrap().len(), 0);
+
+        assert_eq!(
+            quick_enabled_ids(&b, "date"),
+            expect_date,
+            "★ 导入后 date 顺序必须与导出前一致（LIFO 顺序不能在往返中反转）"
+        );
+        assert_eq!(
+            quick_row(&quick_rows(&b), "number.digits")["enabled"],
+            json!(false),
+            "停用状态也要带过来"
+        );
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    /// `strategy = "replace"` 先清空既有调整；缺省（合并）则保留未被文件提到的。
+    #[test]
+    fn quick_import_replace_clears_existing() {
+        let (c, p) = quick_coord("import_replace");
+        c.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "calc", "id": "calc.equation", "enabled": false }),
+        )
+        .unwrap();
+        let file = "[[adjust]]\nkind = 'date'\ndisabled = ['date.basic']\n";
+
+        // 合并：两处改动并存
+        c.web_data_rpc("quick.import", &json!({ "content": file }))
+            .unwrap();
+        let rows = quick_rows(&c);
+        assert_eq!(quick_row(&rows, "calc.equation")["enabled"], json!(false));
+        assert_eq!(quick_row(&rows, "date.basic")["enabled"], json!(false));
+
+        // 替换：文件没提到的 calc 改动被清掉
+        c.web_data_rpc(
+            "quick.import",
+            &json!({ "content": file, "strategy": "replace" }),
+        )
+        .unwrap();
+        let rows = quick_rows(&c);
+        assert_eq!(
+            quick_row(&rows, "calc.equation")["enabled"],
+            json!(true),
+            "replace 应先清空"
+        );
+        assert_eq!(quick_row(&rows, "date.basic")["enabled"], json!(false));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 坏条目**如实报告**，不静默丢弃：用户看到「导入成功」却少了规则，
+    /// 无从判断是文件坏了还是程序吃了。
+    #[test]
+    fn quick_preview_import_reports_skipped() {
+        let (c, p) = quick_coord("preview");
+        let file = "\
+[[formats]]
+id = 'my.one'
+kind = 'date'
+text = '$YY.$MM'
+
+[[adjust]]
+kind = 'weather'
+disabled = ['x']
+
+[[adjust]]
+kind = 'date'
+moved = [{ id = 'date.lunar', position = 0 }]
+";
+        let pv = c
+            .web_data_rpc("quick.previewImport", &json!({ "content": file }))
+            .unwrap();
+        assert_eq!(pv["moved"], json!(1));
+        assert_eq!(pv["ignoredFormats"], json!(1), "自定义条目如实计数");
+        assert_eq!(
+            pv["skipped"].as_array().unwrap().len(),
+            1,
+            "未知类别要报出来"
+        );
+        assert_eq!(pv["kinds"], json!(["date"]));
+        // 预览不得写库
+        assert!(
+            quick_rows(&c).iter().all(|r| r["adjusted"] == json!(false)),
+            "previewImport 必须是只读的"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 未知类别在 RPC 边界就被挡住，且错误信息带上那个类别名。
+    #[test]
+    fn quick_edit_rejects_unknown_kind() {
+        let (c, p) = quick_coord("bad_kind");
+        let e = c
+            .web_data_rpc(
+                "quick.setEnabled",
+                &json!({ "kind": "weather", "id": "x", "enabled": false }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("weather"), "错误应指出是哪个类别: {e}");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 用一份 system.phrases.toml 起一个带 data_dir 的 headless coordinator。

@@ -43,6 +43,37 @@ pub trait WebDataHost {
     /// 当前明暗（system 档按系统实时判定）。语义方法而非暴露 `Mutex<ThemeStyle>`：
     /// 窄面签名不携带宿主内部类型与锁形态。
     fn current_theme_is_dark(&self) -> bool;
+
+    /// 快捷输入格式表的设置页全貌（含被停用的条目）。
+    fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow>;
+
+    /// 设置页对一条格式的编辑：**写库 + 回灌运行时镜像**一并完成。
+    ///
+    /// `kind` 收字符串而不是 `FormatKind`：它从 RPC 的 JSON 来，本就是字符串，在这里解析
+    /// 能给出「未知类别 xxx」这种可读错误，也省得 wind-webdata 为一个枚举去依赖
+    /// wind-quick-input（那是本窄面存在的意义——webdata 只经此面触宿主）。
+    fn quick_format_edit(
+        &self,
+        kind: &str,
+        id: &str,
+        edit: crate::handle_quick_format::QuickFormatEdit,
+    ) -> anyhow::Result<()>;
+
+    /// 导出用户改动（调序 / 停用）为 TOML 文本。
+    fn quick_format_export(&self) -> anyhow::Result<String>;
+
+    /// 导入预览：只解析与计数，不写库。
+    fn quick_format_preview_import(
+        &self,
+        content: &str,
+    ) -> anyhow::Result<crate::handle_quick_format::QuickImportPreview>;
+
+    /// 导入用户改动；`replace` 为真时先清空现有调整。
+    fn quick_format_import(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> anyhow::Result<crate::handle_quick_format::QuickImportOutcome>;
 }
 
 impl WebDataHost for Coordinator {
@@ -99,5 +130,34 @@ impl WebDataHost for Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .resolve_dark()
+    }
+    fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow> {
+        Coordinator::quick_format_rows(self)
+    }
+    fn quick_format_edit(
+        &self,
+        kind: &str,
+        id: &str,
+        edit: crate::handle_quick_format::QuickFormatEdit,
+    ) -> anyhow::Result<()> {
+        let kind = wind_quick_input::FormatKind::parse(kind)
+            .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
+        Coordinator::edit_quick_format(self, kind, id, edit)
+    }
+    fn quick_format_export(&self) -> anyhow::Result<String> {
+        Coordinator::export_quick_format(self)
+    }
+    fn quick_format_preview_import(
+        &self,
+        content: &str,
+    ) -> anyhow::Result<crate::handle_quick_format::QuickImportPreview> {
+        Coordinator::preview_quick_format_import(self, content)
+    }
+    fn quick_format_import(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> anyhow::Result<crate::handle_quick_format::QuickImportOutcome> {
+        Coordinator::import_quick_format(self, content, replace)
     }
 }

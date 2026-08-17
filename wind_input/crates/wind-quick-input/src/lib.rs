@@ -36,9 +36,12 @@ pub mod lunar;
 /// `$` 模板引擎。公开供 `wind-phrase` 的简单模板（`system.phrases.toml`）复用——
 /// 两个配置文件的变量写法必须由同一份解析器决定。
 pub mod template;
+pub mod user_file;
 mod vars;
 
-pub use format_table::{FormatAdjust, FormatEntry, FormatKind, FormatTable};
+pub use format_table::{
+    FormatAdjust, FormatEntry, FormatEntryView, FormatKind, FormatTable, validate_format_text,
+};
 pub use vars::QuickValues;
 
 /// 表达式模板（`{amt(unit='圆')}`）的求值回调，由宿主提供。

@@ -227,6 +227,313 @@ impl Coordinator {
     }
 }
 
+// ───────── 设置页（词库管理 → 快捷输入）─────────
+
+/// 设置页列表的一行。
+///
+/// 与右键菜单的 [`QuickFormatScope`] 不在同一层：那个回答「当前高亮的这条候选属于谁」，
+/// 本结构是**格式表全貌**——含被停用的条目。右键菜单点不到停用项（它们不在候选里），
+/// 所以在设置页出现之前，停用之后的唯一出口是「整类重置」。
+///
+/// ⚠️ 两个下标字段刻意分开，**别拿一个当另一个用**：
+/// - [`Self::display_pos`] 是列表行号（含停用项占位），只给人看；
+/// - [`Self::move_index`] 是这条在**候选**里的下标，是写操作唯一认的口径。
+///
+/// 停用项占着行号却不在候选里，拿行号去写移动规则，用户会看到「上移一位跳过好几条」
+/// ——与 [`QuickFormatScope::index_in_kind`] 防的是同一个错。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickFormatRow {
+    /// 类别（`date` / `month_day` / `year_month` / `number` / `calc`）。
+    pub kind: &'static str,
+    pub id: String,
+    /// 模板原文（`农历$LMD`）。
+    pub text: String,
+    /// 列表行号，1-based，**含停用项**。
+    pub display_pos: usize,
+    /// 这条在候选中的 0-based 下标；停用项为 `None`。
+    ///
+    /// `None` 同时表达了「不能移动」：条目不在候选里，移它没有意义，得先启用。
+    pub move_index: Option<usize>,
+    pub enabled: bool,
+    /// 用户是否调整过（移动或停用）。设置页据此决定「恢复此条」能不能点。
+    pub adjusted: bool,
+    /// 示例效果。渲染不出时为空串（见 [`Coordinator::quick_format_samples`]）。
+    pub sample: String,
+}
+
+/// 设置页对一条格式的直接编辑。
+///
+/// 与右键菜单的 [`QuickFormatOp`] 分层不同，**刻意不合并**：菜单是「相对当前候选位置」
+/// 的动作（「上移一位」得先知道它现在排第几），设置页是「对格式表状态的直接编辑」
+/// （移到第 N 位、启用/停用双向、单条恢复）。合并成一套的话，设置页得先算出一个
+/// 它并不需要的 `index_in_kind`，而菜单侧得凭空造出一个绝对位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickFormatEdit {
+    /// 移到候选内的 0-based 下标（越界由渲染期 clamp）。
+    MoveTo(usize),
+    /// 启用 / 停用。**双向**——菜单只能停用，恢复得靠整类重置。
+    SetEnabled(bool),
+    /// 恢复单条的默认（位置 + 启用状态）。
+    ///
+    /// store 侧的 `reset_quick_format_entry` 此前无人调用，注释写着「单条恢复要等设置页」
+    /// ——就是这里。
+    ResetEntry,
+    /// 恢复整类默认。**忽略 `id` 参数**（整类操作没有单条归属）。
+    ResetKind,
+}
+
+impl Coordinator {
+    /// 设置页要的全部行（按类别分组，组内按显示序）。
+    pub fn quick_format_rows(&self) -> Vec<QuickFormatRow> {
+        let samples = self.quick_format_samples();
+        let mut out = Vec::new();
+        for &kind in FormatKind::ALL {
+            let adjust = self.quick_adjust_of(kind);
+            // 启用项的下标口径必须与候选同源，故这里不自己数——直接看它在
+            // `entries_of_view` 里的启用序（视图的启用段就是候选顺序，有测试钉住）。
+            let mut enabled_seen = 0usize;
+            for (i, v) in self
+                .quick_formats
+                .entries_of_view(kind, &adjust)
+                .iter()
+                .enumerate()
+            {
+                let move_index = if v.enabled {
+                    let n = enabled_seen;
+                    enabled_seen += 1;
+                    Some(n)
+                } else {
+                    None
+                };
+                out.push(QuickFormatRow {
+                    kind: kind.as_str(),
+                    id: v.entry.id.clone(),
+                    text: v.entry.text.clone(),
+                    display_pos: i + 1,
+                    move_index,
+                    enabled: v.enabled,
+                    adjusted: v.adjusted,
+                    sample: samples.get(&v.entry.id).cloned().unwrap_or_default(),
+                });
+            }
+        }
+        out
+    }
+
+    /// 每条格式的示例效果：`格式 id → 渲染文本`。
+    ///
+    /// ★ **不新增渲染路径**：用示例输入串跑一遍真实的候选生成，所以设置页显示的示例与
+    /// 用户实际打出来的东西必然一致。另写一套「设置页专用渲染」迟早与候选漂移，
+    /// 而那种漂移没人会发现——两边看着都对，只是不一样。
+    ///
+    /// 用**空调整**生成：停用条目也要有示例（设置页要显示它们），而候选路径会把停用项
+    /// 剔掉。顺序在这里无意义，只取 id → 文本的映射，行序由 `entries_of_view` 决定。
+    ///
+    /// 取不到示例的条目（农历超出 1900–2100、表达式写错）为空串。⚠️ 「示例为空」
+    /// **不等于**「这条永远不出」——它只说明这一组样本值渲染不出来。
+    fn quick_format_samples(&self) -> std::collections::HashMap<String, String> {
+        use chrono::Datelike;
+        use wind_quick_input::QuickSource;
+        let dp = self.rt().config.schema.quick_input.decimal_places;
+        let empty = wind_quick_input::FormatAdjustMap::default();
+        let eval = |text: &str, values: &wind_quick_input::QuickValues| {
+            crate::quick_eval::eval_expr(text, values)
+        };
+        let now = chrono::Local::now();
+        let (y, m, d) = (now.year(), now.month(), now.day());
+        // `QuickSource::Date` 按输入形态分派到 date / month_day / year_month 三个类别，
+        // 一个样本只能覆盖其中一个，故三种形态各跑一次。
+        //
+        // 日期样本用**今天**：用户脑子里知道今天几号，一眼就能把 `$YC年$MC月$DC日`
+        // 这类模板对上号；固定日期反而要他先换算。
+        let samples: [(QuickSource, String); 5] = [
+            (QuickSource::Date, format!("{y}.{m}.{d}")),
+            (QuickSource::Date, format!("{m}.{d}")),
+            (QuickSource::Date, format!("{y}.{m}")),
+            (QuickSource::Number, "1234.5".to_string()),
+            (QuickSource::Calc, "1+2*3".to_string()),
+        ];
+        let mut out = std::collections::HashMap::new();
+        for (src, buffer) in samples {
+            for r in wind_quick_input::generate_adjusted(
+                src,
+                &buffer,
+                dp,
+                &self.quick_formats,
+                &empty,
+                Some(&eval),
+            ) {
+                out.insert(r.id, r.text);
+            }
+        }
+        out
+    }
+
+    /// 设置页的一次编辑：**写库 + 回灌运行时镜像**。
+    ///
+    /// 两件事合成一个方法而不是让调用方各调一次，是因为「只写库不回灌」的症状是
+    /// 「设置页改了不生效、重启后才生效」——本仓这个坑踩过不止一次，且没有任何报错。
+    /// 合成一个方法后，调用方结构上无法只做一半。
+    pub fn edit_quick_format(
+        &self,
+        kind: FormatKind,
+        id: &str,
+        edit: QuickFormatEdit,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let k = kind.as_str();
+        match edit {
+            QuickFormatEdit::MoveTo(index) => store.move_quick_format(k, id, index)?,
+            QuickFormatEdit::SetEnabled(enabled) => {
+                store.set_quick_format_enabled(k, id, enabled)?
+            }
+            QuickFormatEdit::ResetEntry => store.reset_quick_format_entry(k, id)?,
+            QuickFormatEdit::ResetKind => store.reset_quick_format_kind(k)?,
+        }
+        self.reload_quick_adjust();
+        Ok(())
+    }
+}
+
+/// 导入的结果（RPC 回报给设置页）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuickImportOutcome {
+    /// 实际写入的移动规则数。
+    pub moved: usize,
+    /// 实际写入的停用数。
+    pub disabled: usize,
+    /// 文件里的自定义条目数。
+    ///
+    /// P1 尚无存储落点，故**如实报告为「已忽略」**而不是静默丢弃：用户从新版本导出、
+    /// 在旧版本导入时，得知道自定义格式没带过来。
+    pub ignored_formats: usize,
+    /// 解析期跳过的条目及原因（未知类别、模板非法……）。
+    pub skipped: Vec<String>,
+}
+
+/// 导入预览（只读，不写库）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuickImportPreview {
+    pub moved: usize,
+    pub disabled: usize,
+    pub ignored_formats: usize,
+    pub skipped: Vec<String>,
+    /// 会被改动的类别（`date` / `number` …），给用户一个「影响范围」的直观交代。
+    pub kinds: Vec<&'static str>,
+}
+
+impl Coordinator {
+    /// 导出用户改动为 TOML 文本。
+    ///
+    /// 数据取自 **store**（真相源）而不是运行时镜像：镜像是热路径读缓存，万一某次回灌
+    /// 漏了，从它导出就会写出一份与实际不符的文件——而这种错误在导入到另一台机器之前
+    /// 完全看不出来。
+    pub fn export_quick_format(&self) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let mut settings = wind_quick_input::user_file::UserSettings::default();
+        for (kind, rec) in store.list_quick_format()? {
+            // 无法解析的类别：用户在新版本停用过某类条目、又回退到旧版本时会遇到。
+            // 跳过是对的（旧版本导出的文件不该带它），但不能不响——静默跳过会让
+            // 「导出→导入」悄悄丢掉一段。
+            let Some(k) = FormatKind::parse(&kind) else {
+                tracing::warn!("快捷输入导出: 跳过未知类别 {kind}（可能来自更高版本）");
+                continue;
+            };
+            settings.adjust.push((
+                k,
+                FormatAdjust {
+                    moved: rec.moved.into_iter().map(|m| (m.id, m.position)).collect(),
+                    disabled: rec.disabled,
+                },
+            ));
+        }
+        Ok(wind_quick_input::user_file::serialize_user_settings(
+            &settings,
+        ))
+    }
+
+    /// 导入预览：解析并计数，**不写任何东西**。
+    pub fn preview_quick_format_import(&self, content: &str) -> anyhow::Result<QuickImportPreview> {
+        let out = wind_quick_input::user_file::parse_user_settings(content)
+            .map_err(|e| anyhow::anyhow!("不是一份有效的快捷输入设置文件: {e}"))?;
+        Ok(QuickImportPreview {
+            moved: out.settings.adjust.iter().map(|(_, a)| a.moved.len()).sum(),
+            disabled: out
+                .settings
+                .adjust
+                .iter()
+                .map(|(_, a)| a.disabled.len())
+                .sum(),
+            ignored_formats: out.settings.formats.len(),
+            skipped: out.skipped,
+            kinds: out
+                .settings
+                .adjust
+                .iter()
+                .filter(|(_, a)| !a.is_empty())
+                .map(|(k, _)| k.as_str())
+                .collect(),
+        })
+    }
+
+    /// 导入用户改动。`replace` 为真时先清空现有全部调整。
+    ///
+    /// 应用方式是**逐条重放既有原语**（`move_quick_format` / `set_quick_format_enabled`），
+    /// 不另写一套合并逻辑：这样导入的结果与用户手动操作出来的结果必然一致，
+    /// 同 id 撞车时的顶替语义也由那些原语自带。
+    pub fn import_quick_format(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> anyhow::Result<QuickImportOutcome> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let parsed = wind_quick_input::user_file::parse_user_settings(content)
+            .map_err(|e| anyhow::anyhow!("不是一份有效的快捷输入设置文件: {e}"))?;
+
+        if replace {
+            // 逐类清空。非单事务，但这不是热路径，且中途失败的后果是「清了一部分」——
+            // 与「导入了一部分」同量级，不值得为它新造一个跨类别的清空原语。
+            for &k in FormatKind::ALL {
+                store.reset_quick_format_kind(k.as_str())?;
+            }
+        }
+
+        let mut outcome = QuickImportOutcome {
+            ignored_formats: parsed.settings.formats.len(),
+            skipped: parsed.skipped,
+            ..Default::default()
+        };
+        for (kind, adjust) in &parsed.settings.adjust {
+            let k = kind.as_str();
+            // ★★ **逆序**重放。`moved` 是 LIFO 列表（index 0 = 最新 = 优先级最高），而
+            // `move_quick_format` 每次调用都把规则插到队首。顺着遍历的话，文件里最老的
+            // 规则最后写、反而占了队首，用户会看到「导入后顺序和导出前不一样」。
+            //
+            // 与 shadow 的 pin 规则导入是同一个陷阱（那次是靠 `.rev()` 修的）。
+            for (id, position) in adjust.moved.iter().rev() {
+                store.move_quick_format(k, id, *position)?;
+                outcome.moved += 1;
+            }
+            for id in &adjust.disabled {
+                store.set_quick_format_enabled(k, id, false)?;
+                outcome.disabled += 1;
+            }
+        }
+        // 一次回灌即可（不必每条一次）：镜像是整表替换。
+        self.reload_quick_adjust();
+        Ok(outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
