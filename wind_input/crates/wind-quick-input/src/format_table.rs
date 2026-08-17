@@ -381,20 +381,35 @@ impl FormatTable {
         &self.entries
     }
 
-    /// 某类的条目，**设置页口径**：启用项按候选实际顺序，停用项列在其后。
+    /// 某类的条目，**设置页口径**：启用项按候选实际顺序，停用项**留在原位**。
     ///
     /// ★ 启用项的顺序直接取 [`Self::entries_of_adjusted`] 的结果，**不重算**。同一个
     /// 「第几位」由两段代码各算一遍，迟早漂移，而症状是「设置页显示的顺序与实际候选不符」
     /// ——用户点了上移，列表动了、候选没动，且两边都没有报错。
     ///
-    /// 停用项**沉底**而不是按基表位置插回：它们不在候选里，本就没有「正确位置」。
-    /// 硬要插回去的话，用户重新启用它时还会再跳一次（那次跳才是真实位置），
-    /// 反而像是「启用这个动作把顺序弄乱了」。
+    /// ## 停用项为什么必须留在原位
+    ///
+    /// 停用项不在候选里，看似「没有正确位置」，最初因此把它们沉到该类末尾。**实测被否**：
+    /// 停用是**可逆、反复试**的动作，沉底会让同一行在停用/启用之间来回跳——管理界面里
+    /// 「行不乱动」比「位置反映候选顺序」重要得多。
+    ///
+    /// 故按**基表**顺序给每个停用项找一个锚点（它前面最近的那个启用条目），插在锚点之后；
+    /// 基表里它前面没有启用条目时排到最前。于是**从未调序过的条目，停用与启用位置一致**
+    /// （锚点算出来的就是它的基表位置），来回切一行都不动。
+    ///
+    /// ⚠️ 不能图省事写成「不剔除停用项、直接对全表应用 `moved`」：`moved` 的下标是
+    /// 「剔除停用项之后」的位置，把停用项留在列表里再套同一个下标，启用项之间的相对顺序
+    /// 就会与候选不一致。举例——基表 `[A,B,C,D]`、A 停用、`moved=[(D,1)]`：候选是
+    /// `[B,D,C]`，而直接套下标得到 `[A,D,B,C]`（启用项成了 `[D,B,C]`）。
+    ///
+    /// 已知限制：**被调序过**的条目停用后会回到它的出厂位置（它的 `moved` 规则仍在库里，
+    /// 启用后即恢复）。这个跳动是一次性的，且反映了「它当前不参与排序」这一事实。
     pub fn entries_of_view<'a>(
         &'a self,
         kind: FormatKind,
         adjust: &FormatAdjust,
     ) -> Vec<FormatEntryView<'a>> {
+        let is_disabled = |id: &str| adjust.disabled.iter().any(|d| d == id);
         let mut out: Vec<FormatEntryView<'a>> = self
             .entries_of_adjusted(kind, adjust)
             .into_iter()
@@ -404,16 +419,42 @@ impl FormatTable {
                 entry,
             })
             .collect();
-        out.extend(
-            self.entries_of(kind)
-                .filter(|e| adjust.disabled.iter().any(|d| d == &e.id))
-                .map(|entry| FormatEntryView {
-                    entry,
-                    enabled: false,
-                    // 在 disabled 里即已被调整过，无需再查。
-                    adjusted: true,
-                }),
-        );
+
+        // 停用项按基表顺序归组，每组挂在同一个锚点后面（连续几条停用的保持基表相对顺序）。
+        let mut groups: Vec<(Option<&str>, Vec<&'a FormatEntry>)> = Vec::new();
+        let mut anchor: Option<&str> = None;
+        for e in self.entries_of(kind) {
+            if is_disabled(&e.id) {
+                match groups.last_mut() {
+                    Some((a, v)) if *a == anchor => v.push(e),
+                    _ => groups.push((anchor, vec![e])),
+                }
+            } else {
+                anchor = Some(&e.id);
+            }
+        }
+        // 从后往前插入：插入点每次按锚点 id 重新定位，故靠后的插入不会挪动靠前锚点的下标。
+        for (anchor, items) in groups.iter().rev() {
+            let at = match anchor {
+                None => 0,
+                Some(id) => out
+                    .iter()
+                    .position(|v| v.entry.id == *id)
+                    .map(|i| i + 1)
+                    .unwrap_or(out.len()),
+            };
+            for (k, entry) in items.iter().enumerate() {
+                out.insert(
+                    at + k,
+                    FormatEntryView {
+                        entry,
+                        enabled: false,
+                        // 在 disabled 里即已被调整过，无需再查。
+                        adjusted: true,
+                    },
+                );
+            }
+        }
         out
     }
 }
@@ -722,31 +763,112 @@ text = "$RESULT"
         assert_eq!(view_enabled, candidate);
     }
 
-    /// 停用项**留在列表里**（这正是设置页存在的理由）且沉底。
+    /// 停用项**留在列表里**（这正是设置页存在的理由），且条数一条不少。
     #[test]
-    fn view_keeps_disabled_entries_at_bottom() {
+    fn view_keeps_disabled_entries_listed() {
         let t = FormatTable::builtin();
         let a = FormatAdjust {
             disabled: vec!["date.cn".into(), "date.basic".into()],
             ..Default::default()
         };
         let view = t.entries_of_view(FormatKind::Date, &a);
-        // 条数不减：候选里少了两条，管理列表里一条不少。
-        assert_eq!(view.len(), t.entries_of(FormatKind::Date).count());
-        let disabled_at: Vec<usize> = view
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| !v.enabled)
-            .map(|(i, _)| i)
-            .collect();
         assert_eq!(
-            disabled_at,
-            vec![view.len() - 2, view.len() - 1],
-            "停用项沉底"
+            view.len(),
+            t.entries_of(FormatKind::Date).count(),
+            "候选里少了两条，管理列表里一条不少"
         );
-        // 沉底后的相对顺序仍是基表序（date.cn 在 date.basic 之前）。
-        assert_eq!(view[view.len() - 2].entry.id, "date.cn");
-        assert_eq!(view[view.len() - 1].entry.id, "date.basic");
+        assert_eq!(view.iter().filter(|v| !v.enabled).count(), 2);
+    }
+
+    /// ★★ **停用一行不该让它换位置**。
+    ///
+    /// 停用是可逆、反复试的动作；让停用项沉到末尾（最初的做法）会使同一行在停用/启用之间
+    /// 来回跳。这里对**每一条**都验一遍「停用前的下标 == 停用后的下标」，而不是只挑一条
+    /// ——首条、末条、中间条走的是锚点算法的不同分支（锚点为 None / 锚点在末尾 / 一般情形）。
+    #[test]
+    fn disabling_a_row_does_not_move_it() {
+        let t = FormatTable::builtin();
+        for &kind in FormatKind::ALL {
+            let base: Vec<String> = t
+                .entries_of_view(kind, &FormatAdjust::default())
+                .iter()
+                .map(|v| v.entry.id.clone())
+                .collect();
+            for (i, id) in base.iter().enumerate() {
+                let a = FormatAdjust {
+                    disabled: vec![id.clone()],
+                    ..Default::default()
+                };
+                let after: Vec<String> = t
+                    .entries_of_view(kind, &a)
+                    .iter()
+                    .map(|v| v.entry.id.clone())
+                    .collect();
+                assert_eq!(
+                    after,
+                    base,
+                    "停用 {id}（kind={}, 第 {i} 行）后整列顺序不该有任何变化",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    /// 连续多条停用也各自留在原位（含首条——它的锚点是 `None`）。
+    #[test]
+    fn several_disabled_rows_each_stay_put() {
+        let t = FormatTable::builtin();
+        let base: Vec<String> = t
+            .entries_of(FormatKind::Date)
+            .map(|e| e.id.clone())
+            .collect();
+        // 首条 + 相邻两条 + 末条：覆盖锚点为 None、同锚点多条、锚点在末尾三种情形。
+        let a = FormatAdjust {
+            disabled: vec![
+                base[0].clone(),
+                base[2].clone(),
+                base[3].clone(),
+                base[base.len() - 1].clone(),
+            ],
+            ..Default::default()
+        };
+        let after: Vec<String> = t
+            .entries_of_view(FormatKind::Date, &a)
+            .iter()
+            .map(|v| v.entry.id.clone())
+            .collect();
+        assert_eq!(after, base, "四条同时停用，顺序仍与出厂一致");
+    }
+
+    /// 停用项夹在中间之后，**启用项的相对顺序仍须与候选完全一致**。
+    ///
+    /// 这条与 `view_enabled_order_equals_candidate_order` 的区别在于：那条测的是纯调序，
+    /// 这条测「调序 + 停用」混合——正是「不剔除就套 `moved` 下标」会算错的场景
+    /// （见 `entries_of_view` 的 ⚠️ 段）。
+    #[test]
+    fn enabled_order_still_matches_candidates_with_disabled_in_between() {
+        let t = FormatTable::builtin();
+        let base: Vec<String> = t
+            .entries_of(FormatKind::Date)
+            .map(|e| e.id.clone())
+            .collect();
+        // 停用首条 + 把末条移到下标 1：直接套下标会得到与候选不同的启用序。
+        let a = FormatAdjust {
+            moved: vec![(base[base.len() - 1].clone(), 1)],
+            disabled: vec![base[0].clone()],
+        };
+        let candidate: Vec<&str> = t
+            .entries_of_adjusted(FormatKind::Date, &a)
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        let view_enabled: Vec<&str> = t
+            .entries_of_view(FormatKind::Date, &a)
+            .iter()
+            .filter(|v| v.enabled)
+            .map(|v| v.entry.id.as_str())
+            .collect();
+        assert_eq!(view_enabled, candidate);
     }
 
     /// `adjusted` 标记决定设置页「恢复此条」能不能点：移动过、停用过都算，
