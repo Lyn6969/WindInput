@@ -328,6 +328,8 @@ static REGISTRY: &[ConfigField] = &[
         Enum(&["", "show", "hide"]),
     ),
     f("ui.candidate.max_chars", Int),
+    f("ui.candidate.min_width_chars", Int),
+    f("ui.candidate.min_rows", Int),
     f("ui.candidate.comment_template_vertical", Str),
     f("ui.candidate.comment_template_horizontal", Str),
     f("ui.candidate.comment_max_chars", Int),

@@ -279,6 +279,15 @@ pub struct View {
     pub cross_align: Align,
     pub fixed_w: Option<f32>,
     pub fixed_h: Option<f32>,
+    /// 宽度下限（设备像素）：测得宽度不足时抬到此值，超出则按内容。
+    ///
+    /// 与 `fixed_w` 的区别是「不得窄于」而非「就是这么宽」——候选文本节点用它预留
+    /// 最小字符宽度（`ui.candidate.min_width_chars`），宽度从叶子逐层冒到窗口，
+    /// 序号列宽/内边距由布局引擎自行累加，无需调用方换算。
+    ///
+    /// 只有宽度没有高度：候选窗的高度下限靠补足透明占位行实现（见 `candidate_window`），
+    /// 那样补出的空间参与 `fill_cross` 与命中收集，与钳高不等价。
+    pub min_w: Option<f32>,
     pub bg: Option<[u8; 4]>,
     pub corner_radius: f32,
     /// 边框 (颜色, 宽度)
@@ -335,6 +344,7 @@ impl Default for View {
             cross_align: Align::Start,
             fixed_w: None,
             fixed_h: None,
+            min_w: None,
             bg: None,
             caret_at: None,
             caret_w: 1.0,
@@ -492,6 +502,11 @@ impl View {
         self.fixed_h = Some(h);
         self
     }
+    /// 设置宽度下限（设备像素）。<=0 视为不限制。
+    pub fn min_w(mut self, w: f32) -> Self {
+        self.min_w = (w > 0.0).then_some(w);
+        self
+    }
     pub fn fixed_w(mut self, w: f32) -> Self {
         self.fixed_w = Some(w);
         self
@@ -562,6 +577,10 @@ impl View {
         }
         if let Some(fh) = self.fixed_h {
             h = fh;
+        }
+        // 下限在 fixed_w 之后施加：二者同时给时 min 仍然是下限（fixed 更窄会被抬起来）。
+        if let Some(minw) = self.min_w {
+            w = w.max(minw);
         }
         self.mw = w;
         self.mh = h;
@@ -1850,6 +1869,41 @@ mod layout_tests {
             .child(fixed(999.0, 999.0, -1));
         v.layout(0.0, 0.0, &tr());
         assert_eq!(v.measured_size(), (200.0, 30.0));
+    }
+
+    /// 宽度下限：内容不足时抬到下限。
+    #[test]
+    fn min_w_raises_narrow_content() {
+        let mut v = View::container(Layout::Row)
+            .min_w(200.0)
+            .child(fixed(50.0, 20.0, -1));
+        v.layout(0.0, 0.0, &tr());
+        assert_eq!(v.measured_size(), (200.0, 20.0));
+    }
+
+    /// 反向对照：内容够宽时下限不得改变尺寸，否则 `min_w` 就退化成了 `fixed_w`。
+    #[test]
+    fn min_w_leaves_wide_content_untouched() {
+        let mut v = View::container(Layout::Row)
+            .min_w(200.0)
+            .child(fixed(300.0, 20.0, -1));
+        v.layout(0.0, 0.0, &tr());
+        assert_eq!(v.measured_size(), (300.0, 20.0));
+    }
+
+    /// 候选窗最小宽度的核心机制：下限设在叶子上，宽度逐层冒到祖先，父级 padding 照常累加
+    /// —— 调用方不必自己换算序号列宽与内边距。
+    #[test]
+    fn min_w_propagates_from_leaf_to_ancestor() {
+        let mut v = View::container(Layout::Column).pad(Edges::all(8.0)).child(
+            View::container(Layout::Row)
+                .child(fixed(10.0, 20.0, -1))
+                // fixed_w=30 且 min_w=120：下限在 fixed 之后施加，故取 120。
+                .child(fixed(30.0, 20.0, -1).min_w(120.0)),
+        );
+        v.layout(0.0, 0.0, &tr());
+        // 内层 Row = 10 + 120 = 130；外层再加两侧 padding 16。
+        assert_eq!(v.measured_size().0, 146.0);
     }
 
     #[test]

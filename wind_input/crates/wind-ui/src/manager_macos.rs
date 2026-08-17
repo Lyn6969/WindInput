@@ -172,6 +172,7 @@ impl Forwarder {
                 | UiCommand::SetPreeditEmbedded(_)
                 | UiCommand::SetCandidateFontSize(_)
                 | UiCommand::SetCandidateFontFamily(_)
+                | UiCommand::SetCandidateMinSize { .. }
                 | UiCommand::SetCandidateFlipWhenAbove(_)
                 | UiCommand::SetCandidateSwapWhenAbove(_)
                 | UiCommand::SetPagerInPreedit(_)
@@ -348,6 +349,9 @@ impl Forwarder {
             UiCommand::SetPreeditEmbedded(v) => self.win.set_preedit_embedded(v),
             UiCommand::SetCandidateFontSize(s) => self.win.set_font_size_override(s),
             UiCommand::SetCandidateFontFamily(f) => self.win.set_font_family(&f),
+            UiCommand::SetCandidateMinSize { width_chars, rows } => {
+                self.win.set_min_size(width_chars, rows)
+            }
             UiCommand::SetTooltipDelay(d) => self.win.set_tooltip_delay(d),
             UiCommand::SetCandidateFlipWhenAbove(v) => self.win.set_flip_when_above(v),
             UiCommand::SetCandidateSwapWhenAbove(v) => self.win.set_swap_preedit_when_above(v),

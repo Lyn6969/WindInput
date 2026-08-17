@@ -3077,6 +3077,30 @@ pub struct UiCandidateConfig {
     /// 候选文本最大显示字数，超出截断（0=不限）。
     #[serde(default)]
     pub max_chars: usize,
+    /// 候选行内容的**最小**宽度，按全角字符数计（0=关闭，跟随内容）。
+    ///
+    /// 设 3 即为每个候选行至少预留 3 个汉字宽，不足也占着——单字候选与三字词占位相同，
+    /// 竖排列宽与横排行宽不再随每次按键伸缩。与 [`Self::max_chars`] 成对：一个封下限、
+    /// 一个封上限，两个都配上宽度就完全钉死了。
+    ///
+    /// **衡量的是整行内容**（序号 + 候选文字 + 注释，不含行内边距），不是只有文字段：
+    /// 注释模板往往比候选文字本身更长且长度多变（拆字、编码、注音），只锁文字段的话
+    /// 注释会在右边继续伸缩，宽度照样抖。行内容超出下限后照常跟随内容，下限不封顶。
+    ///
+    /// **单位是字符不是像素**，因为像素值无法跨主题成立：主题各自的字号不同，一个按
+    /// 18px 配好的最小宽度换到 14px 的主题上就过宽了。字符数则随字号与 DPI 自动缩放。
+    #[serde(default)]
+    pub min_width_chars: usize,
+    /// **竖排**候选窗的最小行数（0=关闭，跟随候选数量）。
+    ///
+    /// 不足此数时补足等高的透明占位行，使窗口高度在候选数变化时保持不变。上限自动
+    /// 钳到当前生效的每页候选数（[`Self::per_page`] / [`Self::per_page_extended`]）——
+    /// 补出比一页还多的空行只会得到一个大半空白的窗口。
+    ///
+    /// 横排不适用（候选并列于一行，高度本就恒定）；候选为空的提示态（临拼/临英/网址
+    /// 刚进入）也不补足，那时窗口本就只有一行提示，撑成满高更突兀。
+    #[serde(default)]
+    pub min_rows: usize,
     /// **竖排**候选的注释段（候选右侧灰字）模板。语法见 `wind_coordinator::comment`。
     ///
     /// 横竖各持一份模板、互不影响：两种排布的可用横向空间差一个数量级（竖排每行独占，
@@ -3213,6 +3237,9 @@ impl Default for UiCandidateConfig {
             pager_bar_display: String::new(),
             page_number_display: String::new(),
             max_chars: 16,
+            // 两项下限均出厂关闭：任何非零默认都会让存量用户升级后候选窗突然变宽/变高。
+            min_width_chars: 0,
+            min_rows: 0,
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),
             comment_max_chars: 0,
@@ -3252,6 +3279,20 @@ impl UiCandidateConfig {
     /// 时返回该字符，否则 None。供协调器裁决「用户 > 主题 > 默认」优先级（主题层在 None 时接手）。
     pub fn user_index_label(&self, i: usize) -> Option<String> {
         self.index_labels.chars().nth(i).map(|c| c.to_string())
+    }
+
+    /// 竖排最小行数的**生效值**：按每页候选数封顶（0=不补）。
+    ///
+    /// 补出比一页还多的空行只会得到一个大半空白的窗口，故以 `per_page` 为上限。扩展档
+    /// （`per_page_extended`）若比主档更少，那一档仍可能补出略超一页的空行——为此在每次
+    /// 候选更新时重下发一遍不划算，两档差异通常只有一两条。
+    ///
+    /// 钳制放在配置层而不是 UI 层：候选窗只收到一串候选，不知道也不该知道分页概念。
+    pub fn effective_min_rows(&self) -> u32 {
+        if self.min_rows == 0 {
+            return 0;
+        }
+        self.min_rows.min(self.per_page.max(1)) as u32
     }
 
     /// 当前排布对应的注释模板（`vertical` 为 true 取竖排那份）。

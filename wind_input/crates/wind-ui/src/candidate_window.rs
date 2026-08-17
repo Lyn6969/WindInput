@@ -18,7 +18,7 @@ use crate::sys::{
     SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
-use crate::text::dwrite::TextRenderer;
+use crate::text::dwrite::{TextRenderer, TextStyle};
 use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
 use wind_theme::DEFAULT_ACCENT_BAR_HEIGHT_RATIO;
 
@@ -245,6 +245,13 @@ pub struct CandidateWindow {
     /// 来自 ui.candidate.position_mode + custom_x/custom_y，每次 UpdateCandidates 同步。
     /// `Some((0, 0))` 是"已开启固定但尚未设定位置"，定位时落到屏幕默认锚点。
     fixed_pos: Option<(i32, i32)>,
+    /// 候选文本区最小宽度，按全角字符数（0=不限）。来自 ui.candidate.min_width_chars。
+    min_width_chars: u32,
+    /// 上一次 `build_tree` 算出的最小内容宽（设备像素）：下限文本宽 + 行内 chrome + 各级
+    /// 内边距。由 `build_tree`（`&self`）写、渲染入口读，故用 `Cell`。
+    min_content_w: std::cell::Cell<f32>,
+    /// 竖排最小行数，不足补透明占位行（0=不补）。来自 ui.candidate.min_rows。
+    min_rows: u32,
 }
 
 impl CandidateWindow {
@@ -305,6 +312,9 @@ impl CandidateWindow {
             swap_preedit_when_above: false,
             pager_in_preedit: false,
             fixed_pos: None,
+            min_width_chars: 0,
+            min_content_w: std::cell::Cell::new(0.0),
+            min_rows: 0,
         })
     }
 
@@ -322,6 +332,29 @@ impl CandidateWindow {
     /// 设置候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
     pub fn set_font_size_override(&mut self, font_size: f32) {
         self.font_size_override = font_size.max(0.0);
+    }
+
+    /// 设置候选窗尺寸下限（抗抖动）。来自 ui.candidate.min_width_chars / min_rows。
+    pub fn set_min_size(&mut self, width_chars: u32, rows: u32) {
+        self.min_width_chars = width_chars;
+        self.min_rows = rows;
+    }
+
+    /// `min_width_chars` 撑出的内容宽下界（设备像素；0=未配），由 `build_tree` 现算。
+    ///
+    /// 供三个渲染入口在按主题 `behavior.vertical_max_width` 裁切时保住下限：下限撑出的
+    /// 宽度若被上限钳回去，View 树仍按下限布局，窗口缓冲却更窄——**每一帧**都溢出右缘，
+    /// 不像长候选溢出那样偶发。
+    ///
+    /// ★ 取值宁可高估不可低估，两侧代价不对称：低估会被上限钳窄 ⇒ 可见的裁切；高估只是
+    /// 窗口略宽于主题上限，而用户既然配了下限，那正是他要的。故 `build_tree` 按「一个只含
+    /// 下限文本的行」实测累加（序号列按圆圈直径算，非圆圈时偏大即为有意高估），
+    /// 而非按字号估——早先那版只算「字号 × 字数」，漏掉约 49 逻辑 px 的行内 chrome。
+    fn min_content_w_px(&self) -> u32 {
+        if self.min_width_chars == 0 {
+            return 0;
+        }
+        self.min_content_w.get().ceil().max(0.0) as u32
     }
 
     /// 设置候选字体族（来自 ui.font.family；空=默认 Microsoft YaHei UI）。
@@ -639,7 +672,9 @@ impl CandidateWindow {
             let vmax = self.theme.behavior.vertical_max_width;
             if vmax > 0 {
                 let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
-                content_w = content_w.min(vmax_px);
+                // 下限优先于上限：用户显式配的抗抖动宽度不该被主题的裁切上限压回去。
+                // 见 [`CandidateWindow::min_content_w_px`]（未配 min 时该值为 0，行为不变）。
+                content_w = content_w.min(vmax_px.max(self.min_content_w_px()));
             }
         }
         let content_h = (h_f.ceil() as u32).max(24);
@@ -797,7 +832,9 @@ impl CandidateWindow {
             let vmax = self.theme.behavior.vertical_max_width;
             if vmax > 0 {
                 let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
-                content_w = content_w.min(vmax_px);
+                // 下限优先于上限：用户显式配的抗抖动宽度不该被主题的裁切上限压回去。
+                // 见 [`CandidateWindow::min_content_w_px`]（未配 min 时该值为 0，行为不变）。
+                content_w = content_w.min(vmax_px.max(self.min_content_w_px()));
             }
         }
         let content_h = (h_f.ceil() as u32).max(24);
@@ -963,7 +1000,9 @@ impl CandidateWindow {
             let vmax = self.theme.behavior.vertical_max_width;
             if vmax > 0 {
                 let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
-                content_w = content_w.min(vmax_px);
+                // 下限优先于上限：用户显式配的抗抖动宽度不该被主题的裁切上限压回去。
+                // 见 [`CandidateWindow::min_content_w_px`]（未配 min 时该值为 0，行为不变）。
+                content_w = content_w.min(vmax_px.max(self.min_content_w_px()));
             }
         }
         let content_h = (h_f.ceil() as u32).max(24);
@@ -1551,6 +1590,29 @@ impl CandidateWindow {
         let index_fs = node_fs(&v.index);
         let text_fs = node_fs(&v.text);
         let preedit_fs = node_fs(&v.preedit_bar);
+        // 候选行内容的最小宽度 = N × 全角字宽，实测「一」在候选文字自身的字号/字族下的宽度，
+        // 故随主题字号与 DPI 自动缩放——这正是配置用「字符数」而非像素的理由。
+        //
+        // ★ 衡量的是**整行内容**（序号 + 文字 + 注释）而非只有文字段。早先只锁文字段，
+        // 注释在它右边继续伸缩，行宽照样随每次按键变化——真机实测暴露（用户的注释模板含
+        // 拆字/编码/注音，宽度变化比候选文字本身还大）。改成整行后，只要三段合计仍在下限
+        // 以内，窗口宽度就完全不动。
+        let min_row_content_w = if self.min_width_chars > 0 {
+            let em = self
+                .text_renderer
+                .measure(
+                    "一",
+                    &TextStyle {
+                        family: v.text.font_family.as_deref(),
+                        size: text_fs,
+                        weight: 0,
+                    },
+                )
+                .width;
+            em * self.min_width_chars as f32
+        } else {
+            0.0
+        };
 
         // 颜色：None→兜底。
         let col = |o: Option<[u8; 4]>, d: [u8; 4]| o.unwrap_or(d);
@@ -1814,6 +1876,24 @@ impl CandidateWindow {
         let item_spacing = v.item_spacing.map(|d| d.resolve(s, 0.0)).unwrap_or(0.0);
         let box_gap = (item_spacing - item_pad.l - item_pad.r).max(0.0);
         let row_gap_v = dim(v.row_gap, 0.0);
+        // 候选行容器的宽度下限：View 的 min_w 作用于**含 padding 的总宽**，而配置语义是
+        // 「除 padding 外的内容总宽」，故这里把行内边距加回去。
+        let min_row_w = if self.min_width_chars > 0 {
+            min_row_content_w + item_pad.l + item_pad.r
+        } else {
+            0.0
+        };
+        // 本帧的最小内容宽下界（供渲染入口与主题 vertical_max_width 比较，
+        // 见 [`CandidateWindow::min_content_w_px`]）：行容器下限 + 行外边距 + 列/窗口内边距。
+        // 每次 build_tree 都重算（几何随主题/DPI 变），未配下限时置 0 使上限逻辑完全恒等。
+        self.min_content_w.set(if self.min_width_chars > 0 {
+            let item_mar = edges_or(&v.item.margin, [0.0; 4]);
+            let list_pad = edges_or(&v.candidate_list.padding, [0.0; 4]);
+            let win_pad = edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]);
+            min_row_w + item_mar.l + item_mar.r + list_pad.l + list_pad.r + win_pad.l + win_pad.r
+        } else {
+            0.0
+        });
         // 选中候选左侧强调条（仅主题启用时，如 msime/jidian）。
         // height_ratio 判零回退：RvViews 若未经 resolve 填充（Default 构造）该字段是 0.0，
         // 直接乘会把条高算成 0 → 钳到 2px 细线，观感是强调条消失。
@@ -1933,11 +2013,67 @@ impl CandidateWindow {
                 View::container(Layout::Row)
                     .cross(Align::Center)
                     .pad(item_pad)
+                    // 提示态也守同一宽度下限，否则从「只有模式徽标」到「出候选」的那一刻
+                    // 窗口仍会横向跳一下——抖动只是被推迟到了这个瞬间。
+                    .min_w(min_row_w)
                     .child(
                         View::leaf(" ".to_string(), [0, 0, 0, 0]).font_size(text_fs.max(index_fs)),
                     ),
             );
         }
+        // ── 竖排最小行数（ui.candidate.min_rows）──
+        // 候选不足时补足**与真实候选行同构**的透明占位行，使窗口高度不随候选数变化。
+        //
+        // 同构是硬要求，不能图省事复用上面那个「无候选提示行」（只有一个空格叶子）：真实行
+        // 还带 item.margin 与序号节点（index_circle 时高 = index_fs × 1.5），缺了它们补出的
+        // 行比真实行矮，窗口照样抖、只是抖得小一点——这种「修了但没修干净」最难被发现。
+        let pad_rows = if list_vertical && self.min_rows > 0 {
+            (self.min_rows as usize).saturating_sub(self.candidates.len())
+        } else {
+            0
+        };
+        let placeholder_row = || {
+            let mut ph = View::container(Layout::Row)
+                .cross(Align::Center)
+                .pad(item_pad)
+                .margin(edges_or(&v.item.margin, [0.0; 4]))
+                .min_w(min_row_w)
+                .fill_cross();
+            // ⚠️ font_family / font_weight 必须照搬：真实后端的行高来自**该字族**的 line
+            // metrics（DirectWrite 按 SetFontFamilyName 排版），不是字号的固定倍数。宋体约
+            // 1.17 em、Microsoft YaHei UI 约 1.33 em，配了 [text] font_family 的主题下漏掉
+            // 它就会让占位行矮一截，窗口照旧随候选数抖动。
+            // mock 文本后端只按字号估算、不区分字族 ⇒ 等高性测试**测不出**这一项，靠
+            // `placeholder_row_mirrors_real_row_text_attrs` 从结构上比对兜底。
+            let mut idx = View::leaf(" ".to_string(), [0, 0, 0, 0])
+                .font_size(index_fs)
+                .font_weight(eff_weight(&v.index, &v.item, false, false))
+                .font_family(v.index.font_family.clone())
+                .pad(edges_or(&v.index.padding, [0.0; 4]))
+                .margin(edges_or(&v.index.margin, [0.0; 4]));
+            if index_circle {
+                let d = (index_fs * 1.5).round();
+                idx = idx.fixed_w(d).fixed_h(d);
+            }
+            ph = ph.child(idx);
+            // 不设 tag（默认 -1）：占位行不进命中收集，鼠标划过或点击都不该有反应。
+            ph.child(
+                View::leaf(" ".to_string(), [0, 0, 0, 0])
+                    .font_size(text_fs)
+                    .font_weight(eff_weight(&v.text, &v.item, false, false))
+                    .font_family(v.text.font_family.clone())
+                    .pad(edges_or(&v.text.padding, [0.0; 4]))
+                    .margin(edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])),
+            )
+        };
+        // 反转排列时占位行补在**顶部**：窗口上翻后底边贴光标、候选 1 在最下，空行若压在
+        // 候选 1 下面会把它顶离光标，候选 1 的位置反而随候选数抖动——正是本功能要消除的。
+        if flip_cands {
+            for _ in 0..pad_rows {
+                list = list.child(placeholder_row());
+            }
+        }
+
         // 逆序仅改排列顺序；i 仍是原始索引（tag/标签/选中据此）
         let mut order: Vec<(usize, &CandidateItem)> = self.candidates.iter().enumerate().collect();
         if flip_cands {
@@ -1957,6 +2093,9 @@ impl CandidateWindow {
                 .pad(item_pad)
                 .margin(edges_or(&v.item.margin, [0.0; 4]))
                 .radius(item_radius)
+                // 下限落在行容器上：序号 + 文字 + 注释三段合计不足时整行补足，
+                // 三段各自仍按内容排布（不拉伸、不居中偏移）。
+                .min_w(min_row_w)
                 .tag(i as i32);
             // 竖排时撑满列宽（等于最宽候选的宽度），高亮背景宽度统一，与 Go 行为一致。
             if list_vertical {
@@ -2089,6 +2228,12 @@ impl CandidateWindow {
                 item = item.border(bc, bw);
             }
             list = list.child(item);
+        }
+        // 正常顺序：占位行补在候选之后（窗口下方留白，候选 1 恒在顶部）。
+        if !flip_cands {
+            for _ in 0..pad_rows {
+                list = list.child(placeholder_row());
+            }
         }
         // 内联编码沉底（见 inline_preedit_bottom）：候选项装配完毕后按原顺序追加编码与模式标记。
         // 竖排未并入的翻页栏另在末尾装配段随 swap 翻到顶部，故此处追加即为窗口最底部。
@@ -2602,6 +2747,229 @@ impl WindowMouse for CandidateMouse {
             }
             _ => None,
         }
+    }
+}
+
+/// 候选窗尺寸下限（`ui.candidate.min_width_chars` / `min_rows`，抗抖动）。
+///
+/// 断言含文本尺寸，依赖 mock 文本测量（字符数 × 字号 × 0.6），故与 `view.rs` 的布局测试
+/// 一样 gate 掉真实文本后端。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod min_size_tests {
+    use super::*;
+
+    fn cand(text: &str) -> CandidateItem {
+        cand_c(text, "")
+    }
+
+    fn cand_c(text: &str, comment: &str) -> CandidateItem {
+        CandidateItem {
+            text: text.to_string(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: String::new(),
+            comment: comment.to_string(),
+            no_index: false,
+        }
+    }
+
+    /// 同 `win`，但候选带注释段。
+    fn win_c(vertical: bool, rows: u32, chars: u32, items: &[(&str, &str)]) -> CandidateWindow {
+        let mut w = win(vertical, rows, chars, &[]);
+        let items: Vec<CandidateItem> = items.iter().map(|(t, c)| cand_c(t, c)).collect();
+        w.update("", 0, "", items, 0, -1, 1, 1);
+        w
+    }
+
+    /// 造一个候选窗：`rows`/`chars` 即两项下限，`texts` 是候选文本。
+    fn win(vertical: bool, rows: u32, chars: u32, texts: &[&str]) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.set_vertical(vertical);
+        w.set_min_size(chars, rows);
+        // 序号画成圆圈，使序号节点成为行高的决定项（直径 = index_fs × 1.5，高过文本行高）。
+        // 不这样设，占位行即使漏掉序号节点也照样等高 —— 等高性测试就测不出东西来了。
+        w.theme.views.index.bg_shape = "circle".to_string();
+        let items: Vec<CandidateItem> = texts.iter().map(|t| cand(t)).collect();
+        w.update("", 0, "", items, 0, -1, 1, 1);
+        w
+    }
+
+    fn measured(w: &CandidateWindow) -> (f32, f32) {
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        root.measured_size()
+    }
+
+    const FIVE: &[&str] = &["一", "二", "三", "四", "五"];
+    const THREE: &[&str] = &["一", "二", "三"];
+
+    /// ★ 核心判据：补出的占位行必须与真实候选行**完全等高**。
+    ///
+    /// 「补了行、窗口变高了」是自动成立的废话；只有「3 条候选 + 2 空行 ≡ 5 条真实候选」
+    /// 才锁得住占位行装配不全（漏序号节点、漏 item.margin）导致的「矮一截」——那种缺陷
+    /// 的表现是窗口仍在抖、只是抖得小一点，肉眼很难认定为 bug。
+    #[test]
+    fn padded_rows_equal_real_rows_in_height() {
+        let full = measured(&win(true, 5, 0, FIVE)).1;
+        let padded = measured(&win(true, 5, 0, THREE)).1;
+        assert_eq!(padded, full, "3 候选补 2 空行后须与 5 条真实候选等高");
+    }
+
+    /// 占位行的文本属性必须逐项镜像真实候选行。
+    ///
+    /// ★ 这条测的是等高性测试**测不到**的那一半：mock 文本后端只按字号估算、不区分字族与
+    /// 字重，占位行漏掉 `font_family` 时 `padded_rows_equal_real_rows_in_height` 照样全绿；
+    /// 而真实 DirectWrite 的行高取自该字族的 line metrics（宋体约 1.17em、雅黑约 1.33em），
+    /// 漏配就会让占位行矮一截。测量断言在此无能为力，只能从结构上比对。
+    #[test]
+    fn placeholder_row_mirrors_real_row_text_attrs() {
+        let mut w = win(true, 5, 0, THREE);
+        w.theme.views.text.font_family = Some("宋体".to_string());
+        w.theme.views.index.font_family = Some("楷体".to_string());
+        let root = w.build_tree(false);
+
+        fn find_list(v: &View) -> Option<&View> {
+            if v.children.iter().any(|c| c.tag >= 0) {
+                return Some(v);
+            }
+            v.children.iter().find_map(find_list)
+        }
+        let list = find_list(&root).expect("未找到候选列表容器");
+        // 取第 2 条真实候选：首条是选中态，字重可能被 [text.selected] 改写，
+        // 而占位行按非选中态构造，拿首条比会误报。
+        let real = list
+            .children
+            .iter()
+            .find(|c| c.tag == 1)
+            .expect("未找到非选中的真实候选行");
+        let ph = list
+            .children
+            .iter()
+            .find(|c| c.tag < 0)
+            .expect("未找到占位行");
+
+        assert_eq!(
+            ph.children.len(),
+            real.children.len(),
+            "占位行子节点数须与真实行一致"
+        );
+        for (i, (p, r)) in ph.children.iter().zip(real.children.iter()).enumerate() {
+            assert_eq!(p.font_family, r.font_family, "第 {i} 个子节点字族不一致");
+            assert_eq!(p.font_size, r.font_size, "第 {i} 个子节点字号不一致");
+            assert_eq!(p.font_weight, r.font_weight, "第 {i} 个子节点字重不一致");
+            assert_eq!(p.fixed_h, r.fixed_h, "第 {i} 个子节点固定高不一致");
+        }
+    }
+
+    /// 占位行不得参与命中收集：鼠标划过或点击空行都不该有任何反应。
+    #[test]
+    fn placeholder_rows_are_not_hit_targets() {
+        let w = win(true, 5, 0, THREE);
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        let mut hits = Vec::new();
+        root.collect_hits(&mut hits);
+        let cand_hits = hits.iter().filter(|(t, _)| (0..3).contains(t)).count();
+        assert_eq!(cand_hits, 3, "只有 3 条真实候选可命中");
+        assert!(
+            hits.iter().all(|(t, _)| *t < 3),
+            "补出的空行不得出现在命中矩形里"
+        );
+    }
+
+    /// 反向对照：不配 min_rows 时高度必须随候选数变化，否则上一条测的是恒等式。
+    #[test]
+    fn without_min_rows_height_follows_candidate_count() {
+        let h3 = measured(&win(true, 0, 0, THREE)).1;
+        let h5 = measured(&win(true, 0, 0, FIVE)).1;
+        assert!(h3 < h5, "未配下限时 3 条应矮于 5 条（实测 {h3} vs {h5}）");
+    }
+
+    /// 下限不是定值：候选数超过 min_rows 时照常展开，不得反过来把窗口压回去。
+    #[test]
+    fn min_rows_does_not_shrink_larger_pages() {
+        let clamped = measured(&win(true, 3, 0, FIVE)).1;
+        let plain = measured(&win(true, 0, 0, FIVE)).1;
+        assert_eq!(clamped, plain);
+    }
+
+    /// 补行只发生在竖排：横排候选并列于一行，高度本就恒定。
+    #[test]
+    fn min_rows_is_vertical_only() {
+        let padded = measured(&win(false, 5, 0, THREE)).1;
+        let plain = measured(&win(false, 0, 0, THREE)).1;
+        assert_eq!(padded, plain, "横排不得补行");
+    }
+
+    /// 最小宽度：单字候选与三字候选的窗口宽度须相同 —— 这正是用户报的「宽度一直在变」。
+    ///
+    /// ⚠️ 下限量的是整行内容，**序号列也计入**（圆圈直径 ≈ 1.5 × 序号字号，约 2 个汉字宽）。
+    /// 故要让 1 字与 3 字候选等宽，下限得配到 6 以上，而不是 3——这是「按整行计」相对
+    /// 「按文字段计」在数值手感上的直接差异，配置文档里已写明。
+    #[test]
+    fn min_width_chars_stabilizes_width() {
+        let one = measured(&win(true, 0, 8, &["字"])).0;
+        let three = measured(&win(true, 0, 8, &["候选词"])).0;
+        assert_eq!(one, three, "8 字下限时，1 字候选须与 3 字候选等宽");
+    }
+
+    /// 反向对照：不配下限时宽度随内容伸缩（即改动前的行为）。
+    #[test]
+    fn without_min_width_width_follows_content() {
+        let one = measured(&win(true, 0, 0, &["字"])).0;
+        let three = measured(&win(true, 0, 0, &["候选词"])).0;
+        assert!(
+            one < three,
+            "未配下限时 1 字应窄于 3 字（实测 {one} vs {three}）"
+        );
+    }
+
+    /// ★ 下限衡量的是**整行内容**（序号 + 文字 + 注释），不是只有文字段。
+    ///
+    /// 真机实测出来的缺口：只锁文字段时，注释在它右边继续伸缩，行宽照样随每次按键变化
+    /// （用户的注释模板含拆字/编码/注音，宽度变化比候选文字本身还大）。故「同一候选、
+    /// 注释有无」在总宽仍处下限内时必须完全等宽。
+    #[test]
+    fn min_width_covers_comment_segment() {
+        let plain = measured(&win_c(true, 0, 10, &[("字", "")])).0;
+        let commented = measured(&win_c(true, 0, 10, &[("字", "abc")])).0;
+        assert_eq!(plain, commented, "注释在下限内时不得改变窗口宽度");
+    }
+
+    /// 反向对照：不配下限时，注释会把行撑宽 —— 上一条测的不是恒等式。
+    #[test]
+    fn without_min_width_comment_widens_row() {
+        let plain = measured(&win_c(true, 0, 0, &[("字", "")])).0;
+        let commented = measured(&win_c(true, 0, 0, &[("字", "abc")])).0;
+        assert!(
+            plain < commented,
+            "未配下限时注释应撑宽（{plain} vs {commented}）"
+        );
+    }
+
+    /// 注释把整行内容顶出下限之后，宽度照常跟随内容（下限不是封顶）。
+    #[test]
+    fn min_width_yields_to_long_comment() {
+        let long = measured(&win_c(true, 0, 3, &[("字", "很长的一段注释文本")])).0;
+        let plain = measured(&win_c(true, 0, 0, &[("字", "很长的一段注释文本")])).0;
+        assert_eq!(long, plain);
+    }
+
+    /// 超过下限的候选照常撑宽，下限不是固定宽度。
+    #[test]
+    fn min_width_does_not_truncate_wider_text() {
+        let wide = measured(&win(true, 0, 3, &["六个汉字的候选"])).0;
+        let plain = measured(&win(true, 0, 0, &["六个汉字的候选"])).0;
+        assert_eq!(wide, plain);
+    }
+
+    /// 横排同样按每格施加下限：单字与三字候选占位相同，整行宽度不再随选词变化。
+    #[test]
+    fn min_width_applies_to_horizontal_cells() {
+        let one = measured(&win(false, 0, 8, &["字", "词"])).0;
+        let three = measured(&win(false, 0, 8, &["候选词", "输入法"])).0;
+        assert_eq!(one, three);
     }
 }
 

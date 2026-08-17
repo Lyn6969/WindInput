@@ -202,6 +202,11 @@ impl Coordinator {
         let _ = coordinator.ui_tx.send(UiCommand::SetPagerInPreedit(
             rt0.config.ui.candidate.pager_in_preedit,
         ));
+        // 候选窗尺寸下限（抗抖动）；热重载侧同样下发，见 Coordinator::apply_ui_config。
+        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateMinSize {
+            width_chars: rt0.config.ui.candidate.min_width_chars as u32,
+            rows: rt0.config.ui.candidate.effective_min_rows(),
+        });
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
