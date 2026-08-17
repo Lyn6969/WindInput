@@ -163,11 +163,11 @@ wind-quick-input（零 wind-* 依赖：解析 + 基础转换 + $ 模板引擎 + 
 cmdbar `quick` 函数族与表达式路径、启动预检、农历（§10）。出厂表全部是变量模板
 （表达式是给用户的，出厂不用），故零回归闸门覆盖的就是全部出厂行为。
 
-设置页已落地（P1）：core 侧 `quick.*` 八个 RPC + 视图口径 + 导入导出编解码见 §11.1，
-GUI 在 `wind-setting` 仓（词库页第二个全局域）。能调序、启停、单条/整表恢复、导入导出。
+设置页已落地（见 §11.1）：core 侧 `quick.*` 十二个 RPC + 视图口径 + 导入导出编解码，
+GUI 在 `wind-setting` 仓（词库页第二个全局域）。能调序、启停、单条/整表恢复、导入导出，
+以及新增/编辑/删除**自己的**格式条目（出厂条目的模板不可改，只能停用）。
 
-未做：用户自定义条目（§11.1 末，P2）；`s2t`/`pinyin` 依赖 cmdbar 补实现；
-24 节气（需第二套数据，与农历表同量级）。
+未做：`s2t`/`pinyin` 依赖 cmdbar 补实现；24 节气（需第二套数据，与农历表同量级）。
 
 ## 8. 零回归闸门
 
@@ -413,17 +413,29 @@ disabled = ["date.basic"]
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
-| `quick.list` | — | `[{kind,id,text,displayPos,moveIndex,enabled,adjusted,sample}]` |
+| `quick.list` | — | `[{kind,id,text,displayPos,moveIndex,enabled,adjusted,user,sample}]` |
 | `quick.move` | `kind,id,index` | `{ok}` |
 | `quick.setEnabled` | `kind,id,enabled` | `{ok}` |
 | `quick.resetEntry` | `kind,id` | `{ok}` |
 | `quick.resetKind` | `kind` | `{ok}` |
+| `quick.add` | `kind,text` | `{ok,id}` |
+| `quick.setText` | `kind,id,text` | `{ok}` |
+| `quick.delete` | `kind,id` | `{ok}` |
+| `quick.vars` | — | `[{kind,vars:[{name,desc}]}]` |
 | `quick.export` | — | `{content}` |
-| `quick.previewImport` | `content` | `{moved,disabled,ignoredFormats,skipped,kinds}` |
-| `quick.import` | `content,strategy?` | `{moved,disabled,ignoredFormats,skipped}` |
+| `quick.previewImport` | `content` | `{moved,disabled,formats,skipped,kinds}` |
+| `quick.import` | `content,strategy?` | `{moved,disabled,formats,skipped}` |
 
 `kind` 一律收字符串并在 `WebDataHost` 的实现里解析（未知类别报「未知的快捷输入类别: xxx」），
 这样 `wind-webdata` 不必为一个枚举去依赖 `wind-quick-input`。
+
+★ `user` 与 `adjusted` **不是一回事**，设置页按前者分流行级权限：出厂条目被调序过也是
+`adjusted`，但它只能停用、能「恢复默认」；用户条目反过来——能改模板、能真删，而它没有
+「默认」可回到。
+
+`setText` 而非 `update`：改的是**模板**，且只对用户条目有效（出厂条目返回错误，
+约束由 store 的数据结构兜住——模板只存在 `added` 里）。没有「改出厂条目模板」的 RPC，
+那条路径被刻意否决（见本节末）。
 
 写操作全部经 `Coordinator::edit_quick_format` 一个入口，**写库与回灌镜像合成一步**——
 分成两个方法迟早有人只调一半，而那个 bug 的症状是「设置页改了不生效、重启才生效」，
@@ -438,8 +450,12 @@ disabled = ["date.basic"]
 两边看着都对、只是不一样。
 
 日期样本用**今天**（用户脑子里知道今天几号，一眼能对上号），数字用 `1234.5`，算式用 `1+2*3`。
-`QuickSource::Date` 按输入形态分派到三个类别，故三段/两段/年月各跑一次。用**空调整**生成，
-否则停用条目取不到示例。
+`QuickSource::Date` 按输入形态分派到三个类别，故三段/两段/年月各跑一次。
+
+生成时的调整**只清 `moved`/`disabled`、保留 `added`**：清掉前两者是因为停用条目也要有示例
+（候选路径会把它们剔掉），保留 `added` 是因为用户条目**住在调整里**。P1 这里传的是空 map，
+那时是对的；加了自定义条目之后再传空，等于渲染一张没有用户条目的表——症状是自己加的那几行
+示例恒为空、其它行都好，看着像模板写错了。
 
 ⚠️ 「示例为空」**不等于**「这条永远不出」——只说明这组样本值渲染不出来（农历超出
 1900–2100、表达式写错都会这样）。
@@ -460,14 +476,25 @@ disabled = ["date.basic"]
   症状是「导入后顺序和导出前不一样」。与 shadow 的 pin 规则导入是同一个陷阱。
   注意单条移动时顺序反转**不可观测**，测试夹具必须造出两条互相竞争位置的规则。
 
-导入不静默丢东西：解析期跳过的条目连原因一起进 `skipped`，自定义条目（P1 无落点）计入
-`ignoredFormats` 如实上报。`strategy = "replace"` 先清空既有调整，缺省为合并。
+导入不静默丢东西：解析期与写入期跳过的条目连原因一起进 `skipped`（未知类别、模板非法、
+模板与已有条目逐字相同），实际写入的自定义条目数进 `formats`。
 
-### 待做：自定义条目（P2）
+⚠️ 该字段 P1 时叫 `ignoredFormats`（当时没有存储落点，如实报「已忽略 N 条」）。P2 起真的
+导入，故连**名字一起改**——留着旧名字会让设置页的摘要文案与实际行为对不上，而那种偏差
+没人会发现（两边看着都对）。
 
-存储落点是 `QuickFormatRecord` 加一个 `added` 字段（与 `moved`/`disabled` 同域同事务），
+`strategy = "replace"` 先清空既有数据，缺省为合并。★ replace 走的是
+`clear_quick_format_kind`（**含**自定义条目）而不是 `reset_quick_format_kind`：
+它的语义是「用文件里的状态覆盖现状」，留着旧条目会得到「文件里的 + 我原有的」。
+
+### 自定义条目（P2，已落地）
+
+存储落点是 `QuickFormatRecord` 的 `added` 字段（与 `moved`/`disabled` 同域同事务），
 **不改 `Coordinator::quick_formats`**（那是启动加载的不可变字段）——用户条目走
-`quick_adjust` 这条 RwLock 路径即可即时生效，也不需要文件监视器。
+`quick_adjust` 这条 RwLock 路径即时生效，也不需要文件监视器。
+
+RPC 新增四个：`quick.add`（返回分配到的 id）/ `quick.setText` / `quick.delete` /
+`quick.vars`（模板变量提示清单）。
 
 **已定：不做「编辑出厂条目的模板」**（含一切形式的 `overrides: (id, 新模板)`）。
 出厂条目只能停用与调序；想要别的写法就**停用出厂那条、自己加一条**，加出来的一律是独立
@@ -486,25 +513,75 @@ override 过它，就必须选一个——留用户的旧值（用户永远看�
 采用新值（丢用户改动）。两条路都得给 UI 加解释性提示。而「停用 + 新增」天然无此问题：
 出厂那条照常随版本更新、只是被停用着，用户随时开回来就能看到新版写法，自己那条独立存在。
 
-四个实现要点：
+#### 实现要点
 
-- **id 命名空间要有守门，不能靠约定**：用户条目取 `{kind}.u{n}`，同时让**出厂表加载期拒绝**
-  匹配 `{kind}.u\d+` 的 id（沿用既有「剔除 + warn」策略）。否则某天出厂表加一条 `date.u1`
-  就与用户条目静默撞车。
+- **id 命名空间由加载期守门，不靠约定**：用户条目取 `{kind}.u{n}`，而 `FormatTable::parse`
+  **拒绝**匹配 `{kind}.u\d+` 的出厂 id（沿用既有「剔除 + warn」策略）。否则某天出厂表加一条
+  `date.u1` 就与用户条目静默撞车，行为取决于遍历顺序。
+  序号取「已有最大 + 1」而非「条数 + 1」——删掉中间一条后条数会回退，新条目撞上仍然存在的
+  那个 id（`u1,u2,u3` 删 `u2` 后条数 2 ⇒ 又生成 `u3`）。
 - **删除语义按 `added` 分流**：出厂条目「停用」（真删要回写文件，§3 已排除），用户条目
-  **真删**。同一列两种操作，与 P1 里 `do_set_enabled` 按类别分流主键是同一模式。
-- **「恢复此条」对用户条目无意义**：它没有「默认」可回到。按行禁用该菜单项，而非让它变成
-  隐式的删除。⚠️ 「恢复全部默认」同理**不得删用户条目**——右键一下就永久丢掉手写模板，
-  不可逆且毫无预警。
+  **真删**并连带清掉它的 `moved`/`disabled`（留下孤儿规则本身无害，但重加同 id 条目时那条
+  旧规则会突然复活、把它挪到意外的位置）。
+- ⚠️ **两种「清理」必须分开**：`moved`/`disabled` 是对基表的**调整**（清掉即回到出厂，可逆），
+  `added` 是用户**自己的内容**（清掉就没了）。故 store 有两个方法：
+  `reset_quick_format_kind`（面向用户的「恢复默认」，**保留** `added`）与
+  `clear_quick_format_kind`（导入 replace 的语义，连 `added` 一起清）。
+  前者原先是 `t.remove(kind)`，`added` 落进同一条记录后那个写法会让右键点一下「恢复默认」
+  就永久丢掉手写模板。同理 `QuickFormatRecord::is_empty` 必须算上 `added`，否则
+  `modify_quick_format` 的「空记录即删键」收尾会让新加的条目当场消失。
+- **「恢复此条」对用户条目无意义**：它没有「默认」可回到，按行禁用该菜单项（`spec::row_ops`），
+  而不是让它变成隐式的删除。
 - ★★ **导入时 id 冲突必须连 `moved` 一起改写**：导出文件里 `[[formats]]` 带 `date.u1`、
   `[adjust.date]` 的 `moved` 也引用 `date.u1`。导入到一台已有 `date.u1`（内容不同）的机器
   上时要重新分配 id，若只改 `[[formats]]` 侧不改 `moved` 侧，规则就悄悄指向了本机原有那条。
-  症状与漏 `.rev()` 一样是「导入后顺序不对」，同属导入重放的引用完整性，测试夹具须造出
-  「两台机器各有一条同 id 不同内容的用户条目」。
+  症状与漏 `.rev()` 一样是「导入后顺序不对」，同属导入重放的引用完整性。已由
+  `quick_import_remaps_conflicting_id_and_its_move_rule` 钉住（反向对照确认：去掉改写后，
+  本机原有条目被挪到首位，导入的那条留在原位）。
+- **模板逐字相同则跳过并如实报数**，故重复导入同一份文件是幂等的。
 
-剩下的成本在三处会静默失败的地方：kind 的变量白名单（给 `year_month` 写 `$D` 会整条渲染
-为空）、校验错误要同步可解释（与文件加载「剔除+warn」的策略相反）、预览要如实呈现
-「条目消失」的规则。
+#### 两个「加了 added 之后才成立」的陷阱
+
+★ `entries_of_adjusted` 的两个入参**必须共用生命周期**：条目现在可能住在表里、也可能住在
+`adjust` 里。而 `entries_of_view` 需要「`moved`/`added` 照常、`disabled` 当空」的一趟计算，
+现造临时 `FormatAdjust` 就编译不过（局部变量里的 `added` 活不到返回值需要的 `'a`）。
+故内部拆出 `entries_with` 收三个切片，让调用方能对同一个 `adjust` 做**部分借用**。
+漏把 `added` 传进那一趟的后果是：被停用的用户条目在参照系里根本不存在，锚点算法找不到它、
+只能垫到末尾（`disabled_user_entry_keeps_its_moved_position` 守门）。
+
+★ **示例列的调整不能再传空 map**。P1 传空是对的（那时只有出厂条目），用户条目住在
+`adjust.added` 里之后，空 map 等于「渲染一张没有用户条目的表」——症状是自己加的那几行示例
+恒为空、其它行都好，看着像模板写错了。改为「只清 `moved`/`disabled`、保留 `added`」。
+
+#### 变量提示清单
+
+`FormatKind::var_hints()` 给出每类的 `(变量名, 说明含示例值)`，经 `quick.vars` 供设置页的
+模板输入框提示。**真相源必须在 core**：变量白名单是 `supports_var` 的知识，设置仓硬编码一份
+会在加新变量时静默过时（用户照提示写不出新变量，或提示里的变量已被删，两种都看不出是提示
+的错）。它与 `supports_var` 是两份数据（多了说明文字），故三道测试钉住：名字必须都能通过
+`supports_var`、每类条数写死（加变量时会红，提醒同步文档站变量表）、`year_month` 的提示里
+不得出现农历变量。
+
+设置页把它按类别分节一次列全，**变量集相同的类别合并成一节**（`date` 与 `month_day` 完全
+相同，不合并要把同样的 17 行出两遍）。一次列全而不是只列当前选中的那类，另一个好处是用户
+能直接看到「年月那类没有农历变量」这种最容易写错的地方。
+
+#### 设置页的两处 windui 陷阱（均由 `io_dialogs_build_and_layout` 抓住）
+
+- **类别选项不能在构建期算好**：对话框只构建一次，而那一刻列表数据还没加载，选项会被永久
+  冻结成空的。`Element::segmented` 的 `debug_assert!(!opts.is_empty())` 当场炸；换成容忍空
+  列表的控件则会潜伏到真机，症状是「类别下拉里什么都没有」。改用 `dropdown_signal` 绑信号，
+  在开对话框时填充。
+- **`label` 上不能用 `.wrap()`**（text_input 专用，会 panic），限行用 `max_lines`。
+
+#### 行级权限：`spec::row_ops`
+
+快捷输入是词库页第一个「同一类别里两种行有不同权限」的域。`CategorySpec::ops` 是**类别级**
+声明（这一类有没有这个功能），到了行级还要再过一道 `row_ops`——否则出厂条目上会亮着「删除」，
+点下去收一句 core 的报错，而用户完全不明白为什么。菜单与操作列共读它，判据只此一处。
+
+`save_calls` 对本类别在**解析权重之前**分流：快捷输入没有权重维度，`edit_weight` 从来不被
+设置，让它先跑那个 parse 会得到「权重需为整数」——一个与用户所做之事毫无关系的报错。
 
 ## 12. 生效时机
 
