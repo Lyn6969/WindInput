@@ -499,7 +499,20 @@ pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     //
     // **零回归**：非双拼 / 开关关闭时全域 `is_fullpinyin_fallback == false`，首键恒相等，
     // 比较直接落到原来的三键，与改动前逐字节等价。
-    let fp_demoted = |c: &Candidate| c.is_fullpinyin_fallback && (c.is_prefix || c.is_partial);
+    // ⚠️ 判据用 `eff_prefix` 而非裸 `is_prefix` —— 与下一行**同口径**。
+    //
+    // 本键问的是「这条是不是低置信的预测」，而 `is_promoted_completion` 的定义正是
+    // 「引擎已判定它置信度足够高、主动提升进完整匹配层」（残码上浮 / 用户长词上浮，各自
+    // 还带着 `COMPLETION_FAR_WEIGHT_FLOOR` 或 `max_extra_syllables` 的门槛）。两者在回答
+    // 同一个问题，用结构真值回答就等于把上面刚建立的语义在这里丢掉。
+    //
+    // 真机现场：双拼开「允许全拼输入」后，用全拼打用户词库里的长词
+    // （`qingfengshurufa` → 11 音节的「清风输入法内测问题反馈」）**完全打不出来**。
+    // 双拼主路径把这串当双拼码切、根本命中不到该词，降级支路是它唯一的产出通道；
+    // 而它在那里带 `is_prefix=true` ⇒ 被本键首位沉底 ⇒ 落在 595/604 位，协调器传的
+    // limit 恒为 300 ⇒ 被 `truncate` 丢弃。给它补上上浮判据也无用：`is_promoted_completion`
+    // 在这一行根本不被看，位次只从 603 挪到 595，出不了沉底组。
+    let fp_demoted = |c: &Candidate| c.is_fullpinyin_fallback && (eff_prefix(c) || c.is_partial);
     fp_demoted(a)
         .cmp(&fp_demoted(b))
         .then(a.is_abbrev.cmp(&b.is_abbrev))

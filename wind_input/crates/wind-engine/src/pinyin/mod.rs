@@ -1096,6 +1096,8 @@ impl PinyinEngine {
         let completed_bytes: usize = syllables.iter().map(String::len).sum();
         let trailing_partial = completed_bytes < stroke.len();
         let started = syllables.len() as u32 + u32::from(trailing_partial);
+        // ④ 产出的用户/临时词前缀补全（见那里的注释），末尾据此分流上浮判据。
+        let mut user_prefix_texts: Vec<String> = Vec::new();
         // 同文去重的规则**不是**「无条件保留先到者」，而是「保留解释得更多的那条」。
         //
         // ★ 真机现场（`zaijian` → 「再见」）：双拼流的简拼前缀回退（step 6.2）先用前 4 键
@@ -1233,6 +1235,13 @@ impl PinyinEngine {
                 );
             }
             for c in store_dm.search_prefix(stroke, MAX_FULL_PINYIN_RECALL) {
+                // 记下文本，供末尾施加**用户词专属**的上浮判据。
+                //
+                // 为什么用文本名单而不是索引区间：`push` 带同文去重，本批词若与 ③ 的系统
+                // 词库补全同文，会被合并到 ③ 已占的位置上（在 `user_start` 之前），按区间
+                // 切会漏掉那些。名单通常只有个位数条（用户词本就不多），`contains` 的开销
+                // 可以忽略。
+                user_prefix_texts.push(c.text.clone());
                 push(
                     cands,
                     c.text,
@@ -1338,13 +1347,23 @@ impl PinyinEngine {
         // 漏设的后果：4 音节的「北京大学」与 3 音节的「北京的」在 `beijingd` 下同档竞争
         // （两者 extra 都是 0），协调器的 `cmp_completion_extra` 形同虚设。
         //
-        // ⚠️ **这里不要顺手加上浮判据**。`cands[start..]` 混着 ③ 的系统词库补全与 ④ 的
-        // 用户/临时词，两者的上浮判据不是一套：系统词走
+        // ⚠️ **上浮判据必须按来源分流，不能对整批统一施加**。`cands[start..]` 混着 ③ 的
+        // 系统词库补全与 ④ 的用户/临时词，两者判据不是一套：系统词走
         // `COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES` + `COMPLETION_FAR_WEIGHT_FLOOR`，
-        // 用户词走 `should_promote_user_completion`。在这里统一施加任何一套都会误伤另一批
-        // ——本仓已有一次两套判据因数值巧合被混用、连带打断 `qingfengshu`→「清风输入法」
-        // 的前科。④ 的用户词在本支路确实还缺上浮（既有缺口，非本次引入），要补须先在
-        // push 时把来源分开标记。
+        // 用户词走 `should_promote_user_completion`。统一施加任何一套都会误伤另一批 ——
+        // 本仓已有一次两套判据因数值巧合被混用、连带打断 `qingfengshu`→「清风输入法」
+        // 的前科。故这里只对 `user_prefix_texts` 点名的那批施加用户词判据。
+        //
+        // ## 用户词不上浮的后果：在本支路是「完全打不出」
+        //
+        // 双拼方案下主路径把 `qingfengshurufa` 当**双拼码**解释（每 2 键一音节，切出来是
+        // 另一串音节），根本命中不到这条用户词 —— **本支路是它唯一的产出通道**，主路径
+        // step 6 那道 `should_promote_user_completion` 在此场景下从未被执行到。
+        //
+        // 实测 11 音节用户词、`max_extra=10`、打 `qingfengshurufa`（距词尾 6）：
+        // 不上浮时它落在 **603/604 位**，而协调器传的 limit 恒为 300 ⇒ 被 `truncate` 丢弃
+        // ⇒ 用户看到的是「这个词根本打不出来」。纯拼音方案同输入是位次 1。
+        // 与 `should_promote_user_completion` 文档里那次报障是同一病灶的另一条通道。
         for c in &mut cands[start..] {
             if !c.is_prefix {
                 continue;
@@ -1355,6 +1374,17 @@ impl PinyinEngine {
             }
             c.completion_extra_syllables =
                 word_syls.saturating_sub(started).min(u8::MAX as u32) as u8;
+            if !c.is_promoted_completion
+                && user_prefix_texts.contains(&c.text)
+                && should_promote_user_completion(
+                    syllables.len(),
+                    trailing_partial,
+                    c.boundary,
+                    self.config.completion_max_extra_syllables,
+                )
+            {
+                c.is_promoted_completion = true;
+            }
         }
     }
 

@@ -25,8 +25,10 @@
 //! 走双拼域 —— 两处的算法看着像，混用会静默错配。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use wind_config::Config;
 use wind_engine::EngineManager;
+use wind_store::Store;
 
 fn data_dir() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
@@ -44,6 +46,92 @@ fn manager(dir: &std::path::Path, min_syl: u32, max_extra: u32) -> EngineManager
     cfg.schema.pinyin.completion.min_syllables = min_syl;
     cfg.schema.pinyin.completion.max_extra_syllables = max_extra;
     EngineManager::new(&cfg, Some(dir))
+}
+
+/// 同 [`manager`]，但带一条 11 音节的用户词（报障用户的真实词条）。
+fn manager_with_user_word(dir: &std::path::Path, tag: &str, max_extra: u32) -> EngineManager {
+    const SYLS: &[&str] = &[
+        "qing", "feng", "shu", "ru", "fa", "nei", "ce", "wen", "ti", "fan", "kui",
+    ];
+    let root = std::env::temp_dir().join(format!("wind_fpfb_uw_{tag}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::create_dir_all(&root);
+    let store = Arc::new(Store::open(root.join("user_data.db")).expect("打开 store"));
+    let mut code = String::new();
+    let mut boundary: u64 = 0;
+    for s in SYLS {
+        boundary |= 1u64 << code.len();
+        code.push_str(s);
+    }
+    store
+        .add_user_word("pinyin", &code, USER_WORD, 1000, boundary)
+        .expect("写入用户词");
+
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["shuangpin".to_string()];
+    cfg.schema.active = "shuangpin".to_string();
+    cfg.schema.pinyin.shuangpin.allow_full_pinyin = true;
+    cfg.schema.pinyin.completion.min_syllables = 4;
+    cfg.schema.pinyin.completion.max_extra_syllables = max_extra;
+    EngineManager::with_store_override(&cfg, Some(dir), Some(store), Some(root.join("ov")))
+}
+
+const USER_WORD: &str = "清风输入法内测问题反馈";
+
+/// 协调器实际传给引擎的候选上限（`initial_candidate_limit`，拼音恒 300）。
+/// 回归必须按这个值断言 —— 超出它的候选会被 `truncate` 丢弃，用户永远看不到。
+const COORD_LIMIT: usize = 300;
+
+/// 双拼下用**全拼**打用户词库长词，必须打得出来。
+///
+/// ## 这条路径为什么是唯一通道
+///
+/// 双拼主路径把 `qingfengshurufa` 当**双拼码**解释（每 2 键一音节，切出来是另一串音节），
+/// 根本命中不到这条用户词 —— 降级支路是它唯一的产出通道，主路径 step 6 的
+/// `should_promote_user_completion` 在此场景下从未被执行到。
+///
+/// ## 两处修复缺一不可
+///
+/// 1. 降级支路 ④ 的用户词补上上浮判据（`is_promoted_completion`）；
+/// 2. `cmp_match_layers` 的 `fp_demoted` 改用 `eff_prefix` 口径 —— 只做 1. 时该词位次
+///    从 603 只挪到 595，仍在 300 之外：`fp_demoted` 是**首键**且当时只看 `is_prefix`
+///    结构真值，提升过的候选照样被首位沉底，出不了沉底组。
+#[test]
+fn user_long_word_reachable_via_full_pinyin_fallback() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    let mgr = manager_with_user_word(&dir, "reachable", 10);
+
+    // started 5、词 11 音节 ⇒ 距词尾 6 ≤ max_extra 10。
+    let r = mgr.convert_with("shuangpin", "qingfengshurufa", COORD_LIMIT);
+    let pos = r.candidates.iter().position(|c| c.text == USER_WORD);
+    assert!(
+        pos.is_some(),
+        "双拼+全拼降级下该用户词须在协调器实际上限({COORD_LIMIT})内可见\
+         （修复前落在 595/604 位、被 truncate 丢弃 ⇒ 用户完全打不出来）；实际候选 {} 条",
+        r.candidates.len()
+    );
+}
+
+/// 反向对照：`max_extra` 收紧到装不下时，该词**允许**沉回去。
+///
+/// 缺了这条，「把 fp_demoted 整个删掉」这种过度修复也能让上面那条通过 —— 而那会把
+/// 降级支路的低置信补全全部放出来挤占版面，正是 `fp_demoted` 当初要挡的。
+#[test]
+fn user_long_word_still_sinks_when_max_extra_too_small() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    let mgr = manager_with_user_word(&dir, "sink", 2);
+
+    let r = mgr.convert_with("shuangpin", "qingfengshurufa", COORD_LIMIT);
+    assert!(
+        !r.candidates.iter().any(|c| c.text == USER_WORD),
+        "max_extra=2 时距词尾 6 超限，不该上浮、也就不该出现在前 {COORD_LIMIT} 名"
+    );
 }
 
 /// `beijingd` = bei jing + 残码 d ⇒ started 3。出厂 `min_syllables = 4` 未达门槛，
