@@ -474,6 +474,24 @@ impl crate::coordinator::Coordinator {
         Some(match name {
             "char" => text.to_string(),
             "code" => self.engine_mgr.codetable_reverse_hint(text),
+            // `code_all` —— 该字在码表里的**全部**码位，默认 `/` 连接（`我` → `q/trn/trnt`）。
+            //
+            // 与 `code` 的分工照搬同文件 `chaizi` / `chaizi_all` 的既有惯例：不带后缀取单个，
+            // `_all` 取全部、且可用 `${code_all:分隔符}` 换连接符。
+            //
+            // ★ 反查默认用它而不是 `code`：`codetable_reverse_hint` 取的是 `codes.last()`，
+            // 而 `codes_of` 按**码长升序**，故它给的恒是最长的全码。那对候选注释是对的
+            // （注释是候选右侧的窄条，塞下三个码会把候选行撑爆），但对「这个字怎么打」
+            // 恰恰是最没用的答案 —— 简码才是用户要的。
+            "code_all" => {
+                let sid = self.engine_mgr.code_source_schema();
+                let codes = self.engine_mgr.word_codes_in(&sid, text);
+                match arg {
+                    // `word_codes_in` 固定用 `/` 连接，换分隔符只能在这里替。
+                    Some(sep) if !codes.is_empty() => codes.replace('/', sep),
+                    _ => codes,
+                }
+            }
             "pinyin" => {
                 // 与 `pinyin_text` 的路径 B 同构：先让引擎按词推断音节（多音字消歧），
                 // 推断不出再退回逐字最常用读音。这里没有路径 A —— 裸文本没有词条 code。

@@ -541,6 +541,9 @@ impl Coordinator {
             }
             match wind_phrase::expand_dict_value(&cand.text, input, now, &recent, &host) {
                 wind_phrase::DictExpansion::None => expanded.push(cand),
+                // 是特殊语法但这次求值为空（如剪贴板空 / 反查查不到）→ 整条不出。
+                // **不能**退回原候选：那会把 `{dict.rev(clip())}` 这串源码当文本显示并上屏。
+                wind_phrase::DictExpansion::Drop => {}
                 wind_phrase::DictExpansion::Single {
                     display,
                     command_src,

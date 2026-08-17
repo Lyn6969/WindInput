@@ -32,9 +32,11 @@ fn factory_cofc_parses_and_renders_clipboard_lookup() {
     // 只认第 1 个字，模拟真实反查（第 2 个字不该被这条词条查到）。
     let reverse = |text: &str, fmt: &str| {
         assert_eq!(text, "好", "出厂词条应只查剪贴板第 1 个字");
+        // ★ 必须是 `code_all`（全部码位）而不是 `code`（仅最长的全码）——反查回答的是
+        // 「这个字怎么打」，简码才是最有用的答案。写死这个断言是为了让人改回 `code` 时变红。
         assert!(
-            fmt.contains("${code}") && fmt.contains("${pinyin}"),
-            "默认版式应含编码与拼音，实际收到 {fmt:?}"
+            fmt.contains("${code_all}") && fmt.contains("${pinyin}"),
+            "默认版式应含全部码位与拼音，实际收到 {fmt:?}"
         );
         "好: vbg hǎo".to_string()
     };

@@ -12,7 +12,7 @@ pub fn specs() -> Vec<FuncSpec> {
     func_specs! {
         "dict.add"        : Dict    (1, 2) effect => fn_dict_add,    "把文本加入用户词库; code 可选, 不传时按当前方案规则推导", "dict.add(clip())";
         "dict.rev"        : Dict    (1, 2) pure   => fn_dict_rev,    "反查文本中某个字的编码与读音; n 为第几个字 (1 起, 默认 1), 超出字数返回空串", "dict.rev(clip())"
-            named(fn_dict_rev_named, "format" = "版式模板, 同候选注释段语法; 变量 ${char}/${code}/${pinyin}/${chaizi}/${chaizi_code}/${dict}; 省略='${char}: ${code} ${pinyin}'");
+            named(fn_dict_rev_named, "format" = "版式模板, 同候选注释段语法; 变量 ${char}/${code_all}(全部码位)/${code}(仅全码)/${pinyin}/${chaizi}/${chaizi_code}/${dict}; 省略='${char}: ${code_all} ${pinyin}'");
         "ime.toggle"      : Ime     (1, 1) effect => fn_ime_toggle,  "切换 IME 状态 (cn-en / fullshape / layout / candwin / s2t / preedit / toolbar)", "ime.toggle(\"cn-en\")";
         "ime.schema"      : Ime     (1, 1) effect => fn_ime_schema,  "切换输入方案并持久化", "ime.schema(\"pinyin\")";
         "ime.theme"       : Ime     (1, 1) effect => fn_ime_theme,   "切换主题并持久化 (= config.set ui.theme.name)", "ime.theme(\"msime\")";
@@ -40,10 +40,13 @@ fn fn_dict_add(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     Ok(String::new())
 }
 
-/// `dict.rev` 省略 `format` 时的默认版式 → `好: vbg hǎo`。
+/// `dict.rev` 省略 `format` 时的默认版式 → `我: q/trn/trnt wǒ`。
 ///
 /// 变量名与候选注释段的模板变量**同名同义**（见 `Coordinator::eval_var`）：用户学一次。
-const DEFAULT_REV_FORMAT: &str = "${char}: ${code} ${pinyin}";
+///
+/// 用 `code_all` 而不是 `code`：后者只给最长的那个全码（`我` → `trnt`），而反查回答的是
+/// 「这个字怎么打」—— 简码 `q` 才是最有用的答案。见 `Coordinator::eval_text_var`。
+const DEFAULT_REV_FORMAT: &str = "${char}: ${code_all} ${pinyin}";
 
 fn fn_dict_rev(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     fn_dict_rev_named(ctx, args, &[])

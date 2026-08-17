@@ -485,6 +485,15 @@ impl PhraseLayer {
 pub enum DictExpansion {
     /// 非特殊语法：候选保持原样。
     None,
+    /// **是**特殊语法，但求值结果为空 —— 该候选整条丢弃。
+    ///
+    /// 与 [`Self::None`] 的区别是这条**必须**存在的理由：`None` 的语义是「这不是特殊语法，
+    /// 把原文当文本用」。求值成空时若返回 `None`，候选会显示成模板**源码字面**
+    /// （`{dict.rev(clip())}`）并原样上屏 —— 用户看到的是「配了没生效」，而真相是
+    /// 「语法没问题，只是这次查不到」。两者的正确呈现完全相反，故不能共用一个变体。
+    ///
+    /// 对齐短语层 `lookup_at` 对同一情形的处置（那边直接不 push）。
+    Drop,
     /// 单候选替换：`display` 替换候选文本；`command_src = Some` 表示 `$CC` 命令
     /// （选中 / 顶屏时执行动作，display 仅作展示）。
     Single {
@@ -526,11 +535,11 @@ pub fn expand_dict_value(
         };
         match evaluate_phrase(text, &ctx, default_registry()) {
             // 纯 literal/template（如 {date()}）：display 即上屏文本。
-            // 空展开 → None（不产候选），与 `lookup_at` 同处置。
+            // 空展开 → Drop（整条丢弃），**不是** None —— 见 `DictExpansion::Drop`。
             Ok(PhraseEval::Single { display, actions })
                 if actions.is_empty() && display.is_empty() =>
             {
-                DictExpansion::None
+                DictExpansion::Drop
             }
             Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
                 DictExpansion::Single {
@@ -555,7 +564,9 @@ pub fn expand_dict_value(
                     .map(|el| (el.display, None))
                     .collect();
                 if items.is_empty() {
-                    DictExpansion::None
+                    // 同上：`$SS(...)` 是货真价实的特殊语法，一个成员都没剩时该整条丢弃，
+                    // 而不是把 `$SS("反查", "{dict.rev(clip(),1)}", …)` 这串源码当文本上屏。
+                    DictExpansion::Drop
                 } else {
                     DictExpansion::Group { name, items }
                 }
@@ -1063,6 +1074,43 @@ mod tests {
         assert_eq!(
             cmd[0].command_src.as_deref(),
             Some(r#"$CC("切简繁", ime.toggle("s2t"))"#)
+        );
+    }
+
+    /// ★ **用户词库**里写 `{dict.rev(clip())}` 的完整两种结局。
+    ///
+    /// 这条路径与短语层是两套代码（`expand_dict_value` vs `lookup_at`），
+    /// 短语层测绿**证明不了**词库路径也对 —— 用户正是把词条加在词库里的。
+    #[test]
+    fn dict_value_clipboard_reverse_both_outcomes() {
+        let clip = |_n: i64| "好".to_string();
+
+        // 查得到 → 展开为反查结果，无 command_src（选中即上屏该文本）。
+        let ok = |_t: &str, _f: &str| "好: vbg hǎo".to_string();
+        let host = PhraseHost {
+            clip: &clip,
+            reverse: &ok,
+        };
+        assert_eq!(
+            expand_dict_value("{dict.rev(clip())}", "fc", fixed(), &[], &host),
+            DictExpansion::Single {
+                display: "好: vbg hǎo".into(),
+                command_src: None,
+            }
+        );
+
+        // 查不到 → **绝不能**退回 `None`：词库路径的 `None` 语义是「这不是特殊语法，
+        // 保留原文」，于是候选会显示成源码字面 `{dict.rev(clip())}` 并原样上屏，
+        // 看起来就像「配了没生效」。必须是 Drop（该候选整条不出现）。
+        let miss = |_t: &str, _f: &str| String::new();
+        let host = PhraseHost {
+            clip: &clip,
+            reverse: &miss,
+        };
+        assert_eq!(
+            expand_dict_value("{dict.rev(clip())}", "fc", fixed(), &[], &host),
+            DictExpansion::Drop,
+            "查不到时必须丢弃候选，而不是把模板源码当文本留下"
         );
     }
 
