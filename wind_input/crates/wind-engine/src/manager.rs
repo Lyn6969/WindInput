@@ -2751,6 +2751,10 @@ impl EngineManager {
                 // ⚠️ 判据是「是不是混输辅助」本身，不是 `abbrev` 的取值——两个开关恰好都
                 // 「混输时关掉」，但语义正交，串用会在其中一个被单独调整时静默错配。
                 enable_partial_final: mix_pinyin.is_none(),
+                // ⚠️ 补全这两项**不按 `mix_pinyin` 分流**，与上面三项刻意不同：它们约束的是
+                // 「引擎敢预测多少你没打的音节」，这个偏好与「当前是不是混输」无关，是用户
+                // 对候选面的统一取舍。分流会让同一个设置在两种方案下表现不一致。
+                // 守门测试：`mixed_completion_config`。
                 completion_min_syllables: pg.completion.min_syllables,
                 completion_max_extra_syllables: pg.completion.max_extra_syllables,
                 // 全拼降级输入（双拼下多人共用）。**混输强制关闭**，理由同上面的
