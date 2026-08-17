@@ -417,6 +417,84 @@ impl crate::coordinator::Coordinator {
         })
     }
 
+    /// **任意文本**的反查渲染 —— cmdbar `dict.rev(text, n, format=…)` 的宿主侧实现。
+    ///
+    /// 与 [`Self::comment_for`] 共用模板渲染器与**变量词汇表**：用户在候选注释里学会的
+    /// `${code}` / `${pinyin}` / `${chaizi}` 在这里同名同义，学一次。两处的变量求值
+    /// （[`Self::eval_var`] / [`Self::eval_text_var`]）刻意挨着放 —— 它们是同一套词汇的
+    /// 两个入口，分开写必然漂移。
+    ///
+    /// 与注释段的差别只在**取值对象**：那边是「当前候选」（带 source / code / boundary
+    /// 等身份），这边是「一段裸文本」（剪贴板来的，没有候选身份）。故候选专属的
+    /// `${code_hint}` 在这里不存在，写了会被渲染层原样回显让人看见。
+    ///
+    /// `max_chars` 传 0（不截断）：这里的产物**就是上屏文本**，不是显示投影。
+    /// 候选窗的显示截断另有 `ui.candidate.max_chars` 在下游负责，两者不是一回事。
+    ///
+    /// ⚠️ **调用方不得已持有 `self.reverse` 的读锁**：本方法自取一次读锁，而 std 的
+    /// `RwLock` 在有写者排队时同线程重入读会死锁（读锁不可重入）。当前唯一长期持有该
+    /// 读锁的是 `notify_ui_update` 的候选渲染循环，它不经过短语求值，故无嵌套；
+    /// 新增持锁路径时须回到这里核对。
+    pub(crate) fn reverse_render(&self, text: &str, tpl: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+        // ★ `${char}` 恒有值（它只是把待查文本原样回显），故不能让它算进「查到了」。
+        // 否则 `render` 的「变量全空则整体消失」就永远不会触发：剪贴板里是个查不到的
+        // 字符（英文、标点、生僻字）时，`${char}: ${code} ${pinyin}` 会渲染成孤零零的
+        // `A:` 并当作一条正常候选出现 —— 而正确行为是这条候选压根不该存在。
+        let found = std::cell::Cell::new(false);
+        let out = render(tpl, 0, |name, arg| {
+            let v = self.eval_text_var(name, arg, text, &reverse);
+            if name != "char" && v.as_deref().is_some_and(|s| !s.is_empty()) {
+                found.set(true);
+            }
+            v
+        });
+        if found.get() { out } else { String::new() }
+    }
+
+    /// 纯文本（无候选身份）的模板变量求值。`None` = 未知变量名。
+    ///
+    /// 变量语义与 [`Self::eval_var`] 逐项对齐，仅两点差异：
+    /// - `char` —— 本入口独有：注释段不需要它（候选文本已在注释左边），而反查产物要自带被查的字；
+    /// - `code` —— 恒取主码表反查，**不带**注释段那道 `pinyin_hint && source==Pinyin` 门控。
+    ///   那道门控的理由是「码表方案下候选的码就是用户自己打的，反查是冗余」，而剪贴板文本
+    ///   不是用户打出来的，反查正是这里的全部目的。
+    fn eval_text_var(
+        &self,
+        name: &str,
+        arg: Option<&str>,
+        text: &str,
+        reverse: &wind_reverse::ReverseLookup,
+    ) -> Option<String> {
+        // 判据是 `chars().count()` 而非 `len()`：扩展区汉字走代理对，按字节数会被当成词组。
+        let single = text.chars().count() == 1;
+        Some(match name {
+            "char" => text.to_string(),
+            "code" => self.engine_mgr.codetable_reverse_hint(text),
+            "pinyin" => {
+                // 与 `pinyin_text` 的路径 B 同构：先让引擎按词推断音节（多音字消歧），
+                // 推断不出再退回逐字最常用读音。这里没有路径 A —— 裸文本没有词条 code。
+                let inferred = self.engine_mgr.word_pinyin_syllables(text);
+                if inferred.is_empty() {
+                    reverse.toned_pinyin_of(text, None, SYLLABLE_SEP)
+                } else {
+                    let syls: Vec<&str> = inferred.split(' ').filter(|s| !s.is_empty()).collect();
+                    reverse.toned_pinyin_of(text, Some(&syls), SYLLABLE_SEP)
+                }
+            }
+            "chaizi" if single => reverse.radicals_of(text, ""),
+            "chaizi" => String::new(),
+            "chaizi_code" if single => reverse.chaizi_code_of(text),
+            "chaizi_code" => String::new(),
+            "chaizi_all" => reverse.radicals_of(text, arg.unwrap_or(" ")),
+            "dict" => reverse.comment_of(text, None),
+            _ => return None,
+        })
+    }
+
     /// 变量求值。`None` = 未知变量名（渲染层据此原样回显 `${name}` 让用户看见拼写错误）。
     ///
     /// 可用变量：

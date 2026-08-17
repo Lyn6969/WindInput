@@ -528,13 +528,18 @@ impl Coordinator {
         // 卡按键线程（阻塞版 clipboard_get_text 打不开时会 sleep 重试至 40ms）。真正执行
         // 动作时另有 CmdbarCtx 用非缓存版取值。
         let clip = |_n: i64| -> String { self.host_services().clipboard_get_text_cached() };
+        let reverse = |text: &str, fmt: &str| -> String { self.reverse_render(text, fmt) };
+        let host = wind_phrase::PhraseHost {
+            clip: &clip,
+            reverse: &reverse,
+        };
         let mut expanded: Vec<Candidate> = Vec::with_capacity(raw.len());
         for cand in raw.into_iter() {
             if cand.is_phrase || cand.is_command {
                 expanded.push(cand);
                 continue;
             }
-            match wind_phrase::expand_dict_value(&cand.text, input, now, &recent, &clip) {
+            match wind_phrase::expand_dict_value(&cand.text, input, now, &recent, &host) {
                 wind_phrase::DictExpansion::None => expanded.push(cand),
                 wind_phrase::DictExpansion::Single {
                     display,
@@ -670,7 +675,17 @@ impl Coordinator {
                     String::new()
                 }
             };
-            for hit in phrases.lookup(&state.input_buffer, &recent, &clip) {
+            // 反查渲染（`dict.rev`）：走词库与反查表，无平台调用，三平台一致。
+            //
+            // ⚠️ 它与上面的 `clip` 不同——`clip` 在非 Windows 恒空是**既定行为**，
+            // 而反查没有那个约束。但二者串起来的后果要清楚：`{dict.rev(clip())}`
+            // 在 macOS 上因 `clip` 恒空而查无可查，整条候选不出现。
+            let reverse = |text: &str, fmt: &str| -> String { self.reverse_render(text, fmt) };
+            let host = wind_phrase::PhraseHost {
+                clip: &clip,
+                reverse: &reverse,
+            };
+            for hit in phrases.lookup(&state.input_buffer, &recent, &host) {
                 let is_command = hit.command_src.is_some();
                 let is_system = hit.is_system;
                 // 稳定 id 取**模板原文**：text 可能是求值结果（date/time/clip），逐日变化。

@@ -76,6 +76,7 @@ impl Coordinator {
             front_sel,
             services,
             host: self.host_services().clone(),
+            coord: self,
         };
         let reg = wind_cmdbar::default_registry();
         let actions = match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
@@ -152,8 +153,14 @@ impl Coordinator {
     /// 顶码等同步场景：求值命令源，动作链**全为 Text**（无副作用）时返回拼接文本 `Some(text)`；
     /// 含任一 Effect（shell/key/clip 等需异步回调 coordinator 锁）返回 `None`，交异步 spawn 执行。
     ///
-    /// **不跑任何 Effect**——纯文本求值只碰 `CmdbarCtx` 读快照（input/last/clip/now/env），无锁、
-    /// 无副作用，可在持 state 锁的按键线程内安全调用。`$SS` 组 / 求值失败 / services 未装配亦返回 None。
+    /// **不跑任何 Effect**——纯文本求值只碰 `CmdbarCtx` 读快照（input/last/clip/now/env）与
+    /// 反查表读锁，无副作用，可在持 state 锁的按键线程内安全调用。
+    /// `$SS` 组 / 求值失败 / services 未装配亦返回 None。
+    ///
+    /// ⚠️ 「无锁」已不再成立：`dict.rev` 经 `reverse_render` 取 `self.reverse` 的**读**锁。
+    /// 这与候选构建路径（`build_candidates` 在同一按键线程、同样持 state 锁时取该读锁）
+    /// 是同一个加锁顺序，故不引入新的死锁面；但新增会取其它锁的 `EvalContext` 方法时
+    /// 必须回到这里重新核对顺序。
     pub(crate) fn eval_command_text_only(&self, src: &str, input: &str) -> Option<String> {
         let services = self.cmdbar_services.get()?;
         let (front_app, front_title, front_sel) = self.front_ctx_snapshot();
@@ -166,6 +173,7 @@ impl Coordinator {
             front_sel,
             services,
             host: self.host_services().clone(),
+            coord: self,
         };
         let reg = wind_cmdbar::default_registry();
         let actions = match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
@@ -203,6 +211,9 @@ struct CmdbarCtx<'a> {
     services: &'a Services,
     /// 宿主服务（clip() 取剪贴板）；随构造从协调器 clone 注入。
     host: Arc<dyn crate::host_services::HostServices>,
+    /// 协调器自身（`dict.rev` 的反查渲染需要引擎与反查表）。两个构造点都在
+    /// `impl Coordinator` 里，直接借 `&self` 即可，无需 Weak 升级。
+    coord: &'a Coordinator,
 }
 
 impl EvalContext for CmdbarCtx<'_> {
@@ -220,6 +231,9 @@ impl EvalContext for CmdbarCtx<'_> {
         // 让 clip() 取值与 clip.copy 写入对称——此前 macOS 硬编码返回空是 bug。
         // 读取失败（含不支持平台）降级空串：clip() 是求值上下文，报错没有落点。
         self.host.clipboard_get_text().unwrap_or_default()
+    }
+    fn reverse_lookup(&self, text: &str, format: &str) -> String {
+        self.coord.reverse_render(text, format)
     }
     fn sel(&self) -> String {
         self.front_sel.clone()

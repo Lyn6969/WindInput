@@ -3,7 +3,7 @@
 //! [`ConfigService`](crate::services::ConfigService) 取真实后端。
 
 use super::func_specs;
-use super::util::{runtime_err, services};
+use super::util::{parse_arg_int, runtime_err, services};
 use crate::context::EvalContext;
 use crate::error::{CmdbarError, Result};
 use crate::registry::FuncSpec;
@@ -11,6 +11,8 @@ use crate::registry::FuncSpec;
 pub fn specs() -> Vec<FuncSpec> {
     func_specs! {
         "dict.add"        : Dict    (1, 2) effect => fn_dict_add,    "把文本加入用户词库; code 可选, 不传时按当前方案规则推导", "dict.add(clip())";
+        "dict.rev"        : Dict    (1, 2) pure   => fn_dict_rev,    "反查文本中某个字的编码与读音; n 为第几个字 (1 起, 默认 1), 超出字数返回空串", "dict.rev(clip())"
+            named(fn_dict_rev_named, "format" = "版式模板, 同候选注释段语法; 变量 ${char}/${code}/${pinyin}/${chaizi}/${chaizi_code}/${dict}; 省略='${char}: ${code} ${pinyin}'");
         "ime.toggle"      : Ime     (1, 1) effect => fn_ime_toggle,  "切换 IME 状态 (cn-en / fullshape / layout / candwin / s2t / preedit / toolbar)", "ime.toggle(\"cn-en\")";
         "ime.schema"      : Ime     (1, 1) effect => fn_ime_schema,  "切换输入方案并持久化", "ime.schema(\"pinyin\")";
         "ime.theme"       : Ime     (1, 1) effect => fn_ime_theme,   "切换主题并持久化 (= config.set ui.theme.name)", "ime.theme(\"msime\")";
@@ -36,6 +38,55 @@ fn fn_dict_add(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     dict.add_word(&args[0], code)
         .map_err(|e| runtime_err("dict.add", e))?;
     Ok(String::new())
+}
+
+/// `dict.rev` 省略 `format` 时的默认版式 → `好: vbg hǎo`。
+///
+/// 变量名与候选注释段的模板变量**同名同义**（见 `Coordinator::eval_var`）：用户学一次。
+const DEFAULT_REV_FORMAT: &str = "${char}: ${code} ${pinyin}";
+
+fn fn_dict_rev(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    fn_dict_rev_named(ctx, args, &[])
+}
+
+/// `dict.rev(text, n, format="…")`：取 `text` 的第 n 个字（1 起，默认 1）交宿主反查。
+///
+/// 本层**只负责挑字与填默认模板**，渲染在宿主侧（见
+/// [`EvalContext::reverse_lookup`](crate::context::EvalContext::reverse_lookup)）。
+///
+/// # 越界与非法 n 一律返回空串而不报错
+///
+/// 这个函数的主场是 `$SS` 多候选展开——词条里固定写 N 个元素、各查第 1..N 个字，
+/// 剪贴板不足 N 字是**常态**而非错误。报错会让整条短语求值失败、连带前几个查得到的
+/// 字一起消失（`evaluate_phrase` 的 `Err` 分支是整条丢弃）。返回空串则只让那一条候选
+/// 落空，由短语层的空串守卫丢掉它。
+///
+/// `n` 本身写错（非数字）仍然报错——那是词条作者的笔误，不是运行时的正常输入。
+fn fn_dict_rev_named(
+    ctx: &dyn EvalContext,
+    args: &[String],
+    named: &[(String, String)],
+) -> Result<String> {
+    let n = match args.get(1) {
+        Some(s) => parse_arg_int("dict.rev", s)?,
+        None => 1,
+    };
+    if n < 1 {
+        return Ok(String::new());
+    }
+    // 按 rune 取字：扩展区汉字走代理对，按字节索引会切在半个字上。
+    let Some(ch) = args[0].chars().nth((n - 1) as usize) else {
+        return Ok(String::new());
+    };
+    // 空 format 视同省略：`format=""` 多半是词条拼错，退回默认版式比产出空串好查。
+    let format = named
+        .iter()
+        .find(|(k, _)| k == "format")
+        .map(|(_, v)| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_REV_FORMAT);
+    let mut buf = [0u8; 4];
+    Ok(ctx.reverse_lookup(ch.encode_utf8(&mut buf), format))
 }
 
 fn fn_ime_toggle(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
@@ -181,6 +232,84 @@ mod tests {
         let mut svc = Services::new();
         svc.ime = Some(rec);
         MemoryContext::new().with_services(svc)
+    }
+
+    /// 反查桩：把宿主收到的 `(text, format)` 原样回显成 `text|format`，
+    /// 于是「挑了哪个字」与「透传了哪份模板」都能在返回值里直接断言。
+    fn rev_echo_ctx() -> MemoryContext {
+        let mut c = MemoryContext::new();
+        c.reverse = Some(Box::new(|text: &str, format: &str| {
+            format!("{text}|{format}")
+        }));
+        c
+    }
+
+    /// 省略 n 取第 1 个字；省略 format 填默认版式。
+    #[test]
+    fn rev_defaults_to_first_char_and_default_format() {
+        let ctx = rev_echo_ctx();
+        let out = fn_dict_rev(&ctx, &["好人".to_string()]).unwrap();
+        assert_eq!(out, format!("好|{DEFAULT_REV_FORMAT}"));
+    }
+
+    /// n 按 **rune** 定位，不是字节：扩展区汉字走代理对，按字节索引会切在半个字上。
+    #[test]
+    fn rev_picks_nth_char_by_rune() {
+        let ctx = rev_echo_ctx();
+        // 「𠮷」是扩展 B 区（4 字节），其后一个字若按字节推进必然错位。
+        let text = "𠮷祥".to_string();
+        let first = fn_dict_rev(&ctx, &[text.clone(), "1".into()]).unwrap();
+        let second = fn_dict_rev(&ctx, &[text, "2".into()]).unwrap();
+        assert_eq!(first, format!("𠮷|{DEFAULT_REV_FORMAT}"));
+        assert_eq!(second, format!("祥|{DEFAULT_REV_FORMAT}"));
+    }
+
+    /// 显式 format 原样透传（本层不解析、不渲染，渲染归宿主）。
+    #[test]
+    fn rev_passes_explicit_format_through_verbatim() {
+        let ctx = rev_echo_ctx();
+        let named = vec![("format".to_string(), "${pinyin}".to_string())];
+        let out = fn_dict_rev_named(&ctx, &["好".to_string()], &named).unwrap();
+        assert_eq!(out, "好|${pinyin}");
+    }
+
+    /// `format=""` 视同省略 —— 多半是词条拼错，退回默认版式比产出空串好查。
+    #[test]
+    fn rev_empty_format_falls_back_to_default() {
+        let ctx = rev_echo_ctx();
+        let named = vec![("format".to_string(), String::new())];
+        let out = fn_dict_rev_named(&ctx, &["好".to_string()], &named).unwrap();
+        assert_eq!(out, format!("好|{DEFAULT_REV_FORMAT}"));
+    }
+
+    /// ★ 越界与 n<1 返回**空串而非错误**。
+    ///
+    /// `$SS` 展开时词条固定写 N 个元素、各查第 1..N 个字，剪贴板不足 N 字是常态；
+    /// 若报错，`evaluate_phrase` 的 `Err` 分支会把**整条短语**丢掉——连前几个查得到的
+    /// 字一起消失。这条守着「只落空那一条候选」。
+    #[test]
+    fn rev_out_of_range_yields_empty_not_error() {
+        let ctx = rev_echo_ctx();
+        for n in ["3", "99", "0", "-1"] {
+            let out = fn_dict_rev(&ctx, &["好人".to_string(), n.to_string()]).unwrap();
+            assert_eq!(out, "", "n={n} 应返回空串");
+        }
+        // 空文本同理（剪贴板为空）
+        assert_eq!(fn_dict_rev(&ctx, &[String::new()]).unwrap(), "");
+    }
+
+    /// n 写成非数字是**词条作者的笔误**，不是运行时正常输入 —— 必须报错而非静默取默认。
+    #[test]
+    fn rev_non_numeric_n_errors() {
+        let ctx = rev_echo_ctx();
+        assert!(fn_dict_rev(&ctx, &["好".to_string(), "abc".into()]).is_err());
+    }
+
+    /// 未注入反查能力的上下文返回空串，不 panic（headless / 廉价导航上下文）。
+    #[test]
+    fn rev_without_host_capability_is_empty() {
+        let ctx = MemoryContext::new();
+        assert_eq!(fn_dict_rev(&ctx, &["好".to_string()]).unwrap(), "");
     }
 
     /// `jump` 省略时按**右段 char 数**推导，不是 UTF-16 单元数——emoji 右段按单元算会多移一格。

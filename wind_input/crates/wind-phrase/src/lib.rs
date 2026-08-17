@@ -225,15 +225,9 @@ impl PhraseLayer {
     /// 查 code 对应的展开短语；跳过含不支持变量的项。
     /// `last` 为上屏历史快照（index 0 = 最近），供命令栏 display 侧的 `last(n)` 使用
     /// （如 `coll` 的 `$CC(last(), ...)` 候选需显示上一次上屏内容）。
-    /// `clip` 为剪贴板读取回调（宿主注入，避免本 crate 依赖平台 UI 层）；供命令栏 display
-    /// 侧的 `clip(n)` 使用（如 `coad` 的 `剪贴板加词:{clip()}` 候选标签）。测试传空闭包。
-    pub fn lookup(
-        &self,
-        code: &str,
-        last: &[String],
-        clip: &dyn Fn(i64) -> String,
-    ) -> Vec<PhraseHit> {
-        self.lookup_at(code, Local::now(), last, clip)
+    /// `host` 为宿主能力回调束（剪贴板 / 反查），见 [`PhraseHost`]。测试传 [`PhraseHost::empty`]。
+    pub fn lookup(&self, code: &str, last: &[String], host: &PhraseHost<'_>) -> Vec<PhraseHit> {
+        self.lookup_at(code, Local::now(), last, host)
     }
 
     /// 同 lookup，但显式传入时间（便于测试）。
@@ -242,7 +236,7 @@ impl PhraseLayer {
         code: &str,
         now: DateTime<Local>,
         last: &[String],
-        clip: &dyn Fn(i64) -> String,
+        host: &PhraseHost<'_>,
     ) -> Vec<PhraseHit> {
         let entries = match self.map.get(code) {
             Some(e) => e,
@@ -257,13 +251,21 @@ impl PhraseLayer {
                     input: code.to_string(),
                     now,
                     last,
-                    clip,
+                    host,
                 };
                 match evaluate_phrase(&e.text, &ctx, default_registry()) {
                     // 无动作（literal/template，如 {date()}）→ 显示即上屏文本。
-                    Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
+                    //
+                    // 空展开不出空候选：与下方 `expand_template` 分支、以及 `lookup_prefix_at`
+                    // 同处置。求值型 display 落空是**常态**而非异常——`{dict.rev(clip(),2)}`
+                    // 在剪贴板只有 1 个字时就该什么都不出，而不是给一条点了没反应的空白候选。
+                    Ok(PhraseEval::Single { display, actions })
+                        if actions.is_empty() && !display.is_empty() =>
+                    {
                         out.push(PhraseHit::plain(display, e.weight).with_source(&e.text))
                     }
+                    // 无动作且 display 为空：整条丢弃（不落候选）。
+                    Ok(PhraseEval::Single { actions, .. }) if actions.is_empty() => {}
                     // $CC 命令短语（有动作）：携带命令源，选中时由 coordinator 执行动作。
                     Ok(PhraseEval::Single { display, .. }) => out.push(PhraseHit {
                         text: display,
@@ -277,7 +279,9 @@ impl PhraseLayer {
                     Ok(PhraseEval::Array(arr)) => {
                         for el in arr.elements {
                             // 仅显现无动作的字面元素（符号等）；带动作的嵌入 $CC 需元素级源，后续补。
-                            if el.actions.is_empty() {
+                            // 空元素同样丢弃：`$SS` 的元素是**运行时**求值的，词条固定写 N 个
+                            // 元素、各查第 1..N 个字时，剪贴板不足 N 字必然让尾部几条落空。
+                            if el.actions.is_empty() && !el.display.is_empty() {
                                 out.push(
                                     PhraseHit::plain(el.display, e.weight).with_source(&e.text),
                                 );
@@ -411,6 +415,13 @@ impl PhraseLayer {
                             Ok(ev) => ev.display,
                             Err(_) => continue,
                         };
+                        // 全空求值不出空候选 —— 与上面 Literal 分支、及 `lookup_at` 同处置。
+                        // 这里原先无条件 push：`{clip()}` / `{dict.rev(clip())}` 这类依赖瞬时
+                        // 状态的模板，在**廉价的 NavCtx 下必然求值为空**（见 `NavCtx::clip` /
+                        // `reverse_lookup` 的说明），于是打前缀时会列出一条纯空白的候选。
+                        if display.is_empty() {
+                            continue;
+                        }
                         out.push(PhraseHit::plain(display, e.weight).with_source(&e.text));
                     }
                     Phrase::Array(ap) => {
@@ -494,13 +505,13 @@ pub enum DictExpansion {
 /// （`$Y/$M/$D/...`），都不含则 [`DictExpansion::None`]。让**普通用户 / 系统词库码表词条**也能
 /// 像短语一样内嵌命令 / 模板 / 组，而非把 value 原文当文本上屏。
 ///
-/// `input` 供 cmdbar 语法内 `input()` 求值；`now/last/clip` 为 display 上下文。
+/// `input` 供 cmdbar 语法内 `input()` 求值；`now/last/host` 为 display 上下文。
 pub fn expand_dict_value(
     text: &str,
     input: &str,
     now: DateTime<Local>,
     last: &[String],
-    clip: &dyn Fn(i64) -> String,
+    host: &PhraseHost<'_>,
 ) -> DictExpansion {
     // 快路径：无 `$` 与 `{` 一律非特殊语法（普通词条零开销）。
     if !text.contains('$') && !text.contains('{') {
@@ -511,10 +522,16 @@ pub fn expand_dict_value(
             input: input.to_string(),
             now,
             last,
-            clip,
+            host,
         };
         match evaluate_phrase(text, &ctx, default_registry()) {
             // 纯 literal/template（如 {date()}）：display 即上屏文本。
+            // 空展开 → None（不产候选），与 `lookup_at` 同处置。
+            Ok(PhraseEval::Single { display, actions })
+                if actions.is_empty() && display.is_empty() =>
+            {
+                DictExpansion::None
+            }
             Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
                 DictExpansion::Single {
                     display,
@@ -530,10 +547,11 @@ pub fn expand_dict_value(
             // 带动作的嵌入 $CC 需元素级源，后续补）。
             Ok(PhraseEval::Array(arr)) => {
                 let name = arr.name.clone();
+                // 空元素同样丢弃，与 `lookup_at` 的数组分支同处置。
                 let items: Vec<(String, Option<String>)> = arr
                     .elements
                     .into_iter()
-                    .filter(|el| el.actions.is_empty())
+                    .filter(|el| el.actions.is_empty() && !el.display.is_empty())
                     .map(|el| (el.display, None))
                     .collect();
                 if items.is_empty() {
@@ -567,13 +585,47 @@ pub fn expand_dict_value(
     }
 }
 
+/// 短语 display 求值所需的**宿主能力回调束**（剪贴板、反查）。
+///
+/// # 为什么是结构体而不是继续加形参
+///
+/// 与 [`ProcSpawn`](wind_cmdbar::ProcSpawn) 同一理由：这些回调都是「宿主注入的能力」，
+/// 会随功能增长。加字段时每个构造点都会编译失败、被迫面对新能力；而多加一个形参
+/// 很容易被某个调用点原样漏掉——本 crate 的调用点分散在协调器的四条候选构建路径上，
+/// 漏掉一条的表现是「某个入口下这个功能就是不出来」，没有任何报错。
+///
+/// 本 crate 不依赖平台层，故一律以回调注入，不直接读剪贴板 / 词库。
+pub struct PhraseHost<'a> {
+    /// 剪贴板读取：`n==0/1` 取当前，`n>1` 取历史第 n 条。
+    /// 供命令栏 display 侧的 `clip(n)` 使用（如 `coad` 的 `剪贴板加词:{clip()}` 标签）。
+    ///
+    /// ⚠️ 这条在**每次按键的候选构建期**都会被调用，实现方必须走非阻塞的缓存版读取
+    /// （见 `HostServices::clipboard_get_text_cached` 的行为契约）。
+    pub clip: &'a dyn Fn(i64) -> String,
+    /// 反查渲染：`(待查文本, format 模板) -> 渲染结果`；查不到返回空串。
+    /// 供 `dict.rev(...)` 使用。模板语法与候选注释段一致，渲染在宿主侧完成。
+    pub reverse: &'a dyn Fn(&str, &str) -> String,
+}
+
+impl PhraseHost<'static> {
+    /// 全空宿主：剪贴板与反查都返回空串。供测试与无平台能力的 headless 路径。
+    pub fn empty() -> Self {
+        const CLIP: &dyn Fn(i64) -> String = &|_| String::new();
+        const REVERSE: &dyn Fn(&str, &str) -> String = &|_, _| String::new();
+        PhraseHost {
+            clip: CLIP,
+            reverse: REVERSE,
+        }
+    }
+}
+
 struct PhraseCtx<'a> {
     input: String,
     now: DateTime<Local>,
     /// 上屏历史快照（index 0 = 最近）。
     last: &'a [String],
-    /// 剪贴板读取回调（宿主注入；本 crate 不依赖平台 UI 层）。
-    clip: &'a dyn Fn(i64) -> String,
+    /// 宿主能力回调束（剪贴板 / 反查）。
+    host: &'a PhraseHost<'a>,
 }
 
 impl wind_cmdbar::EvalContext for PhraseCtx<'_> {
@@ -587,7 +639,10 @@ impl wind_cmdbar::EvalContext for PhraseCtx<'_> {
         self.last.get((n - 1) as usize).cloned().unwrap_or_default()
     }
     fn clip(&self, n: i64) -> String {
-        (self.clip)(n)
+        (self.host.clip)(n)
+    }
+    fn reverse_lookup(&self, text: &str, format: &str) -> String {
+        (self.host.reverse)(text, format)
     }
     fn sel(&self) -> String {
         String::new()
@@ -631,6 +686,16 @@ impl wind_cmdbar::EvalContext for NavCtx<'_> {
     }
     fn clip(&self, _n: i64) -> String {
         String::new() // 列举阶段不读剪贴板
+    }
+    fn reverse_lookup(&self, _text: &str, _format: &str) -> String {
+        // 同 clip：列举阶段不查词库。前缀导航要为**每条**候选命令跑一次 display 求值，
+        // 在这里做整词反查等于把 N 次词库查询摊到按键线程上。
+        //
+        // 后果是 `cofc` 这类反查命令在**前缀列举**时求值为空，进而被 `lookup_prefix_at`
+        // 的空串守卫丢弃：它们打前缀时不出现在列表里，打全码才出。这是刻意取舍——
+        // 它们的 display 本就依赖剪贴板这类瞬时状态，列举阶段给不出真值，
+        // 与其列一条空白的不如不列。
+        String::new()
     }
     fn sel(&self) -> String {
         String::new()
@@ -728,8 +793,80 @@ mod tests {
     }
 
     /// 测试用空剪贴板读取回调。
-    fn no_clip() -> impl Fn(i64) -> String {
-        |_| String::new()
+    /// 无宿主能力的求值环境（剪贴板与反查均返回空串）。
+    fn no_clip() -> PhraseHost<'static> {
+        PhraseHost::empty()
+    }
+
+    /// ★ 剪贴板反查（出厂 `cofc`）的端到端形状。
+    ///
+    /// 锁两件事：**纯模板短语的 display 就是上屏文本**（无 `command_src`，不需要
+    /// `type()`），以及**查不到时整条候选消失**而不是留一条空白的。
+    #[test]
+    fn clipboard_reverse_renders_and_drops_when_nothing_found() {
+        let layer = PhraseLayer::from_records(vec![(
+            "cofc".into(),
+            "{dict.rev(clip())}".into(),
+            2000,
+            0,
+            true,
+        )]);
+        let clip = |_n: i64| "好人".to_string();
+        // 只认「好」，借此模拟「这个字查不到」。
+        let reverse = |text: &str, _fmt: &str| {
+            if text == "好" {
+                "好: vbg hǎo".to_string()
+            } else {
+                String::new()
+            }
+        };
+        let host = PhraseHost {
+            clip: &clip,
+            reverse: &reverse,
+        };
+        let hits = layer.lookup_at("cofc", fixed(), &[], &host);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "好: vbg hǎo");
+        assert!(
+            hits[0].command_src.is_none(),
+            "无动作短语：display 即上屏文本，不该被当成命令候选"
+        );
+
+        // 剪贴板为空 → 无字可查 → 不出候选（而不是出一条空白候选）。
+        let empty_clip = |_n: i64| String::new();
+        let host = PhraseHost {
+            clip: &empty_clip,
+            reverse: &reverse,
+        };
+        assert!(
+            layer.lookup_at("cofc", fixed(), &[], &host).is_empty(),
+            "剪贴板为空时不得产出空白候选"
+        );
+    }
+
+    /// ★ `$SS` 逐字反查：**元素个数即上限**，剪贴板不足位数时尾部元素整条消失。
+    ///
+    /// 这是「限制 N 个字」的表达方式——不靠配置键，靠词条里写几个元素。
+    #[test]
+    fn reverse_group_drops_tail_when_clipboard_is_shorter() {
+        let src = r#"$SS("反查", "{dict.rev(clip(),1)}", "{dict.rev(clip(),2)}", "{dict.rev(clip(),3)}")"#;
+        let layer = PhraseLayer::from_records(vec![("cofc".into(), src.into(), 2000, 0, true)]);
+        let clip = |_n: i64| "好人".to_string(); // 只有 2 个字，第 3 个元素必然落空
+        let reverse = |text: &str, _f: &str| format!("{text}=x");
+        let host = PhraseHost {
+            clip: &clip,
+            reverse: &reverse,
+        };
+        let texts: Vec<String> = layer
+            .lookup_at("cofc", fixed(), &[], &host)
+            .into_iter()
+            .map(|h| h.text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["好=x".to_string(), "人=x".to_string()],
+            "第 3 条应整条消失，而不是留一条空白候选"
+        );
     }
 
     #[test]
@@ -1253,7 +1390,7 @@ mod tests {
             ("bj".to_string(), "北京".to_string(), 1000, 0, false),
             ("bj".to_string(), "北京市".to_string(), 500, 1, true),
         ]);
-        let hits = layer.lookup("bj", &[], &|_| String::new());
+        let hits = layer.lookup("bj", &[], &no_clip());
         // 两条同码，按 weight 降序
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].text, "北京");

@@ -143,11 +143,21 @@ impl Coordinator {
     }
 
     /// 短语层查询,返回命中文本(仅测试)。
+    ///
+    /// 反查（`dict.rev`）接**真实**实现：这个探针的用途正是「这条短语实际会显示成什么」，
+    /// 塞个空桩进去就只能验到「求值没崩」。剪贴板仍留空桩——headless 测试没有剪贴板，
+    /// 要验剪贴板相关短语得由调用方另行注入。
     pub fn debug_phrase_texts(&self, code: &str) -> Vec<String> {
+        let clip = |_n: i64| String::new();
+        let reverse = |text: &str, fmt: &str| -> String { self.reverse_render(text, fmt) };
+        let host = wind_phrase::PhraseHost {
+            clip: &clip,
+            reverse: &reverse,
+        };
         self.phrases
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .lookup(code, &[], &|_| String::new())
+            .lookup(code, &[], &host)
             .into_iter()
             .map(|c| c.text)
             .collect()

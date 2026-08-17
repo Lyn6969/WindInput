@@ -38,9 +38,9 @@ fn festival_day() -> DateTime<Local> {
 }
 
 fn texts(layer: &wind_phrase::PhraseLayer, code: &str, now: DateTime<Local>) -> Vec<String> {
-    let clip = |_: i64| String::new();
+    let host = wind_phrase::PhraseHost::empty();
     layer
-        .lookup_at(code, now, &[], &clip)
+        .lookup_at(code, now, &[], &host)
         .into_iter()
         .map(|h| h.text)
         .collect()

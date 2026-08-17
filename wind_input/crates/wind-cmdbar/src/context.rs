@@ -24,6 +24,19 @@ pub trait EvalContext {
     fn title(&self) -> String;
     /// 环境变量值；不存在返回空。
     fn env(&self, name: &str) -> String;
+    /// 反查一段文本的编码/读音，按 `format` 渲染后返回。查不到任何内容返回空串。
+    ///
+    /// `format` 是候选注释段的同款 `${name}` 模板（`${char}` / `${code}` / `${pinyin}` /
+    /// `${chaizi}` / `${chaizi_code}` / `${dict}`）。**渲染在宿主侧完成**：模板渲染器与
+    /// 反查表都住在宿主，而本 crate 刻意零 `wind-*` 依赖；在这里另写一份占位符替换
+    /// 就会变成同一套模板语法的第二份实现，两份必然漂移。
+    ///
+    /// **不给默认实现**，与 [`Self::clip`] 同处置（而不同于 [`Self::quick_var`]）：
+    /// 判据是「漏接会怎样」。`quick_var` 漏接得到空串是**正确答案**——短语上下文本就
+    /// 没有「当前解析出的年月日」。而本方法漏接得到的空串是**错的**：调用方明明要查，
+    /// 拿到空串却只表现为「候选出来了但内容是空的」，没有任何报错。给了默认实现，
+    /// 这种漏接就再也没有编译期的抓手。
+    fn reverse_lookup(&self, text: &str, format: &str) -> String;
     /// 当前时间（测试可注入固定时钟）。
     fn now(&self) -> DateTime<Local>;
     /// 副作用服务束；纯求值场景可为 None，动作函数须自行防御。
@@ -121,6 +134,13 @@ pub struct MemoryContext {
     /// 固定时钟（None 时用 `Local::now()`）。
     pub clock: Option<DateTime<Local>>,
     pub services: Option<Services>,
+    /// 反查桩：`(待查文本, format) -> 渲染结果`；`None` 时 `reverse_lookup` 返回空串。
+    ///
+    /// 用闭包而不是 `HashMap<文本, 结果>`：真实实现里 `format` 决定输出长什么样，
+    /// 而映射表把它整个吃掉了——「format 有没有被正确透传下来」就测不出来，
+    /// 那恰恰是本层唯一负责的事（本层不渲染，只挑字 + 填默认模板 + 转交）。
+    #[allow(clippy::type_complexity)]
+    pub reverse: Option<Box<dyn Fn(&str, &str) -> String + Send + Sync>>,
 }
 
 impl MemoryContext {
@@ -174,6 +194,12 @@ impl EvalContext for MemoryContext {
     }
     fn env(&self, name: &str) -> String {
         self.env.get(name).cloned().unwrap_or_default()
+    }
+    fn reverse_lookup(&self, text: &str, format: &str) -> String {
+        match &self.reverse {
+            Some(f) => f(text, format),
+            None => String::new(),
+        }
     }
     fn now(&self) -> DateTime<Local> {
         self.clock.unwrap_or_else(Local::now)

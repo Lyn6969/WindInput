@@ -79,9 +79,16 @@ impl Coordinator {
             return false;
         }
         let recent = self.recent_commits_snapshot();
-        let clip = |_n: i64| String::new();
+        // 空宿主：本判据只问「有没有这个码的短语」，不关心它显示成什么，故不值得为它
+        // 读一次剪贴板 / 查一次词库（这是每次按键都会过的路径）。
+        //
+        // ⚠️ 代价是**依赖瞬时状态的短语在这里判为不存在**：`{dict.rev(clip())}` 这类
+        // 纯模板短语在空宿主下渲染为空，会被空串守卫丢掉。当前调用方传进来的都是
+        // 单字母或 z 缓冲串，而那些前缀下都还有别的短语撑着，故不影响既有判定；
+        // 若将来有「整个前缀只剩一条瞬时短语」的情形，这里会翻转成 false。
+        let host = wind_phrase::PhraseHost::empty();
         // 存在性判据用 `1`：只问「有没有以 code 开头的短语」，与显示门槛无关（见函数文档）。
-        !phrases.lookup(code, &recent, &clip).is_empty()
+        !phrases.lookup(code, &recent, &host).is_empty()
             || !phrases.lookup_prefix(code, &recent, 1).is_empty()
     }
 

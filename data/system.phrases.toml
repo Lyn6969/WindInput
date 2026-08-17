@@ -482,6 +482,21 @@ code = 'coad'
 text = '$CC("剪贴板加词:{clip()}", dict.add(clip()))'
 weight = 2000
 
+# 剪贴板反查：复制一个不认识的字 → 切回输入法 → 打 cofc → 候选即「字: 编码 拼音」，
+# 选中直接上屏这行文字。
+#
+# 是**纯模板**短语（顶层 `{`）而非 `$CC`：无动作短语的 display 即上屏文本，
+# 不必再写一遍 `type(...)`。
+#
+# 默认只查第 1 个字。要一次看多个字，自己改成 `$SS` 列若干元素、各查第 n 个：
+#   text = '$SS("反查", "{dict.rev(clip(),1)}", "{dict.rev(clip(),2)}", "{dict.rev(clip(),3)}")'
+# 元素个数即上限，查不到的那几条自动不出现。
+# 版式也可换，变量同候选注释段：`{dict.rev(clip(), 1, format="${char} ${chaizi}[${chaizi_code}]")}`
+[[phrases]]
+code = 'cofc'
+text = '{dict.rev(clip())}'
+weight = 2000
+
 [[phrases]]
 code = 'coen'
 text = '$CC("切中英", ime.toggle("cn-en"))'
