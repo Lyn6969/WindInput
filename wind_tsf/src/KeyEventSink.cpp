@@ -758,16 +758,12 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // When digits pass through without reaching Go (no input session),
     // record them so the next punctuation key sent to Go carries this info via prevChar.
     // This handles editors (e.g., EverEdit) where ITfTextEditSink can't read text.
+    //
+    // 中文模式空缓冲下数字键（含小键盘，ClassifyInputKey 归 Number）不被吃，必经此处。
+    // 判据统一交给 _DigitCharFromVk：非数字键返回 0，正好落进「清零」语义。
     if (*pfEaten == FALSE)
     {
-        if (wParam >= '0' && wParam <= '9')
-        {
-            _lastPassthroughDigit = (WCHAR)wParam;
-        }
-        else
-        {
-            _lastPassthroughDigit = 0;
-        }
+        _lastPassthroughDigit = _DigitCharFromVk(wParam, modifiers);
     }
 
     return S_OK;
@@ -1286,9 +1282,14 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // coordinator 返回 PassThrough → OnKeyDown 返 FALSE。此时 OnTestKeyDown 里
     // _lastPassthroughDigit 未设置（因彼时 pfEaten=TRUE 跳过了设置代码）。
     // 在此补设，确保数字后智能标点备用路径在 OnEndEdit 不触发的应用中仍能正确获取 prevChar。
-    if (!(*pfEaten) && wParam >= '0' && wParam <= '9')
+    // 这里只补设不清零：非数字键的清零由 _SendKeyToService 那处负责（它能看到所有
+    // 送往服务端的键，包括本处 pfEaten 为真、根本不进这个分支的那些）。
+    if (!(*pfEaten))
     {
-        _lastPassthroughDigit = (WCHAR)wParam;
+        if (WCHAR digit = _DigitCharFromVk(wParam, modifiers))
+        {
+            _lastPassthroughDigit = digit;
+        }
     }
 
     // Ctrl/Alt combo during active session: decide pass-through based on Go's response.
@@ -1834,6 +1835,11 @@ BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint
     {
         prevChar = (uint16_t)_lastPassthroughDigit;
         _lastPassthroughDigit = 0;  // 已消费，清除以避免后续标点误判
+        // 真机验证锚点：读不回文档的宿主（EverEdit 等）走到这里才说明备用通路生效。
+        // 主路径能读回时本分支不执行——两者症状相同、成因不同，只有这条日志分得开。
+        // 刻意不打字符内容（那是用户输入），只标记路径与键码。
+        WIND_LOG_DEBUG_FMT(L"smart_punct_digit_fallback: prevChar from passthrough digit, vk=0x%02X\n",
+                           keyCode);
     }
     // Clear stale digit passthrough when any non-smart-punct key is sent to Go.
     // Without this, _lastPassthroughDigit persists through eaten keys (composition,
@@ -1961,6 +1967,11 @@ BOOL CKeyEventSink::_HandleServiceResponse()
                 _pTextService->CommitText(response.text, FALSE, response.replacingHeld ? TRUE : FALSE);
                 QueryPerformanceCounter(&ctMid1);
 
+                // 上屏文本末位即新的「光标前一字符」，据此维护备用 prevChar（见 header 注释）。
+                // 只在这条「提交后不留组合」的分支记：restartComposition 分支提交后立刻又起了
+                // 组合，光标前是组合内容而非 response.text 末位，记了就是错的。
+                _TrackCommittedTextForSmartPunct(response.text);
+
                 _isComposing = FALSE;
                 _hasCandidates = FALSE;
                 _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
@@ -2039,6 +2050,10 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         {
             WIND_LOG_DEBUG(L"Processing InsertTextWithCursor response\n");
             _pTextService->CommitText(response.text);
+            // 备用 prevChar：cursorOffset==0 时末位就是光标前一字符；cursorOffset>0（配对
+            // 插入后光标回退到中间）时光标前其实是左符号，末位取的是右符号——但两者都是
+            // 配对符号、都不是数字，结论同为清零，故无须为配对单独分支。
+            _TrackCommittedTextForSmartPunct(response.text);
             _isComposing = FALSE;
             _hasCandidates = FALSE;
             for (int i = 0; i < response.cursorOffset; i++)

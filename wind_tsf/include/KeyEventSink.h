@@ -233,6 +233,50 @@ private:
     // 把一个已被我们吃掉的键原样重放给宿主（skip 表标记，避免自己的钩子二次处理）。
     void _ReplayKeyToHost(WORD vk);
 
+    // ── 数字后智能标点的备用 prevChar 通路 ──────────────────────────────────────
+    //
+    // prevChar 主路径是 TSF 现读文档（CTextService::ConsumeCachedPrevChar）；EverEdit
+    // 这类宿主读不回文档、恒为 0，只能靠 _lastPassthroughDigit 记住「刚打出去的数字」。
+    // 服务端只认 prevChar 的**值**（wind-punct 判 0x30..=0x39），它不知道数字是怎么打的，
+    // 所以「哪些键算数字」这个判据完全落在本文件。
+    //
+    // ★ 主键盘与小键盘必须都认。判据只写 '0'..'9'（VK 0x30-0x39）时小键盘数字
+    // （VK_NUMPAD0-9 = 0x60-0x69）不但记不上，还会落进记录点的 else 分支把已记的值清零
+    // ——症状是「小键盘打的数字后面标点仍出中文」，且只在读不回文档的宿主暴露（能读的
+    // 宿主主路径兜住了，看起来像是随机时灵时不灵）。同族的 _IsHoldReplayKey 一直是两种
+    // 都列的，这里是遗漏。NumLock 关闭时小键盘发的是 VK_END/VK_INSERT 等，语义本就不是
+    // 数字，天然不命中；NumLock 开着按 Shift+小键盘时 Windows 临时取消 NumLock，届时
+    // vk 已是方向键，同样到不了这里。
+    //
+    // 返回 0 表示「这一键不产出数字」，记录点据此清零——把「没记到」与「明确不是数字」
+    // 统一成一个出口，避免两处判据各写一份而漂移。
+    static WCHAR _DigitCharFromVk(WPARAM vk, uint32_t modifiers)
+    {
+        // Shift+主键盘数字产出的是符号（!@#…）而非数字，不能当数字记。
+        if (vk >= '0' && vk <= '9')
+            return (modifiers & KEYMOD_SHIFT) ? 0 : (WCHAR)vk;
+        if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+            return (WCHAR)(L'0' + (vk - VK_NUMPAD0));
+        return 0;
+    }
+
+    // 经引擎上屏的文本也要更新备用 prevChar。全角数字、小键盘 direct「顶屏候选再追加
+    // 数字」、候选文本本身带数字这些路径，pfEaten 为真且响应不是 PassThrough，两个按键侧
+    // 记录点（OnTestKeyDown 透传臂 / OnKeyDown 补设）都不覆盖——能读文档的宿主靠主路径
+    // 兜住，读不回的宿主里这些场景现在是全丢的。
+    //
+    // 记的是「已落进文档、光标紧邻的那个字符」，与 prevChar 语义严格一致：末位是 ASCII
+    // 数字则记，否则清零（上屏汉字/标点后不该再继承数字状态）。全角数字（U+FF10-FF19）
+    // 刻意不记——服务端只认 ASCII 0x30-0x39，记了也不会命中，徒增误判面。
+    // 空文本不动状态：没有东西写进文档，光标前是什么并没有改变。
+    void _TrackCommittedTextForSmartPunct(const std::wstring& text)
+    {
+        if (text.empty())
+            return;
+        WCHAR last = text.back();
+        _lastPassthroughDigit = (last >= L'0' && last <= L'9') ? last : 0;
+    }
+
     // ⛔ 这里曾有 CapsLock 的「回敲复原」机制（_RestoreCapsLockToggle / _capsSessionEaten /
     // 自注入放行窗口），2026-08-11 全部移除——TSF 压不住 CapsLock 的锁定态翻转，而事后
     // 回敲在快速连按下有竞态且会触发厂商 OSD 弹窗。CapsLock 的会话态绑定改由服务进程的

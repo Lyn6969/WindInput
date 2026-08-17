@@ -31,6 +31,47 @@
 
 **修复**：`prev_char == 0` 视为"宿主读不回文档"而非"确定不匹配"，退回只信服务端自己的武装状态（armed + key + timeout，与文档内容无关）判定 press2。改了 `handle_punct.rs` 里 `DeleteReplace` 和 `HoldComposition→fallback` 两个分支。
 
+### 4. 小键盘数字后智能标点不生效（备用 prevChar 通路漏了 numpad VK）
+
+第 3 条给读不回文档的宿主留了备用通路 `_lastPassthroughDigit`，但它的记录判据两处都写成
+`wParam >= '0' && wParam <= '9'`（VK `0x30`-`0x39`），**只覆盖主键盘**。小键盘数字是
+`VK_NUMPAD0`-`VK_NUMPAD9`（`0x60`-`0x69`），不命中；而 `OnTestKeyDown` 那处记录点带
+`else` 分支，于是小键盘数字不但记不上，还会把先前主键盘攒下的值**清零**。
+
+必经性：`ClassifyInputKey` 把 numpad 数字归为 `HotkeyType::Number`，中文模式下 `Number`
+只在「有 input session」或「全角」时才吃键（`KeyEventSink.cpp` 的 `session_select_or_page` /
+`chinese_fullwidth_number` 两个分支）。「打完数字再打标点」时缓冲为空、通常也非全角，
+数字必然透传，必然落到记录点——不是偶发路径。
+
+**症状为什么像是随机**：能读回文档的宿主（记事本/浏览器/Office）走主路径
+`ConsumeCachedPrevChar`，与本缺口无关，一切正常；只有 EverEdit 这类读不回的宿主暴露，
+于是表现为「同一个功能换个程序就时灵时不灵」。
+
+**修复**：抽出 `_DigitCharFromVk(vk, modifiers)` 作为唯一判据，主键盘与小键盘都认（同文件的
+`_IsHoldReplayKey` 一直是两种都列的，这里纯属遗漏），两个记录点共用；返回 0 统一表示
+「这一键不产出数字」，正好对应清零语义。顺带排除 `Shift+主键盘数字`——它产出的是 `!@#` 而
+非数字。NumLock 关闭、或 NumLock 开着按 Shift+小键盘时，系统发的已是 `VK_END`/方向键，
+语义本就不是数字，天然不命中。
+
+**一并补上的同族缺口**：数字**经引擎上屏**时（全角数字、小键盘 `direct` 的「顶屏候选再追加
+数字」、候选文本本身带数字）`pfEaten` 为真且响应不是 `PassThrough`，两个按键侧记录点都不
+覆盖，读不回文档的宿主里这些场景此前是全丢的。新增 `_TrackCommittedTextForSmartPunct`，
+在 `CommitText`（非 `restartComposition`）与 `InsertTextWithCursor` 两个「文本落地且不留组合」
+的响应分支按上屏文本末位更新——末位是 ASCII 数字则记，否则清零。`restartComposition` 分支
+刻意不记：它提交后立刻又起了组合，光标前是组合内容而非 `response.text` 末位。全角数字
+（U+FF10-FF19）也刻意不记，服务端只认 ASCII `0x30`-`0x39`。
+
+**未修的同族缺口**：备用通路的消费判据仍硬编码 `keyCode == VK_OEM_PERIOD || VK_OEM_COMMA`
+（消费与清零两处）。用户把 `input.punct.smart_list` 配成含 `:` `?` `!` 等时，这些键在读不回
+文档的宿主里拿不到备用 `prevChar`，功能失效。要修得干净需要把 `smart_list` 像
+`CONFIG_KEY_CUSTOM_EN_PUNCT` 那样推送给 DLL，并在 DLL 侧做字符→VK 映射，属于新增配置通道，
+本次未做。注意小键盘小数点 `VK_DECIMAL` **不在此列**——它被归为 `Number`、中文模式下直接
+透传出半角 `.`，压根不进引擎，结果本来就是对的。
+
+**验证锚点**：备用通路命中时打 `smart_punct_digit_fallback`（DEBUG）。主路径能读回时该行
+不出现——两条通路症状相同、成因不同，只有这条日志分得开。它同时是「新 DLL 是否真的编进/
+部署上」的自证串（`tr -d '\000' < wind_tsf_dev.dll | grep -ao smart_punct_digit_fallback`）。
+
 ## 已知但决定不修的问题：TSF 报告成功但实际渲染未生效（Tabby / 微信）
 
 实测发现 Tabby（Electron/Chromium 内核终端）、微信（Qt 内核）这两个宿主自制的 TSFTextStore，对 `CReplaceBackwardEditSession` 的 `ShiftStart`+`SetText` 会**全程报告成功**（`hr`、`hrSession`、`GetSuccess()` 皆 `S_OK`），但实际画面上旧符号没删掉、新符号又插入了一份。同一段代码在 Notepad/Office 等原生编辑控件里结果是对的——不是我们这边 range 算错，是宿主自己的 TSFTextStore 内部模型跟它真实渲染的内容对不上，单靠更严格检查 TSF 返回码无法识别。
