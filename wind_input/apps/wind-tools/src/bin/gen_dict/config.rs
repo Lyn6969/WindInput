@@ -131,7 +131,7 @@ pub struct ExtraConfig {
     pub weight_max: i64,
 }
 
-/// 上游特有的**编码约定保护**：这些码的条目整体跳过词频补权与简码降权，
+/// 上游特有的**编码约定保护**：这些码的条目整体跳过词频补权（以及已退役的简码降权），
 /// 权重改由极点原始优先级映射，从而完整保留上游设计的候选顺序。
 ///
 /// 为什么需要它：我们的词频补全是按「这个**词**有多常用」赋权的，而上游对某些码的
@@ -139,6 +139,11 @@ pub struct ExtraConfig {
 /// （`aaaa`=工 `cccc`=又 `dddd`=大…）就是典型：补权后 26 个里有 14 个的键名汉字
 /// 被同码词组反超，其中相当一部分还是 `apply_demotion` 主动降权造成的
 /// （「有简码的字让位给词组」这条规则对普通编码成立，对键位约定则是错的）。
+///
+/// ⚠️ **作用域已收窄为「词库权重」这一层**。上面那句「对键位约定是错的」是
+/// `[demotion]` 时代的判断，取代它的运行时出简让全**不设这层豁免**——规则统一，
+/// 见 `wind-coordinator/src/short_code_yield.rs`。故开启该功能后 `dddd` 首选是
+/// 「大厦」而非「大」。本段保住的是权重与上游序，不再保「谁排第一」。
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProtectedCodesConfig {
@@ -234,7 +239,15 @@ impl Default for ShortcodeConfig {
 impl Default for DemotionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // ⛔ 已退役，默认关。取代者是运行时的「出简让全」
+            // （`schema.codetable.short_code_yield_level`）。
+            //
+            // 默认值必须与 gen_dict.toml 同为 false：这个结构体带 `#[serde(default)]`，
+            // 缺 `[demotion]` 段的配置文件会静默取到这里的值。留 true 的话，谁写一份
+            // 精简配置就会让词库层再让位一次——与算法层叠加，字被压到词后面两遍，
+            // 而产物里看不出异常，只有实际打字才发现。
+            enabled: false,
+            // 以下参数仅为记录当初的标定值，enabled = false 时不参与计算。
             filter_threshold: 200,
             single_char_promote_wt: 1000,
             word_promote_wt: 800,

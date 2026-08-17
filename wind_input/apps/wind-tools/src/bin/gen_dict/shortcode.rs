@@ -294,6 +294,19 @@ mod tests {
         }
     }
 
+    /// `[demotion]` 已退役、**默认关**（取代者是运行时的出简让全，见 config.rs）。
+    ///
+    /// 下面几条降权用例测的是函数自身的逻辑，留着是为了「将来若重新开启，逻辑不至于
+    /// 已经腐烂」，故须显式打开。
+    ///
+    /// ⚠️ 不显式打开的话，`apply_demotion` 在入口就 `return` 空集，于是三条
+    /// `assert!(...is_empty())` 恒真——**测试全绿，实际什么都没测**。
+    fn cfg_demotion_on() -> Config {
+        let mut c = cfg();
+        c.demotion.enabled = true;
+        c
+    }
+
     fn e(text: &str, code: &str, weight: i64, pos: usize) -> Entry {
         Entry::new(text.into(), code.into(), weight, pos)
     }
@@ -337,9 +350,30 @@ mod tests {
         );
     }
 
+    /// **默认必须是关的**——本条钉的是 `DemotionConfig::default()`，不是 gen_dict.toml。
+    ///
+    /// 配置结构体带 `#[serde(default)]`，缺 `[demotion]` 段的配置文件静默取默认值。
+    /// 若默认留 true，词库层会再让位一次，与运行时的出简让全叠加：字被压到词后面两遍。
+    /// 而产物里看不出异常——权重都是合法值，只有实际打字才发现首选不对。
+    #[test]
+    fn demotion_is_disabled_by_default() {
+        let c = cfg(); // 刻意不用 cfg_demotion_on()
+        let mut v = vec![
+            e("中", "k", 9999, 0),
+            e("中", "khkg", 5000, 1),
+            e("口中", "khkg", 4500, 2), // 这组入参在开启时必定触发降权
+        ];
+        v[0].shortcode_level = 1;
+        assert!(
+            apply_demotion(&mut v, &c).is_empty(),
+            "[demotion] 已退役，默认必须关"
+        );
+        assert_eq!(v[1].weight, 5000, "关闭时权重原样不动");
+    }
+
     #[test]
     fn demotion_yields_to_strong_second_candidate() {
-        let c = cfg();
+        let c = cfg_demotion_on();
         let mut v = vec![
             e("中", "k", 9999, 0),      // 一简
             e("中", "khkg", 5000, 1),   // 同字占 4 码首选
@@ -358,7 +392,7 @@ mod tests {
 
     #[test]
     fn demotion_skipped_when_gap_too_large() {
-        let c = cfg();
+        let c = cfg_demotion_on();
         // gap = (5000-900)/5000 = 0.82 > 0.65 → 首字优势太大，保留
         let mut v = vec![
             e("中", "k", 9999, 0),
@@ -372,7 +406,7 @@ mod tests {
 
     #[test]
     fn demotion_skipped_when_second_below_filter_threshold() {
-        let c = cfg();
+        let c = cfg_demotion_on();
         let mut v = vec![
             e("中", "k", 9999, 0),
             e("中", "khkg", 5000, 1),
@@ -384,7 +418,7 @@ mod tests {
 
     #[test]
     fn demotion_requires_the_char_to_have_a_shortcode() {
-        let c = cfg();
+        let c = cfg_demotion_on();
         // 没有任何简码指向「中」→ 4 码首选是它唯一的打法，不能让
         let mut v = vec![e("中", "khkg", 5000, 0), e("口中", "khkg", 4500, 1)];
         assert!(apply_demotion(&mut v, &c).is_empty());
@@ -414,7 +448,7 @@ mod tests {
     /// 两处将来若要改判据范围，必须同时改——故在此钉住当前的不对称。
     #[test]
     fn level1_prefix_demotes_but_is_not_reported_as_conflict() {
-        let c = cfg();
+        let c = cfg_demotion_on();
         let mut v = vec![
             e("中", "k", 9999, 0),      // 一级简码
             e("中", "khkg", 5000, 1),   // 同字占 4 码首选
