@@ -1620,6 +1620,33 @@ fn place_child(
     prefer_left: bool,
 ) -> (i32, i32, bool) {
     let (pox, poy) = parent_origin;
+    place_child_in_area(
+        parent_origin,
+        parent_size,
+        parent_item,
+        child_size,
+        scale,
+        prefer_left,
+        work_area_of(pox, poy),
+    )
+}
+
+/// [`place_child`] 的纯逻辑部分：工作区矩形由调用方传入，而非在函数内部现查。
+///
+/// 拆出这一层是为了让单元测试能注入固定的工作区——`work_area_of` 只在 Windows 上
+/// 才会真正调用 `GetMonitorInfoW`，其余平台恒返回 `None`，若测试直接调用
+/// [`place_child`]，在非 Windows CI（Linux/macOS）上永远走不到本函数里
+/// `Some(..)` 分支的翻转判断，只会原样透传 `prefer_left`。
+fn place_child_in_area(
+    parent_origin: (i32, i32),
+    parent_size: (u32, u32),
+    parent_item: Option<Rect>,
+    child_size: (u32, u32),
+    scale: f32,
+    prefer_left: bool,
+    work_area: Option<(i32, i32, i32, i32)>,
+) -> (i32, i32, bool) {
+    let (pox, poy) = parent_origin;
     let (pw, _ph) = parent_size;
     let (cw, ch) = (child_size.0 as i32, child_size.1 as i32);
     let overlap = (3.0 * scale) as i32;
@@ -1630,7 +1657,7 @@ fn place_child(
     let x_left = pox - cw + overlap;
     let mut y = poy + item_top - pad_top;
 
-    let (x, went_left) = match work_area_of(pox, poy) {
+    let (x, went_left) = match work_area {
         Some((left, top, right, bottom)) => {
             let fits_right = x_right + cw <= right;
             let fits_left = x_left >= left;
@@ -2138,7 +2165,8 @@ mod tests {
     #[test]
     fn place_child_flips_left_when_right_overflows() {
         // 父面板贴在屏幕右侧（右缘 1947），右侧已经没有 200px 空间摆子菜单。
-        let (x, _y, went_left) = place_child((1800, 100), (150, 400), None, (MW, MH), 1.0, false);
+        let (x, _y, went_left) =
+            place_child_in_area((1800, 100), (150, 400), None, (MW, MH), 1.0, false, WA);
         assert!(went_left, "右侧放不下应翻到左侧");
         assert!(
             x + MW as i32 <= 1920,
@@ -2153,7 +2181,8 @@ mod tests {
     #[test]
     fn place_child_continues_left_once_preferred() {
         // 父面板在屏幕中部，单独看右侧明明装得下（1000+150-3+200=1347<1920）。
-        let (x, _y, went_left) = place_child((1000, 100), (150, 400), None, (MW, MH), 1.0, true);
+        let (x, _y, went_left) =
+            place_child_in_area((1000, 100), (150, 400), None, (MW, MH), 1.0, true, WA);
         assert!(
             went_left,
             "已翻左的展开链应延续左侧，即便右侧单独看也装得下"
@@ -2165,7 +2194,8 @@ mod tests {
     /// 左侧连子菜单都摆不下，此时该翻回右侧，而不是被钳出屏幕。
     #[test]
     fn place_child_prefer_left_falls_back_to_right_when_no_room_left() {
-        let (x, _y, went_left) = place_child((50, 100), (150, 400), None, (MW, MH), 1.0, true);
+        let (x, _y, went_left) =
+            place_child_in_area((50, 100), (150, 400), None, (MW, MH), 1.0, true, WA);
         assert!(!went_left, "左侧没有空间时应翻回右侧");
         assert_eq!(x, 50 + 150 - 3, "应贴父面板右缘展开");
     }
