@@ -185,22 +185,40 @@ pub fn rerank_codetable_usedfirst(
 /// 同一个步长在两处天差地别），位次除数则与分布无关——第 2 位就是第 2 位。
 pub const POSITION_HALVING_BASE: u32 = 2;
 
-/// 「残码上浮的补全」豁免 `promote_prefix` 限制的**最大音节预测距离**
-/// （[`Candidate::completion_extra_syllables`]）。
+/// 「残码上浮的补全」按**预测距离**折抵有效使用次数：每多预测一个用户没输入的音节
+/// （[`Candidate::completion_extra_syllables`]），就多要一次实证来兑现。
 ///
-/// 取 1 = 「词恰好在手头这个音节结束，或只再差一个音节」，与残码上浮的本义一致：
-/// - `meiy`→「没有」、`nihaom`→「你好吗」：extra=0，豁免；
-/// - `jisuanjik`→「计算机科学」：extra=1，豁免（`pinyin_sentence_flag` 要求它选过 30 次后
-///   能反超残码整句「计算机看」）；
-/// - `bingdongsanchif`→「冰冻三尺非一日之寒」：extra=4，**不豁免** —— 选过一次就抢首位
-///   正是本常量要挡的（详见 [`promotion_power`] 的注释）。
+/// ## 为什么是折扣而不是阈值
 ///
-/// ⚠️ 与 `pinyin::COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`(1) 数值相同但**语义不同**，
-/// 别合并：那个问「要不要把这条补全提进完整匹配层」（按 `distance`，含残码那个音节），
-/// 本常量问「这条已提层的补全能不能免受词频范围限制」（按 `extra`，不含残码那个音节）。
-/// 本仓已有一次两个常量因数值巧合被合并、连带打断另一个功能的前科，见
-/// `pinyin::COMPLETION_NEAR_SYLLABLES` 的文档。
-const PROMOTED_COMPLETION_FREQ_EXEMPT_EXTRA: u8 = 1;
+/// 前一版写作硬阈值「`extra <= 1` 才豁免 `promote_prefix`」，挡住了 `extra=4` 的
+/// `bingdongsanchif`，却在 `extra=1` 上翻车：真机报障 `bkdssjiifwyiriv`（双拼，
+/// bing dong san chi fei yi ri + 残码 zh，started=8）下 9 音节的
+/// 「冰冻三尺非一日之寒」`extra` 恰好是 1，卡在阈值**里侧**拿到豁免，选过**一次**
+/// 就靠 `power=1` 把 `base_pos=1` 减半到 0、抢走首位。
+///
+/// 而同为 `extra=1` 的 `jisuanjik`→「计算机科学」必须能靠 **30 次**词频反超残码整句
+/// （`pinyin_sentence_flag` 的既有断言）—— 两个案例的真正差异**不是 `extra`，是次数**。
+/// 用一个布尔量去切一个连续量上的差异，必然在阈值两侧同时误伤与漏放；阈值定在 0 会
+/// 打断计算机科学，定在 1 会放过冰冻三尺，无解。
+///
+/// 折扣把两者一次性摆平（`eff` 为衰减后的有效次数）：
+///
+/// | 场景 | extra | 次数 | `eff - extra` | 结果 |
+/// |---|---|---|---|---|
+/// | `bkdssjiifwyiriv` 长词 | 1 | 1 | 0 | 不提升 ✅ |
+/// | `jisuanjik` 计算机科学 | 1 | 30 | 29 | 仍提升 ✅ |
+/// | `bingdongsanchif` 长词 | 4 | 1 | −3 | 不提升 ✅ |
+///
+/// 体感：`extra=1` 的长词选 2 次到首位，`extra=4` 的要 5 次。既守住「音节数对齐优先」
+/// 这个先验，又没堵死「实证推翻先验」——只是让预测得越远的词，兑现门槛越高。这与
+/// librime/fcitx5 把 `overLengthCost` 和用户历史放在同一根轴上相加是同一个思路。
+///
+/// ⚠️ 折扣对**所有**候选生效（非补全候选 `extra` 恒 0，减 0 无影响），不要改成只对
+/// `is_promoted_completion` 施加——那会让「未上浮但 extra > 0」的补全反而比上浮的更
+/// 容易被词频顶上来，次序颠倒。
+fn completion_distance_discount(eff: f64, extra: u8) -> f64 {
+    eff - f64::from(extra)
+}
 
 /// 衰减殆尽的下限：有效强度低于此值视为「没用过」。
 ///
@@ -239,28 +257,18 @@ fn promotion_power(
     // `Single` 档按**语义单元数**而非字符数：英文所有候选都是前缀匹配（打 `hel` 出
     // `hello`），按字符数会把它们全挡死。
     //
-    // ## ⚠️ 豁免要按 `completion_extra_syllables` 收窄，不能只看 `is_promoted_completion`
-    //
-    // 该豁免是为「残码上浮」设的，而残码上浮的本义是**补完手头这个音节**（词恰好在这里
-    // 结束）。但 step4 的上浮判据放行了 `distance > 1 且 weight ≥ FLOOR` 的远距离补全，
-    // 于是「还差 4 个音节才打完」的长词也拿到了 promoted 标志、连带白拿这份豁免。
-    //
-    // 真机现象：`bingdongsanchif`（残码 `f`）下「冰冻三尺非一日之寒」(extra=4) 只要被选过
-    // **一次**，就靠 `power=1` 把 `base_pos` 减半到 0、抢走首位，压过音节数恰好对齐的
-    // 「冰冻三尺分」(extra=0)。而同一个词在 `bingdongsanchi`（无残码，promo=0）下就正常
-    // ——差别只在残码位白给的这份豁免。
-    //
-    // ⇒ 判据回到 `promote_prefix` 想问的那个问题：**这条补全预测了多少用户没输入的内容**。
-    // 预测得越多，越不该靠词频顶到前面。`extra ≤ 1` 保住豁免的本义（`meiy`→「没有」、
-    // `nihaom`→「你好吗」extra=0；`jisuanjik`→「计算机科学」extra=1），把远距离预测交还给
-    // `promote_prefix` 管。
-    let promoted_and_near = c.is_promoted_completion
-        && c.completion_extra_syllables <= PROMOTED_COMPLETION_FREQ_EXEMPT_EXTRA;
-    if c.is_prefix && !promoted_and_near && !promote_prefix.allows(&c.text) {
+    // 「预测得多远」这件事**不在本闸门里判**，交给
+    // [`completion_distance_discount`] 在有效次数上折抵——它是连续量，用布尔闸门切会在
+    // 阈值两侧同时误伤与漏放（那一版的完整事故记录见该函数的文档）。
+    if c.is_prefix && !c.is_promoted_completion && !promote_prefix.allows(&c.text) {
         return 0.0;
     }
     recs.get(&c.text).map_or(0.0, |r| {
         let eff = r.count as f64 * profile.decay_factor(r, now);
+        // 折扣必须在 `MIN_PROMOTION_POWER` 判定**之前**施加：折后不足半次即视为没用过，
+        // 否则「远距离预测选过一次」仍会拿到一个大于 0 的 power，`base_pos` 小的时候
+        // 照样能 floor 到 0 抢走首位——那正是本次要修的现象。
+        let eff = completion_distance_discount(eff, c.completion_extra_syllables);
         if eff < MIN_PROMOTION_POWER {
             return 0.0;
         }
