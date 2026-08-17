@@ -8,6 +8,7 @@ use crate::coordinator::{
 };
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
+use crate::short_code_yield;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
@@ -580,6 +581,12 @@ impl Coordinator {
         state: &mut State,
         limit: usize,
     ) -> (usize, InputOutcome) {
+        // 出简让全的沿途记录：淘汰与当前码无关的那些。放在函数最前面，因为下面每一条
+        // 返回路径都可能不走到记录点，而陈旧记录留着比没有更危险（会让位错的字）。
+        //
+        // 这是**唯一**的失效点：`input_buffer.clear()` 有十余个散落调用点，逐个接线必漏一处；
+        // 按前缀关系统一淘汰后，缓冲清空、光标中间编辑、方案切换全被这一条覆盖。
+        short_code_yield::evict_stale(&mut state.shortcode_tops, &state.input_buffer);
         // 分段上屏进行中**且最后一段来自拼音选词**：剩余编码强制按混输方案的拼音子方案转换，
         // 避免混输让五笔抢首选（你↑选后 hao→虚）。拼音方案 id 取当前混输方案的
         // [engine.mixed].secondary_schema（如 wubi86_pinyin → "pinyin"）。注意不用全局
@@ -935,6 +942,23 @@ impl Coordinator {
                 candidates.extend(completion_pool.into_iter().next());
             }
         }
+        // ── 出简让全 ──────────────────────────────────────────────────────────
+        // 有简码的字，在更长的码位上把首选让给词语。**必须在 `apply_freq_rerank` 之后**：
+        // 4 码位的 `ProtectPolicy.fallback` 是 0（不保护首选），先让位会被调频原样顶回去。
+        //
+        // 判据取自本次输入沿途记录的各级简码位首选（见 `short_code_yield`），零查询——
+        // 打 khtk 必然逐键经过 k/kh/kht，那时的首选已经记下了。
+        let yield_level = self.engine_mgr.codetable_settings().short_code_yield_level;
+        short_code_yield::apply(
+            &mut candidates,
+            &state.input_buffer,
+            &state.shortcode_tops,
+            yield_level,
+        );
+        // 记在让位**之后**：记的是用户实际看到的首条，让位本身也是用户所见的一部分。
+        // 简码位因此可能记到词（该级被让位了），而更短那级仍记着字——`apply` 扫全部级别，
+        // 故链式让位不会把自己的前提擦掉。
+        short_code_yield::record_top(&mut state.shortcode_tops, &state.input_buffer, &candidates);
         state.candidates = candidates;
         // 满码自动上屏「显示态」复评：引擎按未过滤候选判唯一（生僻同码字致不唯一被否决），
         // 但智能过滤后可能只剩唯一精确全码码表候选 → 据显示候选复评放行（逻辑与显示一致）。

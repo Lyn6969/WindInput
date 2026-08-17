@@ -906,12 +906,32 @@ pub struct CodetableGlobal {
     /// 可作**首码**的字符集（`input_chars` 的子集）。空=与 `input_chars` 相同。
     #[serde(default)]
     pub leading_chars: String,
+    /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
+    /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
+    ///
+    /// - `0` 关闭，候选顺序完全按词库原序
+    /// - `2` 一二级简码置后
+    /// - `3` 全部简码置后（默认）
+    ///
+    /// 判据是「当前码长 > 本值」而不是「当前码长 == 全码长」——后者要知道方案有几码，
+    /// 换到非四码方案就错位。
+    ///
+    /// 此前这件事由 `gen_dict` 在词库生成阶段做（`[demotion]` 段，已退役），判定烘进权重、
+    /// 用户关不掉，且触发条件是有条件降权而非标准的出简让全语义。
+    #[serde(default = "default_short_code_yield_level")]
+    pub short_code_yield_level: usize,
     /// 码表调频（统一开关，取代旧 user_frequency）。
     #[serde(default)]
     pub frequency: CodetableFrequency,
     /// 码表自动造词（连续单字）。
     #[serde(default)]
     pub auto_phrase: AutoPhraseConfig,
+}
+
+/// 出简让全默认开到三级（全部简码置后）——与它取代的 `gen_dict` `[demotion]`
+/// 同量级（实测 239 vs 205 个码），升级后手感延续。
+fn default_short_code_yield_level() -> usize {
+    3
 }
 
 impl Default for CodetableGlobal {
@@ -931,6 +951,7 @@ impl Default for CodetableGlobal {
             show_code_hint: true,
             single_code_input: false,
             single_code_complete: false,
+            short_code_yield_level: default_short_code_yield_level(),
             z_key_repeat: false,
             z_key_action: String::new(),
             // 空串 = 未设置 → `CodeCharSet::new` 回落内置默认 `a-z`，与历史硬编码
@@ -976,6 +997,9 @@ impl CodetableGlobal {
         }
         if let Some(v) = o.single_code_complete {
             out.single_code_complete = v;
+        }
+        if let Some(v) = o.short_code_yield_level {
+            out.short_code_yield_level = v;
         }
         if let Some(v) = o.z_key_repeat {
             out.z_key_repeat = v;

@@ -297,6 +297,18 @@ pub(crate) struct State {
     /// ——规则写得进去、读不出来，界面毫无异常。守门测试见 `handle_candidate.rs` 的
     /// `every_shadow_read_goes_through_normalized_code`。
     pub(crate) shadow_code: String,
+    /// 出简让全用：本次输入过程中**各级简码位的首选**，下标 0/1/2 = 码长 1/2/3。
+    /// 值为 `(该级的码, 首选文本)`——记的是用户**实际看到的**那一条（已过 `apply_filter` /
+    /// `apply_freq_rerank` / `apply_shadow`），故天然含调频与候选调整的效果。
+    ///
+    /// **存码而不是只按下标索引**，是因为退格不是唯一的改码方式：`input_cursor_pos` 允许在
+    /// 编码区中间插入/删除，此时缓冲长度不变而码已经变了（`kht` 改成 `kxt`）。用时校验
+    /// `input_buffer.starts_with(code)`，不匹配即视为无记录。
+    ///
+    /// 失效**不靠推送**：`input_buffer.clear()` 在协调器里有十余个散落调用点，逐个接线必漏。
+    /// 改由 `build_candidates` 开头按前缀关系统一淘汰——缓冲清空、光标编辑、方案切换
+    /// 全被同一条规则覆盖。
+    pub(crate) shortcode_tops: [Option<(String, String)>; 3],
     pub(crate) candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     pub(crate) selected_index: usize,
@@ -1260,6 +1272,7 @@ impl Coordinator {
                 preedit_split_body: String::new(),
                 preedit_fp_body: String::new(),
                 shadow_code: String::new(),
+                shortcode_tops: [const { None }; 3],
                 candidates: Vec::new(),
                 selected_index: 0,
                 current_page: 0,

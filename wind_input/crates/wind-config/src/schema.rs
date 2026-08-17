@@ -224,6 +224,12 @@ pub struct CodeTableSpec {
     /// 精确匹配空码补全。
     #[serde(default)]
     pub single_code_complete: Option<bool>,
+    /// 出简让全的简码级别上限（0 关闭 / 2 一二级 / 3 全部）。
+    ///
+    /// 方案级可覆盖：不同码表的简码体系深浅不同，且「短码首选 = 简码」这个等式只对
+    /// 五笔这类前缀式简码成立，别的码表可以在方案里关掉。
+    #[serde(default)]
+    pub short_code_yield_level: Option<usize>,
     /// z 键重复输入。
     #[serde(default)]
     pub z_key_repeat: Option<bool>,
