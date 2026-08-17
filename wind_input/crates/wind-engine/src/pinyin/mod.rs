@@ -197,16 +197,15 @@ fn fuzzy_penalized(weight: i32, fuzzy_edits: usize) -> i32 {
 /// 重排冲掉）。仅裸声母（syllables 为空）时应用——完整音节输入的单字已靠 is_prefix 层级就位。
 const BARE_INITIAL_SINGLE_CHAR_BOOST: i32 = 10_000_000;
 
-/// **用户/临时词**长词上浮（[`should_promote_user_completion`]）的「距词尾」上限。
-///
-/// ⚠️ **本常量只服务用户词判据，不要拿它当系统词库补全的判据** —— 系统词那边用
-/// [`COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`]。两者一度共用同一个 2，改动时连带
-/// 破坏了 `qingfengshu`→「清风输入法」（`promote_user_completion_thresholds` 当场抓到）。
-/// 数值相近纯属巧合，语义是两回事：这里问的是「这个词还差几个音节打完」，
-/// 那里问的是「这条补全预测了多少你还没输入的内容」。
-///
-/// 取 2 而非 1：`qingfengshu`(剩 2)/`qingfengs`(剩 2) 要给，`qingfeng`(剩 3) 不给。
-const COMPLETION_NEAR_SYLLABLES: u32 = 2;
+// **用户/临时词**长词上浮的「距词尾」上限曾是常量 `COMPLETION_NEAR_SYLLABLES = 2`，
+// 现已改为读用户配置 `completion.max_extra_syllables`（见 `should_promote_user_completion`
+// 的文档：硬编码 2 会让配置调宽的用户词长词沉到候选最底、进而被 `truncate` 丢弃）。
+//
+// ⚠️ 它与系统词库那边的 [`COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`] **始终是两回事**，
+// 别因为都被改动过就试图合并：这边问「这个词还差几个音节打完」（用户词，可信度由用户
+// 自己加词背书），那边问「这条补全预测了多少你还没输入的内容」（系统词，还要过
+// [`COMPLETION_FAR_WEIGHT_FLOOR`]）。两者一度共用同一个 2，改动时连带破坏了
+// `qingfengshu`→「清风输入法」（`promote_user_completion_thresholds` 当场抓到）。
 
 /// **系统词库前缀补全**无条件上浮进完整匹配层的最大距离（候选音节数 - 已完成音节数）。
 ///
@@ -498,20 +497,43 @@ const MAX_FULL_PINYIN_SUBPHRASE: usize = 4;
 /// **尾部残码**（未成音节的声母，如 `qingfengs` 的 `s`）算作「已起头的一个音节」——用户已
 /// 明确要接着打这个音节，意图强于停在整音节边界（`qingfeng`）。`started` = 完整音节数 +
 /// (有残码 ? 1 : 0)：
-/// - **有边界**（GUI 加词/学习词带音节真值）：`started ≥ 2` 且**距词尾 ≤ `COMPLETION_NEAR_SYLLABLES`**
-///   才上浮——`qingfengshu`(started 3, 剩 2) 给、`qingfengs`(started 3, 剩 2) 给、`qingfeng`(started 2, 剩 3) 不给、`qing`(1) 不给。
+/// - **有边界**（GUI 加词/学习词带音节真值）：`started ≥ 2` 且**距词尾 ≤ `max_extra`**
+///   （用户配置的 `completion.max_extra_syllables`）才上浮。
 /// - **无边界**（手输码用户词 `boundary=0`，算不出剩余）：退化为「`started ≥ 3`」门槛，
 ///   同样对齐「打到第 3 个音节才给」，避免 1-2 音节时被一堆冷僻长词占满前排。
+///
+/// # 为什么距词尾上限必须读配置，不能硬编码
+///
+/// 该上限一度是常量 `COMPLETION_NEAR_SYLLABLES = 2`，真机报障：用户把
+/// `max_extra_syllables` 调到 10、库里有 11 音节的用户词「清风输入法内测问题反馈」，
+/// 打 `qingfengshurufa`(started 5, 剩 6) **翻遍全部 16 页都找不到它**，必须打到
+/// `...wen't`(started 9, 剩 2) 才出现 —— 分界点正是那个硬编码的 2。
+///
+/// ⚠️ 后果比「排在后面」严重得多，这是本判据最容易被低估的地方：
+///
+/// 不上浮 ⇒ 落进前缀补全层 ⇒ 被首音节同音子短语整层压到候选最底。而引擎侧
+/// **`sort_by` 紧跟着 `truncate`**，于是「排到最底」在候选数超过上限时**等于被丢弃**
+/// —— 协调器再也收不到它，`cmp_by_consumed` 那道补救也就无从谈起。实测同一条件下
+/// `limit=141` 该词消失、`limit=142` 才刚好保住（它就在最后一位）。
+///
+/// ⇒ **「降级不销毁」的界线不由排序决定，而由候选总数有没有超过上限决定**，这是个
+/// 藏在数据规模里的开关：小词库测不出来（本仓测试词库该输入恰好产出 142 条，全保留），
+/// 用户的大词库产出远超 300 就必然丢。定位时四轮探针全部误报「正常」正因如此。
+///
+/// 读配置后语义也与召回层对齐了：召回上限是 `word_syls ≤ started + max_extra`，
+/// 即 `remaining ≤ max_extra` —— **召回得进来的用户词，就该上浮得起来**，不再有
+/// 「召回了却沉在必被截断的位置」这个中间态。
 fn should_promote_user_completion(
     completed_syls: usize,
     trailing_partial: bool,
     boundary: u64,
+    max_extra: u32,
 ) -> bool {
     let started = completed_syls + usize::from(trailing_partial);
     if boundary != 0 {
         let word_syls = boundary.count_ones() as usize;
         let remaining = word_syls.saturating_sub(started);
-        started >= 2 && remaining <= COMPLETION_NEAR_SYLLABLES as usize
+        started >= 2 && remaining <= max_extra as usize
     } else {
         started >= 3
     }
@@ -2455,6 +2477,7 @@ impl Engine for PinyinEngine {
                         completed_syls,
                         trailing_partial,
                         existing.boundary,
+                        self.config.completion_max_extra_syllables,
                     ) {
                         let w = existing.weight.max(c.weight);
                         existing.weight = promotion_cap.map_or(w, |cap| w.min(cap));
@@ -2470,7 +2493,12 @@ impl Engine for PinyinEngine {
                 // 匹配层，否则被首音节同音子短语整层淹没（长词打到第 3-4 音节才给的根因）。
                 // is_prefix 保持结构真值不动，排序提升由 is_promoted_completion 承接。
                 if c.is_prefix
-                    && should_promote_user_completion(completed_syls, trailing_partial, c.boundary)
+                    && should_promote_user_completion(
+                        completed_syls,
+                        trailing_partial,
+                        c.boundary,
+                        self.config.completion_max_extra_syllables,
+                    )
                 {
                     c.is_promoted_completion = true;
                     if let Some(cap) = promotion_cap {
@@ -3542,51 +3570,101 @@ mod tests {
         }
     }
 
-    /// 上浮判据单测：距词尾 ≤2（有边界）/ 已打 ≥3 音节（无边界）才上浮。
+    /// 上浮判据单测：距词尾 ≤ `max_extra`（有边界）/ 已打 ≥3 音节（无边界）才上浮。
     #[test]
     fn promote_user_completion_thresholds() {
         // 5 音节词（boundary 五个音节起始位；此处只关心 count_ones()=5）。
         let b5: u64 = 0b11111; // 5 个置位（count_ones=5，模拟 5 音节词）
         assert_eq!(b5.count_ones(), 5);
+        // 以 max_extra = 2 复核历史档位（本判据长期硬编码的那个值）。
         // 无残码：completed_syls 即 started。
         assert!(
-            !should_promote_user_completion(2, false, b5),
+            !should_promote_user_completion(2, false, b5, 2),
             "5 音节词打 2 音节剩 3 > 2，不上浮"
         );
         assert!(
-            should_promote_user_completion(3, false, b5),
+            should_promote_user_completion(3, false, b5, 2),
             "5 音节词打 3 音节剩 2 = 2，上浮"
         );
         assert!(
-            should_promote_user_completion(4, false, b5),
+            should_promote_user_completion(4, false, b5, 2),
             "5 音节词打 4 音节剩 1，上浮"
         );
         assert!(
-            !should_promote_user_completion(1, false, b5),
+            !should_promote_user_completion(1, false, b5, 2),
             "1 音节 < 2，无条件不上浮"
         );
         // 尾部残码算作已起头的一个音节：qingfengs = 2 完整音节 + 残码 → started 3 → 上浮。
         assert!(
-            should_promote_user_completion(2, true, b5),
+            should_promote_user_completion(2, true, b5, 2),
             "2 完整音节 + 残码（started 3, 剩 2）应上浮"
         );
         assert!(
-            !should_promote_user_completion(1, true, b5),
+            !should_promote_user_completion(1, true, b5, 2),
             "1 完整音节 + 残码（started 2, 剩 3 > 2）不上浮"
         );
-        // 无边界兜底：started>=3。
+        // 无边界兜底：started>=3，与 max_extra 无关（算不出剩余）。
+        for max_extra in [0, 2, 10] {
+            assert!(
+                !should_promote_user_completion(2, false, 0, max_extra),
+                "无边界 2 音节不上浮（max_extra={max_extra} 不参与）"
+            );
+            assert!(
+                should_promote_user_completion(3, false, 0, max_extra),
+                "无边界 3 音节上浮（max_extra={max_extra} 不参与）"
+            );
+            assert!(
+                should_promote_user_completion(2, true, 0, max_extra),
+                "无边界 2 音节 + 残码（started 3）上浮"
+            );
+        }
+    }
+
+    /// 距词尾上限**跟着配置走**：这是「设置对用户词库长词无效」那条报障的判据。
+    ///
+    /// 真机现场：11 音节的用户词、`max_extra_syllables = 10`，打 `qingfengshurufa`
+    /// （started 5，剩 6）翻遍 16 页找不到，必须打到剩 2 才出现 —— 分界点正是旧的
+    /// 硬编码 2。剩 6 在 `max_extra = 10` 下必须上浮。
+    ///
+    /// ⚠️ 不上浮的后果不止「排在后面」：引擎 `sort_by` 紧跟 `truncate`，沉到最底
+    /// 在候选数超上限时**等于被丢弃**。所以这条断言守的是可见性，不是次序。
+    #[test]
+    fn promote_user_completion_follows_max_extra_config() {
+        // 11 音节词（count_ones = 11）。
+        let b11: u64 = (1 << 11) - 1;
+        assert_eq!(b11.count_ones(), 11);
+
+        // started = 5（qingfengshurufa），剩 6。
         assert!(
-            !should_promote_user_completion(2, false, 0),
-            "无边界 2 音节不上浮"
+            !should_promote_user_completion(5, false, b11, 2),
+            "max_extra=2：剩 6 > 2，不上浮（旧硬编码行为，报障现场）"
         );
         assert!(
-            should_promote_user_completion(3, false, 0),
-            "无边界 3 音节上浮"
+            should_promote_user_completion(5, false, b11, 10),
+            "max_extra=10：剩 6 ≤ 10，必须上浮 —— 用户把设置调宽就是这个意思"
         );
         assert!(
-            should_promote_user_completion(2, true, 0),
-            "无边界 2 音节 + 残码（started 3）上浮"
+            should_promote_user_completion(5, false, b11, 6),
+            "max_extra=6：剩 6 恰好等于上限，边界值取闭区间（与召回层同口径）"
         );
+        assert!(
+            !should_promote_user_completion(5, false, b11, 5),
+            "max_extra=5：剩 6 > 5，不上浮"
+        );
+
+        // 与召回层同口径：召回上限是 word_syls ≤ started + max_extra，
+        // 即 remaining ≤ max_extra。召回得进来的，就该上浮得起来。
+        for started in 2..=11usize {
+            let remaining = 11usize.saturating_sub(started);
+            let max_extra = 10u32;
+            let recalled = 11 <= started + max_extra as usize;
+            let promoted = should_promote_user_completion(started, false, b11, max_extra);
+            assert_eq!(
+                promoted,
+                recalled && started >= 2,
+                "started={started} 剩 {remaining}：召回与上浮判据须同口径"
+            );
+        }
     }
 
     /// 补全折扣：每多一个未输入音节，权重减半（对齐 librime `kCompletionPenalty`
