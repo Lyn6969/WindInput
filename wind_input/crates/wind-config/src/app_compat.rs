@@ -218,11 +218,16 @@ pub struct AppCompatRule {
     /// 让它可以按宿主覆盖。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smart_method: Option<SmartMethod>,
-    /// 光标坐标水平校正（像素，正=右）。
+    /// 光标坐标水平校正（dp，96dpi 基准逻辑像素，正=右）。
     ///
     /// 用于宿主报告的 caret 坐标**系统性偏移**的场景（如 Windows Terminal，其它输入法
     /// 同样偏），与主题里的候选窗偏移不是一回事：那个是候选窗相对光标的**布局**（样式层），
     /// 这个修的是光标坐标本身（兼容层），故候选窗/状态气泡/HUD 等所有消费者一并受益。
+    ///
+    /// 单位是 dp 而非物理像素：宿主上报的 caret 坐标是物理像素，同一份配置若直接按物理
+    /// 像素相加，在不同缩放的显示器（尤其多屏混插 100%/150%/200%）上观感会不一致——按
+    /// 目标点所在显示器的 DPI 换算成物理像素在协调器侧完成（`apply_caret_compat`），
+    /// 本字段本身只管「用户想要的视觉量」。
     ///
     /// 用 `i32` 而非 `Option`：0 就是"不偏移"，语义无歧义，不存在 bool 那种"默认值污染"。
     ///
@@ -230,7 +235,7 @@ pub struct AppCompatRule {
     /// 同层同处；漏一处的症状是「有时生效有时不生效」。
     #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub caret_offset_x: i32,
-    /// 光标坐标垂直校正（像素，正=下）。语义见 [`Self::caret_offset_x`]。
+    /// 光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下）。语义见 [`Self::caret_offset_x`]。
     #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub caret_offset_y: i32,
 }
@@ -300,7 +305,7 @@ pub fn set_smart_method(
     upsert_rule(rules, process, |r| r.smart_method = method);
 }
 
-/// 在一组规则上设置指定进程的光标坐标校正偏移（像素，正=右/下；0 = 不偏移）。
+/// 在一组规则上设置指定进程的光标坐标校正偏移（dp，正=右/下；0 = 不偏移）。
 pub fn set_caret_offset(rules: &mut Vec<AppCompatRule>, process: &str, dx: i32, dy: i32) {
     upsert_rule(rules, process, |r| {
         r.caret_offset_x = dx;

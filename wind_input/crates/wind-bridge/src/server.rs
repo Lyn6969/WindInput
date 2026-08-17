@@ -242,6 +242,13 @@ fn handle_client(
     use windows::Win32::Foundation::*;
     use windows::Win32::Storage::FileSystem::*;
 
+    // 连接建立即通知：`ctx.pid` 是本次唯一能免费拿到、还没被任何消息处理耽搁的对端 pid。
+    // 放在读循环之前——命名管道有内核缓冲（见上方 CreateNamedPipeA 的 64KB 收发缓冲区），
+    // 对端此刻发消息不会因为我们还没开始 ReadFile 而丢失或阻塞；本调用只影响*本连接*
+    // 读到*第一条*消息前那一小段时间（<1ms 级的 GetForegroundWindow / 按需 OpenProcess），
+    // 每条连接仅此一次，不会摊到后续每次按键往返上。
+    handler.handle_client_connected(ctx.pid);
+
     let pipe = pipe.0;
     let mut header_buf = [0u8; IpcHeader::SIZE];
     let mut payload_buf = vec![0u8; 65536];

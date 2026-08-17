@@ -50,13 +50,75 @@ use wind_ui_types::CandidateItem;
 use wind_ui_types::{GlobalHotkeyEntry, UiCommand, UiEvent};
 use wind_ui_types::{ToastKind, ToastPosition};
 
-/// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素）。微信 reflow 后的
-/// 权威帧通常上报真实行高（~20px，随 DPI 缩放），直接取用；仅退化帧（height=1）落到此下限，
-/// 保证上方候选窗底边抬到正文之上而不遮挡。偏大只是多留空隙，故取一个稳妥的正文行高量级。
+/// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素——宿主上报的
+/// caret rect 本就是物理像素，此处刻意不做 dp 换算，与 `caret_offset_*` 不是同一件事：
+/// 那是用户配置的校正量，这是拿宿主自己上报的物理量兜底，两者单位巧合都叫「像素」但
+/// 出处不同）。微信 reflow 后的权威帧通常上报真实行高（~20px，随 DPI 缩放），直接取用；
+/// 仅退化帧（height=1）落到此下限，保证上方候选窗底边抬到正文之上而不遮挡。偏大只是
+/// 多留空隙，故取一个稳妥的正文行高量级。
 const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 
 /// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
 pub(crate) const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
+
+/// 把 `caret_offset_*` 的 dp 值按显示器缩放换算成物理像素偏移。纯函数，与 DPI 查询解耦，
+/// 可脱离真实系统单测——`dpi_scale_for_point` 那部分才是不可控的平台调用，两者故意分开。
+fn dp_offset_to_pixels(dx_dp: i32, dy_dp: i32, scale: f32) -> (i32, i32) {
+    (
+        (dx_dp as f32 * scale).round() as i32,
+        (dy_dp as f32 * scale).round() as i32,
+    )
+}
+
+/// `apply_caret_compat` 里 dx/dy≠0 分支的完整落地逻辑（含 composition_start 同步平移），
+/// 抽成接受显式 `scale` 的自由函数，好在不依赖 `dpi_scale_for_point`（`cfg(test)` 下恒
+/// 1.0）的前提下，直接用非 1.0 的 scale 单测「dp 换算确实接进了这条变换」——`dp_offset_to_pixels`
+/// 只验证换算数学本身，不证明它真被这里调用；两者故意分成两条覆盖面（2026-08-17 code
+/// review 指出的 test-wiring gap）。
+fn apply_dp_offset(data: &mut CaretData, dx_dp: i32, dy_dp: i32, scale: f32) {
+    let (px_dx, px_dy) = dp_offset_to_pixels(dx_dp, dy_dp, scale);
+    data.x += px_dx;
+    data.y += px_dy;
+    if data.composition_start_x != 0 {
+        data.composition_start_x += px_dx;
+    }
+    if data.composition_start_y != 0 {
+        data.composition_start_y += px_dy;
+    }
+}
+
+/// 取屏幕点 (x, y) 所在显示器的有效 DPI 缩放（96dpi = 1.0）。
+///
+/// 非 Windows 平台回退 1.0 是**语义正确**而非「还没实现」：本仓 macOS 端的屏幕坐标口径
+/// 本就是点（point），dp 与点在 1x/Retina 下始终 1:1（Retina 的物理像素放大在別处的
+/// backing scale 里处理，不影响这层点坐标），故 1.0 无需再查。⚠️ 不要照抄 `wind-ui/src/dpi.rs`
+/// 给这里补一条 `CGDisplay` Retina 分支——那是候选窗渲染用物理像素定尺寸，跟这里「点/dp
+/// 之间无缩放」不是同一个问题，抄错了 macOS 会双重缩放。Windows 上失败（`GetDpiForMonitor`
+/// 出错）同样回退 1.0，此时才是真的「查不到就当没有」。
+///
+/// `cfg(test)` 下强制回退 1.0：`cargo test` 可能在开发者本机的真实高 DPI 屏幕上跑，
+/// 若测试也走真实 `GetDpiForMonitor`，断言的期望坐标会随本机屏幕缩放而漂移——同一条测试
+/// 换台机器就变红。真实换算逻辑收在 [`dp_offset_to_pixels`] 里单独用显式 scale 值测。
+#[cfg(all(windows, not(test)))]
+fn dpi_scale_for_point(x: i32, y: i32) -> f32 {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x: u32 = 0;
+        let mut dpi_y: u32 = 0;
+        if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_y > 0 {
+            return dpi_y as f32 / 96.0;
+        }
+        1.0
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn dpi_scale_for_point(_x: i32, _y: i32) -> f32 {
+    1.0
+}
 
 /// 取进程 ID 对应的可执行文件名（如 "Weixin.exe"）。对齐 Go `bridge.GetProcessName`：
 /// OpenProcess(QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW，取末段文件名。
@@ -505,8 +567,9 @@ pub(crate) struct ActiveCompat {
     pub(crate) auto_pair: Option<bool>,
     /// 本进程的智能符号替换方案；`None` = 跟随全局 `input.symbol.smart_method`。
     pub(crate) smart_method: Option<wind_config::config::SmartMethod>,
-    /// 光标坐标校正偏移（像素，正=右/下）。宿主报告的 caret 系统性偏移时用，
+    /// 光标坐标校正偏移（dp，96dpi 基准逻辑像素，正=右/下）。宿主报告的 caret 系统性偏移时用，
     /// 与 `caret_use_top` 在同两处消费（`apply_focus_caret` / `handle_caret_update`）。
+    /// 应用时按目标点所在显示器的 DPI 换算成物理像素，见 [`Coordinator::apply_caret_compat`]。
     pub(crate) caret_offset_x: i32,
     pub(crate) caret_offset_y: i32,
 }
@@ -1556,6 +1619,109 @@ impl Coordinator {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(pid, name.to_lowercase());
         }
+    }
+
+    /// `MessageHandler::handle_client_connected` 的纯逻辑部分：只有 `pid` 确实等于当前
+    /// 前台窗口的 pid 才刷新规则字段，避免后台宿主的无关重连（管道抖动等）覆盖掉
+    /// 真正聚焦应用的 per-app 兼容态。`foreground_pid` 作为参数传入而非内部现查，是为了
+    /// 脱离真实 `GetForegroundWindow` 单测——`dpi_scale_for_point` 已经吃过一次「测试跑在
+    /// 真实系统 API 上导致断言随运行环境漂移」的教训。
+    ///
+    /// 生产调用点仅有 `handle_client_connected` 的 `#[cfg(windows)]` 分支；非 Windows 的
+    /// 非测试构建没有调用方也没有本函数（连同 `refresh_active_compat_rule_fields` 一起
+    /// 用同一个 cfg 门控，避免出现「函数存在但调不到」的死代码）。
+    #[cfg(any(windows, test))]
+    fn apply_connected_pid_compat(&self, pid: u32, foreground_pid: u32) {
+        if foreground_pid != pid {
+            return;
+        }
+        self.refresh_active_compat_rule_fields(pid);
+    }
+
+    /// 只刷新 `active_compat` 里「当前生效设置」那一半字段（`caret_use_top` /
+    /// `first_show_mode` / `auto_pair` / `smart_method` / `caret_offset_*`），**刻意不碰
+    /// `.pid` 与 `.has_initial_rule`**。
+    ///
+    /// 这两个字段的另一重身份是「上一次真实 `FOCUS_GAINED` 落在哪个进程」——
+    /// `get_current_mode`（DLL 同步路径）与 `handle_focus_gained` 的 `crossed` 判据都靠
+    /// 它俩识别「这次是不是跨进程切入」。连接建立**不是**真实的焦点事件：对一个全新启动、
+    /// TSF DLL 第一次在其中加载、且此刻恰好已在前台的进程，管道连接必然先于它有史以来
+    /// 第一条 `FOCUS_GAINED`（发不出消息就说明还没连上）。若这里跟 `update_active_compat`
+    /// 一样整体覆写 `ActiveCompat`，会让 `.pid` 提前变成新进程，随后真正到达的那条
+    /// `FOCUS_GAINED` 就会被 `crossed` 误判成「同进程」，吞掉 `should_reapply_initial`
+    /// （该应用的 `initial_mode`/`initial_punct` 规则）与 `get_current_mode` 的首键竞态
+    /// 消除逻辑（2026-08-17 code review 发现，未真机复现）。
+    ///
+    /// 字段提取逻辑刻意与 `update_active_compat` 分开写而非提取共用：那是已跑通真机验证的
+    /// 现有函数，为省几行重复去动它的取值顺序/锁持有范围不划算——两处字段列表如有出入，
+    /// 应同步核对。
+    ///
+    /// 未做「同 pid 重复调用去重」：不像 `update_active_compat` 有 `.pid` 可比对，本函数
+    /// 没有身份缓存可用；接受每次连接都重新 `OpenProcess` 一次（<1ms，且连接本就是低频
+    /// 事件，不是按键路径）。
+    #[cfg(any(windows, test))]
+    fn refresh_active_compat_rule_fields(&self, pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        let cached_name = self.cached_proc_name((pid as u64) << 32);
+        let name = if cached_name.is_empty() {
+            process_name(pid)
+        } else {
+            cached_name
+        };
+        if name.is_empty() {
+            return;
+        }
+        let (
+            caret_use_top,
+            first_show_mode,
+            auto_pair,
+            smart_method,
+            caret_offset_x,
+            caret_offset_y,
+        ) = {
+            let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
+            let rule = table.get_rule(&name);
+            (
+                rule.map(|r| r.caret_use_top).unwrap_or(false),
+                rule.map(|r| r.first_show_mode).unwrap_or_default(),
+                rule.and_then(|r| r.auto_pair),
+                rule.and_then(|r| r.smart_method),
+                rule.map(|r| r.caret_offset_x).unwrap_or(0),
+                rule.map(|r| r.caret_offset_y).unwrap_or(0),
+            )
+        };
+        debug!(
+            "Connected-pid compat refresh for process={name} (pid={pid}): caret_use_top={} first_show_mode={} auto_pair={} smart_method={} caret_offset=({},{})",
+            caret_use_top,
+            first_show_mode.as_config(),
+            match auto_pair {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "(follow-global)",
+            },
+            match smart_method {
+                Some(wind_config::config::SmartMethod::DeleteReplace) => "delete_replace",
+                Some(wind_config::config::SmartMethod::HoldComposition) => "hold_composition",
+                None => "(follow-global)",
+            },
+            caret_offset_x,
+            caret_offset_y
+        );
+        {
+            let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            ac.caret_use_top = caret_use_top;
+            ac.first_show_mode = first_show_mode;
+            ac.auto_pair = auto_pair;
+            ac.smart_method = smart_method;
+            ac.caret_offset_x = caret_offset_x;
+            ac.caret_offset_y = caret_offset_y;
+        }
+        self.pid_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, name.to_lowercase());
     }
 
     /// 按 client_token 高 32 位的 PID 查已缓存的进程名（小写）。未缓存返回空串。
@@ -3754,6 +3920,11 @@ impl Coordinator {
     /// 同样偏）。与主题里的候选窗偏移不是一回事：那个是候选窗相对光标的布局（样式层），
     /// 这个修的是光标坐标（兼容层），故候选窗/状态气泡/HUD 等所有消费者一并受益。
     ///
+    /// `caret_offset_*` 以 dp（96dpi 基准逻辑像素）配置，而宿主上报的 caret 坐标是物理像素
+    /// （屏幕坐标，DPI-aware 进程下即物理像素）——同一份 dp 配置在 100%/200% 缩放的显示器上
+    /// 观感应一致，故须按**目标点所在显示器**的当前 DPI 换算成物理像素后再叠加，而不能直接
+    /// 相加。多屏且缩放不同时，用哪块屏的 DPI 只能在换算时按坐标现查，缓存不得。
+    ///
     /// 组合起点坐标同步平移以保持锚点一致；为 0（未提供）时不动，避免把「没有值」
     /// 变成「一个偏移后的假值」。
     fn apply_caret_compat(&self, data: &mut CaretData) {
@@ -3770,14 +3941,8 @@ impl Coordinator {
             }
         }
         if dx != 0 || dy != 0 {
-            data.x += dx;
-            data.y += dy;
-            if data.composition_start_x != 0 {
-                data.composition_start_x += dx;
-            }
-            if data.composition_start_y != 0 {
-                data.composition_start_y += dy;
-            }
+            let scale = dpi_scale_for_point(data.x, data.y);
+            apply_dp_offset(data, dx, dy, scale);
         }
     }
 
@@ -5570,6 +5735,46 @@ mod caret_compat_tests {
         );
     }
 
+    /// `handle_focus_gained` 内 `update_active_compat` 必须先于它自己那次 `apply_focus_caret`
+    /// 调用跑完，否则本次焦点事件带来的第一份坐标会拿**上一个进程**的规则去变换——
+    /// 2026-08-17 真机复现：切到配了 `caret_offset_y` 的应用后，第一次候选框/状态气泡位置
+    /// 没有校正，之后的坐标更新才对，表现为「多屏下坐标还是有点偏」，一度被误判成 DPI
+    /// 换算没生效。用 `pid_names` 预置该 pid 的名字（同 `update_active_compat_prefers_cached_name_over_process_lookup`
+    /// 的手法），让 `handle_focus_gained` 内对新进程的规则查找无需真实 `OpenProcess` 也能命中。
+    #[test]
+    fn handle_focus_gained_applies_new_process_caret_offset_on_first_caret() {
+        let c = coord();
+        let pid = 8848u32;
+        let token = (pid as u64) << 32 | 1;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(pid, "windowsterminal.exe".to_string());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_caret_offset(&mut rules, "windowsterminal.exe", 0, 12);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+
+        c.handle_focus_gained(&FocusData {
+            x: 100,
+            y: 300,
+            height: 30,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: token,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+            bundle_id: String::new(),
+        });
+        let st = c.state.lock().unwrap();
+        assert_eq!(
+            st.caret_y, 312,
+            "新进程的 caret_offset_y 必须在本次焦点事件的第一份坐标上就生效，\
+             不能等到下一次 caret_update 才校正"
+        );
+    }
+
     /// 造一个 fast 档协调器并指定坐标缓存可信与否。
     fn fast_coord(verified: bool) -> Arc<Coordinator> {
         let c = coord();
@@ -6086,6 +6291,86 @@ mod caret_compat_tests {
         let s = c.state.lock().unwrap();
         assert_eq!(s.caret_y, 200);
         assert_eq!(s.caret_height, 20);
+    }
+
+    /// 真机复现（2026-08-17）：服务重启时 alacritty.exe 早已在前台，管道重连只续发
+    /// `caret_update`，从没有新的 `FOCUS_GAINED` 促发 `update_active_compat`——
+    /// `caret_offset_*` 等 per-app 规则整个会话都停在默认值。`handle_client_connected`
+    /// 应该在连接建立、确认该 pid 就是当前前台窗口时，就提前把规则字段解析好。
+    #[test]
+    fn apply_connected_pid_compat_loads_rule_when_pid_is_foreground() {
+        let c = coord();
+        let pid = 8848u32;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(pid, "alacritty.exe".to_string());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_caret_offset(&mut rules, "alacritty.exe", 0, 12);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+
+        c.apply_connected_pid_compat(pid, pid);
+
+        assert_eq!(
+            c.active_compat.lock().unwrap().caret_offset_y,
+            12,
+            "该 pid 确认在前台时，连接建立即应解析出它的 per-app 规则字段"
+        );
+    }
+
+    /// code review 发现（2026-08-17，未真机复现，逻辑推导）：连接建立不是真实的
+    /// `FOCUS_GAINED`。对一个全新启动、TSF DLL 第一次加载、且此刻恰好已在前台的进程，
+    /// 管道连接必然先于它有史以来第一条 `FOCUS_GAINED`（发不出消息就说明还没连上）。
+    /// `apply_connected_pid_compat` 若像 `update_active_compat` 一样整体覆写
+    /// `active_compat.pid`，会让随后真正到达的那条 `FOCUS_GAINED` 被 `crossed` 判据
+    /// （`get_current_mode` / `handle_focus_gained`）误判成「同进程、未跨进程切入」，
+    /// 吞掉 `initial_mode`/`initial_punct` 规则与首键竞态消除逻辑——本测试钉住
+    /// `.pid`（此处默认值 0）必须原封不动。
+    #[test]
+    fn apply_connected_pid_compat_does_not_claim_pid_identity() {
+        let c = coord();
+        let pid = 8848u32;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(pid, "alacritty.exe".to_string());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_caret_offset(&mut rules, "alacritty.exe", 0, 12);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+
+        c.apply_connected_pid_compat(pid, pid);
+
+        assert_eq!(
+            c.active_compat.lock().unwrap().pid,
+            0,
+            "连接建立不得提前认领 pid 身份，否则该进程随后第一条真实 FOCUS_GAINED 的 \
+             crossed 判据会被误判成「同进程」"
+        );
+    }
+
+    /// 后台宿主的无关重连（管道抖动等）不得覆盖真正聚焦应用的规则字段——
+    /// 否则「哪个应用的规则生效」会被连接顺序而非焦点决定。
+    #[test]
+    fn apply_connected_pid_compat_ignores_non_foreground_pid() {
+        let c = coord();
+        let focused_pid = 100u32;
+        let background_pid = 200u32;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(background_pid, "alacritty.exe".to_string());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_caret_offset(&mut rules, "alacritty.exe", 0, 12);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+
+        // background_pid 建立连接，但当前前台窗口仍是 focused_pid。
+        c.apply_connected_pid_compat(background_pid, focused_pid);
+
+        assert_eq!(
+            c.active_compat.lock().unwrap().caret_offset_y,
+            0,
+            "非前台 pid 的连接不得把它的规则字段写进 active_compat"
+        );
     }
 
     #[test]
@@ -6959,7 +7244,9 @@ mod per_app_compat_tests {
     }
 
     /// 光标坐标校正：两个消费点（`apply_focus_caret` / `handle_caret_update`）共用
-    /// `apply_caret_compat`，此处直接锁住那个变换本身。
+    /// `apply_caret_compat`，此处直接锁住那个变换本身。`dpi_scale_for_point` 在
+    /// `cfg(test)` 下恒回退 1.0（见其文档），故这里的期望坐标等同于 dp 值本身；
+    /// 缩放本身的数学在 [`dp_offset_to_pixels_scales_with_dpi`] 单独覆盖。
     #[test]
     fn caret_offset_shifts_coordinates() {
         let c = coord_with(Config::default());
@@ -6981,6 +7268,49 @@ mod per_app_compat_tests {
         assert_eq!(
             (with_cs.composition_start_x, with_cs.composition_start_y),
             (47, 187)
+        );
+    }
+
+    /// dp→物理像素换算：同一份 dp 配置在不同缩放的显示器上，换算出的物理像素偏移应随
+    /// 缩放等比放大，这正是本功能要解决的「多屏不同缩放下无法完美兼容」的核心数学。
+    #[test]
+    fn dp_offset_to_pixels_scales_with_dpi() {
+        assert_eq!(
+            dp_offset_to_pixels(12, -2, 1.0),
+            (12, -2),
+            "100% 缩放下 dp==物理像素"
+        );
+        assert_eq!(
+            dp_offset_to_pixels(12, -2, 1.5),
+            (18, -3),
+            "150% 缩放等比放大"
+        );
+        assert_eq!(dp_offset_to_pixels(12, -2, 2.0), (24, -4), "200% 缩放翻倍");
+        assert_eq!(
+            dp_offset_to_pixels(3, 0, 1.25),
+            (4, 0),
+            "四舍五入到最近物理像素"
+        );
+    }
+
+    /// `caret_offset_shifts_coordinates` 只在 `cfg(test)` 恒 1.0 的 scale 下测过
+    /// `apply_caret_compat`，证明不了非 1.0 缩放真的接了进去（`dp_offset_to_pixels_scales_with_dpi`
+    /// 也只测纯数学，不碰 `apply_dp_offset` 这条落地路径）。此处直接调 `apply_dp_offset`
+    /// 本体、显式传 150% 缩放，钉住 caret 与 composition_start 两处都按 scale 换算
+    /// （2026-08-17 code review 指出的 test-wiring gap）。
+    #[test]
+    fn apply_dp_offset_wires_scale_into_full_transform() {
+        let mut data = caret(100, 200, 20, 50, 180);
+        apply_dp_offset(&mut data, -3, 7, 1.5);
+        assert_eq!(
+            (data.x, data.y),
+            (100 - 5, 200 + 11),
+            "150% 下 -3dp→-4.5→round(-5)px，7dp→10.5→round(11)px"
+        );
+        assert_eq!(
+            (data.composition_start_x, data.composition_start_y),
+            (50 - 5, 180 + 11),
+            "组合起点须按同一 scale 同步平移，不能只动 caret"
         );
     }
 

@@ -58,6 +58,19 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(false, |h| h.preedit_uses_placeholder())
     }
 
+    fn handle_client_connected(&self, pid: u32) {
+        // 服务重启是本回调的主场景：`bridge.start()` 早于 `set_ready`（引擎/词典加载
+        // 期间），DLL 若恰好在这段窗口重连，per-app 规则预热会被静默吞掉，退化回旧行为
+        // （手动切一次焦点才生效）——不算错误，但值得留痕，否则「为什么这次没生效」
+        // 排查时无从下手。
+        if !self.is_ready() {
+            tracing::debug!(
+                "DeferredHandler: 未就绪期间收到连接 pid={pid}，per-app 规则预热被跳过（真实 FOCUS_GAINED 兜底）"
+            );
+        }
+        self.with_handler((), |h| h.handle_client_connected(pid))
+    }
+
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData> {
         self.with_handler(None, |h| h.handle_focus_gained(data))
     }
@@ -218,6 +231,9 @@ mod tests {
         fn handle_diag_snapshot(&self, _s: &DiagSnapshotPayload) {
             self.calls.lock().unwrap().push("diag_snapshot");
         }
+        fn handle_client_connected(&self, _pid: u32) {
+            self.calls.lock().unwrap().push("client_connected");
+        }
 
         // ── 以下仅为满足 trait 的必需项，本测试不关心 ──
         fn handle_key_event(&self, _d: &KeyEventData) -> KeyAction {
@@ -268,6 +284,7 @@ mod tests {
         deferred.handle_english_stats(1, 2, 3, 4);
         deferred.handle_input_state_report(1, true, 2, 3);
         deferred.handle_diag_snapshot(&DiagSnapshotPayload::default());
+        deferred.handle_client_connected(1234);
         assert!(rec.calls.lock().unwrap().is_empty(), "未就绪时不应触达内层");
 
         deferred.set_ready(rec.clone());
@@ -277,6 +294,7 @@ mod tests {
             pid: 42,
             ..Default::default()
         });
+        deferred.handle_client_connected(1234);
 
         assert!(
             rec.got("english_stats"),
@@ -286,6 +304,10 @@ mod tests {
         assert!(
             rec.got("diag_snapshot"),
             "诊断快照未转发 → HUD 的窗口/上下文分区恒为空"
+        );
+        assert!(
+            rec.got("client_connected"),
+            "连接建立未转发 → 服务重启时已聚焦宿主的 per-app 规则预热整段失效"
         );
     }
 }

@@ -102,6 +102,22 @@ fn shot_result_message(v: &serde_json::Value) -> (String, ToastKind) {
 }
 
 impl MessageHandler for Coordinator {
+    /// 见 trait 文档：DLL/宿主新连接建立时的兜底刷新。真机复现（2026-08-17）：服务重启时
+    /// alacritty.exe 早已在前台，管道重连只续发 `caret_update`，从没有新的 `FOCUS_GAINED`
+    /// 促发 `update_active_compat`——`caret_offset_*` 等 per-app 规则整个会话都停在默认值，
+    /// 用户得手动切一次焦点才生效。
+    ///
+    /// 只在该 pid 确认是当前前台窗口时才写 `active_compat`，避免后台宿主的无关重连
+    /// 覆盖掉真正聚焦应用的规则（见 `foreground_pid` 文档）。非 Windows 平台本回调
+    /// 也不会被 `wind-bridge` 调用（`handle_client` 本身是 `#[cfg(windows)]`），此处
+    /// 仅为满足 trait 签名。
+    fn handle_client_connected(&self, pid: u32) {
+        #[cfg(windows)]
+        self.apply_connected_pid_compat(pid, crate::foreground_pid());
+        #[cfg(not(windows))]
+        let _ = pid;
+    }
+
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
         info!("Menu command: {}", command);
         match command {
@@ -1599,6 +1615,37 @@ impl MessageHandler for Coordinator {
         // （每次 DocMgr 获焦都发一条，Excel 同一 DocMgr 6ms 抖动、VSCode 一次切换 5 次都会
         // 各发一条），全靠 menu_close_on_focus_change 的守卫期挡住刚弹出的菜单。
         self.menu_close_on_focus_change("focus_gained");
+        // 解析焦点进程的 caret 兼容态（微信 caret_use_top、per-app caret_offset_* 等）。
+        // ★★ 必须在下面的 `apply_focus_caret` **之前**跑：那一步会读 `active_compat` 做
+        // `caret_use_top`/`caret_offset_*` 变换，若仍在这之后调用，本次焦点事件带来的第一份
+        // 坐标就会拿**上一个进程**的规则去变换——同步段此刻还没来得及切，症状是「刚切到这个
+        // 应用第一次候选框/状态气泡位置不对，之后才对」，很容易被误判成 DPI 换算没生效。
+        // 本段为 FOCUS_GAINED 的重型后置段（DLL 阻塞响应已写出），同步 OpenProcess 不影响
+        // 首键延迟，提前到这里跑没有性能代价。
+        //
+        // ⚠ 必须在覆写 active_compat **之前**取旧值：`update_active_compat` 会整体覆写它，
+        // 跑完之后读到的已是新进程的规则，「切换前那个应用有没有初始规则」就永远取不到了。
+        // 漏掉这点不会编译报错、不会 panic，只表现为「从规则应用切出去后模式不恢复」。
+        let new_pid = (data.client_token >> 32) as u32;
+        // macOS：宿主名只能由 `.app` 告知（服务进程的 `process_name` 恒空）。必须**先于**
+        // update_active_compat 落进缓存，否则那边读到空名 → compat 规则匹配不上、per-app
+        // 记忆表查不到，整条按应用链路静默退化成全局行为。Windows 恒为空串，不进此分支。
+        if !data.bundle_id.is_empty() && new_pid != 0 {
+            self.pid_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(new_pid, data.bundle_id.to_lowercase());
+        }
+        let (old_pid, old_has_rule) = {
+            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            (ac.pid, ac.has_initial_rule)
+        };
+        self.update_active_compat(data.client_token);
+        let new_has_rule = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_initial_rule;
         // 焦点 caret 走与同步段同一个入口。**不要在这里直写 `state.caret_*`**——重型段晚于
         // 同步段执行，直写会把同步段的 height 守卫与 caret_use_top 变换整个覆盖掉。
         // 详见 apply_focus_caret 的文档注释。
@@ -1653,31 +1700,6 @@ impl MessageHandler for Coordinator {
         if data.client_token != 0 {
             self.push_server.set_active_token(data.client_token);
         }
-        // 解析焦点进程的 caret 兼容态（微信 caret_use_top 等）。本段为 FOCUS_GAINED 的重型
-        // 后置段（DLL 阻塞响应已写出），同步 OpenProcess 不影响首键延迟。
-        // ⚠ 必须在 update_active_compat **之前**取旧值：该函数会整体覆写 active_compat，
-        // 跑完之后读到的已是新进程的规则，「切换前那个应用有没有初始规则」就永远取不到了。
-        // 漏掉这点不会编译报错、不会 panic，只表现为「从规则应用切出去后模式不恢复」。
-        let new_pid = (data.client_token >> 32) as u32;
-        // macOS：宿主名只能由 `.app` 告知（服务进程的 `process_name` 恒空）。必须**先于**
-        // update_active_compat 落进缓存，否则那边读到空名 → compat 规则匹配不上、per-app
-        // 记忆表查不到，整条按应用链路静默退化成全局行为。Windows 恒为空串，不进此分支。
-        if !data.bundle_id.is_empty() && new_pid != 0 {
-            self.pid_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(new_pid, data.bundle_id.to_lowercase());
-        }
-        let (old_pid, old_has_rule) = {
-            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
-            (ac.pid, ac.has_initial_rule)
-        };
-        self.update_active_compat(data.client_token);
-        let new_has_rule = self
-            .active_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .has_initial_rule;
         // per-app 状态：进程名已入缓存，按规则表/记忆表/默认值切换本应用中英状态。若与同步段
         // get_current_mode 回传值不同（该进程首次聚焦），随后的 push_activation_status 推送修正。
         //

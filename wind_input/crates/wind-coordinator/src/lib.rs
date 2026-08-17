@@ -71,6 +71,17 @@ fn window_pid(hwnd: windows::Win32::Foundation::HWND) -> u32 {
     pid
 }
 
+/// 当前前台窗口所属进程 ID（0 = 无前台窗口或查询失败）。
+///
+/// 供 `handle_client_connected` 判断「刚建立连接的这个宿主是否真的在前台」——pid 只说明
+/// 哪个进程打开了管道，不代表它现在有焦点，不加这层判断会让一条无关的重连（后台窗口的
+/// 管道抖动）覆盖掉真正聚焦应用的 per-app 兼容态。
+#[cfg(windows)]
+pub(crate) fn foreground_pid() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    window_pid(unsafe { GetForegroundWindow() })
+}
+
 /// 前台窗口是否全屏（供工具栏 ui.toolbar.hide_in_fullscreen 判定）。
 /// 对齐 Go foreground.IsForegroundFullscreen:① SHQueryUserNotificationState 报 D3D 独占/演示模式;
 /// ② 前台窗口矩形 ⊇ 所在显示器物理矩形(F11/无边框全屏/远程桌面)。排除桌面/Shell 窗口。

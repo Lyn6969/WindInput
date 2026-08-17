@@ -255,6 +255,15 @@ pub trait MessageHandler: Send + Sync {
         }
     }
 
+    /// 新客户端连接建立时调用（仅桥接主通道，`pid` 取自 `GetNamedPipeClientProcessId`
+    /// ——即对端宿主进程，因为 TSF DLL 与宿主同进程）。默认 no-op。
+    ///
+    /// 用途：服务重启或管道抖动重连时，若目标宿主早已是前台窗口，不会有新的
+    /// `FOCUS_GAINED` 促发 per-app 兼容规则解析——旧连接断开、新连接建立就是这种情况下
+    /// **唯一**能拿到该宿主 pid 的时机，借它提前解析（`caret_offset_*`/`caret_use_top`
+    /// 等），否则用户得手动切一次焦点新配置才生效。
+    fn handle_client_connected(&self, _pid: u32) {}
+
     /// 处理焦点获取（返回状态用于 ActivationStatusPush）
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData>;
 
