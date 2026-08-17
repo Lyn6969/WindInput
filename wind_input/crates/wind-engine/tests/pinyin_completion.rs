@@ -34,6 +34,17 @@ fn manager(dir: &std::path::Path) -> EngineManager {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["pinyin".to_string(), "shuangpin".to_string()];
     cfg.schema.active = "pinyin".to_string();
+    // ⚠️ **必须显式设回 2 / 3**，不能吃出厂默认（现为 4 / 5）。
+    //
+    // 本文件测的是补全候选的**上浮与降级**（`COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`、
+    // `COMPLETION_FAR_WEIGHT_FLOOR`、权重折扣），全部以「候选已被召回」为前提。而
+    // `min_syllables` 管的是召回：`started < min` 时上限收紧到 `started`。出厂值升到 4
+    // 之后，本文件的样本（`beijingd`/`nih`/`zhonghuar` 都是 2~3 音节）在召回层就空了，
+    // 断言会以「候选缺失」失败，而要验的上浮逻辑一次都没执行到。
+    //
+    // 召回门槛的出厂行为由 `wind-coordinator` 的 `pinyin_completion_recall_gate` 守。
+    cfg.schema.pinyin.completion.min_syllables = 2;
+    cfg.schema.pinyin.completion.max_extra_syllables = 3;
     EngineManager::new(&cfg, Some(dir))
 }
 
@@ -107,6 +118,10 @@ fn far_completion_returns_when_max_extra_raised() {
         let mut cfg = Config::default();
         cfg.schema.available = vec!["pinyin".to_string()];
         cfg.schema.active = "pinyin".to_string();
+        // `zhonghuar` = zhong hua + 残码 r ⇒ started = 3。出厂 `min_syllables` 已是 4，
+        // 会先把上限收紧到 started 本身，`max_extra` 根本不参与运算——本用例要单独观察
+        // `max_extra` 的作用，故必须把 min 降到不挡路的取值。
+        cfg.schema.pinyin.completion.min_syllables = 2;
         cfg.schema.pinyin.completion.max_extra_syllables = max_extra;
         EngineManager::new(&cfg, Some(&dir))
             .convert_with("pinyin", "zhonghuar", 300)
@@ -115,7 +130,7 @@ fn far_completion_returns_when_max_extra_raised() {
             .any(|c| c.text == "中华人民共和国")
     };
 
-    assert!(!has(3), "出厂值 3 下 extra=4 的补全不该产出");
+    assert!(!has(3), "max_extra=3 下 extra=4 的补全不该产出");
     assert!(has(4), "调到 4 后「中华人民共和国」必须回来");
 }
 

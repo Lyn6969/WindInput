@@ -40,6 +40,12 @@ fn manager(dir: &Path, tag: &str, words: &[(&str, &str, i32, u64)]) -> EngineMan
     let mut cfg = Config::default();
     cfg.schema.available = vec!["pinyin".to_string()];
     cfg.schema.active = "pinyin".to_string();
+    // ⚠️ **必须显式设回 2 / 3**，不能吃出厂默认（现为 4 / 5）。本文件的样本
+    // （`dabo`/`qingfengs` 等）只有 2~3 个音节，出厂门槛下超音节候选在召回层就没了，
+    // 而本文件要验的是 boundary 能否抵达候选、长词上浮判据是否吃到它——都以候选在场
+    // 为前提。召回门槛的出厂行为由 `pinyin_completion_recall_gate` 守。
+    cfg.schema.pinyin.completion.min_syllables = 2;
+    cfg.schema.pinyin.completion.max_extra_syllables = 3;
     EngineManager::with_store_override(&cfg, Some(dir), Some(store), Some(root.join("ov")))
 }
 
@@ -57,6 +63,9 @@ fn manager_shuangpin(dir: &Path, tag: &str, words: &[(&str, &str, i32, u64)]) ->
     let mut cfg = Config::default();
     cfg.schema.available = vec!["shuangpin".to_string()];
     cfg.schema.active = "shuangpin".to_string();
+    // 同 [`manager`]：召回门槛设回旧出厂值，让样本进得来。
+    cfg.schema.pinyin.completion.min_syllables = 2;
+    cfg.schema.pinyin.completion.max_extra_syllables = 3;
     EngineManager::with_store_override(&cfg, Some(dir), Some(store), Some(root.join("ov")))
 }
 

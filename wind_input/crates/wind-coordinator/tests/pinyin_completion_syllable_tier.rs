@@ -41,6 +41,17 @@ fn config() -> Config {
     cfg.schema.available = vec!["pinyin".into()];
     cfg.schema.active = "pinyin".into();
     cfg.input.default.chinese_mode = true;
+    // ⚠️ **必须显式设回 2**，不能吃出厂默认（现为 4）。
+    //
+    // 本文件测的是「谁排在前」（`cmp_completion_extra` 显示序档位），而 `min_syllables`
+    // 管的是「谁在场」（召回门槛）：`started < min` 时上限收紧到 `started`，超音节候选
+    // 压根不进候选列表。出厂值升到 4 之后，`zaim`（started=2）下「在美国」在召回层就被
+    // 挡掉了——两条断言会以「候选缺失」失败，而它们本想验的排序逻辑一次都没执行到。
+    //
+    // 两件事必须解耦：召回门槛的行为由 `pinyin_completion_recall_gate` 那侧的用例守，
+    // 本文件只负责「召回进来之后的先后」，故把门槛钉死在能产生跨档样本的取值上。
+    cfg.schema.pinyin.completion.min_syllables = 2;
+    cfg.schema.pinyin.completion.max_extra_syllables = 3;
     cfg
 }
 

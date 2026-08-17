@@ -32,6 +32,16 @@ fn config() -> Config {
     cfg.schema.available = vec!["pinyin".into()];
     cfg.schema.active = "pinyin".into();
     cfg.input.default.chinese_mode = true;
+    // ⚠️ **必须显式设回 2**，不能吃出厂默认（现为 4）。
+    //
+    // 本文件测的是「让位，不是消失」——即超音节候选被排到后面但仍在场。而
+    // `min_syllables` 管的是「在不在场」：`started < min` 时上限收紧到 `started`。
+    // 出厂值升到 4 之后，`zhonghuar`（started=3）下的「中华人民」在**召回层**就没了，
+    // 断言会以「让位变消失」失败——可它压根不是让位逻辑坏了，是样本没进来。
+    //
+    // 召回门槛的出厂行为由 `pinyin_completion_recall_gate` 守，本文件只管排序。
+    cfg.schema.pinyin.completion.min_syllables = 2;
+    cfg.schema.pinyin.completion.max_extra_syllables = 3;
     cfg
 }
 

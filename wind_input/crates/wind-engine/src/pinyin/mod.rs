@@ -618,8 +618,13 @@ impl Default for Config {
             use_smart_compose: true,
             enable_abbrev: true,
             enable_partial_final: true,
-            completion_min_syllables: 2,
-            completion_max_extra_syllables: 3,
+            // ⚠️ 与 `wind_config::PinyinCompletion::default()` 的 4 / 5 **保持同值**。
+            // 真实路径总是从 wind-config 传入（`manager.rs` 的 `completion_min_syllables:
+            // pg.completion.min_syllables`），本处只在纯引擎构造时兜底——但两处分叉会让
+            // 「引擎单测通过、协调器行为不同」这类假绿有可乘之机，故必须一起改。
+            // 取值理由（对齐 librime/fcitx5 的 4 音节门槛、4+5=9 音节上限）见 wind-config 侧。
+            completion_min_syllables: 4,
+            completion_max_extra_syllables: 5,
             // 默认关：全拼降级是显式开启的降级通道，不该在任何未声明的地方生效
             // （测试要覆盖支路时显式置 true，这样"支路参与了哪些用例"一目了然）。
             allow_full_pinyin: false,
@@ -3226,6 +3231,23 @@ mod tests {
         )
     }
 
+    /// 把补全召回门槛设回旧出厂值 2 / 3 的配置。
+    ///
+    /// 出厂 `completion_min_syllables` 现为 4（对齐 librime/fcitx5），语义是「输入不足
+    /// 4 个音节时上限收紧到 `started` 本身，不预测用户没打的内容」。用 2~3 音节输入验证
+    /// **排序 / 上浮**的用例因此会在召回层就拿不到样本，断言以「候选缺失」失败，而要验
+    /// 的逻辑一次都没执行到。
+    ///
+    /// ⇒ 凡是「已召回之后谁排前面」的用例都该用本函数，把门槛这个变量从用例里摘掉。
+    /// 门槛自身的出厂行为由 `wind-coordinator` 的 `pinyin_completion_recall_gate` 守。
+    fn relaxed_completion_config() -> Config {
+        Config {
+            completion_min_syllables: 2,
+            completion_max_extra_syllables: 3,
+            ..Config::default()
+        }
+    }
+
     // ── 音节分析（顶码歧义裁决用；对齐 Go isPossiblePinyinSequence / isWholeSyllablePinyin /
     //    hasNonInitialSingleLetterSyllable）。trie 为封闭标准音节集，不依赖词典。──
 
@@ -3431,7 +3453,8 @@ mod tests {
             .unwrap();
         let dm = DictManager::new();
         dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
-        PinyinEngine::new(Config::default(), CachedDict::Memory(raw))
+        // 门槛设回 2：本组用例用 `qingfengshu`(3 音节) 验用户长词上浮，出厂的 4 会挡掉样本。
+        PinyinEngine::new(relaxed_completion_config(), CachedDict::Memory(raw))
             .with_store_layers(Arc::new(dm))
     }
 
@@ -4546,7 +4569,8 @@ mod tests {
         raw.merge_single("sikao".to_string(), "思考".to_string(), 100, 0);
         raw.merge_single("sikaozhe".to_string(), "思考者".to_string(), 9000, 0);
         let dict = CachedDict::Memory(raw);
-        let eng = PinyinEngine::new(Config::default(), dict);
+        // 门槛设回 2：`sikao` 只有 2 音节，出厂的 4 会让「思考者」在召回层就没了。
+        let eng = PinyinEngine::new(relaxed_completion_config(), dict);
 
         let r = eng.convert("sikao", 10).unwrap();
         let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();

@@ -19,6 +19,11 @@ fn make_config(schemas: &[&str]) -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = schemas.iter().map(|s| s.to_string()).collect();
     cfg.schema.active = schemas[0].to_string();
+    // ⚠️ 召回门槛设回旧出厂值 2 / 3（现出厂为 4 / 5）。本文件有用例以 `qingfengs`
+    // （3 音节）验用户长词上浮，出厂门槛下该候选在召回层就没了。门槛本身的出厂行为由
+    // `wind-coordinator` 的 `pinyin_completion_recall_gate` 守，这里不重复。
+    cfg.schema.pinyin.completion.min_syllables = 2;
+    cfg.schema.pinyin.completion.max_extra_syllables = 3;
     cfg
 }
 

@@ -511,12 +511,25 @@ pub struct PinyinCompletion {
     pub max_extra_syllables: u32,
 }
 
+/// 取 4，与两个参考实现独立选定的门槛一致：librime 的
+/// `UserDictionary::kNumSyllablesToPredictWord = 4`、fcitx5-chinese-addons 的
+/// `LongWordLengthLimit` 默认 4。语义都是「输入不足 4 个音节时不预测用户没打的内容」。
+///
+/// 旧值 2 会让 `zaim`（2 音节）混进「在美国」「在没有」这类 3 音节候选——档位排序
+/// （`cmp_completion_extra`）能把它们压到后面，但压不掉「候选列表里全是没打的音节」
+/// 这个体感。参考实现是从**召回**层面直接不给。
 fn default_completion_min_syllables() -> u32 {
-    2
+    4
 }
 
+/// 取 5：与 `min_syllables = 4` 配合，`started = 4` 时上限 4 + 5 = 9 音节，恰好够
+/// 「冰冻三尺非一日之寒」这类 9 音节长成语在打到第 4 个音节时被召回。
+///
+/// ⚠️ **两个旋钮必须配合改**。上限 = `started < min ? started : started + max_extra`，
+/// 故 `min = 4` 配旧值 3 会把上限压到 7，9 音节的长词在任何输入长度下都召回不到
+/// （报障用户正是自己把本项调到 6 才补上的）。
 fn default_completion_max_extra_syllables() -> u32 {
-    3
+    5
 }
 
 impl Default for PinyinCompletion {

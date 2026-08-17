@@ -175,15 +175,23 @@ promote_prefix = "single"
 # 算 2 个音节，故它照常出「电话」；而 `dian` / `xia` / `d` 都只算 1 个。
 [schema.pinyin.completion]
 # 至少输入几个音节才给出词组候选。
-# 2 = 打到第 2 个音节才给（`d`/`dian`/`xia` 只出单字，对齐主流拼音输入法）。
-# 1 = 不设限，回到 0.x 的历史行为（单字母就混进「但是」「的时候」）。
-min_syllables = 2
+# 4 = 出厂值，与 librime（kNumSyllablesToPredictWord）、fcitx5（LongWordLengthLimit）一致：
+#     打到第 4 个音节才开始预测你没输入的内容，前 3 个音节只给音节数对齐的候选。
+# 2 = 0.x~1.x 的旧出厂值（`zaim` 会混进 3 音节的「在美国」）。
+# 1 = 不设限，回到 0.x 更早的行为（单字母就混进「但是」「的时候」）。
+min_syllables = 4
 # 词组最多比输入多几个音节。数值越大，引擎越敢预测你还没打的内容。
 # 0 = 只给音节数与输入相等的词；
 # 1 = 只补下一个音节（`nih` 出「你好」「你会」，不出 4 音节的「你会发现」）；
-# 3 = 出厂值；
-# 4 以上才够 `zhonghuar`（3 音节）补出 7 音节的「中华人民共和国」。
-max_extra_syllables = 3
+# 5 = 出厂值，与 min_syllables=4 配合，`started=4` 时上限 4+5=9 音节，够「冰冻三尺非
+#     一日之寒」这类长成语在打到第 4 个音节时就召回；
+# 4 以上才够 `zhonghuar`（3 音节）补出 7 音节的「中华人民共和国」——注意 min_syllables=4
+#     下 `zhonghuar` 只算 3 个音节，本就不预测，要打到第 4 个音节才轮到本项生效。
+#
+# ⚠️ 两个旋钮要配合调：上限 = started < min_syllables ? started : started + max_extra。
+# 单独调大 min_syllables 而不动本项，长词要到更晚才召回；单独调大本项，前几个音节
+# 仍然完全不预测（被 min_syllables 卡住），改了也看不出变化。
+max_extra_syllables = 5
 
 # 上下文语言模型（n-gram）。
 # ⚠️ 实验性，尚未正式发布：默认关闭，且不随安装包提供模型文件。
