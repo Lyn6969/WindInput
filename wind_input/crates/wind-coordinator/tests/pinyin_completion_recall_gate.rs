@@ -130,6 +130,34 @@ fn at_min_syllables_long_word_is_recalled() {
     );
 }
 
+/// 门槛之下的**2 音节**输入仍给同音节数的词 —— 收紧的是「超出部分」，不是整个词组。
+///
+/// 这条守的是**文档站上写着的例子**（`/docs/settings/schema/pinyin#completion` 的对照表）：
+/// `dianh`(dian + 残码 h) → 电话/电荷、`nih`(ni + 残码 h) → 你好/你会。它们都是 2 音节，
+/// `started` 也是 2，上限收紧到 `started` 本身时**恰好等于**、必须放行。
+///
+/// ⚠️ 出厂值从 2 提到 4 时很容易误以为「2 音节输入不再给词组」——不是。
+/// `started < min` ⇒ 上限 = `started`，不是 0；被挡掉的只有**比输入长**的那些。
+/// 文档若按前一种理解改写就会与实现脱节，故在此钉死。
+#[test]
+fn below_min_syllables_still_yields_same_length_words() {
+    if !has_pinyin() {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    for (input, wants) in [("dianh", ["电话", "电荷"]), ("nih", ["你好", "你会"])] {
+        let cands = candidates_for(input);
+        for w in wants {
+            assert!(
+                cands.contains(&w.to_string()),
+                "{input}（started=2）应给出同为 2 音节的「{w}」——上限收紧到 started 本身，\
+                 不是不给词组；实际前 12: {:?}",
+                &cands[..cands.len().min(12)]
+            );
+        }
+    }
+}
+
 /// 门槛之下的**短输入**不受影响：单音节照常只出单字，不混进词组。
 ///
 /// 这是 `min_syllables` 从 1 提到 2 时就有的行为（`d` 不出「但是」），提到 4 之后

@@ -1088,6 +1088,14 @@ impl PinyinEngine {
     fn recall_full_pinyin(&self, stroke: &str, syllables: &[String], cands: &mut Vec<Candidate>) {
         let dict = &self.dict;
         let start = cands.len();
+        // 输入自身表达的音节数，口径同主路径的 `started_syllables`：完整音节 + (有残码 ? 1 : 0)。
+        //
+        // 本支路可以直接按字节长度判残码 —— 全拼域与击键域**是同一个域**（支路的定义就是
+        // 把击键当全拼读，见函数文档「为什么消费长度可以直接取字节数」）。主路径那边两域
+        // 不同，`started_syllables` 必须走双拼域，混用会静默错配（见 step 6.7 的位置说明）。
+        let completed_bytes: usize = syllables.iter().map(String::len).sum();
+        let trailing_partial = completed_bytes < stroke.len();
+        let started = syllables.len() as u32 + u32::from(trailing_partial);
         // 同文去重的规则**不是**「无条件保留先到者」，而是「保留解释得更多的那条」。
         //
         // ★ 真机现场（`zaijian` → 「再见」）：双拼流的简拼前缀回退（step 6.2）先用前 4 键
@@ -1180,7 +1188,21 @@ impl PinyinEngine {
         }
 
         // ③ 前缀补全（码比击键长，`niha` → 「你好」）：以**整串击键**为前缀，含尾部残码。
-        for h in dict.search_prefix_with_boundary(stroke, MAX_FULL_PINYIN_RECALL) {
+        //
+        // ⚠️ 必须与主路径 step 4 同口径地过 `completion_syllable_cap` —— 本支路一度直接用
+        // 不带 cap 的 `search_prefix_with_boundary`，于是 `[schema.pinyin.completion]` 的两个
+        // 旋钮对它**完全失效**：实测 `beijingd`（started 3、出厂 min_syllables=4 ⇒ 上限应
+        // 收紧到 3）照样召回「北京大学」「北京地区」乃至 **7 音节的「北京大学出版社」**，
+        // 而纯拼音主路径同输入下一条都不给。用户抱怨的「候选里全是我没打的音节」在这条
+        // 支路上原样复现。
+        let cap = completion_syllable_cap(
+            started,
+            self.config.completion_min_syllables,
+            self.config.completion_max_extra_syllables,
+        );
+        for h in
+            dict.search_prefix_with_boundary_syllable_capped(stroke, MAX_FULL_PINYIN_RECALL, cap)
+        {
             push(
                 cands,
                 h.text,
@@ -1307,6 +1329,32 @@ impl PinyinEngine {
                     ..Default::default()
                 });
             }
+        }
+
+        // 本支路产出的前缀补全统一补齐音节数对齐档位。放在末尾一次做完，而不是散在 ③④
+        // 各自的 push 旁边：push 闭包带同文去重（可能替换已在表里的那条），逐条回填要跟
+        // 去重逻辑纠缠，而本项只依赖 `boundary` 与 `started`，与谁 push 的无关。
+        //
+        // 漏设的后果：4 音节的「北京大学」与 3 音节的「北京的」在 `beijingd` 下同档竞争
+        // （两者 extra 都是 0），协调器的 `cmp_completion_extra` 形同虚设。
+        //
+        // ⚠️ **这里不要顺手加上浮判据**。`cands[start..]` 混着 ③ 的系统词库补全与 ④ 的
+        // 用户/临时词，两者的上浮判据不是一套：系统词走
+        // `COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES` + `COMPLETION_FAR_WEIGHT_FLOOR`，
+        // 用户词走 `should_promote_user_completion`。在这里统一施加任何一套都会误伤另一批
+        // ——本仓已有一次两套判据因数值巧合被混用、连带打断 `qingfengshu`→「清风输入法」
+        // 的前科。④ 的用户词在本支路确实还缺上浮（既有缺口，非本次引入），要补须先在
+        // push 时把来源分开标记。
+        for c in &mut cands[start..] {
+            if !c.is_prefix {
+                continue;
+            }
+            let word_syls = c.boundary.count_ones();
+            if word_syls == 0 {
+                continue; // 无边界信息：算不出，保持默认 0（同主路径对 boundary==0 的处置）
+            }
+            c.completion_extra_syllables =
+                word_syls.saturating_sub(started).min(u8::MAX as u32) as u8;
         }
     }
 
