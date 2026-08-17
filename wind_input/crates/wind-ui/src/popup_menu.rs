@@ -715,6 +715,9 @@ impl PopupMenu {
             .unwrap_or((0, 0, 0, 0));
         let mut geom: Vec<LayerGeom> = Vec::with_capacity(snap.len());
         let mut wgeom: Vec<LayerGeom> = Vec::with_capacity(snap.len());
+        // 展开方向串联态：一旦某层因右侧无空间翻到左侧，后续更深层级延续左侧展开，
+        // 避免各层各自判断出现锯齿重叠（见 place_child 文档注释）。
+        let mut prefer_left = false;
         for k in 0..snap.len() {
             let (items, selected) = &snap[k];
             let (mut root, cw, ch, content_hits) = self.build_view(items, *selected);
@@ -725,7 +728,16 @@ impl PopupMenu {
                 let (pox, poy, pw, ph, prects) = &geom[k - 1];
                 let psel = snap[k - 1].1;
                 let prect = prects.iter().find(|(i, _)| *i == psel).map(|(_, r)| *r);
-                place_child((*pox, *poy), (*pw, *ph), prect, (cw, ch), self.scale)
+                let (x, y, went_left) = place_child(
+                    (*pox, *poy),
+                    (*pw, *ph),
+                    prect,
+                    (cw, ch),
+                    self.scale,
+                    prefer_left,
+                );
+                prefer_left = went_left;
+                (x, y)
             };
             let (win_w, win_h) = (cw + ml + mr, ch + mt + mb);
             let (wox, woy) = (cox - ml as i32, coy - mt as i32);
@@ -1592,14 +1604,21 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
     (x, y)
 }
 
-/// 子菜单定位：默认贴父面板右侧、纵向对齐父高亮项；右溢出则翻到左侧；最后钳制工作区。
+/// 子菜单定位：贴父面板右缘展开，纵向对齐父高亮项；某侧放不下则翻到另一侧；最后钳制工作区。
+///
+/// `prefer_left`：本次展开链此前是否已经翻到左侧。菜单本身贴在屏幕右侧时，二级子菜单会
+/// 因右侧无空间翻到左侧——此时三级、四级子菜单如果继续各自独立判断（它们贴着二级的左侧
+/// 展开，往右侧仍然装得下），就会翻回右侧压在二级面板上面，出现"二级在左、三级在右"的
+/// 锯齿重叠。所以一旦翻过一次左，后续层级要延续这个方向，除非左侧也真的没空间了才翻回右侧。
+/// 返回值第三项是本层实际选定的方向，供调用方串成下一层的 `prefer_left`（见 `reconcile`）。
 fn place_child(
     parent_origin: (i32, i32),
     parent_size: (u32, u32),
     parent_item: Option<Rect>,
     child_size: (u32, u32),
     scale: f32,
-) -> (i32, i32) {
+    prefer_left: bool,
+) -> (i32, i32, bool) {
     let (pox, poy) = parent_origin;
     let (pw, _ph) = parent_size;
     let (cw, ch) = (child_size.0 as i32, child_size.1 as i32);
@@ -1607,25 +1626,38 @@ fn place_child(
     let pad_top = (4.0 * scale) as i32;
 
     let item_top = parent_item.map(|r| r.y as i32).unwrap_or(0);
-    let mut x = pox + pw as i32 - overlap;
+    let x_right = pox + pw as i32 - overlap;
+    let x_left = pox - cw + overlap;
     let mut y = poy + item_top - pad_top;
 
-    if let Some((left, top, right, bottom)) = work_area_of(pox, poy) {
-        // 右侧放不下 → 翻到父面板左侧
-        if x + cw > right {
-            x = pox - cw + overlap;
+    let (x, went_left) = match work_area_of(pox, poy) {
+        Some((left, top, right, bottom)) => {
+            let fits_right = x_right + cw <= right;
+            let fits_left = x_left >= left;
+            let (x, went_left) = if prefer_left {
+                // 延续左侧展开；左侧也放不下时才翻回右侧。
+                if fits_left {
+                    (x_left, true)
+                } else {
+                    (x_right, false)
+                }
+            } else if fits_right {
+                (x_right, false)
+            } else {
+                (x_left, true)
+            };
+            if y + ch > bottom {
+                y = bottom - ch;
+            }
+            if y < top {
+                y = top;
+            }
+            (x.max(left), went_left)
         }
-        if x < left {
-            x = left;
-        }
-        if y + ch > bottom {
-            y = bottom - ch;
-        }
-        if y < top {
-            y = top;
-        }
-    }
-    (x, y)
+        // 取不到工作区：无从判断是否装得下，按当前偏好方向摆（与 place_menu 同一原则）。
+        None => (if prefer_left { x_left } else { x_right }, prefer_left),
+    };
+    (x, y, went_left)
 }
 
 /// 「点菜单外面就关」的判据（见 [`PopupMenu::poll_outside_press`]）。
@@ -2100,6 +2132,42 @@ mod tests {
         let (x2, _) = place_menu(&a, 400, 500, MW, MH, WA, 2.0);
         assert_eq!(x1 - a.right, GAP);
         assert_eq!(x2 - a.right, GAP * 2);
+    }
+
+    /// 二级子菜单因右侧无空间翻到左侧——最基础的翻转场景（`prefer_left=false`）。
+    #[test]
+    fn place_child_flips_left_when_right_overflows() {
+        // 父面板贴在屏幕右侧（右缘 1947），右侧已经没有 200px 空间摆子菜单。
+        let (x, _y, went_left) = place_child((1800, 100), (150, 400), None, (MW, MH), 1.0, false);
+        assert!(went_left, "右侧放不下应翻到左侧");
+        assert!(
+            x + MW as i32 <= 1920,
+            "翻到左侧后子菜单不应再超出工作区右边界"
+        );
+    }
+
+    /// 上一层已经翻到左侧（`prefer_left=true`）：即便本层单独看右侧其实装得下，
+    /// 也应继续往左展开——这正是要修的"二级在左、三级又翻回右"锯齿重叠：三级子菜单
+    /// 贴着二级（已在左侧）展开，它右侧腾出来的空间恰恰是一级面板所在处，翻回右侧
+    /// 会重新压在一级上面。
+    #[test]
+    fn place_child_continues_left_once_preferred() {
+        // 父面板在屏幕中部，单独看右侧明明装得下（1000+150-3+200=1347<1920）。
+        let (x, _y, went_left) = place_child((1000, 100), (150, 400), None, (MW, MH), 1.0, true);
+        assert!(
+            went_left,
+            "已翻左的展开链应延续左侧，即便右侧单独看也装得下"
+        );
+        assert_eq!(x, 1000 - MW as i32 + 3, "应贴父面板左缘展开");
+    }
+
+    /// 延续左侧的偏好只在左侧确实没有空间时才放弃：父面板贴在屏幕左侧，
+    /// 左侧连子菜单都摆不下，此时该翻回右侧，而不是被钳出屏幕。
+    #[test]
+    fn place_child_prefer_left_falls_back_to_right_when_no_room_left() {
+        let (x, _y, went_left) = place_child((50, 100), (150, 400), None, (MW, MH), 1.0, true);
+        assert!(!went_left, "左侧没有空间时应翻回右侧");
+        assert_eq!(x, 50 + 150 - 3, "应贴父面板右缘展开");
     }
 }
 
