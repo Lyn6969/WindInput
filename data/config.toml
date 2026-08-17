@@ -28,7 +28,7 @@ primary_pinyin = ""
 
 # ── 刻意不在本文件出现的一个键（实例集合，注册表类型 StructList）────────────
 # schema.mix_modes      临时融合模式列表（代码默认 = 内置「快捷」quick_mix，`;` 触发，
-#                       成员 quick_input.calc/.date/.number/.repeat + $primary_pinyin + english）
+#                       成员 quick_input.calc/.number/.date/.repeat + $primary_pinyin + english）
 #
 # 它是**结构体数组**，本文件一旦写出就会整体替换代码默认值，把当时的定义**冻结**
 # 成快照——日后在 `default_mix_modes()` 里给内置「快捷」加成员或改触发键，全部会被
