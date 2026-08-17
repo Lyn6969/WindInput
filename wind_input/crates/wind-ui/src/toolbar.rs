@@ -154,6 +154,16 @@ fn bar_layout(vertical: bool, thickness: f32, grip_len: f32, cell: f32, n: usize
     BarLayout { w, h, grip, cells }
 }
 
+/// 整条外框圆角的兜底半径（主题 `[toolbar] border.radius` 未配时）：**短边**×0.30。
+///
+/// 必须取短边而非 `h`：`bar_layout` 把纵条画成横条的转置，`h` 在横条里是厚度、在纵条里
+/// 却是整条长度。用 `h` 算出的纵条半径恒远超厚度，被 `push_round_rect` 的
+/// `min(w*0.5)` 静默钳成满胶囊——错误被下游钳制吸收，只表现为「纵排圆角明显更大」。
+/// 取短边后两个朝向同为厚度×0.30，横条行为与原来逐字节相同。
+fn default_border_radius(w: f32, h: f32) -> f32 {
+    w.min(h) * 0.30
+}
+
 impl Toolbar {
     // 几何默认值（逻辑像素，随 DPI 缩放）。主题 [toolbar] 未描述时的兜底；
     // 与 _base/theme.toml [toolbar] 保持一致，改这里也应同步 _base（反之亦然）。
@@ -463,12 +473,13 @@ impl Toolbar {
         {
             let buf = self.window.buffer_mut();
             buf[..buf_size].fill(0);
-            // 整条圆角：主题 [toolbar] border.radius 优先，未配则 = 条高×0.30（原派生行为，
-            // 胶囊外形）。配 0 即直角——硬边缘风格靠这条实现。
+            // 整条圆角：主题 [toolbar] border.radius 优先，未配则 = 条**短边**×0.30
+            // （见 `default_border_radius`）。配 0 即直角——硬边缘风格靠这条实现。
             let radius = self
                 .tb_border_radius
                 .map(|d| d.resolve(s, 0.0))
-                .unwrap_or(h as f32 * 0.30) as u32;
+                .unwrap_or_else(|| default_border_radius(w as f32, h as f32))
+                as u32;
             fill_rounded(buf, w, h, 0, 0, w, h, self.bg, radius);
             // 细边框（与背景同弧度），增强浅色背景下的轮廓（对齐设计稿胶囊外框）。
             // 线宽：主题 border.width 优先，未配落 1dp（原字面量）。
@@ -1199,6 +1210,36 @@ mod tests {
             assert_eq!(c.w, THICK, "纵条每格宽 = 条宽");
         }
         assert_eq!(v.h, GRIP + CELL * N as f32, "纵条总高 = 拖动柄 + 各格");
+    }
+
+    /// 兜底外框圆角在两个朝向下必须相等——它描述的是**条的厚度**，与条有多长无关。
+    ///
+    /// 曾经这里写的是 `h * 0.30`：横条下 `h` 是厚度（30dp→9dp，正确），纵条下 `h` 却成了
+    /// 整条长度（192dp→57.6dp），再被 `push_round_rect` 的 `min(w*0.5)` 钳成 15dp 满胶囊。
+    /// 症状是「纵排圆角明显比横排大」，且格数越多越必然触顶。同一个转置问题在按钮高亮
+    /// 圆角那里（`hw.min(hh)`）修对了、外框这里漏了——故此处按朝向对拍钉死。
+    #[test]
+    fn border_radius_is_orientation_invariant() {
+        let h = bar_layout(false, THICK, GRIP, CELL, N);
+        let v = bar_layout(true, THICK, GRIP, CELL, N);
+        let rh = default_border_radius(h.w, h.h);
+        let rv = default_border_radius(v.w, v.h);
+        assert_eq!(rh, rv, "同一套几何转 90° 后圆角不得改变");
+        assert_eq!(rh, THICK * 0.30, "圆角派生自条厚，与条长无关");
+
+        // 钳制上限 = 短边一半；兜底值必须留在其下，否则会被静默压成满胶囊。
+        for (tag, l) in [("横", &h), ("纵", &v)] {
+            let r = default_border_radius(l.w, l.h);
+            assert!(
+                r < l.w.min(l.h) * 0.5,
+                "{tag}条圆角 {r} 触顶（短边半值 {}）",
+                l.w.min(l.h) * 0.5
+            );
+        }
+
+        // 条越长圆角越不该跟着变——纵条加 5 格，半径原地不动。
+        let longer = bar_layout(true, THICK, GRIP, CELL, N + 5);
+        assert_eq!(default_border_radius(longer.w, longer.h), rv);
     }
 
     /// 格数随简繁格增减（`cells()` 的既有行为），布局须跟着长短，不能越界。
