@@ -1232,16 +1232,43 @@ impl Default for AutoPhraseConfig {
 }
 
 /// 拼音自动造词（[schema.pinyin.auto_learn]）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoLearnConfig {
     #[serde(default)]
     pub enabled: bool,
     /// 造词最小字数（默认 0=回退 2）。
     #[serde(default)]
     pub min_word_length: usize,
+    /// 造词最大字数（`0` = 不限）。超出后先按「从尾部保留整段」裁剪，仍超则**整体放弃**
+    /// ——在一串汉字中间切一刀，切出来的多半不是词（同 `AutoPhraseConfig::max_phrase_len`）。
+    ///
+    /// 整句一次上屏时只有一段可裁，故本项对整句等价于「超过就不学」。默认 10：既覆盖
+    /// 「今天天气不错」这类值得进词库的长词，又挡住整句解常见的跨句拼接。
+    #[serde(default = "default_learn_max_len")]
+    pub max_word_length: usize,
     /// 临时词晋升所需使用次数（原 learning.temp_promote_count）。
     #[serde(default)]
     pub promote_count: usize,
+}
+
+/// 拼音造词最大字数默认值。比码表侧的 5 宽松——码表造词的素材是**连续单字序列**
+/// （跨句拼接风险高），而拼音整句/分步转换的每一段都是用户明确选中的语义单元。
+fn default_learn_max_len() -> usize {
+    10
+}
+
+/// ⚠️ 手写而非 `derive(Default)`：`max_word_length` 的默认值是 10 而非零值，
+/// derive 会让**代码默认**（`AutoLearnConfig::default()`）给 0=不限、而**配置默认**
+/// （serde 反序列化缺键）给 10，同一个语义在两条路上分叉。
+impl Default for AutoLearnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_word_length: 0,
+            max_word_length: default_learn_max_len(),
+            promote_count: 0,
+        }
+    }
 }
 
 /// 全局混输配置（[schema.mix]）。融合策略；全局唯一，无方案级 override。
@@ -5951,6 +5978,39 @@ active = "x"
         assert_eq!(c.schema.pinyin.separator, "auto");
         assert!(!c.schema.pinyin.fuzzy.enabled);
         assert!(!c.schema.pinyin.fuzzy.zh_z);
+    }
+
+    /// `auto_learn.max_word_length` 的默认值必须**两条路一致**：代码默认
+    /// （`AutoLearnConfig::default()`）与配置默认（serde 缺键）都得是 10。
+    ///
+    /// 这正是 `AutoLearnConfig` 不能再 `derive(Default)` 的原因——derive 给零值，
+    /// 而 `#[serde(default = "…")]` 给 10，同一个语义在两条路上分叉，且分叉只在
+    /// 「用户配置里恰好没写这个键」时才显形。
+    ///
+    /// 拼音造词分支在协调器的 headless 测试里执行不到（`is_pinyin()` 依赖引擎加载，
+    /// 那里恒 false），故这条配置接线只能在本 crate 钉住。
+    #[test]
+    fn auto_learn_max_word_length_default_is_consistent() {
+        assert_eq!(
+            AutoLearnConfig::default().max_word_length,
+            10,
+            "代码默认（Default impl）"
+        );
+        assert_eq!(
+            Config::default().schema.pinyin.auto_learn.max_word_length,
+            10,
+            "经 PinyinGlobal::default() 传导后仍是 10"
+        );
+        // 配置里写了 [auto_learn] 段但没写本键 → serde default 兜底，仍是 10。
+        let c = merged_with("[schema.pinyin.auto_learn]\nenabled = true\n");
+        assert_eq!(
+            c.schema.pinyin.auto_learn.max_word_length, 10,
+            "缺键应走 serde default，而非零值"
+        );
+        assert!(c.schema.pinyin.auto_learn.enabled, "同段其它键正常覆盖");
+        // 显式配置可覆盖；0 = 不限（保留旧行为的逃生舱）。
+        let c = merged_with("[schema.pinyin.auto_learn]\nmax_word_length = 0\n");
+        assert_eq!(c.schema.pinyin.auto_learn.max_word_length, 0);
     }
 
     #[test]

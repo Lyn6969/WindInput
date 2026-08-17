@@ -122,6 +122,221 @@ fn mixed_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
     (c, store)
 }
 
+/// 整句造词测试统一使用的字数上限（与出厂默认 10 一致；由 `pinyin_coord` 给两条分支同时设定）。
+const LEARN_MAX_LEN: usize = 10;
+
+/// 拼音方案（active=py_solo）的无头 Coordinator，用于整句造词测试。
+///
+/// ## ⚠️ 为什么两条配置分支都要开
+///
+/// `learn_phrase_on_commit` 按 `is_pinyin()` 分流读 `[pinyin.auto_learn]` 或
+/// `[codetable.auto_phrase]`，而 `is_pinyin()` 走 `active_engine()` → `ensure_loaded()`
+/// —— **headless 测试环境里引擎加载不起来，它恒为 false**，实际落在 codetable 分支。
+/// 现有造词测试（`mixed_learn_phrase_same_source_only`、`learn_phrase_promotes_at_threshold_via_6a`）
+/// 全都显式开 `codetable.auto_phrase.enabled` 才跑得通，正是同一个原因。
+///
+/// 只配拼音那一侧的话，这里每个用例都会因为「造词整个没执行」而**全绿**——其中三个
+/// 断言的是「不该造词」，假绿完全看不出来。故两侧 enabled 与 max 都给同样的值，
+/// 让测试语义不依赖「引擎这次加载成没成」。
+///
+/// `data_schema_id` 不受影响：它只读 `schema.toml` 的 `engine.type`，故归属仍是 "pinyin"。
+fn pinyin_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
+    use std::io::Write;
+    let base_dir = std::env::temp_dir().join(format!("wind_coord_pysolo_{tag}"));
+    let schemas = base_dir.join("schemas");
+    let _ = std::fs::remove_dir_all(&base_dir);
+    std::fs::create_dir_all(&schemas).unwrap();
+    {
+        let mut f = std::fs::File::create(schemas.join("py_solo.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]\nid = \"py_solo\"\n[engine]\ntype = \"pinyin\"\n"
+        )
+        .unwrap();
+    }
+    let mut cfg = Config::default();
+    cfg.schema.active = "py_solo".into();
+    cfg.schema.available = vec!["py_solo".into()];
+    cfg.schema.pinyin.auto_learn.enabled = true;
+    cfg.schema.pinyin.auto_learn.max_word_length = LEARN_MAX_LEN;
+    // 见函数文档：headless 下实际走的是这一支。
+    cfg.schema.codetable.auto_phrase.enabled = true;
+    cfg.schema.codetable.auto_phrase.max_phrase_len = LEARN_MAX_LEN;
+
+    let db_path = std::env::temp_dir().join(format!("wind_coord_pysolo_{tag}.redb"));
+    let _ = std::fs::remove_file(&db_path);
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    let c = Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+    (c, store)
+}
+
+/// 把一整句压成**单段** `committed_segs` —— 整句消费整串（`consumed == total` ⇒
+/// `partial == false`），故 `commit_selected` 只 push 这一段。这正是本组测试的前提条件。
+fn push_single_seg(c: &Coordinator, code: &str, text: &str, boundary: u64) {
+    let mut st = c.state.lock().unwrap();
+    st.committed_segs.clear();
+    st.committed_segs.push((
+        code.into(),
+        code.into(),
+        text.into(),
+        CandidateSource::Pinyin,
+        boundary,
+    ));
+}
+
+/// 智能组句生成的整句，一次上屏也要进临时词库。
+///
+/// 回归的是「整句长词打不出简拼」：整句只 push 一段，而旧守卫 `committed_segs.len() < 2`
+/// 问的是「用户是不是分步组的」，于是整句永远够不着门槛 —— 词没进临时库，简拼索引自然为空。
+#[test]
+fn single_segment_sentence_is_learned_and_abbrev_searchable() {
+    let (c, store) = pinyin_coord("sentence_single");
+
+    // nihaoshijie → 你好世界。boundary 位 i = 1 表示第 i 个字节是某音节的首字节：
+    // n(0) h(2) s(5) j(8)，即 ni|hao|shi|jie。
+    let b = (1u64 << 0) | (1u64 << 2) | (1u64 << 5) | (1u64 << 8);
+    push_single_seg(&c, "nihaoshijie", "你好世界", b);
+    {
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.committed_segs.len(), 1, "前提：整句只有一段");
+        c.learn_phrase_on_commit(&st, true);
+    }
+
+    let recs = store.get_temp_words("pinyin", "nihaoshijie").unwrap();
+    let w = recs
+        .iter()
+        .find(|w| w.text == "你好世界")
+        .expect("单段整句应写进临时词库");
+    assert_eq!(w.boundary, b, "整句自带的音节边界要原样落库");
+
+    // 真正要治的症状：简拼召回。边界落库了，`TEMP_ABBREV` 索引才建得出 nhsj。
+    let by_abbrev: Vec<String> = store
+        .search_temp_words_by_abbrev("pinyin", "nhsj", 0)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(
+        by_abbrev,
+        vec!["你好世界"],
+        "整句入库后必须能被简拼召回 —— 这才是用户报的那个症状"
+    );
+}
+
+/// 单段但**不是**整句（用户直接选中的词典整词）不造词。
+///
+/// 判据取 `is_sentence` 而非「单段且够长」正是为了这条：词典里本就有「你好」，
+/// 再写一份临时词只会让候选面多一条同文项，且永远不会被用到。
+#[test]
+fn single_segment_non_sentence_is_not_learned() {
+    let (c, store) = pinyin_coord("sentence_nonsent");
+    push_single_seg(&c, "nihao", "你好", 0b101);
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, false);
+    }
+    assert!(
+        store.get_temp_words("pinyin", "nihao").unwrap().is_empty(),
+        "单段非整句不该造词"
+    );
+    // 反向对照：同一段、同一个 store，只把 is_sentence 翻成 true 就该造出来。
+    // 少了这条，上面的断言在「造词整条路径根本没执行」时也会绿。
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, true);
+    }
+    assert!(
+        !store.get_temp_words("pinyin", "nihao").unwrap().is_empty(),
+        "翻成整句就该造词——证明差异确实来自 is_sentence 而非路径没跑"
+    );
+}
+
+/// 超过 `max_word_length` 的整句整体放弃，不在中间切一刀。
+///
+/// 整句只有一段，`trim_segs_start` 裁不动它 —— 上限对整句能生效，全靠裁剪后的那道
+/// 「仍超则放弃」判断。少了它，配置项对整句形同虚设。
+#[test]
+fn oversized_sentence_is_dropped_not_truncated() {
+    let (c, store) = pinyin_coord("sentence_toolong");
+    // 恰好 LEARN_MAX_LEN 字 → 应造词（上限是闭区间，先钉住边界的「放行」侧，
+    // 否则「超长不造」的断言可能只是因为整条路径没跑）。
+    let ok_text = "今天天气不错我们去玩";
+    assert_eq!(ok_text.chars().count(), LEARN_MAX_LEN);
+    push_single_seg(&c, "jttqbcwmqw", ok_text, 0b1);
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, true);
+    }
+    assert!(
+        !store
+            .get_temp_words("pinyin", "jttqbcwmqw")
+            .unwrap()
+            .is_empty(),
+        "恰好等于上限应放行——这条同时证明本用例的造词路径确实是通的"
+    );
+
+    // 超出 1 字 → 整体放弃，且不得留下被截断的残词。
+    let long_text = "今天天气不错我们去公园";
+    assert_eq!(long_text.chars().count(), LEARN_MAX_LEN + 1);
+    push_single_seg(&c, "jttqbcwmqgy", long_text, 0b1);
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, true);
+    }
+    let all: Vec<String> = store
+        .search_temp_words_prefix("pinyin", "", 0)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(
+        all,
+        vec![ok_text],
+        "超长整句应整体放弃，不得入库、也不得留下任何被截断的残词"
+    );
+}
+
+/// 用户词库已有同「码+词」时不再写临时层（对齐码表侧 `flush_auto_phrase` 的查重②）。
+#[test]
+fn learned_phrase_skips_when_user_dict_already_has_it() {
+    let (c, store) = pinyin_coord("sentence_dedup");
+    store
+        .add_user_word("pinyin", "nihaoshijie", "你好世界", 1200, 0b1)
+        .unwrap();
+
+    push_single_seg(&c, "nihaoshijie", "你好世界", 0b1);
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, true);
+    }
+    assert!(
+        store
+            .get_temp_words("pinyin", "nihaoshijie")
+            .unwrap()
+            .is_empty(),
+        "用户词库已有则不该再进临时层"
+    );
+
+    // 反向对照：同码、不同文 → 用户词库那条不匹配，应照常造词。
+    // 查重键是「码 + 词」而非只看码，这条钉住的正是这一点。
+    push_single_seg(&c, "nihaoshijie", "你好世姐", 0b1);
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, true);
+    }
+    let texts: Vec<String> = store
+        .get_temp_words("pinyin", "nihaoshijie")
+        .unwrap()
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["你好世姐"],
+        "同码不同文应放行——查重键是「码+词」，不是只看码"
+    );
+}
+
 /// P2d Task 2：混输 active 下 record_selection 按候选来源落子方案键空间；无法归因跳过。
 #[test]
 fn mixed_record_selection_routes_by_source() {
@@ -325,7 +540,7 @@ fn mixed_learn_phrase_same_source_only() {
             CandidateSource::Pinyin,
             0b1,
         ));
-        c.learn_phrase_on_commit(&st);
+        c.learn_phrase_on_commit(&st, false); // 分步造词路径，非整句
     }
     let py_words = store.get_temp_words("pinyin", "nihao").unwrap();
     let nihao = py_words
@@ -359,7 +574,7 @@ fn mixed_learn_phrase_same_source_only() {
             CandidateSource::Pinyin,
             0b1,
         ));
-        c.learn_phrase_on_commit(&st);
+        c.learn_phrase_on_commit(&st, false); // 分步造词路径，非整句
     }
     for schema in ["ct_test", "pinyin", "mx_test"] {
         assert!(
@@ -396,7 +611,7 @@ fn mixed_learn_phrase_same_source_only() {
             CandidateSource::CodeTable,
             0,
         ));
-        c.learn_phrase_on_commit(&st);
+        c.learn_phrase_on_commit(&st, false); // 分步造词路径，非整句
     }
     for schema in ["ct_test", "pinyin", "mx_test"] {
         assert!(

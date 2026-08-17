@@ -2180,7 +2180,9 @@ impl Coordinator {
                 cand.commit_override.as_deref().unwrap_or(&cand.text)
             );
             if !from_assoc {
-                self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
+                // 自动造词：多段组成的词，或一次选中的整句解（后者只有一段，
+                // 靠 `is_sentence` 放行——见 `learn_phrase_on_commit` 的「为什么单段整句要单独放行」）。
+                self.learn_phrase_on_commit(state, cand.is_sentence);
             }
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
             // 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。

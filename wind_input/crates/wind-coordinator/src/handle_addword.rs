@@ -399,7 +399,8 @@ impl Coordinator {
         Ok(word.to_string())
     }
 
-    /// 拼音自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
+    /// 拼音自动造词（L）：用户**分步**组成（committed_segs ≥2 段），
+    /// **或**一次选中引擎合成的**整句**（单段，`single_is_sentence`）时学。
     /// 完整拼音码 = 各段码拼接；词 = 各段汉字拼接。写入临时层（达阈值由 store 晋升路线处理）。
     ///
     /// # 为什么这里只剩拼音
@@ -409,8 +410,27 @@ impl Coordinator {
     /// 对码表恒真 → 一行都执行不到，是码表自动造词「完全不工作」的根因之一。码表已迁至
     /// 独立的连续单字缓冲（`feed_auto_phrase` / `flush_auto_phrase`），此处不再兼管，
     /// 否则两套路径会对同一次输入重复造词。
-    pub(crate) fn learn_phrase_on_commit(&self, state: &State) {
-        if state.committed_segs.len() < 2 {
+    ///
+    /// # 为什么单段整句要单独放行
+    ///
+    /// `committed_segs.len() >= 2` 问的是「用户**是不是分步组的**」——那是**过程**特征。
+    /// 造词真正关心的是**产出**：这次上屏是不是一个词库里没有的多字词。整句消费整串
+    /// （`consumed == total` ⇒ `partial == false`）故只 push 一段，用段数当判据它永远够不着
+    /// 门槛，于是「智能组句出来的长词打不出简拼」——词根本没进临时库，简拼索引自然是空的。
+    ///
+    /// 判据取 `Candidate::is_sentence`（引擎对整串输入的最优解读）而非「单段且够长」：
+    /// 后者会把用户**直接选中的词典整词**（「你好」）也写进临时层，造出一堆本就存在于
+    /// 系统词库的冗余条目。同款教训见 `crate::auto_phrase` 模块头——用过程指纹代替结果
+    /// 判据，在码表侧已经栽过一次。
+    ///
+    /// `is_sentence` 必须由调用方传入：它是**候选级**信息，而 `committed_segs` 的元组
+    /// （`raw_code, code, text, source, boundary`）里没有它。三个调用点
+    /// （`handle_candidate` / `handle_temp` / `handle_mode`）都要传，漏一个就是该模式下静默失效。
+    pub(crate) fn learn_phrase_on_commit(&self, state: &State, single_is_sentence: bool) {
+        // 单段仅当它是整句解时放行；其余仍要求 ≥2 段。
+        if state.committed_segs.len() < 2
+            && !(state.committed_segs.len() == 1 && single_is_sentence)
+        {
             return;
         }
         // **纯码表**方案不经此路：该态是拼音专属（码表选词消费整串），对码表恒为死代码；
@@ -423,13 +443,26 @@ impl Coordinator {
             return;
         }
         // 闸门：拼音方案读 [pinyin.auto_learn]；混输读有效 [codetable.auto_phrase]（继承主码表）。
-        // min_len 为造词最小字数（0 回退 2）；max_len 拼音路径不限（0）。
+        // min_len 为造词最小字数（0 回退 2）；max_len 为最大字数（0=不限）。
+        //
+        // 两个分支各读**自己配置段**里的上限，不互相借：拼音的 10 是按「值得进词库的长词」
+        // 定的，码表的 5 是按「连续单字序列易跨句拼接」定的，量级本就不同。
         let (enabled, min_len, max_len, promote_count) = if self.engine_mgr.is_pinyin() {
             let al = self.engine_mgr.auto_learn_settings();
-            (al.enabled, al.min_word_length, 0, al.promote_count)
+            (
+                al.enabled,
+                al.min_word_length,
+                al.max_word_length,
+                al.promote_count,
+            )
         } else {
             let ap = self.engine_mgr.codetable_settings().auto_phrase;
-            (ap.enabled, ap.min_phrase_len, 0, ap.promote_count)
+            (
+                ap.enabled,
+                ap.min_phrase_len,
+                ap.max_phrase_len,
+                ap.promote_count,
+            )
         };
         if !enabled {
             return;
@@ -437,7 +470,8 @@ impl Coordinator {
         // 超长裁剪：从尾部保留整段使合并字数 ≤ max_len（最近输入优先）。
         let start = trim_segs_start(&state.committed_segs, max_len);
         let segs = &state.committed_segs[start..];
-        if segs.len() < 2 {
+        // 裁剪只在段边界上切，故可能一段都留不下（首段自身就超上限）。
+        if segs.is_empty() || (segs.len() < 2 && !single_is_sentence) {
             return;
         }
         // 拼接各段码，并把**段内**音节边界平移到全局位置。段自身可能是多音节整词
@@ -458,7 +492,15 @@ impl Coordinator {
         let boundary = if boundary_ok { boundary } else { 0 };
         let text: String = segs.iter().map(|(_, _, t, _, _)| t.as_str()).collect();
         let min_len = if min_len == 0 { 2 } else { min_len };
-        if text.chars().count() < min_len || code.is_empty() {
+        let n_chars = text.chars().count();
+        if n_chars < min_len || code.is_empty() {
+            return;
+        }
+        // 裁剪后**仍**超上限 → 整体放弃，不在词中间切一刀（对齐 `auto_phrase::word_from_seq`
+        // 的「宁可放过，不可错造」）。整句只有一段可裁，裁剪对它是 no-op，这条判断才是
+        // 上限对整句真正生效的地方。
+        if max_len > 0 && n_chars > max_len {
+            debug!("auto-learn: 超长（{} 字 > {}）整体放弃", n_chars, max_len);
             return;
         }
         let Some(store) = &self.store else { return };
@@ -467,7 +509,7 @@ impl Coordinator {
         // 混输仅当全段同源时用该源归属 id（混源/无法归因跳过，混合码写给谁都无意义）。
         // 注：混源判定使用截后 segs，截掉的段不参与归属判断。
         let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
-            let first = segs[0].3; // segs.len()>=2 已保证非空
+            let first = segs[0].3; // 上面的 is_empty 守卫已保证非空
             if segs.iter().any(|(_, _, _, s, _)| *s != first) {
                 return; // 混源：跳过自动造词
             }
@@ -485,6 +527,17 @@ impl Coordinator {
         } else {
             self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         };
+        // 查重用户词库：同「码+词」已在用户层则不再写临时层（对齐码表侧 `flush_auto_phrase`
+        // 的查重②）。已经是用户词的，再进临时层既无晋升意义、又让候选面多一条同文项。
+        //
+        // **刻意不查临时词库**：`learn_temp_word` 对已存在的记录是 `count++`（推进晋升进度），
+        // 那正是复选该学的东西。在这里过滤掉就等于冻结晋升计数。
+        if let Ok(recs) = store.get_user_words(&schema, &code)
+            && recs.iter().any(|r| r.text == text)
+        {
+            debug!("auto-learn: 用户词库已有 {} -> {}，跳过", code, text);
+            return;
+        }
         // add_weight 取保守默认；达 promote_count 阈值时晋升入用户词库（权重统一为 PROMOTED_WEIGHT）。
         match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, boundary) {
             Ok(count) => {
@@ -1086,7 +1139,7 @@ mod tests {
         make_state_with_segs();
         {
             let st = c.state.lock().unwrap();
-            c.learn_phrase_on_commit(&st);
+            c.learn_phrase_on_commit(&st, false); // 分步造词路径，非整句
         }
 
         let active = c.engine_mgr.active_schema_id();
@@ -1098,7 +1151,7 @@ mod tests {
         make_state_with_segs();
         {
             let st = c.state.lock().unwrap();
-            c.learn_phrase_on_commit(&st);
+            c.learn_phrase_on_commit(&st, false); // 分步造词路径，非整句
         }
 
         // 临时层应已删除

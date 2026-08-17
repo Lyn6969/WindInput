@@ -158,6 +158,7 @@ static REGISTRY: &[ConfigField] = &[
     ),
     f("schema.pinyin.auto_learn.enabled", Bool),
     f("schema.pinyin.auto_learn.min_word_length", Int),
+    f("schema.pinyin.auto_learn.max_word_length", Int),
     f("schema.pinyin.auto_learn.promote_count", Int),
     f("schema.pinyin.completion.min_syllables", Int),
     f("schema.pinyin.completion.max_extra_syllables", Int),

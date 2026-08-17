@@ -431,7 +431,8 @@ impl Coordinator {
                 cand.boundary,
             ));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
-            self.learn_phrase_on_commit(state);
+            // 单段整句同样要造词（临拼模式下整句一次上屏亦只 push 一段）。
+            self.learn_phrase_on_commit(state, cand.is_sentence);
             // 变体候选末段用覆盖文本；普通候选整体转换（保留 STPhrases 跨段词级消歧）。
             let out = match &cand.s2t_override {
                 Some(t) => format!("{}{}", self.maybe_s2t(state, &state.committed_text), t),
