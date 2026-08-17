@@ -393,9 +393,25 @@ impl FormatTable {
     /// 停用是**可逆、反复试**的动作，沉底会让同一行在停用/启用之间来回跳——管理界面里
     /// 「行不乱动」比「位置反映候选顺序」重要得多。
     ///
-    /// 故按**基表**顺序给每个停用项找一个锚点（它前面最近的那个启用条目），插在锚点之后；
-    /// 基表里它前面没有启用条目时排到最前。于是**从未调序过的条目，停用与启用位置一致**
-    /// （锚点算出来的就是它的基表位置），来回切一行都不动。
+    /// 故给每个停用项找一个锚点（它前面最近的那个启用条目），插在锚点之后；前面没有启用
+    /// 条目时排到最前。于是**停用与启用的位置一致**，来回切一行都不动。
+    ///
+    /// ## 锚点的参照系是「假设全部启用」的顺序，不是基表
+    ///
+    /// 这一点决定了「先调序、再停用同一条」会不会跳。位置信息其实一直都在——**停用不清
+    /// `moved` 规则**（两者是独立字段），丢失只发生在计算环节：[`Self::entries_of_adjusted`]
+    /// 先剔除停用项，那条 `moved` 就找不到目标、成了孤儿规则被跳过。
+    ///
+    /// 所以锚点不查基表，而是查「把 `disabled` 清空后重算一遍」的顺序——那里每条的 `moved`
+    /// 都生效。于是被移到首位又停用的条目仍显示在首位。零新增状态，代价是每类多算一次
+    /// 排序（至多七条，可忽略）。
+    ///
+    /// ```text
+    /// 基表 [A,B,C]、moved=[(C,0)]、C 停用
+    ///   假设全启用  [C,A,B]   ← C 的 moved 生效
+    ///   真实候选    [A,B]     ← C 的 moved 成了孤儿
+    ///   C 的前驱: 无 → 插最前 ⇒ 视图 [C,A,B]，与停用前一致
+    /// ```
     ///
     /// ⚠️ 不能图省事写成「不剔除停用项、直接对全表应用 `moved`」：`moved` 的下标是
     /// 「剔除停用项之后」的位置，把停用项留在列表里再套同一个下标，启用项之间的相对顺序
@@ -420,10 +436,20 @@ impl FormatTable {
             })
             .collect();
 
-        // 停用项按基表顺序归组，每组挂在同一个锚点后面（连续几条停用的保持基表相对顺序）。
+        // 「假设全部启用」的顺序：停用项的位置从这里读，它们的 moved 规则在此生效
+        // （见上方 doc）。只借 `moved`，`disabled` 清空。
+        let as_if_all_enabled = self.entries_of_adjusted(
+            kind,
+            &FormatAdjust {
+                moved: adjust.moved.clone(),
+                disabled: Vec::new(),
+            },
+        );
+
+        // 停用项按该顺序归组，每组挂在同一个锚点后面（连续几条停用的保持彼此相对顺序）。
         let mut groups: Vec<(Option<&str>, Vec<&'a FormatEntry>)> = Vec::new();
         let mut anchor: Option<&str> = None;
-        for e in self.entries_of(kind) {
+        for e in as_if_all_enabled {
             if is_disabled(&e.id) {
                 match groups.last_mut() {
                     Some((a, v)) if *a == anchor => v.push(e),
@@ -809,6 +835,55 @@ text = "$RESULT"
                     base,
                     "停用 {id}（kind={}, 第 {i} 行）后整列顺序不该有任何变化",
                     kind.as_str()
+                );
+            }
+        }
+    }
+
+    /// ★★ **先调序、再停用同一条，位置也不该变**。
+    ///
+    /// 这条比 `disabling_a_row_does_not_move_it` 更严：那条测的是从未调序过的条目（锚点
+    /// 落在基表位置即可），这条要求锚点参照「假设全部启用」的顺序，否则被移到首位的条目
+    /// 一停用就跳回出厂位置。位置信息本就没丢（停用不清 `moved`），全靠参照系选对。
+    #[test]
+    fn disabling_a_reordered_row_keeps_its_new_position() {
+        let t = FormatTable::builtin();
+        for &kind in FormatKind::ALL {
+            let ids: Vec<String> = t.entries_of(kind).map(|e| e.id.clone()).collect();
+            if ids.len() < 3 {
+                continue; // calc 只有两条，移动空间不足以体现差别
+            }
+            // 把末条移到每一个可能的位置，各验一遍「停用前后视图不变」。
+            for target in 0..ids.len() {
+                let moved = vec![(ids[ids.len() - 1].clone(), target)];
+                let before: Vec<String> = t
+                    .entries_of_view(
+                        kind,
+                        &FormatAdjust {
+                            moved: moved.clone(),
+                            disabled: Vec::new(),
+                        },
+                    )
+                    .iter()
+                    .map(|v| v.entry.id.clone())
+                    .collect();
+                let after: Vec<String> = t
+                    .entries_of_view(
+                        kind,
+                        &FormatAdjust {
+                            moved: moved.clone(),
+                            disabled: vec![ids[ids.len() - 1].clone()],
+                        },
+                    )
+                    .iter()
+                    .map(|v| v.entry.id.clone())
+                    .collect();
+                assert_eq!(
+                    after,
+                    before,
+                    "kind={} 把 {} 移到第 {target} 位后再停用，顺序不该变",
+                    kind.as_str(),
+                    ids[ids.len() - 1]
                 );
             }
         }
