@@ -6,6 +6,7 @@
 use crate::config::Config;
 use crate::entry::Entry;
 use crate::extra::Category;
+use crate::order_report::{Change, Summary};
 use crate::shortcode::Conflict;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -225,6 +226,59 @@ pub fn write_demotion_report(path: &Path, conflicts: &[Conflict]) -> anyhow::Res
                 second.text,
                 second.weight,
                 c.candidates_count
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// 写出候选顺序变化报告：上游原序 vs 产物最终序。
+///
+/// 第一列 `against_upstream` 是判读的入口——`Y` 表示上游用不同的优先级明确安排过次序
+/// 而我们把它翻了过来；`N` 表示上游整组同档、没表过态，换首选无所谓对错。
+/// 不分这两档就只剩一个「多少个首选变了」的大数字，指导不了任何修正。
+pub fn write_order_report(
+    path: &Path,
+    changes: &[Change],
+    summary: &Summary,
+) -> anyhow::Result<()> {
+    atomic_write(path, |w| {
+        writeln!(w, "# 候选顺序变化: 上游 rime-wubi86-jidian → gen_dict 产物")?;
+        writeln!(
+            w,
+            "# 可比码={} 顺序变化={} 首选变化={} 其中违逆上游明确优先级={}",
+            summary.comparable,
+            summary.order_changed,
+            summary.top_changed,
+            summary.top_changed_against_upstream
+        )?;
+        writeln!(
+            w,
+            "# up_order 括号内是上游原始优先级(10/20/…/60)，gen_order 括号内是产物最终权重"
+        )?;
+        writeln!(
+            w,
+            "against_upstream\ttop_changed\tcause\tcode\tn\tup_top\tup_prio\tgen_top\tgen_prio\tgen_wt\tup_freq\tgen_freq\tup_order\tgen_order"
+        )?;
+        for c in changes {
+            let yn = |b: bool| if b { "Y" } else { "N" };
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                yn(c.upstream_had_opinion),
+                yn(c.top_changed),
+                c.cause,
+                c.code,
+                c.count,
+                c.up_top,
+                c.up_top_priority,
+                c.gen_top,
+                c.gen_top_priority,
+                c.gen_top_weight,
+                c.up_top_freq,
+                c.gen_top_freq,
+                c.up_order.join(" > "),
+                c.gen_order.join(" > "),
             )?;
         }
         Ok(())

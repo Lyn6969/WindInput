@@ -12,7 +12,7 @@
 
 use crate::config::Config;
 use crate::entry::Entry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 识别简码词条并赋予分层权重。
 ///
@@ -216,21 +216,24 @@ fn build_full4_conflict(
 
 // ── 降权 ──────────────────────────────────────────────
 
-/// 对同时占据简码和 4 码首选的字降权，让位给第二候选。返回实际降权条数。
+/// 对同时占据简码和 4 码首选的字降权，让位给第二候选。
+///
+/// 返回**实际被降权**的 `(code, text)`——顺序变化报告靠它认定成因。降权后的权重是
+/// 「第二候选 -1」，但词频补权也能凑出同样的差值，从权重形状反推会把两者混为一谈。
 ///
 /// 触发条件（两个都要满足，否则保留原样）：
 /// - 第二候选权重 ≥ promote 阈值（单字/词组各一档）——太弱的候选不值得让位
 /// - gap 比例 ≤ max_gap_ratio——首字优势太大时让位会明显劣化体验
-pub fn apply_demotion(entries: &mut [Entry], cfg: &Config) -> usize {
+pub fn apply_demotion(entries: &mut [Entry], cfg: &Config) -> BTreeSet<(String, String)> {
+    let mut demoted = BTreeSet::new();
     if !cfg.demotion.enabled {
-        return 0;
+        return demoted;
     }
     let dc = &cfg.demotion;
     // 基于降权前的状态计算，循环中不再更新（与 Go 一致）
     let short_top = short_top_table(entries);
     let full4 = full4_table(entries);
 
-    let mut demoted = 0usize;
     for (code4, cands) in &full4 {
         if cands.len() < 2 {
             continue;
@@ -273,7 +276,7 @@ pub fn apply_demotion(entries: &mut [Entry], cfg: &Config) -> usize {
 
         // 只动这一条 4 码条目；简码条目本身不变
         entries[*top_idx].weight = second.weight - 1;
-        demoted += 1;
+        demoted.insert((code4.clone(), top.text.clone()));
     }
     demoted
 }
@@ -343,10 +346,14 @@ mod tests {
             e("口中", "khkg", 4500, 2), // 第二候选：词组，权重 ≥ 800
         ];
         v[0].shortcode_level = 1;
-        let n = apply_demotion(&mut v, &c);
-        assert_eq!(n, 1);
+        let demoted = apply_demotion(&mut v, &c);
         assert_eq!(v[1].weight, 4499, "应降到第二候选之下");
         assert_eq!(v[0].weight, 9999, "简码条目本身不动");
+        // 返回的是被降者本身的 (code, text)，不是让位得来的第二候选
+        assert_eq!(
+            demoted.into_iter().collect::<Vec<_>>(),
+            vec![("khkg".to_string(), "中".to_string())]
+        );
     }
 
     #[test]
@@ -359,7 +366,7 @@ mod tests {
             e("口中", "khkg", 900, 2),
         ];
         v[0].shortcode_level = 1;
-        assert_eq!(apply_demotion(&mut v, &c), 0);
+        assert!(apply_demotion(&mut v, &c).is_empty());
         assert_eq!(v[1].weight, 5000);
     }
 
@@ -372,7 +379,7 @@ mod tests {
             e("罕见词", "khkg", 150, 2), // < filter_threshold(200)
         ];
         v[0].shortcode_level = 1;
-        assert_eq!(apply_demotion(&mut v, &c), 0);
+        assert!(apply_demotion(&mut v, &c).is_empty());
     }
 
     #[test]
@@ -380,7 +387,7 @@ mod tests {
         let c = cfg();
         // 没有任何简码指向「中」→ 4 码首选是它唯一的打法，不能让
         let mut v = vec![e("中", "khkg", 5000, 0), e("口中", "khkg", 4500, 1)];
-        assert_eq!(apply_demotion(&mut v, &c), 0);
+        assert!(apply_demotion(&mut v, &c).is_empty());
         assert_eq!(v[0].weight, 5000);
     }
 
@@ -419,7 +426,7 @@ mod tests {
             !analyze_conflicts(&v).iter().any(|x| x.long_code == "khkg"),
             "一级简码前缀不进冲突报告"
         );
-        assert_eq!(apply_demotion(&mut v, &c), 1, "但降权仍会处理它");
+        assert_eq!(apply_demotion(&mut v, &c).len(), 1, "但降权仍会处理它");
     }
 
     #[test]

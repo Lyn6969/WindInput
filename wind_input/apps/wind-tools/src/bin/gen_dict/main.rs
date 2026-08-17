@@ -14,9 +14,11 @@ mod boost;
 mod config;
 mod entry;
 mod extra;
+mod order_report;
 mod parse;
 mod reverse;
 mod shortcode;
+mod upstream_order;
 mod weight;
 mod writer;
 
@@ -159,6 +161,10 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
     // 单字→首选编码反查表：供自定义词反查与 extra 非法编码修正复用
     let char_codes = reverse::build_char_code_map(&jidian);
 
+    // 上游候选序快照必须在过滤与赋权**之前**拍下：`Entry.weight` 一字两用，赋权会把
+    // 上游的原始优先级原地覆盖掉（见 entry.rs），事后无从重建。
+    let upstream_order_snapshot = order_report::Snapshot::capture(&jidian);
+
     // ── 3. 过滤 + 赋权 ────────────────────────────────
     eprintln!("[3/4] 过滤 + 补充词频...");
     let mut kept: Vec<Entry> = Vec::with_capacity(jidian.len());
@@ -267,6 +273,23 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
         );
     }
 
+    // 组内权重重排：把同码次序换回上游序，权重值集合不变（该码在权重轴上的高度守恒）。
+    //
+    // 位置在补权与保护码之后、降权之前：重排是「权重怎么分配」的收尾，而 demotion 是
+    // 建立在权重之上的**策略**，须看到最终分配才判得准。
+    let uo =
+        upstream_order::reapply_upstream_order(&mut kept, &upstream_order_snapshot, &unigram, cfg);
+    if uo.examined > 0 {
+        eprintln!(
+            "\n      上游序回归: {} 个码（判定 {}，护栏拦下：生僻 {} + 倍数>{} 共 {}）",
+            uo.reordered,
+            uo.examined,
+            uo.held_unseen,
+            cfg.upstream_order.max_freq_ratio,
+            uo.held_unseen + uo.held_ratio
+        );
+    }
+
     eprintln!("\n      权重分布预览:");
     let mut buckets: Vec<(&String, &usize)> = weight_buckets.iter().collect();
     buckets.sort_by_key(|(k, _)| {
@@ -295,10 +318,18 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
     } else {
         Vec::new()
     };
+    // 顺序报告的成因列取自这两个集合，是**观测到的动作**而非从权重形状反推——
+    // 降权结果是「第二候选 -1」，词频补权也能凑出同样的差值。
+    let mut demoted_entries: std::collections::BTreeSet<(String, String)> = Default::default();
+    let mut boosted_entries: std::collections::BTreeSet<(String, String)> = Default::default();
+
     if cfg.shortcodes.enabled && cfg.demotion.enabled {
-        let n = shortcode::apply_demotion(&mut kept, cfg);
-        if n > 0 {
-            eprintln!("\n      简码降权: {n} 条简码字被降权（第二候选满足权重+gap条件）");
+        demoted_entries = shortcode::apply_demotion(&mut kept, cfg);
+        if !demoted_entries.is_empty() {
+            eprintln!(
+                "\n      简码降权: {} 条简码字被降权（第二候选满足权重+gap条件）",
+                demoted_entries.len()
+            );
         } else {
             eprintln!("\n      简码降权: 无符合条件的降权条目");
         }
@@ -313,6 +344,11 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
             Ok(rules) if !rules.is_empty() => {
                 let (applied, missing) = boost::apply_boost_rules(&mut kept, &rules, &mut log);
                 eprintln!("      词序提升: {applied} 条生效，{missing} 条未匹配");
+                // 未匹配的规则一并收进来无害：其 (code, text) 在产物里不存在，查不到
+                boosted_entries = rules
+                    .iter()
+                    .map(|r| (r.code.clone(), r.text.clone()))
+                    .collect();
             }
             Ok(_) => {}
             Err(e) => eprintln!("      [警告] boost 解析失败: {e}"),
@@ -375,6 +411,30 @@ fn run(cfg: &Config, paths: &config::Paths, version: &str) -> anyhow::Result<()>
                 Ok(()) => eprintln!("      降权报告: {}（降权前快照）", p.display()),
                 Err(e) => eprintln!("      [警告] 降权报告写出失败: {e}"),
             }
+        }
+    }
+
+    // 顺序变化报告：唯一回答「我们把上游的候选安排改成了什么样」的产物。
+    // 摘要无条件打印——不传 --report 时也该看到规模，那是调参时最要紧的一个数。
+    let (order_changes, order_summary) = order_report::diff(
+        &upstream_order_snapshot,
+        &kept,
+        &unigram,
+        cfg,
+        &demoted_entries,
+        &boosted_entries,
+    );
+    eprintln!(
+        "\n      候选顺序变化: 可比码 {} / 顺序变化 {} / 首选变化 {}（其中违逆上游明确优先级 {}）",
+        order_summary.comparable,
+        order_summary.order_changed,
+        order_summary.top_changed,
+        order_summary.top_changed_against_upstream
+    );
+    if let Some(p) = &paths.order_report {
+        match writer::write_order_report(p, &order_changes, &order_summary) {
+            Ok(()) => eprintln!("      顺序变化报告: {}", p.display()),
+            Err(e) => eprintln!("      [警告] 顺序变化报告写出失败: {e}"),
         }
     }
 

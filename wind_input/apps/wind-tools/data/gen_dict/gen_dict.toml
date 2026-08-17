@@ -45,6 +45,10 @@ custom_emoji_named_path = ""
 dropped_path = "wubi86_jidian.dict.filtered.tsv"
 conflict_report_path = "wubi86_jidian.shortcode_conflicts.tsv"
 demotion_report_path = "wubi86_jidian.demotion_candidates.tsv"
+# 候选顺序变化：上游原序 vs 产物最终序。第一列 against_upstream=Y 表示上游用不同优先级
+# 明确安排过次序而我们翻了它（如 tgyn 上游「重启 20 > 生词 10」，补权后「生词 > 重启」），
+# =N 表示上游整组同档、没表过态。修正候选顺序前先看这份，boost_words.txt 是它的下游。
+order_report_path = "wubi86_jidian.order_changes.tsv"
 
 # ── 权重归一化 ─────────────────────────────────────────
 target_median = 1000    # unigram 中位词频映射到此权重
@@ -70,6 +74,24 @@ enabled = true
 level1_weight = 9999      # 一级简码（25 个，每码唯一）
 level2_base_weight = 9950 # 二级简码基础权重，组内按 jidian 顺序递减
 level3_base_weight = 9000 # 三级简码基础权重，组内按 jidian 顺序递减（900 个槽）
+
+# ── 组内权重重排（回归极点上游序）─────────────────────
+# 把同码候选的次序换回上游原序，**不改变该码在权重轴上的高度**：只把这些条目当前持有的
+# 权重值按上游序重新发一遍。跨码可比性因此完全不受影响——五笔按前缀匹配，打 `tg` 会召出
+# `tgyn`/`tgab` 全部后代，它们必须在同一根轴上比，而上游 weight 列是码内局部优先级
+# （值域 5~890、86% 是最低档 10），跨码不可比。
+#
+# 现场：tgyn 上游「重启 20 > 生词 10」，补权后变成「生词 1497 > 重启 1479」。
+#
+# 护栏（两道，任一命中即保持词频序）：
+#   ① 上游首选不在 unigram 里 —— 上游序混着大量随手排的低频词（川崎 / SD卡 / 滨州学院）
+#   ② 当前首选词频 / 上游首选词频 > max_freq_ratio
+[upstream_order]
+enabled = true
+# 26 由实测样本夹定：生效 24.7× 与 梗概 25.3× 回归、大路 26.2× 与 鸽子 29.1× 拦下。
+# ⚠ 这一带极不敏感（24× 到 30× 只差 17 个码），真正的分水岭在 3×（+169）与 10×（+49），
+# 要调先看那一段，别在 25/26/28 之间纠结。
+max_freq_ratio = 26
 
 # ── 简码降权策略 ───────────────────────────────────────
 # 当一个字同时占据简码和 4 码全码首选时，按第二候选的权重决定是否给简码字降权。

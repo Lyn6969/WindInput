@@ -29,6 +29,11 @@ pub struct Config {
     pub dropped_path: String,
     pub conflict_report_path: String,
     pub demotion_report_path: String,
+    /// 候选顺序变化报告：上游原序 vs 产物最终序。
+    ///
+    /// 与另外三份报告的视角不同——它们只看产物内部，这份是唯一能回答
+    /// 「我们把上游的候选安排改成了什么样」的产物。
+    pub order_report_path: String,
 
     // 权重归一化
     pub target_median: i64,
@@ -42,6 +47,7 @@ pub struct Config {
 
     pub shortcodes: ShortcodeConfig,
     pub demotion: DemotionConfig,
+    pub upstream_order: UpstreamOrderConfig,
     pub extra: ExtraConfig,
     pub filter: FilterConfig,
     pub protected_codes: ProtectedCodesConfig,
@@ -86,6 +92,26 @@ pub struct DemotionConfig {
     pub word_promote_wt: i64,
     pub max_gap_ratio_single: f64,
     pub max_gap_ratio_word: f64,
+}
+
+/// 组内权重重排：把同码次序换回极点上游序，同时不改变该码在权重轴上的高度。
+///
+/// 上游 `weight` 列是**码内局部优先级**（值域 5~890、86% 是最低档 10），跨码不可比；
+/// 词频提供的才是跨码可比的高度。两者各答一半，本功能把它们分开使用。
+/// 详见 [`crate::upstream_order`] 的模块文档。
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamOrderConfig {
+    pub enabled: bool,
+    /// 护栏：`当前首选词频 / 上游首选词频` 超过此倍数则**不**回归上游序。
+    ///
+    /// 上游序里混着大量作者随手排上去的低频词，纯回归会把它们顶回首选。
+    /// 阈值 26 由实测样本夹定（`生效` 24.7× 与 `梗概` 25.3× 回归、
+    /// `大路` 26.2× 与 `鸽子` 29.1× 拦下）。**该区间极不敏感**：24× 到 30× 只差 17 条，
+    /// 真正的分水岭在 3×（+169 条）与 10×（+49 条），调参先看那一段。
+    ///
+    /// 另有一道无条件护栏：上游首选不在 unigram 里（生僻词）一律不回归。
+    pub max_freq_ratio: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +190,7 @@ impl Default for Config {
             dropped_path: String::new(),
             conflict_report_path: String::new(),
             demotion_report_path: String::new(),
+            order_report_path: String::new(),
             target_median: 1000,
             weight_max: 9999,
             weight_min: 1,
@@ -172,6 +199,7 @@ impl Default for Config {
             regular_weight_max: 8999,
             shortcodes: ShortcodeConfig::default(),
             demotion: DemotionConfig::default(),
+            upstream_order: UpstreamOrderConfig::default(),
             extra: ExtraConfig::default(),
             filter: FilterConfig::default(),
             protected_codes: ProtectedCodesConfig::default(),
@@ -212,6 +240,15 @@ impl Default for DemotionConfig {
             word_promote_wt: 800,
             max_gap_ratio_single: 0.60,
             max_gap_ratio_word: 0.65,
+        }
+    }
+}
+
+impl Default for UpstreamOrderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_freq_ratio: 26,
         }
     }
 }
@@ -278,6 +315,7 @@ pub struct Paths {
     pub dropped: Option<PathBuf>,
     pub conflict_report: Option<PathBuf>,
     pub demotion_report: Option<PathBuf>,
+    pub order_report: Option<PathBuf>,
 }
 
 impl Config {
@@ -321,6 +359,14 @@ impl Config {
         }
         if self.target_median <= 0 {
             anyhow::bail!("target_median 必须为正数");
+        }
+        // 0 或负数会让护栏恒真（任何词频都「超过」），表现为整个功能静默失效——
+        // 而失效的样子恰好和「没启用」一模一样，不拦下就要靠翻产物才发现。
+        if self.upstream_order.enabled && self.upstream_order.max_freq_ratio <= 0 {
+            anyhow::bail!(
+                "upstream_order.max_freq_ratio({}) 必须为正数，否则护栏恒拦、组内重排静默失效",
+                self.upstream_order.max_freq_ratio
+            );
         }
         // 扩展库带必须整体低于主库最低档，否则「扩展库排在主库之后」不成立。
         // 引擎侧的 base_order 救不了——它排在 weight 之后，只是等权 tiebreaker。
@@ -412,6 +458,7 @@ impl Config {
             dropped: report_dir.and_then(|d| opt(&self.dropped_path, d)),
             conflict_report: report_dir.and_then(|d| opt(&self.conflict_report_path, d)),
             demotion_report: report_dir.and_then(|d| opt(&self.demotion_report_path, d)),
+            order_report: report_dir.and_then(|d| opt(&self.order_report_path, d)),
         }
     }
 
