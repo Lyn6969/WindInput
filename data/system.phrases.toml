@@ -483,10 +483,14 @@ text = '$CC("剪贴板加词:{clip()}", dict.add(clip()))'
 weight = 2000
 
 # 剪贴板反查：复制一个不认识的字 → 切回输入法 → 打 cofc → 候选即「字: 编码 拼音」，
-# 选中直接上屏这行文字。
+# 选中上屏这行文字。
 #
-# 是**纯模板**短语（顶层 `{`）而非 `$CC`：无动作短语的 display 即上屏文本，
-# 不必再写一遍 `type(...)`。
+# 用 `$CC` 而不是纯模板，是为了让**显示**与**上屏**分开：
+#   display = default(反查结果, 提示语)  → 查不到时显示提示，不让用户面对一片空白
+#   动作    = type(反查结果)             → 查不到时 type 到空串，选中什么也不上屏
+# 写成纯模板 `{dict.rev(clip())}` 的话，display 既是显示又是上屏文本，二者绑死：
+# 要么查不到时整条候选消失（用户分不清「没复制」还是「功能坏了」），
+# 要么把提示语本身当文本打进文档。
 #
 # 默认只查第 1 个字。要一次看多个字，自己改成 `$SS` 列若干元素、各查第 n 个：
 #   text = '$SS("反查", "{dict.rev(clip(),1)}", "{dict.rev(clip(),2)}", "{dict.rev(clip(),3)}")'
@@ -494,7 +498,7 @@ weight = 2000
 # 版式也可换，变量同候选注释段：`{dict.rev(clip(), 1, format="${char} ${chaizi}[${chaizi_code}]")}`
 [[phrases]]
 code = 'cofc'
-text = '{dict.rev(clip())}'
+text = '$CC(default(dict.rev(clip()), "剪贴板反查（需先复制文字）"), type(dict.rev(clip())))'
 weight = 2000
 
 [[phrases]]
