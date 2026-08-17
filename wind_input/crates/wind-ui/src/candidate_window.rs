@@ -245,8 +245,10 @@ pub struct CandidateWindow {
     /// 来自 ui.candidate.position_mode + custom_x/custom_y，每次 UpdateCandidates 同步。
     /// `Some((0, 0))` 是"已开启固定但尚未设定位置"，定位时落到屏幕默认锚点。
     fixed_pos: Option<(i32, i32)>,
-    /// 候选文本区最小宽度，按全角字符数（0=不限）。来自 ui.candidate.min_width_chars。
-    min_width_chars: u32,
+    /// 横排候选格最小宽度，按全角字符数（0=不限）。来自 ui.candidate.min_width_chars_horizontal。
+    min_width_chars_horizontal: u32,
+    /// 竖排候选行最小宽度，按全角字符数（0=不限）。来自 ui.candidate.min_width_chars_vertical。
+    min_width_chars_vertical: u32,
     /// 上一次 `build_tree` 算出的最小内容宽（设备像素）：下限文本宽 + 行内 chrome + 各级
     /// 内边距。由 `build_tree`（`&self`）写、渲染入口读，故用 `Cell`。
     min_content_w: std::cell::Cell<f32>,
@@ -312,7 +314,8 @@ impl CandidateWindow {
             swap_preedit_when_above: false,
             pager_in_preedit: false,
             fixed_pos: None,
-            min_width_chars: 0,
+            min_width_chars_horizontal: 0,
+            min_width_chars_vertical: 0,
             min_content_w: std::cell::Cell::new(0.0),
             min_rows: 0,
         })
@@ -334,13 +337,33 @@ impl CandidateWindow {
         self.font_size_override = font_size.max(0.0);
     }
 
-    /// 设置候选窗尺寸下限（抗抖动）。来自 ui.candidate.min_width_chars / min_rows。
-    pub fn set_min_size(&mut self, width_chars: u32, rows: u32) {
-        self.min_width_chars = width_chars;
+    /// 设置候选窗尺寸下限（抗抖动）。来自 ui.candidate.min_width_chars_horizontal /
+    /// min_width_chars_vertical / min_rows。
+    pub fn set_min_size(
+        &mut self,
+        width_chars_horizontal: u32,
+        width_chars_vertical: u32,
+        rows: u32,
+    ) {
+        self.min_width_chars_horizontal = width_chars_horizontal;
+        self.min_width_chars_vertical = width_chars_vertical;
         self.min_rows = rows;
     }
 
-    /// `min_width_chars` 撑出的内容宽下界（设备像素；0=未配），由 `build_tree` 现算。
+    /// 当前排版方向（`self.vertical`）下生效的最小宽度字符数（0=不限）。
+    ///
+    /// 横竖两项各自独立：候选列表是否**物理**渲染为竖排列（`list_vertical`，无候选时强制
+    /// 横排提示行）不影响这里的取值——提示态也要延续用户配置的排布方向，否则从「只有
+    /// 模式徽标」到「出候选」的那一刻窗口仍会按另一套下限跳一下。
+    fn min_width_chars(&self) -> u32 {
+        if self.vertical {
+            self.min_width_chars_vertical
+        } else {
+            self.min_width_chars_horizontal
+        }
+    }
+
+    /// `min_width_chars()` 撑出的内容宽下界（设备像素；0=未配），由 `build_tree` 现算。
     ///
     /// 供三个渲染入口在按主题 `behavior.vertical_max_width` 裁切时保住下限：下限撑出的
     /// 宽度若被上限钳回去，View 树仍按下限布局，窗口缓冲却更窄——**每一帧**都溢出右缘，
@@ -351,7 +374,7 @@ impl CandidateWindow {
     /// 下限文本的行」实测累加（序号列按圆圈直径算，非圆圈时偏大即为有意高估），
     /// 而非按字号估——早先那版只算「字号 × 字数」，漏掉约 49 逻辑 px 的行内 chrome。
     fn min_content_w_px(&self) -> u32 {
-        if self.min_width_chars == 0 {
+        if self.min_width_chars() == 0 {
             return 0;
         }
         self.min_content_w.get().ceil().max(0.0) as u32
@@ -1597,7 +1620,11 @@ impl CandidateWindow {
         // 注释在它右边继续伸缩，行宽照样随每次按键变化——真机实测暴露（用户的注释模板含
         // 拆字/编码/注音，宽度变化比候选文字本身还大）。改成整行后，只要三段合计仍在下限
         // 以内，窗口宽度就完全不动。
-        let min_row_content_w = if self.min_width_chars > 0 {
+        //
+        // ★ 横排/竖排各取各的下限（min_width_chars()），两种排布的实用值不同——真机实测
+        // 反馈横排候选并列一行，每格多留的宽度成倍放大，竖排每行独占则更宽裕。
+        let min_width_chars = self.min_width_chars();
+        let min_row_content_w = if min_width_chars > 0 {
             let em = self
                 .text_renderer
                 .measure(
@@ -1609,7 +1636,7 @@ impl CandidateWindow {
                     },
                 )
                 .width;
-            em * self.min_width_chars as f32
+            em * min_width_chars as f32
         } else {
             0.0
         };
@@ -1878,7 +1905,7 @@ impl CandidateWindow {
         let row_gap_v = dim(v.row_gap, 0.0);
         // 候选行容器的宽度下限：View 的 min_w 作用于**含 padding 的总宽**，而配置语义是
         // 「除 padding 外的内容总宽」，故这里把行内边距加回去。
-        let min_row_w = if self.min_width_chars > 0 {
+        let min_row_w = if min_width_chars > 0 {
             min_row_content_w + item_pad.l + item_pad.r
         } else {
             0.0
@@ -1886,7 +1913,7 @@ impl CandidateWindow {
         // 本帧的最小内容宽下界（供渲染入口与主题 vertical_max_width 比较，
         // 见 [`CandidateWindow::min_content_w_px`]）：行容器下限 + 行外边距 + 列/窗口内边距。
         // 每次 build_tree 都重算（几何随主题/DPI 变），未配下限时置 0 使上限逻辑完全恒等。
-        self.min_content_w.set(if self.min_width_chars > 0 {
+        self.min_content_w.set(if min_width_chars > 0 {
             let item_mar = edges_or(&v.item.margin, [0.0; 4]);
             let list_pad = edges_or(&v.candidate_list.padding, [0.0; 4]);
             let win_pad = edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]);
@@ -2750,7 +2777,8 @@ impl WindowMouse for CandidateMouse {
     }
 }
 
-/// 候选窗尺寸下限（`ui.candidate.min_width_chars` / `min_rows`，抗抖动）。
+/// 候选窗尺寸下限（`ui.candidate.min_width_chars_horizontal` / `_vertical` / `min_rows`，
+/// 抗抖动）。
 ///
 /// 断言含文本尺寸，依赖 mock 文本测量（字符数 × 字号 × 0.6），故与 `view.rs` 的布局测试
 /// 一样 gate 掉真实文本后端。
@@ -2781,12 +2809,17 @@ mod min_size_tests {
         w
     }
 
-    /// 造一个候选窗：`rows`/`chars` 即两项下限，`texts` 是候选文本。
+    /// 造一个候选窗：`rows` 即行数下限，`chars` 只灌进与 `vertical` 相符的那一项宽度下限
+    /// （另一项留 0），`texts` 是候选文本。
+    ///
+    /// 只灌当前方向那一项，顺带白嫖一份「读错方向」的回归覆盖：本模块几乎每条既有测试
+    /// 都会在 build_tree 误读了另一方向的字段（恒为 0）时失效下限而变红。
     fn win(vertical: bool, rows: u32, chars: u32, texts: &[&str]) -> CandidateWindow {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
         w.set_vertical(vertical);
-        w.set_min_size(chars, rows);
+        let (h, v) = if vertical { (0, chars) } else { (chars, 0) };
+        w.set_min_size(h, v, rows);
         // 序号画成圆圈，使序号节点成为行高的决定项（直径 = index_fs × 1.5，高过文本行高）。
         // 不这样设，占位行即使漏掉序号节点也照样等高 —— 等高性测试就测不出东西来了。
         w.theme.views.index.bg_shape = "circle".to_string();
@@ -2970,6 +3003,46 @@ mod min_size_tests {
         let one = measured(&win(false, 0, 8, &["字", "词"])).0;
         let three = measured(&win(false, 0, 8, &["候选词", "输入法"])).0;
         assert_eq!(one, three);
+    }
+
+    /// ★ 横排下限与竖排下限互不影响——这正是本项从单一 min_width_chars 拆成
+    /// horizontal/vertical 两项的诉求：两种排布的实用值不同，共用一个值时调宽了竖排就顶得
+    /// 横排太松，调紧了横排就不够竖排用。
+    ///
+    /// 只灌一侧字段（另一侧留 0）后按**另一个**方向渲染：若 `min_width_chars()` 读错了
+    /// 方向（例如恒读 horizontal），这里会把本该跟随内容的渲染错锁成定宽，宽度不再随
+    /// 候选字数变化，与 `without_min_width_width_follows_content` 断言的方向刚好相反。
+    #[test]
+    fn horizontal_and_vertical_min_width_are_independent() {
+        // 只配横排下限，竖排渲染时该下限不得生效。
+        let (tx1, _rx1) = std::sync::mpsc::channel();
+        let mut v_win = CandidateWindow::new(CandidateWindowConfig::default(), tx1).unwrap();
+        v_win.set_vertical(true);
+        v_win.set_min_size(8, 0, 0);
+        v_win.theme.views.index.bg_shape = "circle".to_string();
+        v_win.update("", 0, "", vec![cand("字")], 0, -1, 1, 1);
+        let v_one = measured(&v_win).0;
+        v_win.update("", 0, "", vec![cand("候选词")], 0, -1, 1, 1);
+        let v_three = measured(&v_win).0;
+        assert!(
+            v_one < v_three,
+            "只配横排下限时竖排应照常跟随内容（{v_one} vs {v_three}）"
+        );
+
+        // 只配竖排下限，横排渲染时该下限不得生效。
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut h_win = CandidateWindow::new(CandidateWindowConfig::default(), tx2).unwrap();
+        h_win.set_vertical(false);
+        h_win.set_min_size(0, 8, 0);
+        h_win.theme.views.index.bg_shape = "circle".to_string();
+        h_win.update("", 0, "", vec![cand("字"), cand("词")], 0, -1, 1, 1);
+        let h_one = measured(&h_win).0;
+        h_win.update("", 0, "", vec![cand("候选词"), cand("输入法")], 0, -1, 1, 1);
+        let h_three = measured(&h_win).0;
+        assert!(
+            h_one < h_three,
+            "只配竖排下限时横排应照常跟随内容（{h_one} vs {h_three}）"
+        );
     }
 }
 

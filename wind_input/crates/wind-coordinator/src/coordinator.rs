@@ -2335,9 +2335,10 @@ impl Coordinator {
         let _ = self
             .ui_tx
             .send(UiCommand::SetPagerInPreedit(cand.pager_in_preedit));
-        // 候选窗尺寸下限（ui.candidate.min_width_chars / min_rows，抗抖动）
+        // 候选窗尺寸下限（ui.candidate.min_width_chars_horizontal / _vertical / min_rows，抗抖动）
         let _ = self.ui_tx.send(UiCommand::SetCandidateMinSize {
-            width_chars: cand.min_width_chars as u32,
+            width_chars_horizontal: cand.min_width_chars_horizontal as u32,
+            width_chars_vertical: cand.min_width_chars_vertical as u32,
             rows: cand.effective_min_rows(),
         });
         // 悬停提示延迟（ui.tooltip.delay）

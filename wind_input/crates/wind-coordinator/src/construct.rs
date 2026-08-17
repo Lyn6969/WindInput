@@ -204,7 +204,8 @@ impl Coordinator {
         ));
         // 候选窗尺寸下限（抗抖动）；热重载侧同样下发，见 Coordinator::apply_ui_config。
         let _ = coordinator.ui_tx.send(UiCommand::SetCandidateMinSize {
-            width_chars: rt0.config.ui.candidate.min_width_chars as u32,
+            width_chars_horizontal: rt0.config.ui.candidate.min_width_chars_horizontal as u32,
+            width_chars_vertical: rt0.config.ui.candidate.min_width_chars_vertical as u32,
             rows: rt0.config.ui.candidate.effective_min_rows(),
         });
         let _ = coordinator

@@ -889,8 +889,16 @@ impl UiManager {
                     UiCommand::SetCandidateFontFamily(family) => {
                         candidate_window.set_font_family(&family);
                     }
-                    UiCommand::SetCandidateMinSize { width_chars, rows } => {
-                        candidate_window.set_min_size(width_chars, rows);
+                    UiCommand::SetCandidateMinSize {
+                        width_chars_horizontal,
+                        width_chars_vertical,
+                        rows,
+                    } => {
+                        candidate_window.set_min_size(
+                            width_chars_horizontal,
+                            width_chars_vertical,
+                            rows,
+                        );
                     }
                     UiCommand::SetTooltipDelay(delay) => {
                         candidate_window.set_tooltip_delay(delay);
