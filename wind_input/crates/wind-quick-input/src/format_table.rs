@@ -99,6 +99,59 @@ impl FormatKind {
             Self::Calc => matches!(name, "EXPR" | "RESULT"),
         }
     }
+
+    /// 本类可用变量的**展示清单**（名字 + 一句话，含示例值），供设置页的模板输入框提示。
+    ///
+    /// ★ 放在 core 而不是设置仓：变量白名单是 [`Self::supports_var`] 的知识，设置页硬编码
+    /// 一份就会在加新变量时静默过时（用户照着提示写不出新变量，或提示里的变量已被删）。
+    ///
+    /// 与 `supports_var` 是**两份数据**（这里多了说明文字），故有两道测试钉住：
+    /// 名字必须都能通过 `supports_var`，且每类的条数写死——加变量时那个数字会红，
+    /// 提醒同步这里与文档站的变量表。
+    pub fn var_hints(self) -> &'static [(&'static str, &'static str)] {
+        // 公历年月日（date / month_day / year_month 共用前几项）
+        const YEAR: &[(&str, &str)] = &[
+            ("Y", "年，如 2026"),
+            ("YYYY", "四位年，2026"),
+            ("YY", "两位年，26"),
+            ("YC", "汉字年，二〇二六"),
+        ];
+        const MONTH: &[(&str, &str)] =
+            &[("M", "月，3"), ("MM", "两位月，03"), ("MC", "汉字月，三")];
+        const DAY: &[(&str, &str)] = &[("D", "日，5"), ("DD", "两位日，05"), ("DC", "汉字日，五")];
+        const LUNAR: &[(&str, &str)] = &[
+            ("LY", "农历干支年，丙午"),
+            ("LYN", "农历年数字，2026（以正月初一为界，可能与公历差 1）"),
+            ("LZ", "生肖，马"),
+            ("LM", "农历月，四月"),
+            ("LD", "农历日，廿九"),
+            ("LMD", "农历月日，四月廿九"),
+            ("LF", "农历节日，端午节（非节日为空）"),
+        ];
+        // 拼接结果必须是 `'static`，故各类各写一份完整的常量（拼接要分配）。
+        const DATE_ALL: &[(&str, &str)] = &[
+            YEAR[0], YEAR[1], YEAR[2], YEAR[3], MONTH[0], MONTH[1], MONTH[2], DAY[0], DAY[1],
+            DAY[2], LUNAR[0], LUNAR[1], LUNAR[2], LUNAR[3], LUNAR[4], LUNAR[5], LUNAR[6],
+        ];
+        const YEAR_MONTH_ALL: &[(&str, &str)] = &[
+            YEAR[0], YEAR[1], YEAR[2], YEAR[3], MONTH[0], MONTH[1], MONTH[2],
+        ];
+        match self {
+            // 月日与完整日期同一套变量（年份取当前年），故共用一份清单。
+            Self::Date | Self::MonthDay => DATE_ALL,
+            // 无 $D 系列、无农历：农历月与公历月不是一一对应，`2026.12` 推不出唯一农历月。
+            Self::YearMonth => YEAR_MONTH_ALL,
+            Self::Number => &[
+                ("N", "原数字，1234.5"),
+                ("THOU", "千分位，1,234.5"),
+                ("CNL", "中文小写，一千二百三十四点五"),
+                ("CNU", "中文大写，壹仟贰佰叁拾肆点伍"),
+                ("DIG", "逐位读，一二三四点五"),
+                ("AMT", "金额大写，壹仟贰佰叁拾肆元伍角（超两位小数为空）"),
+            ],
+            Self::Calc => &[("EXPR", "算式原文，1+2*3"), ("RESULT", "计算结果，7")],
+        }
+    }
 }
 
 /// 一条格式：解析出的量渲染成候选文本的模板。
@@ -1406,6 +1459,61 @@ text = "$RESULT"
         };
         assert_eq!(next_user_format_id(FormatKind::Date, &a), "date.u3");
         assert_eq!(next_user_format_id(FormatKind::Number, &a), "number.u1");
+    }
+
+    /// ★ 提示清单里的每个名字都必须真的被 `supports_var` 接受——否则设置页照着提示写出的
+    /// 模板会在保存时被拒，而提示本身看不出错。
+    #[test]
+    fn var_hints_are_all_actually_supported() {
+        for &k in FormatKind::ALL {
+            for (name, desc) in k.var_hints() {
+                assert!(
+                    k.supports_var(name),
+                    "kind={} 的提示里有不被支持的变量 ${name}",
+                    k.as_str()
+                );
+                assert!(!desc.is_empty(), "${name} 缺说明");
+            }
+            assert!(
+                !k.var_hints().is_empty(),
+                "kind={} 没有任何提示",
+                k.as_str()
+            );
+        }
+    }
+
+    /// 每类的变量条数写死。**加变量时这条会红**——那正是它的用途：提醒同步
+    /// `var_hints`（设置页提示）与文档站的变量表，那两处没有编译期约束。
+    #[test]
+    fn var_hint_counts_are_pinned() {
+        let n = |k: FormatKind| k.var_hints().len();
+        assert_eq!(n(FormatKind::Date), 17, "公历 10 + 农历 7");
+        assert_eq!(n(FormatKind::MonthDay), 17, "与 date 同一套");
+        assert_eq!(n(FormatKind::YearMonth), 7, "无 $D 系列、无农历");
+        assert_eq!(n(FormatKind::Number), 6);
+        assert_eq!(n(FormatKind::Calc), 2);
+    }
+
+    /// 农历变量给 date/month_day 而**不给 year_month**：这条分工在提示清单里也要成立，
+    /// 否则用户照提示给年月写 `$LMD`，保存时才被拒。
+    #[test]
+    fn year_month_hints_offer_no_lunar_vars() {
+        let names: Vec<&str> = FormatKind::YearMonth
+            .var_hints()
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            !names.iter().any(|n| crate::lunar::is_var(n)),
+            "年月的提示里不该有农历变量: {names:?}"
+        );
+        assert!(
+            FormatKind::Date
+                .var_hints()
+                .iter()
+                .any(|(n, _)| crate::lunar::is_var(n)),
+            "完整日期应当提供农历变量"
+        );
     }
 
     #[test]

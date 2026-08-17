@@ -283,6 +283,7 @@ pub trait WebDataRpc: WebDataHost {
             "quick.setEnabled" => self.web_quick_set_enabled(params),
             "quick.resetEntry" => self.web_quick_reset_entry(params),
             "quick.resetKind" => self.web_quick_reset_kind(params),
+            "quick.vars" => self.web_quick_vars(),
             "quick.add" => self.web_quick_add(params),
             "quick.setText" => self.web_quick_set_text(params),
             "quick.delete" => self.web_quick_delete(params),
@@ -1841,6 +1842,27 @@ pub trait WebDataRpc: WebDataHost {
         // 整类操作没有单条归属，id 传空串（`QuickFormatEdit::ResetKind` 忽略它）。
         self.quick_format_edit(kind, "", QuickFormatEdit::ResetKind)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// 每类可用的模板变量清单，供设置页的模板输入框提示。
+    ///
+    /// 静态数据，一次取完即可缓存。真相源在 core 的 `FormatKind::var_hints`——设置仓自己
+    /// 硬编码一份会在加新变量时静默过时（照提示写的模板反被拒，或提示里的变量已删）。
+    fn web_quick_vars(&self) -> anyhow::Result<Value> {
+        let kinds: Vec<Value> = self
+            .quick_format_var_hints()
+            .into_iter()
+            .map(|(kind, vars)| {
+                json!({
+                    "kind": kind,
+                    "vars": vars
+                        .into_iter()
+                        .map(|(name, desc)| json!({ "name": name, "desc": desc }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Ok(json!(kinds))
     }
 
     /// 新增用户自定义条目。返回分配到的 id，好让设置页立刻高亮/滚到那一行。
@@ -3647,6 +3669,49 @@ moved = [{ id = 'date.lunar', position = 0 }]
     }
 
     // ───────── quick.* 自定义条目（P2）─────────
+
+    /// 变量提示覆盖全部五类，且 year_month **不含**农历变量。
+    ///
+    /// 后一条是真实的分工（农历月与公历月不一一对应），提示里放了农历，用户照着给年月写
+    /// `$LMD`，保存时才会被拒——错误发生在他已经写完之后。
+    #[test]
+    fn quick_vars_covers_all_kinds_without_lunar_in_year_month() {
+        let (c, p) = quick_coord("vars");
+        let v = c.web_data_rpc("quick.vars", &json!({})).unwrap();
+        let arr = v.as_array().unwrap();
+        let kinds: Vec<&str> = arr.iter().map(|k| k["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            vec!["date", "month_day", "year_month", "number", "calc"],
+            "五类齐全且按 ALL 序"
+        );
+        let names_of = |kind: &str| -> Vec<String> {
+            arr.iter().find(|k| k["kind"] == json!(kind)).unwrap()["vars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(names_of("date").contains(&"LMD".to_string()));
+        assert!(
+            !names_of("year_month").contains(&"LMD".to_string()),
+            "年月不该提供农历变量"
+        );
+        assert!(names_of("calc").contains(&"RESULT".to_string()));
+        // 每条都得有说明，否则界面上是一列空白
+        for k in arr {
+            for var in k["vars"].as_array().unwrap() {
+                assert!(
+                    var["desc"].as_str().is_some_and(|d| !d.is_empty()),
+                    "kind={} 的 {} 缺说明",
+                    k["kind"],
+                    var["name"]
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
 
     /// 新增的条目立刻是一个**完整的**列表行：能列出、有示例、可调序、标着 user。
     ///

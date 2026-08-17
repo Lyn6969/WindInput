@@ -59,6 +59,13 @@ pub trait WebDataHost {
         edit: crate::handle_quick_format::QuickFormatEdit,
     ) -> anyhow::Result<()>;
 
+    /// 每个类别可用的模板变量清单：`[(kind, [(变量名, 说明)])]`。
+    ///
+    /// 静态数据，但仍走本窄面：`wind-webdata` 不依赖 `wind-quick-input`（那是本 trait 存在的
+    /// 意义）。设置页的模板输入框据此提示，故清单的真相源必须在 core——设置仓硬编码一份
+    /// 会在加新变量时静默过时。
+    fn quick_format_var_hints(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>;
+
     /// 新增一条用户自定义格式，返回分配到的 id。
     ///
     /// 没有「改出厂条目模板」的对应方法：那条路径被刻意否决（见
@@ -155,6 +162,12 @@ impl WebDataHost for Coordinator {
         let kind = wind_quick_input::FormatKind::parse(kind)
             .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
         Coordinator::edit_quick_format(self, kind, id, edit)
+    }
+    fn quick_format_var_hints(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+        wind_quick_input::FormatKind::ALL
+            .iter()
+            .map(|k| (k.as_str(), k.var_hints().to_vec()))
+            .collect()
     }
     fn quick_format_add(&self, kind: &str, text: &str) -> anyhow::Result<String> {
         let kind = wind_quick_input::FormatKind::parse(kind)
