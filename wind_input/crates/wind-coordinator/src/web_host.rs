@@ -59,7 +59,19 @@ pub trait WebDataHost {
         edit: crate::handle_quick_format::QuickFormatEdit,
     ) -> anyhow::Result<()>;
 
-    /// 导出用户改动（调序 / 停用）为 TOML 文本。
+    /// 新增一条用户自定义格式，返回分配到的 id。
+    ///
+    /// 没有「改出厂条目模板」的对应方法：那条路径被刻意否决（见
+    /// `Coordinator::add_quick_format` 的 doc），出厂条目只能停用与调序。
+    fn quick_format_add(&self, kind: &str, text: &str) -> anyhow::Result<String>;
+
+    /// 改写**用户条目**的模板。出厂条目会被拒绝。
+    fn quick_format_set_text(&self, kind: &str, id: &str, text: &str) -> anyhow::Result<()>;
+
+    /// 删除**用户条目**（连带它的调序/停用规则）。出厂条目会被拒绝——它们只能停用。
+    fn quick_format_delete(&self, kind: &str, id: &str) -> anyhow::Result<()>;
+
+    /// 导出用户改动（调序 / 停用 / 自定义条目）为 TOML 文本。
     fn quick_format_export(&self) -> anyhow::Result<String>;
 
     /// 导入预览：只解析与计数，不写库。
@@ -143,6 +155,21 @@ impl WebDataHost for Coordinator {
         let kind = wind_quick_input::FormatKind::parse(kind)
             .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
         Coordinator::edit_quick_format(self, kind, id, edit)
+    }
+    fn quick_format_add(&self, kind: &str, text: &str) -> anyhow::Result<String> {
+        let kind = wind_quick_input::FormatKind::parse(kind)
+            .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
+        Coordinator::add_quick_format(self, kind, text)
+    }
+    fn quick_format_set_text(&self, kind: &str, id: &str, text: &str) -> anyhow::Result<()> {
+        let kind = wind_quick_input::FormatKind::parse(kind)
+            .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
+        Coordinator::set_quick_format_text(self, kind, id, text)
+    }
+    fn quick_format_delete(&self, kind: &str, id: &str) -> anyhow::Result<()> {
+        let kind = wind_quick_input::FormatKind::parse(kind)
+            .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
+        Coordinator::delete_quick_format(self, kind, id)
     }
     fn quick_format_export(&self) -> anyhow::Result<String> {
         Coordinator::export_quick_format(self)

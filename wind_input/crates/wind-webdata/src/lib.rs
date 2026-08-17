@@ -283,6 +283,9 @@ pub trait WebDataRpc: WebDataHost {
             "quick.setEnabled" => self.web_quick_set_enabled(params),
             "quick.resetEntry" => self.web_quick_reset_entry(params),
             "quick.resetKind" => self.web_quick_reset_kind(params),
+            "quick.add" => self.web_quick_add(params),
+            "quick.setText" => self.web_quick_set_text(params),
+            "quick.delete" => self.web_quick_delete(params),
             "quick.export" => self.web_quick_export(),
             "quick.import" => self.web_quick_import(params),
             "quick.previewImport" => self.web_quick_preview_import(params),
@@ -1802,6 +1805,7 @@ pub trait WebDataRpc: WebDataHost {
                     "moveIndex": r.move_index,
                     "enabled": r.enabled,
                     "adjusted": r.adjusted,
+                    "user": r.user,
                     "sample": r.sample,
                 })
             })
@@ -1839,6 +1843,28 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({ "ok": true }))
     }
 
+    /// 新增用户自定义条目。返回分配到的 id，好让设置页立刻高亮/滚到那一行。
+    ///
+    /// 没有对应的「改出厂条目模板」RPC：那条路径被刻意否决，出厂条目只能停用与调序
+    /// （见 `docs/design/quick-input-format-table.md` §11.1）。
+    fn web_quick_add(&self, params: &Value) -> anyhow::Result<Value> {
+        let (kind, text) = (str_param(params, "kind")?, str_param(params, "text")?);
+        let id = self.quick_format_add(kind, text)?;
+        Ok(json!({ "ok": true, "id": id }))
+    }
+
+    fn web_quick_set_text(&self, params: &Value) -> anyhow::Result<Value> {
+        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        self.quick_format_set_text(kind, id, str_param(params, "text")?)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_quick_delete(&self, params: &Value) -> anyhow::Result<Value> {
+        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        self.quick_format_delete(kind, id)?;
+        Ok(json!({ "ok": true }))
+    }
+
     fn web_quick_export(&self) -> anyhow::Result<Value> {
         Ok(json!({ "content": self.quick_format_export()? }))
     }
@@ -1848,7 +1874,7 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({
             "moved": p.moved,
             "disabled": p.disabled,
-            "ignoredFormats": p.ignored_formats,
+            "formats": p.formats,
             "skipped": p.skipped,
             "kinds": p.kinds,
         }))
@@ -1865,7 +1891,7 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({
             "moved": o.moved,
             "disabled": o.disabled,
-            "ignoredFormats": o.ignored_formats,
+            "formats": o.formats,
             "skipped": o.skipped,
         }))
     }
@@ -3590,7 +3616,7 @@ moved = [{ id = 'date.lunar', position = 0 }]
             .web_data_rpc("quick.previewImport", &json!({ "content": file }))
             .unwrap();
         assert_eq!(pv["moved"], json!(1));
-        assert_eq!(pv["ignoredFormats"], json!(1), "自定义条目如实计数");
+        assert_eq!(pv["formats"], json!(1), "自定义条目如实计数");
         assert_eq!(
             pv["skipped"].as_array().unwrap().len(),
             1,
@@ -3618,6 +3644,415 @@ moved = [{ id = 'date.lunar', position = 0 }]
             .to_string();
         assert!(e.contains("weather"), "错误应指出是哪个类别: {e}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ───────── quick.* 自定义条目（P2）─────────
+
+    /// 新增的条目立刻是一个**完整的**列表行：能列出、有示例、可调序、标着 user。
+    ///
+    /// 示例列尤其要验：它由「只清 moved/disabled、保留 added」的那份调整渲染，若沿用 P1 的
+    /// 空调整，用户条目的示例会恒为空——其它行都好，看着像是模板写错了。
+    #[test]
+    fn quick_add_yields_a_complete_row() {
+        let (c, p) = quick_coord("add");
+        let r = c
+            .web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        assert_eq!(r["id"], json!("date.u1"), "首条用户条目的 id");
+
+        let rows = quick_rows(&c);
+        let row = quick_row(&rows, "date.u1");
+        assert_eq!(row["user"], json!(true), "标记为用户条目");
+        assert_eq!(row["enabled"], json!(true));
+        assert!(row["moveIndex"].is_number(), "启用的条目可调序");
+        assert!(
+            row["sample"].as_str().is_some_and(|s| s.contains('/')),
+            "★ 示例必须渲染出来，实际: {:?}",
+            row["sample"]
+        );
+        // 出厂条目不该被误标
+        assert_eq!(quick_row(&rows, "date.cn")["user"], json!(false));
+
+        // 第二条接着排号，且落在本类末尾
+        let r2 = c
+            .web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$D-$M-$Y" }))
+            .unwrap();
+        assert_eq!(r2["id"], json!("date.u2"));
+        let rows = quick_rows(&c);
+        let date_ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["kind"] == json!("date"))
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &date_ids[date_ids.len() - 2..],
+            &["date.u1", "date.u2"],
+            "用户条目排在出厂条目之后"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 校验在**保存前**拒绝并说明原因（与文件加载「剔除 + warn」相反：那边用户看不到日志）。
+    #[test]
+    fn quick_add_rejects_invalid_template() {
+        let (c, p) = quick_coord("add_bad");
+        // year_month 没有 $D 系列
+        let e = c
+            .web_data_rpc(
+                "quick.add",
+                &json!({ "kind": "year_month", "text": "$Y-$M-$D" }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$D") || e.contains('D'),
+            "错误要指出是哪个变量: {e}"
+        );
+
+        let e = c
+            .web_data_rpc("quick.add", &json!({ "kind": "date", "text": "   " }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("为空"), "纯空白模板要拒绝: {e}");
+
+        assert!(
+            quick_rows(&c).iter().all(|r| r["user"] == json!(false)),
+            "被拒绝的条目不得落库"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 模板逐字相同就拒绝，并**指出撞的是哪一条**——两行长得一模一样时用户看不到 id，
+    /// 只说「重复了」他还得自己一行行找。
+    #[test]
+    fn quick_add_rejects_duplicate_template() {
+        let (c, p) = quick_coord("add_dup");
+        let e = c
+            .web_data_rpc(
+                "quick.add",
+                &json!({ "kind": "date", "text": "$Y年$M月$D日" }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("date.cn"), "要指出撞的是哪条: {e}");
+
+        c.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        let e = c
+            .web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("date.u1"), "也要认出撞的是用户条目: {e}");
+
+        // 同一串模板在别的类别里不算撞车（各类各一张表）
+        c.web_data_rpc(
+            "quick.add",
+            &json!({ "kind": "month_day", "text": "$Y/$M/$D" }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★★ 出厂条目的模板不可改、不可删——这是 P2 的核心设计决策，由 store 的数据结构
+    /// 兜住（模板只存在 `added` 里）。这条测试是那个决策的守门。
+    #[test]
+    fn quick_factory_entries_refuse_edit_and_delete() {
+        let (c, p) = quick_coord("factory_ro");
+        let e = c
+            .web_data_rpc(
+                "quick.setText",
+                &json!({ "kind": "date", "id": "date.cn", "text": "$Y.$M.$D" }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("不可修改"), "要说清为什么: {e}");
+
+        let e = c
+            .web_data_rpc("quick.delete", &json!({ "kind": "date", "id": "date.cn" }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("只能停用"), "要指出替代做法: {e}");
+
+        // 模板没被动过
+        assert_eq!(
+            quick_row(&quick_rows(&c), "date.cn")["text"],
+            json!("$Y年$M月$D日")
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn quick_set_text_updates_user_entry_and_its_sample() {
+        let (c, p) = quick_coord("set_text");
+        // 模板不能与出厂条目逐字相同（`$CNL` 就是出厂的 number.cn_lower），否则被查重拦下
+        c.web_data_rpc("quick.add", &json!({ "kind": "number", "text": "约$CNL" }))
+            .unwrap();
+        c.web_data_rpc(
+            "quick.setText",
+            &json!({ "kind": "number", "id": "number.u1", "text": "共$THOU元" }),
+        )
+        .unwrap();
+        let row = quick_row(&quick_rows(&c), "number.u1");
+        assert_eq!(row["text"], json!("共$THOU元"));
+        assert!(
+            row["sample"].as_str().is_some_and(|s| s.starts_with('共')),
+            "示例要跟着变: {:?}",
+            row["sample"]
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 改写时把自己排除掉：只改了个错别字、模板本身没动，不该被判成「与自己重复」。
+    #[test]
+    fn quick_set_text_to_the_same_value_is_allowed() {
+        let (c, p) = quick_coord("set_same");
+        c.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        c.web_data_rpc(
+            "quick.setText",
+            &json!({ "kind": "date", "id": "date.u1", "text": "$Y/$M/$D" }),
+        )
+        .expect("模板没变也该允许保存");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 删除连带清掉它的调序规则，否则重加一条同 id 的条目会被旧规则挪到意外的位置。
+    #[test]
+    fn quick_delete_also_drops_its_move_rule() {
+        let (c, p) = quick_coord("del");
+        c.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        c.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.u1", "index": 0 }),
+        )
+        .unwrap();
+        assert_eq!(quick_rows(&c)[0]["id"], json!("date.u1"));
+
+        c.web_data_rpc("quick.delete", &json!({ "kind": "date", "id": "date.u1" }))
+            .unwrap();
+        let rows = quick_rows(&c);
+        assert!(
+            !rows.iter().any(|r| r["id"] == json!("date.u1")),
+            "已从列表消失"
+        );
+        // 重新加一条：不该继承已删条目的位置，而要落回本类末尾。
+        //
+        // 这里刻意**不断言 id 是什么**：删掉唯一一条后 id 会复用 `date.u1`，而那是安全的
+        // ——删除已连带清掉它的全部规则，没有任何东西还引用这个 id。真正要防的「删中间
+        // 一条后撞上仍存在的 id」由 `next_user_id_survives_a_deletion_in_the_middle` 覆盖。
+        // 断言 id 不复用会把一个无害的实现细节钉死。
+        let r = c
+            .web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        let fresh = r["id"].as_str().unwrap().to_string();
+        let rows = quick_rows(&c);
+        assert_ne!(rows[0]["id"], json!(fresh), "★ 不得继承已删条目的首位");
+        let date_ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["kind"] == json!("date"))
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(*date_ids.last().unwrap(), fresh, "落回本类末尾");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★★ 「恢复默认」清调序与停用，**保留用户条目**。
+    ///
+    /// 端到端守门：store 那层已有同名测试，这里再钉一次 RPC 全链路——右键菜单的
+    /// `resetKind` 与设置页共用这条路径，而它一度是 `t.remove(kind)`（会删穿用户条目）。
+    #[test]
+    fn quick_reset_kind_keeps_user_entries() {
+        let (c, p) = quick_coord("reset_keep");
+        c.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        c.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.u1", "index": 0 }),
+        )
+        .unwrap();
+        c.web_data_rpc(
+            "quick.setEnabled",
+            &json!({ "kind": "date", "id": "date.cn", "enabled": false }),
+        )
+        .unwrap();
+
+        c.web_data_rpc("quick.resetKind", &json!({ "kind": "date" }))
+            .unwrap();
+
+        let rows = quick_rows(&c);
+        let row = quick_row(&rows, "date.u1");
+        assert_eq!(row["user"], json!(true), "★ 用户条目必须还在");
+        assert_eq!(row["adjusted"], json!(false), "它的调序规则被清掉了");
+        assert_eq!(quick_row(&rows, "date.cn")["enabled"], json!(true));
+        let date_ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["kind"] == json!("date"))
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            *date_ids.last().unwrap(),
+            "date.u1",
+            "回到「用户条目在末尾」的初始位置"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 导出/导入往返带上用户条目本身（不只是调整）。
+    #[test]
+    fn quick_roundtrip_carries_user_entries() {
+        let (a, pa) = quick_coord("rt_user_a");
+        a.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        a.web_data_rpc(
+            "quick.add",
+            &json!({ "kind": "calc", "text": "结果是$RESULT" }),
+        )
+        .unwrap();
+        a.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.u1", "index": 0 }),
+        )
+        .unwrap();
+        let content = a.web_data_rpc("quick.export", &json!({})).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (b, pb) = quick_coord("rt_user_b");
+        let o = b
+            .web_data_rpc("quick.import", &json!({ "content": content }))
+            .unwrap();
+        assert_eq!(o["formats"], json!(2), "两条自定义条目都导入了");
+        assert!(
+            o["skipped"].as_array().unwrap().is_empty(),
+            "不该有跳过项: {:?}",
+            o["skipped"]
+        );
+
+        let rows = quick_rows(&b);
+        assert_eq!(rows[0]["id"], json!("date.u1"), "调序规则也带过来了");
+        assert_eq!(rows[0]["text"], json!("$Y/$M/$D"));
+        assert_eq!(quick_row(&rows, "calc.u1")["text"], json!("结果是$RESULT"));
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    /// ★★ 导入时 id 冲突：换新 id 之后，**引用它的 `moved` 规则必须一起改写**。
+    ///
+    /// 场景是两台机器各有一条 `date.u1`（内容不同）。若只改 `[[formats]]` 侧不改 `moved` 侧，
+    /// 那条移动规则会指向本机原有的 `date.u1`——症状是「导入后顺序不对」，两条条目都在、
+    /// 都没报错。与漏 `.rev()` 同属导入重放的引用完整性。
+    #[test]
+    fn quick_import_remaps_conflicting_id_and_its_move_rule() {
+        // A 机：date.u1 = $Y/$M/$D，并把它移到首位
+        let (a, pa) = quick_coord("remap_a");
+        a.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        a.web_data_rpc(
+            "quick.move",
+            &json!({ "kind": "date", "id": "date.u1", "index": 0 }),
+        )
+        .unwrap();
+        let content = a.web_data_rpc("quick.export", &json!({})).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // B 机：已有一条**内容不同**的 date.u1
+        let (b, pb) = quick_coord("remap_b");
+        b.web_data_rpc(
+            "quick.add",
+            &json!({ "kind": "date", "text": "本机原有$Y" }),
+        )
+        .unwrap();
+
+        let o = b
+            .web_data_rpc("quick.import", &json!({ "content": content }))
+            .unwrap();
+        assert_eq!(o["formats"], json!(1));
+
+        let rows = quick_rows(&b);
+        // 本机原有那条内容不变
+        assert_eq!(quick_row(&rows, "date.u1")["text"], json!("本机原有$Y"));
+        // 导入的那条换了 id
+        let fresh = quick_row(&rows, "date.u2");
+        assert_eq!(fresh["text"], json!("$Y/$M/$D"), "导入的条目改用 u2");
+        // ★ 移动规则跟着改写：排首位的是导入的那条，不是本机原有的
+        assert_eq!(
+            rows[0]["id"],
+            json!("date.u2"),
+            "★ moved 必须一起改写，否则规则会指向本机原有的 date.u1"
+        );
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    /// 重复导入同一份文件是幂等的：模板相同的条目按「撞车」跳过并如实报告，
+    /// 而不是每导一次就多出一条一模一样的候选。
+    #[test]
+    fn quick_import_twice_does_not_duplicate_entries() {
+        let (a, pa) = quick_coord("idem_a");
+        a.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "$Y/$M/$D" }))
+            .unwrap();
+        let content = a.web_data_rpc("quick.export", &json!({})).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (b, pb) = quick_coord("idem_b");
+        b.web_data_rpc("quick.import", &json!({ "content": &content }))
+            .unwrap();
+        let o = b
+            .web_data_rpc("quick.import", &json!({ "content": &content }))
+            .unwrap();
+        assert_eq!(o["formats"], json!(0), "第二次一条都不该写入");
+        assert_eq!(
+            o["skipped"].as_array().unwrap().len(),
+            1,
+            "跳过要如实报告: {:?}",
+            o["skipped"]
+        );
+        assert_eq!(
+            quick_rows(&b)
+                .iter()
+                .filter(|r| r["user"] == json!(true))
+                .count(),
+            1,
+            "只有一条用户条目"
+        );
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    /// `strategy = "replace"` 连用户条目一起清（语义是「用文件覆盖现状」），
+    /// 与面向用户的「恢复默认」刻意相反。
+    #[test]
+    fn quick_import_replace_clears_user_entries_too() {
+        let (a, pa) = quick_coord("repl_user_a");
+        a.web_data_rpc("quick.add", &json!({ "kind": "calc", "text": "得$RESULT" }))
+            .unwrap();
+        let content = a.web_data_rpc("quick.export", &json!({})).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (b, pb) = quick_coord("repl_user_b");
+        b.web_data_rpc("quick.add", &json!({ "kind": "date", "text": "本机的$Y" }))
+            .unwrap();
+        b.web_data_rpc(
+            "quick.import",
+            &json!({ "content": content, "strategy": "replace" }),
+        )
+        .unwrap();
+
+        let rows = quick_rows(&b);
+        assert!(
+            !rows.iter().any(|r| r["text"] == json!("本机的$Y")),
+            "replace 应清掉本机原有的用户条目"
+        );
+        assert_eq!(quick_row(&rows, "calc.u1")["text"], json!("得$RESULT"));
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
     }
 
     /// 用一份 system.phrases.toml 起一个带 data_dir 的 headless coordinator。

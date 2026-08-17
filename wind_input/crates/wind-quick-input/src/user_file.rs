@@ -227,6 +227,7 @@ mod tests {
                     FormatAdjust {
                         moved: vec![("date.lunar".into(), 0), ("date.iso".into(), 2)],
                         disabled: vec!["date.basic".into()],
+                        added: Vec::new(),
                     },
                 ),
                 (
@@ -234,6 +235,7 @@ mod tests {
                     FormatAdjust {
                         moved: vec![],
                         disabled: vec!["number.digits".into()],
+                        added: Vec::new(),
                     },
                 ),
             ],

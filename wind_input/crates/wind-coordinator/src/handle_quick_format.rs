@@ -108,11 +108,38 @@ impl Coordinator {
         };
         let mut map = std::collections::HashMap::new();
         for (kind, rec) in rows {
+            // 用户条目要带上类别才能进 `FormatAdjust`（store 那侧只按字符串键分表）。
+            // 未知类别（存量数据来自更高版本）连同它的条目一起丢弃：渲染是按 kind 查表的，
+            // 留着也永远匹配不上，而 warn 让「我的自定义条目不见了」有迹可循。
+            let added = match FormatKind::parse(&kind) {
+                Some(k) => rec
+                    .added
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| wind_quick_input::FormatEntry {
+                        id: a.id.clone(),
+                        kind: k,
+                        text: a.text.clone(),
+                        // 组内序号 = 存储序：新条目追加在后，故「加的顺序」就是初始顺序。
+                        position: i as i32,
+                    })
+                    .collect(),
+                None => {
+                    if !rec.added.is_empty() {
+                        tracing::warn!(
+                            "快捷输入格式调整: 类别 {kind} 无法识别，其 {} 条自定义条目本次不生效",
+                            rec.added.len()
+                        );
+                    }
+                    Vec::new()
+                }
+            };
             map.insert(
                 kind,
                 FormatAdjust {
                     moved: rec.moved.into_iter().map(|m| (m.id, m.position)).collect(),
                     disabled: rec.disabled,
+                    added,
                 },
             );
         }
@@ -257,6 +284,12 @@ pub struct QuickFormatRow {
     pub enabled: bool,
     /// 用户是否调整过（移动或停用）。设置页据此决定「恢复此条」能不能点。
     pub adjusted: bool,
+    /// 是不是用户自己加的条目。
+    ///
+    /// 设置页按它分流三件事，**别拿 [`Self::adjusted`] 当它用**：出厂条目被调序过也是
+    /// `adjusted`，但它只能停用、能「恢复默认」；用户条目反过来——能删、能改模板，
+    /// 而它没有「默认」可回到。
+    pub user: bool,
     /// 示例效果。渲染不出时为空串（见 [`Coordinator::quick_format_samples`]）。
     pub sample: String,
 }
@@ -313,6 +346,7 @@ impl Coordinator {
                     move_index,
                     enabled: v.enabled,
                     adjusted: v.adjusted,
+                    user: v.user,
                     sample: samples.get(&v.entry.id).cloned().unwrap_or_default(),
                 });
             }
@@ -326,8 +360,13 @@ impl Coordinator {
     /// 用户实际打出来的东西必然一致。另写一套「设置页专用渲染」迟早与候选漂移，
     /// 而那种漂移没人会发现——两边看着都对，只是不一样。
     ///
-    /// 用**空调整**生成：停用条目也要有示例（设置页要显示它们），而候选路径会把停用项
-    /// 剔掉。顺序在这里无意义，只取 id → 文本的映射，行序由 `entries_of_view` 决定。
+    /// 调整**只清 `moved`/`disabled`、保留 `added`**：停用条目也要有示例（设置页要显示
+    /// 它们），而候选路径会把停用项剔掉；顺序在这里无意义，只取 id → 文本的映射，
+    /// 行序由 `entries_of_view` 决定。
+    ///
+    /// ⚠️ P1 这里用的是**空调整**，那时是对的（只有出厂条目）。用户条目住在 `adjust.added`
+    /// 里，继续传空 map 就等于「渲染一张没有用户条目的表」——症状是自己加的那几行示例列
+    /// 恒为空，而其它行都好，看着像模板写错了。
     ///
     /// 取不到示例的条目（农历超出 1900–2100、表达式写错）为空串。⚠️ 「示例为空」
     /// **不等于**「这条永远不出」——它只说明这一组样本值渲染不出来。
@@ -335,7 +374,11 @@ impl Coordinator {
         use chrono::Datelike;
         use wind_quick_input::QuickSource;
         let dp = self.rt().config.schema.quick_input.decimal_places;
-        let empty = wind_quick_input::FormatAdjustMap::default();
+        let mut samples_adjust = self.quick_adjust_snapshot();
+        for a in samples_adjust.values_mut() {
+            a.moved.clear();
+            a.disabled.clear();
+        }
         let eval = |text: &str, values: &wind_quick_input::QuickValues| {
             crate::quick_eval::eval_expr(text, values)
         };
@@ -360,7 +403,7 @@ impl Coordinator {
                 &buffer,
                 dp,
                 &self.quick_formats,
-                &empty,
+                &samples_adjust,
                 Some(&eval),
             ) {
                 out.insert(r.id, r.text);
@@ -396,6 +439,77 @@ impl Coordinator {
         self.reload_quick_adjust();
         Ok(())
     }
+
+    /// 新增一条用户自定义格式，返回分配到的 id。
+    ///
+    /// ## 为什么没有「编辑出厂条目」的对应方法
+    ///
+    /// 出厂条目的模板**不可改**（设计决策，见 `docs/design/quick-input-format-table.md`
+    /// §11.1）：这张表的顺序由用户直接指定，「停用出厂那条 + 自己加一条 + 摆到想要的位置」
+    /// 已完整覆盖「想改出厂那条」，再开一条 `overrides` 路径就得额外处理出厂表升级时的
+    /// 三方合并（留用户旧值 = 他永远看不到新出厂模板；采用新值 = 丢他的改动）。
+    ///
+    /// 约束由数据结构兜住：模板只存在 `added` 里，出厂条目根本没有可写的字段。
+    pub fn add_quick_format(&self, kind: FormatKind, text: &str) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        // 校验在**保存前**拒绝并给出原因，与文件加载「剔除 + warn」的策略刻意相反：
+        // 那边用户看不到日志、只能发现候选少了一条，这边他正盯着输入框等回话。
+        wind_quick_input::validate_format_text(kind, text).map_err(|e| anyhow::anyhow!(e))?;
+        let adjust = self.quick_adjust_of(kind);
+        if let Some(dup) = self
+            .quick_formats
+            .duplicate_text_of(kind, text, &adjust, None)
+        {
+            anyhow::bail!("已有一条相同的格式（{dup}），不必重复添加");
+        }
+        let id = wind_quick_input::next_user_format_id(kind, &adjust);
+        store.add_quick_format(kind.as_str(), &id, text)?;
+        self.reload_quick_adjust();
+        Ok(id)
+    }
+
+    /// 改写用户条目的模板。出厂条目会被拒绝（它们不在 `added` 里）。
+    pub fn set_quick_format_text(
+        &self,
+        kind: FormatKind,
+        id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        wind_quick_input::validate_format_text(kind, text).map_err(|e| anyhow::anyhow!(e))?;
+        let adjust = self.quick_adjust_of(kind);
+        // 排除自己：只改了个错别字、模板本身没动时，不该被判成「与自己重复」。
+        if let Some(dup) = self
+            .quick_formats
+            .duplicate_text_of(kind, text, &adjust, Some(id))
+        {
+            anyhow::bail!("已有一条相同的格式（{dup}）");
+        }
+        if !store.set_quick_format_text(kind.as_str(), id, text)? {
+            anyhow::bail!("{id} 不是自定义条目，出厂条目的模板不可修改");
+        }
+        self.reload_quick_adjust();
+        Ok(())
+    }
+
+    /// 删除用户条目（连带它的调序/停用规则）。出厂条目会被拒绝——它们只能停用。
+    pub fn delete_quick_format(&self, kind: FormatKind, id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        if !store.delete_quick_format(kind.as_str(), id)? {
+            anyhow::bail!("{id} 不是自定义条目，出厂条目只能停用");
+        }
+        self.reload_quick_adjust();
+        Ok(())
+    }
 }
 
 /// 导入的结果（RPC 回报给设置页）。
@@ -405,12 +519,14 @@ pub struct QuickImportOutcome {
     pub moved: usize,
     /// 实际写入的停用数。
     pub disabled: usize,
-    /// 文件里的自定义条目数。
+    /// 实际写入的自定义条目数。
     ///
-    /// P1 尚无存储落点，故**如实报告为「已忽略」**而不是静默丢弃：用户从新版本导出、
-    /// 在旧版本导入时，得知道自定义格式没带过来。
-    pub ignored_formats: usize,
-    /// 解析期跳过的条目及原因（未知类别、模板非法……）。
+    /// P1 时叫 `ignored_formats`（那时没有存储落点，如实报「已忽略 N 条」）。P2 起真的
+    /// 导入，故连名字一起改——留着旧名字会让 UI 文案与行为对不上，而那种偏差没人会发现。
+    ///
+    /// 被跳过的（模板非法、与已有条目模板相同）不计在这里，进 [`Self::skipped`]。
+    pub formats: usize,
+    /// 解析期与写入期跳过的条目及原因（未知类别、模板非法、模板重复……）。
     pub skipped: Vec<String>,
 }
 
@@ -419,7 +535,11 @@ pub struct QuickImportOutcome {
 pub struct QuickImportPreview {
     pub moved: usize,
     pub disabled: usize,
-    pub ignored_formats: usize,
+    /// 文件里的自定义条目数。
+    ///
+    /// 预览**不判重复**：那要模拟一遍写入过程（同一份文件里两条相同模板，第二条才算撞车），
+    /// 而预览的职责是「让用户看清影响范围」，不是精确到条。实际导入时被跳过的会进 `skipped`。
+    pub formats: usize,
     pub skipped: Vec<String>,
     /// 会被改动的类别（`date` / `number` …），给用户一个「影响范围」的直观交代。
     pub kinds: Vec<&'static str>,
@@ -445,11 +565,22 @@ impl Coordinator {
                 tracing::warn!("快捷输入导出: 跳过未知类别 {kind}（可能来自更高版本）");
                 continue;
             };
+            for (i, a) in rec.added.iter().enumerate() {
+                settings.formats.push(wind_quick_input::FormatEntry {
+                    id: a.id.clone(),
+                    kind: k,
+                    text: a.text.clone(),
+                    position: i as i32,
+                });
+            }
             settings.adjust.push((
                 k,
                 FormatAdjust {
                     moved: rec.moved.into_iter().map(|m| (m.id, m.position)).collect(),
                     disabled: rec.disabled,
+                    // 自定义条目走上面的 `formats` 段（文件里两段分开，与 `system.quick.toml`
+                    // 的结构一致），不在 adjust 里重复一份。
+                    added: Vec::new(),
                 },
             ));
         }
@@ -470,7 +601,7 @@ impl Coordinator {
                 .iter()
                 .map(|(_, a)| a.disabled.len())
                 .sum(),
-            ignored_formats: out.settings.formats.len(),
+            formats: out.settings.formats.len(),
             skipped: out.skipped,
             kinds: out
                 .settings
@@ -502,16 +633,21 @@ impl Coordinator {
         if replace {
             // 逐类清空。非单事务，但这不是热路径，且中途失败的后果是「清了一部分」——
             // 与「导入了一部分」同量级，不值得为它新造一个跨类别的清空原语。
+            //
+            // ⚠️ 用 `clear_`（含自定义条目）而不是 `reset_`（保留自定义条目）：replace 的
+            // 语义是「用文件里的状态覆盖现状」，留着旧条目会得到「文件里的 + 我原有的」。
+            // 面向用户的「恢复默认」才是 reset。
             for &k in FormatKind::ALL {
-                store.reset_quick_format_kind(k.as_str())?;
+                store.clear_quick_format_kind(k.as_str())?;
             }
+            self.reload_quick_adjust(); // 下面生成 id 要看清空后的状态
         }
 
         let mut outcome = QuickImportOutcome {
-            ignored_formats: parsed.settings.formats.len(),
             skipped: parsed.skipped,
             ..Default::default()
         };
+        let remap = self.import_quick_user_entries(&parsed.settings.formats, &mut outcome)?;
         for (kind, adjust) in &parsed.settings.adjust {
             let k = kind.as_str();
             // ★★ **逆序**重放。`moved` 是 LIFO 列表（index 0 = 最新 = 优先级最高），而
@@ -520,17 +656,89 @@ impl Coordinator {
             //
             // 与 shadow 的 pin 规则导入是同一个陷阱（那次是靠 `.rev()` 修的）。
             for (id, position) in adjust.moved.iter().rev() {
-                store.move_quick_format(k, id, *position)?;
+                store.move_quick_format(
+                    k,
+                    remap.get(id).map_or(id.as_str(), |s| s.as_str()),
+                    *position,
+                )?;
                 outcome.moved += 1;
             }
             for id in &adjust.disabled {
-                store.set_quick_format_enabled(k, id, false)?;
+                store.set_quick_format_enabled(
+                    k,
+                    remap.get(id).map_or(id.as_str(), |s| s.as_str()),
+                    false,
+                )?;
                 outcome.disabled += 1;
             }
         }
         // 一次回灌即可（不必每条一次）：镜像是整表替换。
         self.reload_quick_adjust();
         Ok(outcome)
+    }
+
+    /// 写入文件里的自定义条目，返回**被改过 id 的映射**（旧 id → 新 id）。
+    ///
+    /// ## ★★ 为什么必须返回映射
+    ///
+    /// 文件里 `[[formats]]` 带 `date.u1`，`[[adjust]]` 的 `moved` 也引用 `date.u1`。
+    /// 导入到一台**已有 `date.u1`**（内容不同）的机器上时，那条得改叫 `date.u3`；
+    /// 若只改 `[[formats]]` 侧、不改 `moved` 侧，那条移动规则就悄悄指向了本机原有的
+    /// `date.u1`——用户看到的症状是「导入后顺序不对」，而两条条目都在、都没报错。
+    ///
+    /// 与漏 `.rev()` 是同一类错（导入重放的引用完整性），只是这次跨了两个段。
+    fn import_quick_user_entries(
+        &self,
+        formats: &[wind_quick_input::FormatEntry],
+        outcome: &mut QuickImportOutcome,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let mut remap = std::collections::HashMap::new();
+        // 每类的当前状态在内存里推进，不是每写一条就整表回灌：生成不冲突的 id 需要看到
+        // 「连同刚导入的那几条」的全貌，而回灌一次要读整张表。
+        let mut live: std::collections::HashMap<&'static str, FormatAdjust> =
+            std::collections::HashMap::new();
+        for e in formats {
+            let cur = live
+                .entry(e.kind.as_str())
+                .or_insert_with(|| self.quick_adjust_of(e.kind));
+            if let Err(err) = wind_quick_input::validate_format_text(e.kind, &e.text) {
+                outcome.skipped.push(format!("条目 {}：{}", e.id, err));
+                continue;
+            }
+            // 模板撞车（与出厂或已有用户条目逐字相同）：跳过并如实报告。两条一样的候选
+            // 除了占位没有作用，而静默导入会让用户在列表里看到两行长得完全一样的东西。
+            if let Some(dup) = self
+                .quick_formats
+                .duplicate_text_of(e.kind, &e.text, cur, None)
+            {
+                outcome
+                    .skipped
+                    .push(format!("条目 {}：与已有的 {dup} 模板相同", e.id));
+                continue;
+            }
+            // id 冲突：本机已有同 id 的用户条目（内容必然不同——相同的话上一步已按模板
+            // 撞车跳掉了），故换一个没被占用的 id，并记下映射供 moved/disabled 改写。
+            let id = if cur.is_user(&e.id) {
+                let fresh = wind_quick_input::next_user_format_id(e.kind, cur);
+                remap.insert(e.id.clone(), fresh.clone());
+                fresh
+            } else {
+                e.id.clone()
+            };
+            store.add_quick_format(e.kind.as_str(), &id, &e.text)?;
+            cur.added.push(wind_quick_input::FormatEntry {
+                id,
+                kind: e.kind,
+                text: e.text.clone(),
+                position: cur.added.len() as i32,
+            });
+            outcome.formats += 1;
+        }
+        Ok(remap)
     }
 }
 

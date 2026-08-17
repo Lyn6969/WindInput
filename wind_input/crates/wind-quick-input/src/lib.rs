@@ -40,7 +40,8 @@ pub mod user_file;
 mod vars;
 
 pub use format_table::{
-    FormatAdjust, FormatEntry, FormatEntryView, FormatKind, FormatTable, validate_format_text,
+    FormatAdjust, FormatEntry, FormatEntryView, FormatKind, FormatTable, is_user_format_id,
+    next_user_format_id, validate_format_text,
 };
 pub use vars::QuickValues;
 

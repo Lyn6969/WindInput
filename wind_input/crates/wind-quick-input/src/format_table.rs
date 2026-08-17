@@ -186,11 +186,24 @@ pub struct FormatAdjust {
     pub moved: Vec<(String, usize)>,
     /// 被停用的格式 id。
     pub disabled: Vec<String>,
+    /// 用户自己加的条目，排在基表条目**之后**（组内按 `position` 稳定排序）。
+    ///
+    /// 之后要挪位置走 `moved` 那套现成规则——出厂条目与用户条目共用同一个调序机制，
+    /// 不给用户条目另开「它自己的顺序」。停用也一样（`disabled` 同时管两类）。
+    ///
+    /// ⚠️ 与 `moved`/`disabled` 不同，它是用户的**内容**而不是对出厂的**调整**：
+    /// [`Self::is_empty`] 要算上它，「恢复默认」不得清它。
+    pub added: Vec<FormatEntry>,
 }
 
 impl FormatAdjust {
     pub fn is_empty(&self) -> bool {
-        self.moved.is_empty() && self.disabled.is_empty()
+        self.moved.is_empty() && self.disabled.is_empty() && self.added.is_empty()
+    }
+
+    /// 这个 id 是不是用户自己加的条目。
+    pub fn is_user(&self, id: &str) -> bool {
+        self.added.iter().any(|e| e.id == id)
     }
 
     /// 这条格式是否被用户调整过（移动或停用）。
@@ -215,6 +228,11 @@ pub struct FormatEntryView<'a> {
     pub enabled: bool,
     /// 用户是否调整过它（见 [`FormatAdjust::has_rule`]）。
     pub adjusted: bool,
+    /// 是不是用户自己加的条目（而非出厂表里的）。
+    ///
+    /// 设置页据此分流三件事，**别拿 `adjusted` 当它用**：出厂条目被调序过也是 `adjusted`，
+    /// 但它不能删、能「恢复默认」；用户条目反过来——能删、能改模板，而它没有「默认」可回到。
+    pub user: bool,
 }
 
 /// 格式表。条目已按 kind 分组、组内按 position 稳定排序。
@@ -265,6 +283,15 @@ impl FormatTable {
             };
             if let Err(e) = validate_format_text(kind, &r.text) {
                 warn!("快捷输入格式表: 跳过 id={} —— {}", r.id, e);
+                continue;
+            }
+            // `{kind}.u{数字}` 是设置页里用户条目的保留形态。基表占用它就会与用户条目
+            // 同 id，行为取决于遍历顺序——把约定变成加载期检查（见 `is_user_format_id`）。
+            if is_user_format_id(&r.id) {
+                warn!(
+                    "快捷输入格式表: 跳过 id={} —— `.u数字` 结尾是设置页自定义条目的保留形态，请换个 id",
+                    r.id
+                );
                 continue;
             }
             if entries.iter().any(|e| e.kind == kind && e.id == r.id) {
@@ -351,18 +378,46 @@ impl FormatTable {
     /// 规则，怎么定都会让人意外。
     ///
     /// 找不到的 id（高级用户改文件时删掉了那条）静默忽略，不清理——他可能过会儿又加回来。
+    ///
+    /// ## 用户自定义条目
+    ///
+    /// `adjust.added` 里的条目也在结果中（排在基表条目之后，再由 `moved` 决定最终位置），
+    /// 故返回的引用可能指向**表**也可能指向**调整**——两个入参因此共用生命周期 `'a`。
     pub fn entries_of_adjusted<'a>(
         &'a self,
         kind: FormatKind,
-        adjust: &FormatAdjust,
+        adjust: &'a FormatAdjust,
     ) -> Vec<&'a FormatEntry> {
-        let mut list: Vec<&FormatEntry> = self
-            .entries_of(kind)
-            .filter(|e| !adjust.disabled.iter().any(|d| d == &e.id))
+        self.entries_with(kind, &adjust.moved, &adjust.disabled, &adjust.added)
+    }
+
+    /// [`Self::entries_of_adjusted`] 的实现，三段规则**分开收**。
+    ///
+    /// ★ 拆参数不是为了好看，是为了让调用方能做**部分借用**：[`Self::entries_of_view`]
+    /// 需要「`moved` 与 `added` 照常生效、`disabled` 当作空」的一趟计算。若签名收整个
+    /// `&'a FormatAdjust`，那就得现造一个临时的 `FormatAdjust`——而它是局部变量，
+    /// 里面的 `added` 活不到 `'a`，返回的引用直接悬垂（编译不过，且没有不 clone 的绕法）。
+    /// 收三个切片就能各自借自真正的 `adjust`，生命周期天然成立。
+    fn entries_with<'a>(
+        &'a self,
+        kind: FormatKind,
+        moved: &[(String, usize)],
+        disabled: &[String],
+        added: &'a [FormatEntry],
+    ) -> Vec<&'a FormatEntry> {
+        let alive = |e: &FormatEntry| !disabled.iter().any(|d| d == &e.id);
+        let mut list: Vec<&FormatEntry> = self.entries_of(kind).filter(|e| alive(e)).collect();
+        // 用户条目接在基表之后（组内按 position 稳定排序），于是「新加的排末尾」，
+        // 而出厂日后新增的条目仍落在它的出厂位置——两类互不挤位。
+        let mut mine: Vec<&FormatEntry> = added
+            .iter()
+            .filter(|e| e.kind == kind && alive(e))
             .collect();
-        for (id, position) in adjust.moved.iter().rev() {
+        mine.sort_by_key(|e| e.position);
+        list.extend(mine);
+        for (id, position) in moved.iter().rev() {
             let Some(from) = list.iter().position(|e| &e.id == id) else {
-                continue; // 孤儿规则：基表里没有这个 id
+                continue; // 孤儿规则：基表与用户条目里都没有这个 id
             };
             let entry = list.remove(from);
             // 下标可能越界：条目被停用、或基表条目数变少（用户改了文件）
@@ -418,12 +473,13 @@ impl FormatTable {
     /// 就会与候选不一致。举例——基表 `[A,B,C,D]`、A 停用、`moved=[(D,1)]`：候选是
     /// `[B,D,C]`，而直接套下标得到 `[A,D,B,C]`（启用项成了 `[D,B,C]`）。
     ///
-    /// 已知限制：**被调序过**的条目停用后会回到它的出厂位置（它的 `moved` 规则仍在库里，
-    /// 启用后即恢复）。这个跳动是一次性的，且反映了「它当前不参与排序」这一事实。
+    /// 用户自定义条目（`adjust.added`）与出厂条目在这里**同等对待**：一样能停用、调序，
+    /// 一样按上述规则保位。只有 [`FormatEntryView::user`] 标记出身，供设置页决定
+    /// 「删除」还是「停用」、「恢复此条」能不能点。
     pub fn entries_of_view<'a>(
         &'a self,
         kind: FormatKind,
-        adjust: &FormatAdjust,
+        adjust: &'a FormatAdjust,
     ) -> Vec<FormatEntryView<'a>> {
         let is_disabled = |id: &str| adjust.disabled.iter().any(|d| d == id);
         let mut out: Vec<FormatEntryView<'a>> = self
@@ -432,19 +488,15 @@ impl FormatTable {
             .map(|entry| FormatEntryView {
                 enabled: true,
                 adjusted: adjust.has_rule(&entry.id),
+                user: adjust.is_user(&entry.id),
                 entry,
             })
             .collect();
 
         // 「假设全部启用」的顺序：停用项的位置从这里读，它们的 moved 规则在此生效
-        // （见上方 doc）。只借 `moved`，`disabled` 清空。
-        let as_if_all_enabled = self.entries_of_adjusted(
-            kind,
-            &FormatAdjust {
-                moved: adjust.moved.clone(),
-                disabled: Vec::new(),
-            },
-        );
+        // （见上方 doc）。`moved` 与 `added` 照常，只把 `disabled` 当作空——三段规则
+        // 分开收正是为了这一趟（见 `entries_with`：造临时 FormatAdjust 会让 added 悬垂）。
+        let as_if_all_enabled = self.entries_with(kind, &adjust.moved, &[], &adjust.added);
 
         // 停用项按该顺序归组，每组挂在同一个锚点后面（连续几条停用的保持彼此相对顺序）。
         let mut groups: Vec<(Option<&str>, Vec<&'a FormatEntry>)> = Vec::new();
@@ -477,12 +529,67 @@ impl FormatTable {
                         enabled: false,
                         // 在 disabled 里即已被调整过，无需再查。
                         adjusted: true,
+                        user: adjust.is_user(&entry.id),
                     },
                 );
             }
         }
         out
     }
+
+    /// 本类里是否已有逐字相同的模板（基表与用户条目一起查），返回撞上的那条 id。
+    ///
+    /// 两条完全一样的候选除了占位没有任何作用，还会让「候选里怎么有两个一样的」变成
+    /// 一个查不出原因的报障（用户看不到 id，两行长得一模一样）。故新增/改写时拒绝并
+    /// **指出撞的是哪一条**——只说「重复了」用户还得自己一行行找。
+    ///
+    /// 只比逐字相同：`$Y年` 与 `$YYYY年` 渲染结果可能一致，但那是两种不同写法，
+    /// 判「等价」需要真渲染一遍，且结果随输入而变，不是稳定判据。
+    pub fn duplicate_text_of(
+        &self,
+        kind: FormatKind,
+        text: &str,
+        adjust: &FormatAdjust,
+        except: Option<&str>,
+    ) -> Option<String> {
+        let keep = |id: &str| except != Some(id);
+        self.entries_of(kind)
+            .chain(adjust.added.iter().filter(|e| e.kind == kind))
+            .find(|e| e.text == text && keep(&e.id))
+            .map(|e| e.id.clone())
+    }
+}
+
+/// 用户条目 id 的保留形态：`{kind}.u{序号}`（如 `date.u1`）。
+///
+/// ★ 命名空间必须**有守门**，不能只靠约定：出厂表某天加一条 `date.u1`，就与用户条目
+/// 静默撞车（同 id 两条内容，行为取决于遍历顺序）。故 [`FormatTable::parse`] 拒绝
+/// 匹配本形态的出厂 id，把约定变成加载期检查。
+pub fn is_user_format_id(id: &str) -> bool {
+    match id.rsplit_once(".u") {
+        Some((head, n)) => {
+            !head.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// 下一个可用的用户条目 id。
+///
+/// ★ 取「已有最大序号 + 1」而不是「条数 + 1」：删掉中间一条后条数会回退，
+/// 下一个新条目就撞上仍然存在的那个 id（`u1,u2,u3` 删 `u2` 后条数 2 ⇒ 又生成 `u3`）。
+/// 症状是新加的条目「变成了」另一条的样子。
+pub fn next_user_format_id(kind: FormatKind, adjust: &FormatAdjust) -> String {
+    let prefix = format!("{}.u", kind.as_str());
+    let max = adjust
+        .added
+        .iter()
+        .filter(|e| e.kind == kind)
+        .filter_map(|e| e.id.strip_prefix(&prefix))
+        .filter_map(|n| n.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{prefix}{}", max + 1)
 }
 
 /// 模板静态校验：变量名必须在本 kind 的白名单内。
@@ -495,7 +602,9 @@ impl FormatTable {
 /// 原因给用户看。同一份判据两处共用，否则设置页放行的模板会在下次启动时被静默剔除，
 /// 用户只看到「我加的格式没了」。
 pub fn validate_format_text(kind: FormatKind, text: &str) -> Result<(), String> {
-    if text.is_empty() {
+    // 用 trim 判空而不是 `is_empty`：纯空白模板会渲染出一条「看起来是空的」候选，
+    // 选中它则上屏几个空格。设置页的输入框里这是最容易误提交的内容。
+    if text.trim().is_empty() {
         return Err("模板为空".into());
     }
     if crate::template::has_bare_brace(text) {
@@ -774,6 +883,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![("date.iso".into(), 0), ("date.lunar".into(), 2)],
             disabled: vec!["date.basic".into()],
+            added: Vec::new(),
         };
         let candidate: Vec<&str> = t
             .entries_of_adjusted(FormatKind::Date, &a)
@@ -862,6 +972,7 @@ text = "$RESULT"
                         &FormatAdjust {
                             moved: moved.clone(),
                             disabled: Vec::new(),
+                            added: Vec::new(),
                         },
                     )
                     .iter()
@@ -873,6 +984,7 @@ text = "$RESULT"
                         &FormatAdjust {
                             moved: moved.clone(),
                             disabled: vec![ids[ids.len() - 1].clone()],
+                            added: Vec::new(),
                         },
                     )
                     .iter()
@@ -931,6 +1043,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![(base[base.len() - 1].clone(), 1)],
             disabled: vec![base[0].clone()],
+            added: Vec::new(),
         };
         let candidate: Vec<&str> = t
             .entries_of_adjusted(FormatKind::Date, &a)
@@ -954,6 +1067,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![("date.lunar".into(), 0)],
             disabled: vec!["date.basic".into()],
+            added: Vec::new(),
         };
         let view = t.entries_of_view(FormatKind::Date, &a);
         let flag = |id: &str| {
@@ -971,8 +1085,10 @@ text = "$RESULT"
     #[test]
     fn view_without_adjust_is_base_table() {
         let t = FormatTable::builtin();
+        // 视图借用 adjust（用户条目住在里面），故不能传临时值
+        let none = FormatAdjust::default();
         for &k in FormatKind::ALL {
-            let view = t.entries_of_view(k, &FormatAdjust::default());
+            let view = t.entries_of_view(k, &none);
             let base: Vec<&str> = t.entries_of(k).map(|e| e.id.as_str()).collect();
             let got: Vec<&str> = view.iter().map(|v| v.entry.id.as_str()).collect();
             assert_eq!(got, base, "kind={}", k.as_str());
@@ -1061,6 +1177,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![("date.nonexistent".into(), 0), ("date.lunar".into(), 0)],
             disabled: vec!["date.alsogone".into()],
+            added: Vec::new(),
         };
         let ids = date_ids(&t, &a);
         assert_eq!(ids[0], "date.lunar");
@@ -1074,6 +1191,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![("date.slash".into(), 0)],
             disabled: vec!["date.cn".into()],
+            added: Vec::new(),
         };
         let ids = date_ids(&t, &a);
         assert_eq!(ids[0], "date.slash");
@@ -1088,6 +1206,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![("date.basic".into(), 0)],
             disabled: vec!["date.basic".into()],
+            added: Vec::new(),
         };
         assert!(!date_ids(&t, &a).contains(&"date.basic".to_string()));
     }
@@ -1099,6 +1218,7 @@ text = "$RESULT"
         let a = FormatAdjust {
             moved: vec![("number.amount".into(), 0)],
             disabled: vec!["calc.result".into()],
+            added: Vec::new(),
         };
         // date 类不含这些 id，故完全不受影响
         let base: Vec<String> = t
@@ -1132,5 +1252,243 @@ text = "$RESULT"
         std::fs::write(&p, "[[formats]]\nid = ").unwrap();
         assert_eq!(FormatTable::load(Some(&p)), FormatTable::builtin());
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ───────── 用户自定义条目（P2）─────────
+
+    fn user_entry(id: &str, kind: FormatKind, text: &str, position: i32) -> FormatEntry {
+        FormatEntry {
+            id: id.into(),
+            kind,
+            text: text.into(),
+            position,
+        }
+    }
+
+    /// 新加的条目落在本类**末尾**：出厂条目的位置不因为用户加了东西而变。
+    #[test]
+    fn user_entries_come_after_factory_ones() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            added: vec![
+                user_entry("date.u1", FormatKind::Date, "$Y/$M/$D", 0),
+                user_entry("date.u2", FormatKind::Date, "$D.$M.$Y", 1),
+            ],
+            ..Default::default()
+        };
+        let ids: Vec<&str> = t
+            .entries_of_adjusted(FormatKind::Date, &a)
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        let base: Vec<&str> = t
+            .entries_of(FormatKind::Date)
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(&ids[..base.len()], &base[..], "出厂条目原序不动");
+        assert_eq!(&ids[base.len()..], &["date.u1", "date.u2"]);
+    }
+
+    /// 用户条目**只出现在它自己的类别**里——`added` 是一张跨类别的表，按 kind 过滤。
+    #[test]
+    fn user_entries_do_not_leak_across_kinds() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            added: vec![user_entry("number.u1", FormatKind::Number, "$N", 0)],
+            ..Default::default()
+        };
+        for &k in FormatKind::ALL {
+            let has = t
+                .entries_of_adjusted(k, &a)
+                .iter()
+                .any(|e| e.id == "number.u1");
+            assert_eq!(has, k == FormatKind::Number, "kind={}", k.as_str());
+        }
+    }
+
+    /// ★ 用户条目与出厂条目共用同一套调序/停用机制，不另开一条路径。
+    #[test]
+    fn user_entry_obeys_move_and_disable() {
+        let t = FormatTable::builtin();
+        let added = vec![user_entry("date.u1", FormatKind::Date, "$Y/$M/$D", 0)];
+
+        let moved = FormatAdjust {
+            moved: vec![("date.u1".into(), 0)],
+            added: added.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.entries_of_adjusted(FormatKind::Date, &moved)[0].id,
+            "date.u1",
+            "能移到首位"
+        );
+
+        let off = FormatAdjust {
+            disabled: vec!["date.u1".into()],
+            added: added.clone(),
+            ..Default::default()
+        };
+        assert!(
+            !t.entries_of_adjusted(FormatKind::Date, &off)
+                .iter()
+                .any(|e| e.id == "date.u1"),
+            "停用后不出候选"
+        );
+    }
+
+    /// ★★ 停用保位对用户条目同样成立：移到首位再停用，视图里仍在首位。
+    ///
+    /// 这条不是重复覆盖——`entries_of_view` 的「假设全部启用」那趟计算必须把 `added`
+    /// 一起带上，漏了的话用户条目在那趟里根本不存在，锚点算法找不到它、只能垫到末尾。
+    #[test]
+    fn disabled_user_entry_keeps_its_moved_position() {
+        let t = FormatTable::builtin();
+        let added = vec![user_entry("date.u1", FormatKind::Date, "$Y/$M/$D", 0)];
+        let a = FormatAdjust {
+            moved: vec![("date.u1".into(), 0)],
+            disabled: vec!["date.u1".into()],
+            added,
+        };
+        let view = t.entries_of_view(FormatKind::Date, &a);
+        assert_eq!(view[0].entry.id, "date.u1", "★ 停用后仍在首位");
+        assert!(!view[0].enabled);
+        assert!(view[0].user);
+    }
+
+    #[test]
+    fn view_marks_user_entries() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            added: vec![user_entry("date.u1", FormatKind::Date, "$Y/$M/$D", 0)],
+            ..Default::default()
+        };
+        let view = t.entries_of_view(FormatKind::Date, &a);
+        for v in &view {
+            assert_eq!(
+                v.user,
+                v.entry.id == "date.u1",
+                "只有 date.u1 是用户条目，实际 id={}",
+                v.entry.id
+            );
+        }
+    }
+
+    /// ★ id 生成取「最大序号 + 1」。反向对照：换成「条数 + 1」这条就红——
+    /// 删掉中间一条后条数回退，新条目会撞上仍然存在的那个 id。
+    #[test]
+    fn next_user_id_survives_a_deletion_in_the_middle() {
+        let mut a = FormatAdjust {
+            added: vec![
+                user_entry("date.u1", FormatKind::Date, "$Y", 0),
+                user_entry("date.u2", FormatKind::Date, "$M", 1),
+                user_entry("date.u3", FormatKind::Date, "$D", 2),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(next_user_format_id(FormatKind::Date, &a), "date.u4");
+        a.added.retain(|e| e.id != "date.u2"); // 删中间那条
+        assert_eq!(
+            next_user_format_id(FormatKind::Date, &a),
+            "date.u4",
+            "★ 不能回退成 date.u3——那个 id 还在用"
+        );
+    }
+
+    /// 序号按类别各自计数（`added` 是跨类别的一张表）。
+    #[test]
+    fn next_user_id_counts_per_kind() {
+        let a = FormatAdjust {
+            added: vec![
+                user_entry("date.u1", FormatKind::Date, "$Y", 0),
+                user_entry("date.u2", FormatKind::Date, "$M", 1),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(next_user_format_id(FormatKind::Date, &a), "date.u3");
+        assert_eq!(next_user_format_id(FormatKind::Number, &a), "number.u1");
+    }
+
+    #[test]
+    fn user_id_shape_is_recognized() {
+        assert!(is_user_format_id("date.u1"));
+        assert!(is_user_format_id("month_day.u42"));
+        assert!(!is_user_format_id("date.upper"), "u 后面不是数字");
+        assert!(!is_user_format_id("date.cn"));
+        assert!(!is_user_format_id("u1"), "没有 kind 前缀");
+        assert!(!is_user_format_id("date.u"), "缺序号");
+        assert!(!is_user_format_id(""));
+    }
+
+    /// ★ 加载期守门：出厂表/手写文件占用 `.u数字` 形态时跳过该条。
+    /// 靠约定不够——真撞上了行为取决于遍历顺序，且完全没有报错。
+    #[test]
+    fn parse_rejects_reserved_user_id_shape() {
+        let t = FormatTable::parse(
+            r#"
+[[formats]]
+id = "date.u1"
+kind = "date"
+text = "$Y"
+
+[[formats]]
+id = "date.mine"
+kind = "date"
+text = "$M"
+"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = t.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["date.mine"], "保留形态的那条被剔除");
+    }
+
+    #[test]
+    fn duplicate_text_spots_factory_and_user_entries() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            added: vec![user_entry("date.u1", FormatKind::Date, "$Y/$M/$D", 0)],
+            ..Default::default()
+        };
+        assert_eq!(
+            t.duplicate_text_of(FormatKind::Date, "$Y年$M月$D日", &a, None)
+                .as_deref(),
+            Some("date.cn"),
+            "撞出厂条目"
+        );
+        assert_eq!(
+            t.duplicate_text_of(FormatKind::Date, "$Y/$M/$D", &a, None)
+                .as_deref(),
+            Some("date.u1"),
+            "撞用户条目"
+        );
+        assert!(
+            t.duplicate_text_of(FormatKind::Date, "$YY年", &a, None)
+                .is_none(),
+            "没撞上"
+        );
+        // 同一串模板在别的类别里不算撞车（各类独立一张表）
+        assert!(
+            t.duplicate_text_of(FormatKind::Number, "$Y/$M/$D", &a, None)
+                .is_none()
+        );
+    }
+
+    /// 改写一条时要把自己排除掉，否则「只改了个错别字、模板没动」会被判成撞自己。
+    #[test]
+    fn duplicate_text_can_exclude_the_entry_being_edited() {
+        let t = FormatTable::builtin();
+        let a = FormatAdjust {
+            added: vec![user_entry("date.u1", FormatKind::Date, "$Y/$M/$D", 0)],
+            ..Default::default()
+        };
+        assert!(
+            t.duplicate_text_of(FormatKind::Date, "$Y/$M/$D", &a, Some("date.u1"))
+                .is_none()
+        );
+        assert_eq!(
+            t.duplicate_text_of(FormatKind::Date, "$Y年$M月$D日", &a, Some("date.u1"))
+                .as_deref(),
+            Some("date.cn"),
+            "排除自己不影响撞别人"
+        );
     }
 }

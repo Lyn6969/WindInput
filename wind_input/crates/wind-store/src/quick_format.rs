@@ -45,7 +45,22 @@ pub struct QuickFormatMove {
     pub position: usize,
 }
 
-/// 某一类（`date` / `year_month` / `number` / `calc`）的用户调整。
+/// 用户自己加的一条格式。
+///
+/// 没有 `position` 字段：顺序由 `Vec` 的插入序表达（新条目落本类末尾），
+/// 之后要挪位置走 [`QuickFormatRecord::moved`] 那套现成规则——出厂条目与用户条目
+/// 共用同一个调序机制，不给用户条目另开一条「它自己的顺序」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickFormatAdded {
+    pub id: String,
+    pub text: String,
+}
+
+/// 某一类（`date` / `month_day` / `year_month` / `number` / `calc`）的用户数据。
+///
+/// 三个字段分两种性质，**清理时必须区别对待**：`moved`/`disabled` 是对基表的**调整**
+/// （清掉即回到出厂），`added` 是用户**自己的内容**（清掉就没了，不可逆）。
+/// 见 [`Store::reset_quick_format_kind`] 与 [`Store::clear_quick_format_kind`]。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuickFormatRecord {
     /// 被移动过的格式。**LIFO，index 0 = 最新**，应用时逆序遍历（最新的最后应用、
@@ -59,11 +74,61 @@ pub struct QuickFormatRecord {
     /// 列表消失，用户便再也点不到它——右键菜单里它本来就已经不出现了。
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// 用户自己加的条目（不在 `system.quick.toml` 里）。
+    ///
+    /// 落在这张表而不是回写格式表文件：回写会抢走高级用户手写文件的所有权，
+    /// 也会让普通用户永久脱离出厂更新（见模块头）。放这里则两类用户各写各的落点。
+    ///
+    /// ⚠️ 与 `moved`/`disabled` 不同，它**不是**「对出厂的调整」而是用户的内容本身，
+    /// 所以「恢复默认」不得删它。
+    #[serde(default)]
+    pub added: Vec<QuickFormatAdded>,
 }
 
 impl QuickFormatRecord {
     pub fn is_empty(&self) -> bool {
-        self.moved.is_empty() && self.disabled.is_empty()
+        self.moved.is_empty() && self.disabled.is_empty() && self.added.is_empty()
+    }
+
+    /// 追加一条用户条目（调用方负责 id 唯一与模板校验）。
+    pub fn add_entry(&mut self, id: &str, text: &str) {
+        self.added.push(QuickFormatAdded {
+            id: id.to_string(),
+            text: text.to_string(),
+        });
+    }
+
+    /// 改写用户条目的模板；`false` = 没有这条（不是用户条目，或已被删）。
+    ///
+    /// 出厂条目走不到这里：它们不在 `added` 里，故返回 `false`——「不许编辑出厂模板」
+    /// 这条约束由数据结构本身兜住，不靠调用方自觉。
+    pub fn set_text(&mut self, id: &str, text: &str) -> bool {
+        match self.added.iter_mut().find(|a| a.id == id) {
+            Some(a) => {
+                a.text = text.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 删除用户条目，**连带清掉它的调序与停用规则**；`false` = 没有这条。
+    ///
+    /// 不清规则的话会留下指向已删条目的孤儿：本身无害（应用时找不到目标即跳过），
+    /// 但用户重新加一条同 id 的条目时，那条旧规则会突然复活并把它挪到意外的位置。
+    pub fn remove_entry(&mut self, id: &str) -> bool {
+        let before = self.added.len();
+        self.added.retain(|a| a.id != id);
+        if self.added.len() == before {
+            return false;
+        }
+        self.apply_reset(id);
+        true
+    }
+
+    /// 这个 id 是不是用户自己加的条目。
+    pub fn is_added(&self, id: &str) -> bool {
+        self.added.iter().any(|a| a.id == id)
     }
 
     /// 移动：把 `id` 固定到 `position`。同 id 的旧规则被顶替（LIFO，新规则插队首）。
@@ -146,11 +211,47 @@ impl Store {
         self.modify_quick_format(kind, |rec| rec.apply_reset(id))
     }
 
-    /// 恢复某一类的全部默认（清空该类记录）。
+    /// 追加一条用户自定义格式。
+    pub fn add_quick_format(&self, kind: &str, id: &str, text: &str) -> anyhow::Result<()> {
+        self.modify_quick_format(kind, |rec| rec.add_entry(id, text))
+    }
+
+    /// 改写用户条目的模板。返回 `false` = 不存在这条用户条目（出厂条目也走这里返回 false）。
+    pub fn set_quick_format_text(&self, kind: &str, id: &str, text: &str) -> anyhow::Result<bool> {
+        let mut hit = false;
+        self.modify_quick_format(kind, |rec| hit = rec.set_text(id, text))?;
+        Ok(hit)
+    }
+
+    /// 删除用户条目（连带它的调序/停用规则）。返回 `false` = 不存在这条用户条目。
+    pub fn delete_quick_format(&self, kind: &str, id: &str) -> anyhow::Result<bool> {
+        let mut hit = false;
+        self.modify_quick_format(kind, |rec| hit = rec.remove_entry(id))?;
+        Ok(hit)
+    }
+
+    /// 恢复某一类的默认顺序与显示：清 `moved`/`disabled`，**保留用户自定义条目**。
     ///
-    /// 这是**停用之后的唯一出口**（在没有设置页时）：被停用的格式不出现在候选里，
+    /// 这也是**停用之后的唯一出口**（在没有设置页时）：被停用的格式不出现在候选里，
     /// 右键点不到，只能整类重置。
+    ///
+    /// ⚠️ 曾经是 `t.remove(kind)`（整键删除）。`added` 落进同一条记录后，那个写法会让
+    /// 用户点一下右键的「恢复默认」就永久丢掉手写的模板——不可逆、无预警，而且症状会被
+    /// 归因成「我的自定义条目自己消失了」。要连用户条目一起清的场合走
+    /// [`Self::clear_quick_format_kind`]，那是导入 replace 的语义，不是「恢复默认」的。
     pub fn reset_quick_format_kind(&self, kind: &str) -> anyhow::Result<()> {
+        self.modify_quick_format(kind, |rec| {
+            rec.moved.clear();
+            rec.disabled.clear();
+        })
+    }
+
+    /// 清空某一类的**全部**用户数据，含自定义条目。
+    ///
+    /// 只给「导入并替换」用：那个动作的语义是「用文件里的状态覆盖我现在的状态」，
+    /// 留着旧的自定义条目会得到「文件里的 + 我原有的」，那不叫替换。
+    /// 面向用户的「恢复默认」一律走 [`Self::reset_quick_format_kind`]。
+    pub fn clear_quick_format_kind(&self, kind: &str) -> anyhow::Result<()> {
         self.with_db(|db| {
             let txn = db.begin_write()?;
             {
@@ -317,5 +418,116 @@ mod tests {
         assert!(s.get_quick_format("date").unwrap().is_none());
         assert!(s.list_quick_format().unwrap().is_empty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn add_then_read_back() {
+        let (s, p) = store();
+        s.add_quick_format("date", "date.u1", "$Y/$M/$D").unwrap();
+        let rec = s.get_quick_format("date").unwrap().unwrap();
+        assert_eq!(rec.added.len(), 1);
+        assert_eq!(rec.added[0].id, "date.u1");
+        assert_eq!(rec.added[0].text, "$Y/$M/$D");
+        assert!(rec.is_added("date.u1"));
+        assert!(!rec.is_added("date.cn"), "出厂条目不属于 added");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★ 只有用户条目能改模板。出厂 id 走到这里必须返回 false——「不许编辑出厂模板」
+    /// 由数据结构兜住（它们不在 `added` 里），不靠调用方自觉。
+    #[test]
+    fn set_text_refuses_factory_entries() {
+        let (s, p) = store();
+        s.add_quick_format("date", "date.u1", "$Y").unwrap();
+        assert!(s.set_quick_format_text("date", "date.u1", "$M").unwrap());
+        assert!(
+            !s.set_quick_format_text("date", "date.cn", "篡改").unwrap(),
+            "出厂条目不可改写"
+        );
+        let rec = s.get_quick_format("date").unwrap().unwrap();
+        assert_eq!(rec.added[0].text, "$M");
+        assert_eq!(rec.added.len(), 1, "失败的改写不该添出一条来");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★ 删条目必须连带清掉它的调序规则。留着孤儿规则本身无害（应用时找不到目标即跳过），
+    /// 但用户重加一条同 id 的条目时，那条旧规则会突然复活、把它挪到意外的位置。
+    #[test]
+    fn delete_also_clears_its_rules() {
+        let (s, p) = store();
+        s.add_quick_format("date", "date.u1", "$Y").unwrap();
+        s.move_quick_format("date", "date.u1", 0).unwrap();
+        s.set_quick_format_enabled("date", "date.u1", false)
+            .unwrap();
+        s.move_quick_format("date", "date.cn", 2).unwrap();
+
+        assert!(s.delete_quick_format("date", "date.u1").unwrap());
+        let rec = s.get_quick_format("date").unwrap().unwrap();
+        assert!(rec.added.is_empty());
+        assert!(!rec.has_rule("date.u1"), "自己的规则要一起清掉");
+        assert!(rec.has_rule("date.cn"), "别人的规则不受影响");
+
+        assert!(
+            !s.delete_quick_format("date", "date.u1").unwrap(),
+            "删第二次报 false"
+        );
+        assert!(
+            !s.delete_quick_format("date", "date.cn").unwrap(),
+            "出厂条目删不掉"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★★ 「恢复默认」清调整、**留用户条目**。
+    ///
+    /// 反向对照：把实现换回 `t.remove(kind)` 这条就红——那正是它防的回归
+    /// （用户点一下右键的「恢复默认」就永久丢掉手写模板，不可逆且无预警）。
+    #[test]
+    fn reset_kind_keeps_added_entries() {
+        let (s, p) = store();
+        s.add_quick_format("date", "date.u1", "$Y").unwrap();
+        s.move_quick_format("date", "date.lunar", 0).unwrap();
+        s.set_quick_format_enabled("date", "date.cn", false)
+            .unwrap();
+
+        s.reset_quick_format_kind("date").unwrap();
+        let rec = s.get_quick_format("date").unwrap().unwrap();
+        assert!(rec.moved.is_empty(), "调序已清");
+        assert!(rec.disabled.is_empty(), "停用已清");
+        assert_eq!(rec.added.len(), 1, "★ 用户条目必须留下");
+        assert_eq!(rec.added[0].text, "$Y");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 没有用户条目时，「恢复默认」应把整条键删掉（不留空记录）——与改造前同行为。
+    #[test]
+    fn reset_kind_without_added_removes_the_key() {
+        let (s, p) = store();
+        s.move_quick_format("date", "date.lunar", 0).unwrap();
+        s.reset_quick_format_kind("date").unwrap();
+        assert!(s.get_quick_format("date").unwrap().is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 「导入并替换」用的清空**含**用户条目——replace 的语义是「用文件覆盖现状」，
+    /// 留着旧条目会得到「文件里的 + 我原有的」。与上一个测试刻意相反。
+    #[test]
+    fn clear_kind_removes_added_too() {
+        let (s, p) = store();
+        s.add_quick_format("date", "date.u1", "$Y").unwrap();
+        s.add_quick_format("number", "number.u1", "$N").unwrap();
+        s.clear_quick_format_kind("date").unwrap();
+        assert!(s.get_quick_format("date").unwrap().is_none());
+        assert!(s.get_quick_format("number").unwrap().is_some(), "只清本类");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 只有用户条目、没有任何调整的记录**不是空的**，不能被 `modify` 的收尾逻辑删掉。
+    #[test]
+    fn record_with_only_added_is_not_empty() {
+        let mut rec = QuickFormatRecord::default();
+        assert!(rec.is_empty());
+        rec.add_entry("date.u1", "$Y");
+        assert!(!rec.is_empty(), "★ 否则加完一条就被当空记录删掉");
     }
 }
