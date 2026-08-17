@@ -211,4 +211,28 @@ mod tests {
         assert_eq!(w.get("padding").unwrap().as_integer(), Some(8)); // base 保留
         assert_eq!(w.get("radius").unwrap().as_integer(), Some(6)); // over 覆盖
     }
+
+    /// **inline table** 同样深合并——子主题只写其中一个键，base 的其余键必须留下。
+    ///
+    /// 上面那条测的是表节点（`[window]`）层。inline table 是另一种书写形态，主题里
+    /// 大量用于 `prev_image = { ref, mode, tint, ... }`、`border = { width, color }`
+    /// 这类聚合值。若这层退化成整表替换，子主题写 `{ tint = "…" }` 换个颜色就会顺手
+    /// 抹掉 `ref`，箭头静默退化成文字 ‹ ›：主题照常加载、无报错、无日志，只有肉眼
+    /// 能发现。故与表节点层分开各钉一次。
+    #[test]
+    fn merge_deep_overrides_inline_tables() {
+        let base: Value =
+            toml::from_str("[footer_bar]\nprev_image = { ref = \"a.svg\", mode = \"center\", tint = \"#111111\" }\n")
+                .unwrap();
+        let over: Value =
+            toml::from_str("[footer_bar]\nprev_image = { tint = \"#222222\" }\n").unwrap();
+        let img = merge(base, over);
+        let img = img
+            .get("footer_bar")
+            .and_then(|f| f.get("prev_image"))
+            .expect("prev_image");
+        assert_eq!(img.get("ref").and_then(|v| v.as_str()), Some("a.svg"));
+        assert_eq!(img.get("mode").and_then(|v| v.as_str()), Some("center"));
+        assert_eq!(img.get("tint").and_then(|v| v.as_str()), Some("#222222"));
+    }
 }

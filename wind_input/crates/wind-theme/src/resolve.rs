@@ -696,16 +696,27 @@ radius = 6
         );
     }
 
-    /// 内置主题都没写 height_ratio —— 它们必须拿到 0.6 而不是 0.0。
+    /// 内置主题真实加载出的条高比必须**可用**（0 < r ≤ 1），不会塌成 2px 细线。
+    ///
+    /// 这条原先写作「内置主题都没写 height_ratio，故都应等于 0.6」——把「守住默认值」
+    /// 借「主题恰好没配」当载体。msime 后来显式配了条高比，载体作废、测试误红，可
+    /// resolve 的默认值逻辑一行没动。故此处只锁「值可用」这个与主题选值无关的性质；
+    /// 「未配→0.6」由上面的 `..._defaults_and_clamps` 用受控文本正面覆盖，且下面单独
+    /// 用 default（确未配）再钉一次，两者互不牵连。
     #[test]
-    fn test_builtin_themes_get_default_accent_ratio() {
+    fn test_builtin_themes_get_usable_accent_ratio() {
         for name in ["default", "msime"] {
-            let r = load(name, false);
-            assert_eq!(
-                r.views.accent_bar_height_ratio, DEFAULT_ACCENT_BAR_HEIGHT_RATIO,
-                "{name} 未配 height_ratio，应落默认值而非 0"
+            let r = load(name, false).views.accent_bar_height_ratio;
+            assert!(
+                r > 0.0 && r <= 1.0,
+                "{name} 条高比 {r} 不可用（0 会被渲染钳成 2px 细线）"
             );
         }
+        assert_eq!(
+            load("default", false).views.accent_bar_height_ratio,
+            DEFAULT_ACCENT_BAR_HEIGHT_RATIO,
+            "default 未配 height_ratio，应落默认值而非 0"
+        );
     }
 
     /// 工具栏整体背景色/边框色：节点优先，未配回退 toolbar_* token。

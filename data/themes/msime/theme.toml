@@ -1,5 +1,11 @@
-# v3-C schema: base 单链继承唯一基础主题 _base。msime 仅微调主色（微软蓝）+ 紧凑几何 + 文本序号 + 强调条。
-# 其余颜色（border/selection/text/toolbar 等）继承 _base 清风蓝色系。
+# v3-C schema: base 单链继承唯一基础主题 _base。msime = 微软输入法观感。
+#
+# 与 _base（清风蓝）的关键分歧：**选中候选不用蓝底**。整窗保持中性灰白、选中项只比
+# 底色深一档，选中身份交给左侧蓝色强调条。故成套覆盖中性色 token，而非只换 primary
+# ——只换主色会得到「淡蓝选中块 + 蓝条」的双重强调。
+#
+# 覆盖的 token 一律成对给 light/dark：这些键在 _base 里都是双变体，只写一个字面色会
+# 让暗色主题跟着变亮。
 # 注意：顶层标量键 base 必须在任何 [table] 之前。
 base = "_base"
 
@@ -11,24 +17,52 @@ order = 10
 
 [behavior]
 always_show_pager = false
-show_page_number = true
+show_page_number = false
 
 [colors]
-primary = "#0078D4"   # 微软蓝（base 其余清风蓝色继承）
+primary = "#0078D4"   # 微软蓝：只用于强调条 / accent 语义，不再当选中底色
+
+bg = { light = "#F9F9F9", dark = "#2B2B2B" }
+selection = { light = "#EDEDED", dark = "#3D3D3D" }
+# hover 必须显式给：_base 里 hover = "${selection}"，只改 selection 会让悬停与选中撞成
+# 同一个灰，鼠标划过时看不出落在哪一项。
+hover = { light = "#F3F3F3", dark = "#353535" }
+# 边框须**明显深于软阴影**才划得出窗口的边，调阴影浓度时要连它一起看。暗色下阴影
+# （黑对黑）几乎不可见，边框是唯一的轮廓来源，故与底色的差值给得比浅色更足。
+border = { light = "#D9D9D9", dark = "#464646" }
+text = { light = "#1A1A1A", dark = "#E8E8E8" }
+text_dim = { light = "#605E5C", dark = "#B3B0AD" }   # 微软的暖中灰
+
+[window]
+# 阴影用扩散式：无方向性硬偏移，靠模糊做环绕软投影，只留 1dp 下沉。
+#
+# ⚠️ blur 不只是观感参数——`candidate_window.rs` 会按 blur 把整窗下移（让浓阴影落在
+# caret 下方而非盖住它），blur 每大 1dp 候选窗就离光标远 1dp，故刻意压小。
+# 颜色比 _base 的硬边阴影更不透明：模糊把同样的 alpha 摊到几倍面积，照抄会淡到看不见。
+padding = [4, 6]   # 窗口内边距收紧（原继承 _base [6, 8]）
+shadow = { offset = [0, 1], blur = 6, color = { light = "#00000024", dark = "#00000059" } }
 
 [item]
-padding = [6, 8]   # msime 紧凑
+# 行高比与候选间距均小于 _base；窗口 padding 同步收紧，只改一处会显得比例失衡。
+padding = [4, 6]
 
 [index]
-color = "#888888"   # 灰色文本序号
-font_size = 2
+color = "#605E5C"   # 灰色文本序号（比 _base 的蓝色序号克制）
+font_size = 0
 
 [comment]
 font_size = -2
 
 [footer_bar]
 font_size = -2
+prev_image = { ref = "" }
+next_image = { ref = "" }
 
 [accent_bar]
-enabled = true   # msime 选中强调条
+enabled = true   # 中性面板里它是**唯一**的选中身份标识，不可关
 width = 3
+height_ratio = 0.5
+
+[preedit_bar]
+padding = [3, 3, 3, 3]
+background = "transparent"
