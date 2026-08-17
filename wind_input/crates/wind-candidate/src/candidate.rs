@@ -238,6 +238,32 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_sentence_demoted: bool,
+    /// 该整句是引擎**新合成**的解读，词库里没有以它为整体的词条。
+    ///
+    /// ## 为什么不能用 [[is_sentence]] 代替
+    ///
+    /// `is_sentence` 有两个来源：① 引擎新建的整句候选（Viterbi 多节点拼出，词库无此词条）；
+    /// ② 整句与词典候选**同文合并**时给那条已有词典候选补的标记
+    /// （`existing.is_sentence = true`，见 `pinyin/mod.rs` step 2 / 2b / 6.2 三处，
+    /// 注释「同文合并后它就是整句解本身，须继承整句身份」）。
+    ///
+    /// 对排序而言两者等价——都该被 `freq_rerank` 锚在顶部，所以 `is_sentence` 合并它们是对的。
+    /// 但对**自动造词**是致命的：打 `nihao` 选系统词库里的「你好」时 ② 同样为真，
+    /// 照 `is_sentence` 放行就会把系统词一条条抄进临时词库，每次上屏多一次 redb 写事务，
+    /// 配了 `promote_count` 的用户还会把大量系统词「晋升」进用户词库。
+    ///
+    /// 本字段只由 ① 置位，故语义恰好是造词要问的那句话：**这个词词库里有没有**。
+    ///
+    /// ## 为什么不改成协调器侧查词库
+    ///
+    /// 查系统词库要走 `word_codes_in` → `reverse_index_for`，而那份反查索引**最多缓存两份**
+    /// （本次方案 + 全局主码表）。造词查拼音方案、悬停查主码表，两者会交替把对方挤掉，
+    /// 每次重建是十万词级几十毫秒 —— 直接落在按键路径上。引擎侧本就知道这个事实，
+    /// 透出一个 bool 是零运行时代价的做法。
+    ///
+    /// 引擎内部用，不推送 UI。
+    #[serde(skip)]
+    pub is_synthesized: bool,
     /// 前缀补全**已被提升进完整匹配层**（排序决策，与 `is_prefix` 表达的「码更长」结构事实正交）。
     ///
     /// `is_prefix=true` 表达的是结构事实——候选码严格长于输入（补全词）；而「该不该沉到
@@ -361,6 +387,7 @@ impl Default for Candidate {
             is_exact_code: false,
             is_sentence: false,
             is_sentence_demoted: false,
+            is_synthesized: false,
             is_promoted_completion: false,
             completion_extra_syllables: 0,
             consumed_length: 0,

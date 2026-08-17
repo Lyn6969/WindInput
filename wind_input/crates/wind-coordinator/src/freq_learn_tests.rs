@@ -112,8 +112,10 @@ fn mixed_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
     cfg.schema.available = vec!["mx_test".into(), "ct_test".into(), "py_test".into()];
     // 开启码表词频，供 apply_freq_rerank 测试生效（混输走码表 used-first 路径）。
     cfg.schema.codetable.frequency.enabled = true;
-    // 开启码表自动造词，供 learn_phrase_on_commit 测试生效（混输继承主码表 auto_phrase）。
-    cfg.schema.codetable.auto_phrase.enabled = true;
+    // 开启**拼音**自动造词：`learn_phrase_on_commit` 的产出恒是拼音词，闸门已统一归
+    // `[schema.pinyin.auto_learn]`。此前这里开的是 `codetable.auto_phrase.enabled`，
+    // 那正是让功能对真实用户静默失效的错配（出厂 available 里没有纯拼音方案）。
+    cfg.schema.pinyin.auto_learn.enabled = true;
 
     let db_path = std::env::temp_dir().join(format!("wind_coord_p2d_{tag}.redb"));
     let _ = std::fs::remove_file(&db_path);
@@ -127,19 +129,16 @@ const LEARN_MAX_LEN: usize = 10;
 
 /// 拼音方案（active=py_solo）的无头 Coordinator，用于整句造词测试。
 ///
-/// ## ⚠️ 为什么两条配置分支都要开
+/// 闸门统一读 `[schema.pinyin.auto_learn]` 后，本 helper 只需配这一处。
 ///
-/// `learn_phrase_on_commit` 按 `is_pinyin()` 分流读 `[pinyin.auto_learn]` 或
-/// `[codetable.auto_phrase]`，而 `is_pinyin()` 走 `active_engine()` → `ensure_loaded()`
-/// —— **headless 测试环境里引擎加载不起来，它恒为 false**，实际落在 codetable 分支。
-/// 现有造词测试（`mixed_learn_phrase_same_source_only`、`learn_phrase_promotes_at_threshold_via_6a`）
-/// 全都显式开 `codetable.auto_phrase.enabled` 才跑得通，正是同一个原因。
+/// ⚠️ 曾经这里**两条配置分支都得开**：那时 `learn_phrase_on_commit` 按 `is_pinyin()` 分流，
+/// 而 `is_pinyin()` 走 `active_engine()` → `ensure_loaded()`，**headless 环境里引擎加载不
+/// 起来、它恒为 false**，于是实际落在 codetable 分支。只配拼音那侧的话，用例会因为
+/// 「造词整条路径没执行」而齐刷刷假绿——其中三个断言的正是「不该造词」。
+/// 闸门归一之后这个环境依赖消失了，但下面每个「断言没有」的用例仍各配一条反向对照，
+/// 因为假绿的成因不止这一种。
 ///
-/// 只配拼音那一侧的话，这里每个用例都会因为「造词整个没执行」而**全绿**——其中三个
-/// 断言的是「不该造词」，假绿完全看不出来。故两侧 enabled 与 max 都给同样的值，
-/// 让测试语义不依赖「引擎这次加载成没成」。
-///
-/// `data_schema_id` 不受影响：它只读 `schema.toml` 的 `engine.type`，故归属仍是 "pinyin"。
+/// `data_schema_id` 只读 `schema.toml` 的 `engine.type`，故存储归属仍是 "pinyin"。
 fn pinyin_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
     use std::io::Write;
     let base_dir = std::env::temp_dir().join(format!("wind_coord_pysolo_{tag}"));
@@ -159,9 +158,6 @@ fn pinyin_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
     cfg.schema.available = vec!["py_solo".into()];
     cfg.schema.pinyin.auto_learn.enabled = true;
     cfg.schema.pinyin.auto_learn.max_word_length = LEARN_MAX_LEN;
-    // 见函数文档：headless 下实际走的是这一支。
-    cfg.schema.codetable.auto_phrase.enabled = true;
-    cfg.schema.codetable.auto_phrase.max_phrase_len = LEARN_MAX_LEN;
 
     let db_path = std::env::temp_dir().join(format!("wind_coord_pysolo_{tag}.redb"));
     let _ = std::fs::remove_file(&db_path);
@@ -223,7 +219,43 @@ fn single_segment_sentence_is_learned_and_abbrev_searchable() {
     );
 }
 
-/// 单段但**不是**整句（用户直接选中的词典整词）不造词。
+/// 单段整句造词后，`learn_phrase_on_commit` 要把写入的 code 报给调用方，
+/// 好让 `handle_candidate` 的「6b 临时词使用累积」跳过同一条 —— 否则一次上屏 count +2。
+///
+/// 这条守的是返回值契约本身（6b 那段在 `commit_selected` 里，白盒测试够不着）：
+/// 返回 `Some(code)` 且 code 恰是本次候选的码时，调用方才有依据判断「刚写的就是它」。
+#[test]
+fn learn_returns_written_code_so_caller_can_skip_double_count() {
+    let (c, store) = pinyin_coord("sentence_retcode");
+    push_single_seg(&c, "nihaoshijie", "你好世界", 0b1);
+    let written = {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit(&st, true)
+    };
+    assert_eq!(
+        written.as_deref(),
+        Some("nihaoshijie"),
+        "须返回写入的 code，单段时它恰等于本次候选的码 —— 6b 靠这个比对来跳过"
+    );
+    assert_eq!(
+        store
+            .get_temp_word("pinyin", "nihaoshijie", "你好世界")
+            .unwrap(),
+        Some(1),
+        "首次造词 count 应为 1；若 6b 未跳过，真实链路上这里会是 2"
+    );
+
+    // 未造词的各条路径都要返回 None，否则调用方会误跳过 6b 的正常累积。
+    push_single_seg(&c, "nihao", "你好", 0b101);
+    let st = c.state.lock().unwrap();
+    assert_eq!(
+        c.learn_phrase_on_commit(&st, false),
+        None,
+        "未造词须返回 None"
+    );
+}
+
+/// 单段但**不是**引擎新合成（用户直接选中的词典整词）不造词。
 ///
 /// 判据取 `is_sentence` 而非「单段且够长」正是为了这条：词典里本就有「你好」，
 /// 再写一份临时词只会让候选面多一条同文项，且永远不会被用到。

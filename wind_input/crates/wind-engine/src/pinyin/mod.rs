@@ -1362,6 +1362,8 @@ impl PinyinEngine {
                     source: CandidateSource::Pinyin,
                     is_fullpinyin_fallback: true,
                     is_sentence: true,
+                    // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
+                    is_synthesized: true,
                     is_partial: completed.len() < stroke.len(),
                     boundary: result.boundary,
                     consumed_length: completed.len(),
@@ -2003,6 +2005,8 @@ impl Engine for PinyinEngine {
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
                                 is_sentence: true,
+                                // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
+                                is_synthesized: true,
                                 // 整句的边界 = 解码器**实际选中**的那条路径（多路径下同一串
                                 // 输入可有多种切法，只有解码器知道走的是哪条）。回退到
                                 // maximum_match 仅用于解码器给不出边界的极端情形（超 64 字节）。
@@ -2134,6 +2138,8 @@ impl Engine for PinyinEngine {
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
                                 is_sentence: true,
+                                // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
+                                is_synthesized: true,
                                 boundary: result.boundary,
                                 ..Default::default()
                             },
@@ -2228,6 +2234,8 @@ impl Engine for PinyinEngine {
                             natural_order: 0,
                             source: CandidateSource::Pinyin,
                             is_sentence: true,
+                            // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
+                            is_synthesized: true,
                             // 解码器实际走的那条路径。简拼段每字母一位，故回填出的
                             // preedit 是 `b'z'd'hao'bu'hao` —— 与击键同域，正是要的。
                             boundary: result.boundary,
@@ -2992,6 +3000,8 @@ impl Engine for PinyinEngine {
                             natural_order: 0,
                             source: CandidateSource::Pinyin,
                             is_sentence: true,
+                            // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
+                            is_synthesized: true,
                             boundary,
                             ..Default::default()
                         },
@@ -5208,6 +5218,15 @@ mod tests {
             !c.is_sentence_demoted,
             "它本身即精确整词，无处可让，不该走 6.5 降级"
         );
+        // ★ 同文合并**不得**置 `is_synthesized`：这条候选是词库里实打实的词条，
+        // 只是恰好被 Viterbi 选中而继承了整句身份。协调器的自动造词以该字段为准
+        // ——若在这里跟着置真，打 `nihao` 选「你好」就会把系统词一条条抄进临时词库
+        //（每次上屏一次 redb 写，还会被 promote_count 批量「晋升」进用户词库）。
+        // 这正是 `is_sentence` 不能直接用作造词判据的原因，见该字段文档。
+        assert!(
+            !c.is_synthesized,
+            "词库已有此词条 ⇒ 不是引擎新合成，不得置 is_synthesized"
+        );
         // 同文合并取 `max(词典 weight, W_eff)`，50_000 是构造里「你好」的词典值。
         assert!(
             c.weight >= 50_000,
@@ -5280,6 +5299,14 @@ mod tests {
         let sc = &r.candidates[sent];
         assert!(sc.is_sentence, "「你好」应是合成整句");
         assert!(sc.is_sentence_demoted, "存在精确整词时整句须降级");
+        // ★ 正向对照（与 `dict_word_selected_by_viterbi_inherits_sentence_identity` 里那条
+        // 反向断言配对）：这里的「你好」是「你」+「好」两个节点**拼**出来的，词库里没有
+        // `nihao → 你好` 这个词条，故必须置 `is_synthesized` —— 协调器的自动造词只认它。
+        // 少了这条对照，哪怕引擎再也不置该字段（功能整个失效），反向断言照样全绿。
+        assert!(
+            sc.is_synthesized,
+            "多节点合成、词库无此词条 ⇒ 必须置 is_synthesized，否则自动造词全线失效"
+        );
         // 64 = 上面三个同码精确整词的权重（取自 cn_dicts 的「拟好」真实值）。
         // 写成 `64 - 1` 而非硬编码 63：本断言要守的是「降到 max(同码词) - 1」这个关系，
         // 跟着构造走；写死数值会在下次调整夹具权重时变成一个无从追溯的魔数。

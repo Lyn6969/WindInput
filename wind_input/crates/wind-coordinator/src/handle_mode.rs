@@ -1327,7 +1327,7 @@ impl Coordinator {
                     cand.boundary,
                 ));
                 // 单段整句同样要造词（混输下拼音子引擎的整句一次上屏亦只 push 一段）。
-                self.learn_phrase_on_commit(state, cand.is_sentence);
+                self.learn_phrase_on_commit(state, cand.is_synthesized);
             } else {
                 // 数字透镜（计算/日期/金额）无编码可记词频，但同样是一次上屏：
                 // 单独记历史，使「算完再按 ; 空格」能重复刚上屏的结果。
