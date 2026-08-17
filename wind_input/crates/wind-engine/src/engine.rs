@@ -37,6 +37,17 @@ pub struct ConvertResult {
     /// 混输的高亮跟随占住（拆分串 vs 原始码），双拼在它们之上还需要第三种形态——同一串
     /// 击键的**两种切法**。挤进老字段会连带改掉混输行为，那是两条无关的路径。
     pub preedit_fullpinyin: String,
+    /// **简拼分段形态**：把击键串按简拼/混合简拼候选的真值音节序列切开（`wbwn` → `w'b'w'n`）。
+    ///
+    /// 供协调器的高亮跟随：高亮到 [`Candidate::is_abbrev`] 的候选时显示它。空串 = 本次转换
+    /// 没有可用的简拼候选（或切不出与击键等长的串）。
+    ///
+    /// ⚠️ **只有双拼方案会填**。全拼下简拼分段已经就是 `preedit_display` 本身（那里的首选
+    /// 一旦是简拼候选，`convert` 就地把它切好了），再填一份等于给协调器加一条恒等分支。
+    /// 双拼则不同：`build_raw_preedit` 按**两键一音节**切，与简拼「每键一个声母」是同一串
+    /// 击键的两种切法（`wbwn` 双拼切成 `wbwn`／`wf'wt`，简拼该切成 `w'b'w'n`／`w'f'w't`），
+    /// 二者必须并存、由高亮决定用哪个——同 `preedit_fullpinyin` 的理由。
+    pub preedit_abbrev: String,
     /// 已完成音节（拼音 UI 高亮用）
     pub completed_syllables: Vec<String>,
     /// 末尾未完成音节（拼音）

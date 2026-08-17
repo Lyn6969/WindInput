@@ -624,6 +624,8 @@ impl Coordinator {
         state.preedit_split_body = result.preedit_pinyin.clone();
         // 全拼降级形态（双拼下按全拼的切法），供 effective_preedit_body 按高亮候选切换。
         state.preedit_fp_body = result.preedit_fullpinyin.clone();
+        // 简拼分段形态（双拼下按简拼的切法，`wbwn` → `w'b'w'n`），同上按高亮候选切换。
+        state.preedit_abbrev_body = result.preedit_abbrev.clone();
         // 候选调整（shadow）的归一编码。双拼下 = 全拼码（`hc`→`hao`），使双拼与全拼共享
         // 同一条规则；全拼/码表/混输恒空串 = 落回击键，行为不变。见 `State::shadow_code`。
         state.shadow_code = result.shadow_code.clone();
@@ -1273,6 +1275,7 @@ impl Coordinator {
         state.preedit = state.input_buffer.clone();
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
+        state.preedit_abbrev_body.clear();
         state.shadow_code.clear();
         if state.input_buffer.is_empty() {
             state.has_more = false;
@@ -1598,15 +1601,24 @@ impl Coordinator {
         }
         let hi = self.highlighted_global_index(state);
         let cand = state.candidates.get(hi);
+        // ★ 下面三条「按高亮选形态」的分支都必须在这里判，不能由引擎就地算定：引擎每次
+        // 按键只 convert 一次，而翻页 / 方向键移动高亮都发生在那之后，就地算定的形态不会
+        // 跟着变。本函数由 `sync_preedit_to_highlight` 在每次高亮变化时重算，是唯一能跟住
+        // 的位置。三条也都与最后那条 `source == Pinyin` 判据分开：双拼流、全拼支路、简拼
+        // 候选的**来源同为 Pinyin**，那条分不开它们；且它的两个分支（拆分串 / 原始码）
+        // 都不是这里要的切法。
+
+        // 双拼下的**简拼候选**：编码栏按简拼切法显示（`w'b'w'n`），而不是双拼的 `wbwn`／
+        // `wf'wt`——四个字的候选「万般无奈」配着一段两键式编码，用户看不出自己打的是简拼。
+        //
+        // 排在全拼降级那条**之前**：双拼的全拼降级支路把击键当全拼再查一遍，查出来的词条
+        // 同样可能是简拼命中，于是两个标记同真。那时简拼切法才是对的——全拼切法
+        // (`compose_segment`) 会把 `wbwn` 按音节最大匹配乱切一气。
+        if !state.preedit_abbrev_body.is_empty() && cand.is_some_and(|c| c.is_abbrev) {
+            return &state.preedit_abbrev_body;
+        }
         // 双拼下的**全拼降级候选**：编码栏按全拼切法显示（`zai'jian`），而不是双拼的
         // `za'ij'ia'n`——三段编码配着两字候选「再见」，用户看不懂，退格时更会以为光标错位。
-        //
-        // ★ 必须在这里（按高亮）判，不能由引擎就地算定：引擎每次按键只 convert 一次，而
-        // 翻页 / 方向键移动高亮都发生在那之后，就地算定的形态不会跟着变。本函数由
-        // `sync_preedit_to_highlight` 在每次高亮变化时重算，是唯一能跟住的位置。
-        //
-        // 与下面 `source == Pinyin` 那条判据分开：双拼流与全拼支路的候选**来源同为
-        // Pinyin**，那条分不开它们；且它的两个分支（拆分串 / 原始码）都不是全拼切法。
         if !state.preedit_fp_body.is_empty() && cand.is_some_and(|c| c.is_fullpinyin_fallback) {
             return &state.preedit_fp_body;
         }

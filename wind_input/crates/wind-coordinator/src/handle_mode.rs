@@ -1391,7 +1391,13 @@ impl Coordinator {
         let members = self.mix_members_resolved(state.mix_id);
         let mut cands: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        // 文本透镜：取首个真实方案的 preedit_display（拼音含音节分隔 "ni hao"）作组合区显示。
+        // 文本透镜：取首个**真的给出了分段**的成员方案的 preedit_display（拼音的 `ni'hao`）
+        // 作组合区显示。
+        //
+        // ⚠️ 判据是「与缓冲不同形」，不是「非空」。码表/英文引擎的 `preedit_display` 恒等于
+        // 原始输入（见 `CodeTableEngine::convert`），按「非空即采纳」会让**成员顺序**决定编码栏
+        // 形态：用户把快符 `kf` 排在 `$primary_pinyin` 之前，拼音的拆分串就永远轮不上，
+        // 表现为「快捷输入里完全没有拆分显示」。成员顺序管的是候选优先级，管不到这里。
         let mut text_display: Option<String> = None;
         for member in &members {
             if let Some(src) = wind_quick_input::QuickSource::from_member(member) {
@@ -1447,7 +1453,12 @@ impl Coordinator {
                     continue;
                 }
                 let result = self.engine_mgr.convert_with(member, &state.mix_buffer, 50);
-                if text_display.is_none() && !result.preedit_display.is_empty() {
+                // 空串是「这个成员没给出显示串」（方案加载失败等），不是一种形态——漏掉这半个
+                // 判据会把组合区整段吞成前缀。
+                if text_display.is_none()
+                    && !result.preedit_display.is_empty()
+                    && result.preedit_display != state.mix_buffer
+                {
                     text_display = Some(result.preedit_display.clone());
                 }
                 for c in result.candidates {

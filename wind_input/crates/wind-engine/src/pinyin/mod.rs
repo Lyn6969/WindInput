@@ -810,6 +810,36 @@ impl PinyinEngine {
         (preedit, syllables, partial)
     }
 
+    /// 简拼（`nh`→`n'h`）与混合简拼（`nhao`→`n'hao`、`wbwn`→`w'b'w'n`）的击键分段显示。
+    /// 非简拼候选 / 无边界真值 / 切不出与击键相符的串 → `None`（调用方保持原显示）。
+    ///
+    /// **切的是击键串，不是候选的 code。** 直接渲染 code 会显示成 `ni'hao`：用户只敲了
+    /// 4 键却看到 5 个字母，退格与光标编辑立刻错位。这里用候选自带的真值音节序列去切
+    /// `raw_input`，声母段吃 1 字节、音节段吃整段（见 `render_keystroke_preedit`）。
+    ///
+    /// 返回 `None` 而不是硬拼一个串：preedit 是显示层，宁可少一个分隔符，也不能给出与
+    /// 击键长度不符的串。
+    fn abbrev_keystroke_preedit(&self, cand: &Candidate, raw_input: &str) -> Option<String> {
+        if !cand.is_abbrev || cand.boundary == 0 {
+            return None;
+        }
+        let syls = mixed_abbrev::syllables_from_boundary(&cand.code, cand.boundary)?;
+        let (head, used) = mixed_abbrev::render_keystroke_preedit(raw_input, &syls)?;
+        if used == raw_input.len() {
+            return Some(head);
+        }
+        if cand.consumed_length != 0 && used == cand.consumed_length {
+            // 部分匹配（step 6.2 前缀回退）：余下的击键**自己再切一遍**，别整段甩上去。
+            // `bzdnihaob` 选中「不知道」(消费 bzd) 后尾巴是 `nihaob`，含完整音节
+            // `ni`/`hao` + 残码 `b`——整段追加会显示成 `b'z'd'nihaob`，该切的地方没切。
+            // 走 compose_segment 得 `ni'hao'b`，最终 `b'z'd'ni'hao'b`。
+            let (tail, _, _) = self.compose_segment(&raw_input[used..]);
+            return Some(format!("{head}'{tail}"));
+        }
+        // 走不完且不是部分候选：模式与击键对不上，硬拼只会给出与击键长度不符的串。
+        None
+    }
+
     /// 尊重手动分隔符 `'` 的音节分段：按 `'` 切段、各段独立 DAG 最大匹配，
     /// 拼接为纯音节序列（不含 `'`）。`'` 为硬边界，任何音节不得跨越。
     /// 段内未成音节的残码（partial）不计入（仅用于 completed 音节序列）。
@@ -3151,34 +3181,8 @@ impl Engine for PinyinEngine {
                 // 走不到上一支是因为 `completed` 对这类输入恒为空串——`bzdhaobuhao`
                 // 从位置 0 就切不出完整音节。
                 preedit_display = render_preedit(raw_input, top.boundary, "");
-            } else if top.is_abbrev && top.boundary != 0 {
-                // 简拼（`nh`→`n'h`）与混合简拼（`nhao`→`n'hao`）的分段显示。
-                //
-                // **切的是击键串，不是候选的 code。** 直接渲染 code 会显示成 `ni'hao`：
-                // 用户只敲了 4 键却看到 5 个字母，退格与光标编辑立刻错位。这里用候选
-                // 自带的真值音节序列去切 `raw_input`，声母段吃 1 字节、音节段吃整段
-                // （见 `render_keystroke_preedit`）。
-                //
-                // 对不上就保持原显示：preedit 是显示层，宁可少一个分隔符，
-                // 也不能给出与击键长度不符的串。
-                if let Some((head, used)) =
-                    mixed_abbrev::syllables_from_boundary(&top.code, top.boundary)
-                        .and_then(|syls| mixed_abbrev::render_keystroke_preedit(raw_input, &syls))
-                {
-                    if used == raw_input.len() {
-                        preedit_display = head;
-                    } else if top.consumed_length != 0 && used == top.consumed_length {
-                        // 部分匹配（step 6.2 前缀回退）：余下的击键**自己再切一遍**，
-                        // 别整段甩上去。`bzdnihaob` 选中「不知道」(消费 bzd) 后尾巴是
-                        // `nihaob`，含完整音节 `ni`/`hao` + 残码 `b`——整段追加会显示成
-                        // `b'z'd'nihaob`，该切的地方没切。走 compose_segment 得
-                        // `ni'hao'b`，最终 `b'z'd'ni'hao'b`。
-                        let (tail, _, _) = self.compose_segment(&raw_input[used..]);
-                        preedit_display = format!("{head}'{tail}");
-                    }
-                    // 其余情形（走不完且不是部分候选）保持原显示：那说明模式与击键
-                    // 对不上，硬拼只会给出与击键长度不符的串。
-                }
+            } else if let Some(s) = self.abbrev_keystroke_preedit(top, raw_input) {
+                preedit_display = s;
             }
         }
 
@@ -3187,8 +3191,33 @@ impl Engine for PinyinEngine {
         // consumed_length 仍保持全拼语义不变。
         // 双拼自身的音节切分恒为**默认**显示形态。
         let mut preedit_fullpinyin = String::new();
+        let mut preedit_abbrev = String::new();
+        // 双拼分段形态：非简拼候选（也就是绝大多数情形）的显示串，同时是 `preedit_pinyin`
+        // 交出去的那一份——它必须**始终**是双拼切法，否则高亮从简拼候选移回双拼候选时
+        // 协调器无处取回原形态。
+        let mut sp_body = String::new();
         if let Some(r) = &sp_result {
-            preedit_display = build_raw_preedit(raw_input, r);
+            sp_body = build_raw_preedit(raw_input, r);
+            preedit_display = sp_body.clone();
+            // 简拼/混合简拼候选的**击键分段**（`wbwn` → `w'b'w'n`），供协调器按高亮切换
+            // （见 `ConvertResult::preedit_abbrev`）。
+            //
+            // 双拼的 `build_raw_preedit` 按两键一音节切，对简拼击键给出的是无意义的分段
+            // （`wbwn` 一段都切不出、`wfwt` 切成 `wf'wt`）——它答的是「这串按双拼怎么读」，
+            // 而用户打的是每键一个声母。两种切法都成立，只能由高亮候选来选。
+            //
+            // 取**首个**简拼候选而非 `candidates.first()`：这一份是给「高亮到简拼候选时」
+            // 用的，首选是不是简拼与它无关。同码的简拼候选彼此切法一致（同一条 mixed
+            // pattern），故一份足够。
+            preedit_abbrev = candidates
+                .iter()
+                .find_map(|c| self.abbrev_keystroke_preedit(c, raw_input))
+                .unwrap_or_default();
+            // 首选就是简拼候选 ⇒ 初显直接用简拼分段（overlay 模式如快捷输入/临拼只读
+            // `preedit_display`，不走协调器的高亮跟随，靠的就是这一步）。
+            if candidates.first().is_some_and(|c| c.is_abbrev) && !preedit_abbrev.is_empty() {
+                preedit_display = preedit_abbrev.clone();
+            }
             // 支路有产出时额外给出**全拼切分**，供协调器按高亮候选切换
             // （见 `ConvertResult::preedit_fullpinyin`）。
             //
@@ -3199,7 +3228,10 @@ impl Engine for PinyinEngine {
             // 在每次高亮变化时重算），引擎只负责把两种形态都交出去。
             if candidates.iter().any(|c| c.is_fullpinyin_fallback) {
                 let fp = self.compose_segment(raw_input).0;
-                if fp != preedit_display {
+                // 与 `sp_body` 比而不是 `preedit_display`：这一步答的是「全拼切法与**双拼
+                // 切法**是否不同」，而 preedit_display 上一步可能已被换成简拼分段。拿它作
+                // 基准的话，`nihao` 这类两种切法本就相同的串会因为简拼覆盖而白给一份 fp。
+                if fp != sp_body {
                     preedit_fullpinyin = fp;
                 }
             }
@@ -3243,9 +3275,18 @@ impl Engine for PinyinEngine {
         Ok(ConvertResult {
             candidates,
             // 拼音恒为拆分形态（供混输高亮跟随：高亮拼音候选时取此串）。
-            preedit_pinyin: preedit_display.clone(),
+            //
+            // 双拼下取 `sp_body`（双拼切法）**而非 `preedit_display`**：首选是简拼候选时
+            // 后者已被换成简拼分段，若跟着一起换，高亮从简拼候选移回双拼候选时协调器就
+            // 取不回双拼形态了——两种切法必须各有一个稳定的落点。
+            preedit_pinyin: if sp_body.is_empty() {
+                preedit_display.clone()
+            } else {
+                sp_body
+            },
             preedit_display,
             preedit_fullpinyin,
+            preedit_abbrev,
             completed_syllables,
             partial_syllable,
             has_partial,

@@ -1947,6 +1947,35 @@ fn test_quick_input_repeat_last_commit() {
     }
 }
 
+/// ★ 快捷输入的编码栏拆分**不受成员顺序影响**。
+///
+/// 组合区形态该由「谁真的给得出分段」决定，而成员顺序管的是候选优先级。判据曾写成
+/// 「第一个 `preedit_display` 非空的真实方案」——码表/英文引擎的 `preedit_display` 恒等于
+/// 原始输入，于是用户只要把一个码表方案（真实案例是快符 `kf`）排在 `$primary_pinyin`
+/// 之前，拼音的拆分串就永远轮不上，表现为「快捷输入里完全没有拆分显示」。
+#[test]
+fn mix_preedit_split_survives_codetable_member_first() {
+    if !has_schemas() {
+        return;
+    }
+    for members in [
+        vec!["wubi86", "$primary_pinyin"],
+        vec!["$primary_pinyin", "wubi86"],
+    ] {
+        let mut cfg = config_with("wubi86");
+        cfg.schema.mix_modes[0].members = members.iter().map(|s| s.to_string()).collect();
+        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+        coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+        let last = press_str(&coord, "nihao");
+        assert_eq!(
+            action_text(&last).unwrap_or_default(),
+            ";ni'hao",
+            "members={:?} 时组合区应显示拼音音节拆分",
+            members
+        );
+    }
+}
+
 /// 移除成员即关闭该来源：members 去掉 `quick_input.calc` 后，算式不再产出计算候选
 /// （金额来源仍会对结果求值，故这里连 number 一起移除，验证「开关=增删」）。
 #[test]
@@ -8461,6 +8490,67 @@ fn shuangpin_preedit_follows_highlight_between_domains() {
         switched_back,
         "高亮移到双拼候选时编码栏应切回 za'ij'ia'n，实际候选: {:?}",
         coord.debug_all_candidate_texts()
+    );
+}
+
+/// ★ 双拼下打**简拼**，编码栏须按简拼切（每键一个声母），不能按双拼的两键一音节切。
+///
+/// `wbwn`（万般无奈）在双拼里一个合法音节都拼不出，`build_raw_preedit` 于是原样回显
+/// `wbwn`；`wfwt`（无法无天）更糟——`wf` 恰好是合法双拼音节，切成 `wf'wt`，两段编码配着
+/// 四字候选，用户根本看不出自己打的是简拼。两种切法都成立，只能由高亮候选来选。
+///
+/// ⚠️ 反向对照（下半段）不可省：只断言「简拼时显示 w'f'w't」的话，把 `preedit_display`
+/// 无条件改成简拼切法也能全绿，而那样双拼候选的编码栏就废了。
+#[test]
+fn shuangpin_abbrev_preedit_splits_by_keystroke() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    let mut last = None;
+    for c in "wfwt".chars() {
+        last = Some(press_letter(&coord, c));
+    }
+    let preedit0 = action_text(&last.expect("按键应有回执")).unwrap_or_default();
+    assert_eq!(
+        preedit0,
+        "w'f'w't",
+        "首选是简拼候选「无法无天」，编码栏应按简拼击键切分；实际候选: {:?}",
+        coord.debug_page_texts()
+    );
+
+    // 高亮下移到双拼候选（`wf` 的单字，如「问」）时，编码栏须切回双拼切分。
+    // 不锁定具体位置（词库权重会浮动），只要求这个切换确实发生。
+    let mut switched_back = false;
+    for _ in 0..24 {
+        let act = coord.handle_key_event(&key_event(0x28, EVENT_KEY_DOWN));
+        if action_text(&act).as_deref() == Some("wf'wt") {
+            switched_back = true;
+            break;
+        }
+    }
+    assert!(
+        switched_back,
+        "高亮移到双拼候选时编码栏应切回 wf'wt，实际候选: {:?}",
+        coord.debug_all_candidate_texts()
+    );
+}
+
+/// 双拼下**非**简拼的击键不受影响：`nhao` 的首选是双拼候选，仍按 `nh'ao` 显示。
+/// 与上一条构成配对——防止简拼分支把所有双拼击键都抢过去。
+#[test]
+fn shuangpin_non_abbrev_preedit_unchanged() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    let mut last = None;
+    for c in "nhao".chars() {
+        last = Some(press_letter(&coord, c));
+    }
+    assert_eq!(
+        action_text(&last.expect("按键应有回执")).unwrap_or_default(),
+        "nh'ao",
+        "首选是双拼候选时编码栏应保持双拼切分；实际候选: {:?}",
+        coord.debug_page_texts()
     );
 }
 

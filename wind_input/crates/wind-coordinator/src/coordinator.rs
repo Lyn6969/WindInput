@@ -285,6 +285,13 @@ pub(crate) struct State {
     /// 高亮到 `is_fullpinyin_fallback` 的候选时 preedit 用它；其余情形不读。
     /// 空串 = 无此形态（非双拼 / 开关关 / 支路无产出）。每次 build_candidates 重置。
     pub(crate) preedit_fp_body: String,
+    /// **简拼分段**形态（把击键按简拼候选的音节序列切开，`wbwn` → `w'b'w'n`）。
+    /// 高亮到 `is_abbrev` 的候选时 preedit 用它；其余情形不读。
+    /// 空串 = 无此形态（非双拼 / 无简拼候选）。每次 build_candidates 重置。
+    ///
+    /// 只有双拼会有值：全拼下简拼分段已经是 `preedit_split_body` 本身
+    /// （见 `ConvertResult::preedit_abbrev`）。
+    pub(crate) preedit_abbrev_body: String,
     /// 候选调整（shadow）规则的**归一编码**；空串 = 落回 `input_buffer`（击键原样）。
     ///
     /// 取自 `ConvertResult::shadow_code`，与 `preedit_split_body` 同生命周期（每次
@@ -1271,6 +1278,7 @@ impl Coordinator {
                 preedit: String::new(),
                 preedit_split_body: String::new(),
                 preedit_fp_body: String::new(),
+                preedit_abbrev_body: String::new(),
                 shadow_code: String::new(),
                 shortcode_tops: [const { None }; 3],
                 candidates: Vec::new(),
@@ -2934,6 +2942,7 @@ impl Coordinator {
         state.preedit.clear();
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
+        state.preedit_abbrev_body.clear();
         state.shadow_code.clear();
         state.candidates.clear();
         self.reset_candidate_view(state);
