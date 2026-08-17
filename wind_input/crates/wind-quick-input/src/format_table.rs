@@ -2,7 +2,7 @@
 //!
 //! 设计与约束见 `docs/design/quick-input-format-table.md`。三条要点：
 //!
-//! - **解析归代码、渲染归配置**：`kind` 是白名单（对应四个已有解析器），配置不能新增；
+//! - **解析归代码、渲染归配置**：`kind` 是白名单（对应五个已有解析器），配置不能新增；
 //! - **组内顺序归 `position`，跨来源顺序仍归 `mix_modes.members`**（不设第二真相源）；
 //! - **坏掉也得能打字**：文件缺失/整份解析失败一律回落 [`FormatTable::builtin`]，
 //!   单条非法只剔除该条。
@@ -10,11 +10,17 @@
 use std::path::Path;
 use tracing::warn;
 
-/// 解析器类别。恰好对应四个已有解析器，**不可由配置新增**。
+/// 解析器类别。恰好对应五个已有解析器，**不可由配置新增**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatKind {
-    /// 完整日期 `12.25` / `2025.12.25`
+    /// 完整日期 `2025.12.25`（用户明确给了年）
     Date,
+    /// 月日 `12.25`（年由代码补当年）
+    ///
+    /// 与 [`Self::Date`] 分开而不是共用一套模板：用户只打两段时想要的多半是
+    /// 「12月25日」这种不带年的短写法，而替他补上的年份在三段输入里才是他自己打的。
+    /// 变量集与 `Date` 相同（年可用，取当前年），差别只在**出厂条目**与用户调整各自记账。
+    MonthDay,
     /// 年月 `2025.12`
     YearMonth,
     /// 数字 / 金额（纯数字，或算式求值结果）
@@ -29,6 +35,7 @@ impl FormatKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "date" => Some(Self::Date),
+            "month_day" => Some(Self::MonthDay),
             "year_month" => Some(Self::YearMonth),
             "number" => Some(Self::Number),
             "calc" => Some(Self::Calc),
@@ -41,9 +48,10 @@ impl FormatKind {
     fn group_order(self) -> u8 {
         match self {
             Self::Date => 0,
-            Self::YearMonth => 1,
-            Self::Number => 2,
-            Self::Calc => 3,
+            Self::MonthDay => 1,
+            Self::YearMonth => 2,
+            Self::Number => 3,
+            Self::Calc => 4,
         }
     }
 
@@ -51,6 +59,7 @@ impl FormatKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Date => "date",
+            Self::MonthDay => "month_day",
             Self::YearMonth => "year_month",
             Self::Number => "number",
             Self::Calc => "calc",
@@ -59,13 +68,15 @@ impl FormatKind {
 
     /// 本类支持的变量名（校验用；取值实现见 `crate::vars`）。
     ///
-    /// ⚠️ 农历变量**只给 `Date`，不给 `YearMonth`**：农历月与公历月不是一一对应
-    /// （闰月、且月首不在公历月初），`2026.12` 根本推不出唯一的农历月。
-    /// 放行了只会让用户拿到一个看似合理的错值。
+    /// ⚠️ 农历变量给 `Date` 与 `MonthDay`（两者都有确定的年月日），**不给 `YearMonth`**：
+    /// 农历月与公历月不是一一对应（闰月、且月首不在公历月初），`2026.12` 根本推不出唯一的
+    /// 农历月。放行了只会让用户拿到一个看似合理的错值。
     pub fn supports_var(self, name: &str) -> bool {
         let common_year = matches!(name, "Y" | "YYYY" | "YY" | "YC");
         match self {
-            Self::Date => {
+            // 月日与完整日期同一套变量：年份取当前年，故 `$Y`/农历照样可用
+            // （出厂表借此把「2026年12月25日」留作月日组的次选）。
+            Self::Date | Self::MonthDay => {
                 common_year
                     || matches!(name, "M" | "MM" | "MC" | "D" | "DD" | "DC")
                     || crate::lunar::is_var(name)
@@ -116,6 +127,25 @@ const BUILTIN: &[(&str, FormatKind, &str)] = &[
     // 超出 1900–2100 时这两条自动消失（变量取不到值 → 整条模板作废）。
     ("date.lunar", FormatKind::Date, "农历$LMD"),
     ("date.lunar_ganzhi", FormatKind::Date, "$LY年$LMD"),
+    // 月日（只打两段）：不带年的短写法在前——用户没打年份，首选就不该替他补一个。
+    // 农历紧随其后（它也不带公历年份），补年的两条垫底：「打 12.25 想要 2026年12月25日」
+    // 是真实用法，翻一下仍取得到。**改这里必须同步出厂 `data/system.quick.toml`**
+    // （`factory_file_matches_builtin_table` 逐条比对）。
+    ("month_day.cn", FormatKind::MonthDay, "$M月$D日"),
+    ("month_day.cn_hans", FormatKind::MonthDay, "$MC月$DC日"),
+    ("month_day.iso", FormatKind::MonthDay, "$MM-$DD"),
+    ("month_day.slash", FormatKind::MonthDay, "$MM/$DD"),
+    ("month_day.lunar", FormatKind::MonthDay, "农历$LMD"),
+    (
+        "month_day.with_year_cn",
+        FormatKind::MonthDay,
+        "$Y年$M月$D日",
+    ),
+    (
+        "month_day.with_year_iso",
+        FormatKind::MonthDay,
+        "$YYYY-$MM-$DD",
+    ),
     // 年月：与完整日期同构
     ("year_month.cn", FormatKind::YearMonth, "$Y年$M月"),
     ("year_month.cn_hans", FormatKind::YearMonth, "$YC年$MC月"),
@@ -192,7 +222,7 @@ impl FormatTable {
         for (i, r) in raw.formats.into_iter().enumerate() {
             let Some(kind) = FormatKind::parse(&r.kind) else {
                 warn!(
-                    "快捷输入格式表: 跳过 id={} —— 未知 kind {:?}（可用: date/year_month/number/calc）",
+                    "快捷输入格式表: 跳过 id={} —— 未知 kind {:?}（可用: date/month_day/year_month/number/calc）",
                     r.id, r.kind
                 );
                 continue;
@@ -388,10 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn builtin_covers_all_four_kinds() {
+    fn builtin_covers_every_kind() {
         let t = FormatTable::builtin();
         for k in [
             FormatKind::Date,
+            FormatKind::MonthDay,
             FormatKind::YearMonth,
             FormatKind::Number,
             FormatKind::Calc,

@@ -1913,6 +1913,16 @@ fn test_quick_input_date_trailing_dot_keeps_year_month() {
         "2026.3. 应维持年月候选，实际: {:?}",
         after
     );
+    // ★ 同一步还要**收掉**金额与数字读法：第二个点一落下，用户显然在打日期第三段，
+    // 而尾点被裁掉后 `2026.3` 又是合法小数。判据看裁剪前的点数（见 `has_second_dot`）。
+    // 断言走协调器层的全量候选，不能只看当页——金额排在年月之后，页内可能看不到。
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        !all.iter().any(|t| t.contains('元')),
+        "2026.3. 不该有金额候选，实际: {:?}",
+        all
+    );
+    assert_eq!(all.len(), 4, "只剩年月四条，实际: {:?}", all);
 }
 
 /// 重复上屏（成员 `quick_input.repeat`）：空缓冲时把上次上屏内容作唯一候选，空格再上屏一次。
@@ -2014,7 +2024,9 @@ fn test_quick_input_member_removal_disables_source() {
     for vk in [0x32, 0x35] {
         press_vk(&coord2, vk, false); // 25
     }
-    let texts2 = coord2.debug_page_texts();
+    // ⚠️ 断言走全量候选而非当页：出厂让 number 排在 date **之前**（`12.25` 作金额比作
+    // 月日常见），日期候选可能落到第二页去，按页内文本判断会误报「来源被关掉了」。
+    let texts2 = coord2.debug_all_candidate_texts();
     assert!(
         texts2.iter().any(|t| t.ends_with("月25日")),
         "date 成员仍在，日期候选应照常产出，实际: {:?}",

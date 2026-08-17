@@ -244,6 +244,7 @@ mod tests {
     fn all_kinds_roundtrip() {
         for k in [
             FormatKind::Date,
+            FormatKind::MonthDay,
             FormatKind::YearMonth,
             FormatKind::Number,
             FormatKind::Calc,

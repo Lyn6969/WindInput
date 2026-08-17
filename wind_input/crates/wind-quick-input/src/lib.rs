@@ -134,9 +134,14 @@ pub const MEMBER_REPEAT: &str = "quick_input.repeat";
 
 /// 旧值 `quick_input` 的展开序，同时是内置「快捷」融合的默认来源序。
 ///
-/// calc 在 date 之前：二者的输入形态互斥（表达式必含二元运算符，日期只有数字与点），
-/// 谁在前都不会互相遮蔽，但计算结果作首选是明确诉求，故把 calc 排在最前。
-pub const LEGACY_EXPANSION: &[&str] = &[MEMBER_CALC, MEMBER_DATE, MEMBER_NUMBER, MEMBER_REPEAT];
+/// calc 在最前：它与 date 的输入形态互斥（表达式必含二元运算符，日期只有数字与点），
+/// 与 number 则**刻意共存**（`123*4` 先求值再转金额），而计算结果作首选是明确诉求。
+///
+/// ★ number 在 date **之前**：只有一个小数点时（`12.25` / `2026.2`）数字与日期是真歧义，
+/// 而 `12.25` 作金额远比作月日常见。想要日期的人多打一个点即可——`12.25.` 会把数字整组
+/// 隔离掉（见 [`has_second_dot`]），日期自然提前。用「第二个点」表达「我要日期」比让
+/// 每次打金额都翻页更划算，且两个方向都有确定出口，不靠猜。
+pub const LEGACY_EXPANSION: &[&str] = &[MEMBER_CALC, MEMBER_NUMBER, MEMBER_DATE, MEMBER_REPEAT];
 
 /// 是否为快捷输入家族的内置成员 id（含 `quick_input.repeat` 与旧值 `quick_input`）。
 /// 用于把它们从「真实方案成员」中排除——它们没有对应的 `.schema.toml`。
@@ -230,7 +235,12 @@ pub fn generate_adjusted(
 /// 便捷入口，主要供测试与不读配置的调用方使用；协调器按 `members` 逐个调 [`generate`]。
 pub fn generate_quick_input_candidates(buffer: &str, decimal_places: i32) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for src in [QuickSource::Calc, QuickSource::Date, QuickSource::Number] {
+    // 序取自 LEGACY_EXPANSION 而不是另写一份字面量：那是出厂来源序的单一真相源，
+    // 两处各写一遍的话，调整来源优先级时这个便捷入口会静默落后（`repeat` 无来源，被滤掉）。
+    for src in LEGACY_EXPANSION
+        .iter()
+        .filter_map(|m| QuickSource::from_member(m))
+    {
         for c in generate(src, buffer, decimal_places) {
             if !c.is_empty() && !out.contains(&c) {
                 out.push(c);
@@ -340,30 +350,38 @@ pub fn small_int_to_chinese(n: u32) -> String {
     }
 }
 
-/// 完整日期（y.m.d 或 m.d，后者补当前年）。
+/// 完整日期（`y.m.d`）或月日（`m.d`，年补当前年）。
+///
+/// ★ 两者**分派到不同的格式类别**：用户只打两段时想要的多半是「12月25日」这种不带年的
+/// 短写法，而三段输入里的年份是他自己打的。同一套 `date` 条目伺候两种形态，就只能二选一
+/// ——要么两段输入被强行补年（改造前的行为），要么三段输入冒出不带年的候选。
+/// 变量集两类相同（月日的年 = 当前年），差别只在出厂条目与用户调整各自记账。
 fn render_full_date(
     input: &str,
     table: &FormatTable,
     adjust: &FormatAdjustMap,
     eval: Option<ExprEval>,
 ) -> Vec<Rendered> {
-    let (mut year, month, day) = match parse_date_parts(input) {
+    let (year, month, day) = match parse_date_parts(input) {
         Some(v) => v,
         None => return Vec::new(),
     };
-    if year == 0 {
-        year = chrono::Local::now().year();
-    }
-    render(
-        table,
-        adjust,
-        &QuickValues::Date {
+    // year == 0 是 `parse_date_parts` 对「只打了两段」的标记，同时也隐含了
+    // 「首段是合法月份」——`2026.2` 在那里就已被拒（月份越界），落到年月路径去。
+    let values = if year == 0 {
+        QuickValues::MonthDay {
+            y: chrono::Local::now().year(),
+            m: month,
+            d: day,
+        }
+    } else {
+        QuickValues::Date {
             y: year,
             m: month,
             d: day,
-        },
-        eval,
-    )
+        }
+    };
+    render(table, adjust, &values, eval)
 }
 
 /// 年月表达式（首段>31，第二段 1-12）。
@@ -675,6 +693,22 @@ fn is_decimal_number(s: &str) -> bool {
     true
 }
 
+/// 原始缓冲里是否已经出现**第二个**小数点。
+///
+/// [`trim_pending_tail`] 抹掉尾点是为了让 `123.`（小数位还没打）仍出「壹佰贰拾叁元整」，
+/// 但它连带抹掉了「用户已经打下第二个点」这一信号：`2026.2.` 被裁成合法小数 `2026.2`，
+/// 于是打日期打到第三段时冒出一屏金额读法。数字只容一个小数点，第二个点一出现就
+/// 不再可能是数字，故这道判据必须看**裁剪前**的串。
+///
+/// ★ 判据只能是点的**个数**，不能是「首段像不像年份」：`5000.5`（伍仟元伍角整）与
+/// `2000.5`（贰仟元伍角整）和年月形态完全同构，按首段范围砍会静默吃掉常见金额——
+/// 多几条候选是可见噪音，金额消失是不可见失败，两侧代价不对称。
+///
+/// 算式形态不受影响（`1.5*2.5` 走求值那条路，不经这里）。
+fn has_second_dot(buffer: &str) -> bool {
+    buffer.matches('.').count() > 1
+}
+
 /// "123.45" → ("123","45")，"123" → ("123","")
 fn split_decimal(s: &str) -> (&str, &str) {
     match s.find('.') {
@@ -864,7 +898,7 @@ fn format_thousands(int_part: &str, dec_part: &str) -> String {
 /// （`123*4` 也能出「肆佰玖拾贰元整」）。负数结果无金额读法，返回 None。
 fn number_subject(buffer: &str, decimal_places: i32) -> Option<String> {
     let s = trim_pending_tail(buffer);
-    if is_decimal_number(s) {
+    if is_decimal_number(s) && !has_second_dot(buffer) {
         return Some(s.to_string());
     }
     if !has_binary_operator(s) || !is_expr_charset(s) {
@@ -1194,6 +1228,33 @@ mod tests {
     }
 
     #[test]
+    fn test_number_rejected_after_second_dot() {
+        // ★ 打日期到第三段（`2026.2.`）时不该再出金额：尾点被 `trim_pending_tail` 裁掉后
+        // 剩下的 `2026.2` 是合法小数，此前于是在这一步冒出一屏金额读法
+        // （年月 4 条 + 数字 5 条），而用户显然正在打 `2026.2.3`。
+        assert!(
+            generate_number_candidates("2026.2.", 6).is_empty(),
+            "实际: {:?}",
+            generate_number_candidates("2026.2.", 6)
+        );
+        assert!(generate_number_candidates("12.25.", 6).is_empty());
+        // ★ 反向对照：判据只能是「点的个数」，不能是「首段像不像年份」——
+        // `5000.5`/`2026.2` 与年月形态同构，按首段砍会砍掉常见金额。
+        assert_eq!(generate_number_candidates("5000.5", 6)[0], "伍仟元伍角整");
+        assert_eq!(
+            generate_number_candidates("2026.2", 6)[0],
+            "贰仟零贰拾陆元贰角整"
+        );
+        // 单个尾点仍是「小数位还没打」，与无尾点同解（不能连这条一起收掉）
+        assert_eq!(
+            generate_number_candidates("123.", 6),
+            generate_number_candidates("123", 6)
+        );
+        // 日期一侧不受影响：中途照常给年月候选
+        assert_eq!(generate_date_candidates("2026.2.").len(), 4);
+    }
+
+    #[test]
     fn test_number_from_calc_result() {
         // 算完顺手要金额：表达式先求值再转
         let c = generate_number_candidates("123*4", 6);
@@ -1255,10 +1316,43 @@ mod tests {
 
     #[test]
     fn test_date_and_number_coexist() {
-        // "12.25" 既是日期也是数字：日期在前（number 排在 LEGACY_EXPANSION 之后）
+        // ★ "12.25" 既是金额也是月日，一个点是真歧义：出厂让**数字在前**
+        // （`12.25` 作金额比作月日常见），日期紧随其后。
         let c = generate_quick_input_candidates("12.25", 6);
+        assert_eq!(c[0], "壹拾贰元贰角伍分");
+        assert!(c.contains(&"12月25日".to_string()), "实际: {:?}", c);
+        // 想要日期就多打一个点：数字整组被隔离，日期独占候选面且首选是短月日
+        let d = generate_quick_input_candidates("12.25.", 6);
+        assert_eq!(d[0], "12月25日");
+        assert!(
+            !d.iter().any(|s| s.contains('元')),
+            "第二个点应隔离数字，实际: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn test_month_day_forms_prefer_short_writing() {
+        // 只打两段：不带年的短写法在前，补年的两条留作次选（用户没打年份，首选不替他补）
+        let c = generate_date_candidates("12.25");
         let year = chrono::Local::now().year();
-        assert_eq!(c[0], format!("{}年12月25日", year));
-        assert!(c.contains(&"壹拾贰元贰角伍分".to_string()), "实际: {:?}", c);
+        assert_eq!(
+            c[..4],
+            ["12月25日", "十二月二十五日", "12-25", "12/25"],
+            "实际: {:?}",
+            c
+        );
+        assert!(c.contains(&format!("{}年12月25日", year)), "实际: {:?}", c);
+        assert!(c.contains(&format!("{}-12-25", year)), "实际: {:?}", c);
+        // 三段输入不受影响：年份是自己打的，仍走 date 类且首选带年
+        assert_eq!(generate_date_candidates("2025.12.25")[0], "2025年12月25日");
+        // 月日类不产出 date 类那两条长写法（`20251225` / `2025/12/25`）。
+        // 期望值按当前年拼出——写死 "20261225" 的话跨年后这条断言恒真，形同没写。
+        assert!(
+            !c.iter()
+                .any(|s| s == &format!("{}1225", year) || s == &format!("{}/12/25", year)),
+            "实际: {:?}",
+            c
+        );
     }
 }

@@ -20,10 +20,31 @@ use crate::{
 /// `{month()}` 与 `$M` 若能取到不同的值，用户就没法在两种写法间迁移。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuickValues {
-    Date { y: i32, m: u32, d: u32 },
-    YearMonth { y: i32, m: u32 },
-    Number { subject: String },
-    Calc { expr: String, result: String },
+    Date {
+        y: i32,
+        m: u32,
+        d: u32,
+    },
+    /// 只打了月日（`12.25`），`y` 是代码补的当前年。
+    ///
+    /// 与 [`Self::Date`] 同构且共用 [`date_var`]——差别不在取值，而在**渲染哪一组条目**
+    /// （见 [`FormatKind::MonthDay`]）。合成一个变体就没法让两种输入形态各有出厂格式集。
+    MonthDay {
+        y: i32,
+        m: u32,
+        d: u32,
+    },
+    YearMonth {
+        y: i32,
+        m: u32,
+    },
+    Number {
+        subject: String,
+    },
+    Calc {
+        expr: String,
+        result: String,
+    },
 }
 
 impl QuickValues {
@@ -32,7 +53,7 @@ impl QuickValues {
     /// 返回 `None` = 本类不支持该变量（与 [`FormatKind::supports_var`] 一一对应）。
     pub fn get(&self, name: &str) -> Option<String> {
         match self {
-            Self::Date { y, m, d } => date_var(name, *y, *m, *d),
+            Self::Date { y, m, d } | Self::MonthDay { y, m, d } => date_var(name, *y, *m, *d),
             Self::YearMonth { y, m } => year_month_var(name, *y, *m),
             Self::Number { subject } => number_var(name, subject),
             Self::Calc { expr, result } => calc_var(name, expr, result),
@@ -43,6 +64,7 @@ impl QuickValues {
     pub fn kind(&self) -> FormatKind {
         match self {
             Self::Date { .. } => FormatKind::Date,
+            Self::MonthDay { .. } => FormatKind::MonthDay,
             Self::YearMonth { .. } => FormatKind::YearMonth,
             Self::Number { .. } => FormatKind::Number,
             Self::Calc { .. } => FormatKind::Calc,
@@ -50,7 +72,8 @@ impl QuickValues {
     }
 }
 
-/// 年份三态 + 中文年。`date` 与 `year_month` 共用。
+/// 年份三态 + 中文年。`date` / `month_day` / `year_month` 共用
+/// （`month_day` 的年是代码补的当前年，取值路径与另两类无差别）。
 fn year_var(name: &str, y: i32) -> Option<String> {
     Some(match name {
         // 原样：改造前 `format!("{}年", year)` 的等价物
@@ -64,7 +87,9 @@ fn year_var(name: &str, y: i32) -> Option<String> {
     })
 }
 
-/// `kind = "date"`：年 + 月 + 日（含农历）。
+/// `kind = "date"` 与 `kind = "month_day"`：年 + 月 + 日（含农历）。
+///
+/// 两类共用一份实现——它们的差别在渲染哪组条目，不在取值。
 pub(crate) fn date_var(name: &str, y: i32, m: u32, d: u32) -> Option<String> {
     if let Some(v) = year_var(name, y) {
         return Some(v);
@@ -162,6 +187,9 @@ mod tests {
                 // 退化成 None」这类回归从这里溜过去（由
                 // `festival_is_empty_on_ordinary_days` 正面覆盖）。
                 (FormatKind::Date, date_var(name, 2026, 6, 14).is_some()),
+                // 月日与完整日期共用 date_var，白名单也必须同口径——只给 Date 放行
+                // 而漏了 MonthDay，`12.25` 的农历/年份条目会在渲染期整条静默作废。
+                (FormatKind::MonthDay, date_var(name, 2026, 6, 14).is_some()),
                 (
                     FormatKind::YearMonth,
                     year_month_var(name, 2026, 6).is_some(),

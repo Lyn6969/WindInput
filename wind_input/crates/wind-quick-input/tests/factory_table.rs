@@ -81,6 +81,11 @@ fn builtin_output_equals_pre_refactor_hardcoding() {
         generate(QuickSource::Date, "2025.6", 6),
         vec!["2025年6月", "二〇二五年六月", "2025-06", "2025/06"]
     );
+    // ⚠️ 两段日期（`12.25`）**不在这道闸门里**：它已分出 `month_day` 类，首选由
+    // 「替用户补年的完整日期」改为不带年的 `12月25日`，是**有意的行为变更**。
+    // 把新值抄进这里会让闸门从「公历行为永不变」退化成「当前实现等于当前实现」
+    // ——与农历两条同一条纪律。正面覆盖见 lib.rs 的
+    // `test_month_day_forms_prefer_short_writing`。
     // 整数：金额 → 中文小写 → 中文大写 → 逐位 → 千分位
     assert_eq!(
         generate(QuickSource::Number, "123", 6),
