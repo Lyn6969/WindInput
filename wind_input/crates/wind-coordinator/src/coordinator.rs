@@ -5662,6 +5662,7 @@ mod caret_compat_tests {
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::GUI_CARET,
             bundle_id: String::new(),
+            window_class: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -5698,6 +5699,7 @@ mod caret_compat_tests {
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
+            window_class: String::new(),
         });
         assert!(
             !c.composition_start.lock().unwrap().2,
@@ -5726,6 +5728,7 @@ mod caret_compat_tests {
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
+            window_class: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -5766,6 +5769,7 @@ mod caret_compat_tests {
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
+            window_class: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -5948,6 +5952,7 @@ mod caret_compat_tests {
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
+            window_class: String::new(),
         });
         assert!(
             !c.caret_cache_verified
@@ -6523,11 +6528,11 @@ mod initial_mode_tests {
             .unwrap()
             .insert("game.exe".to_string(), false);
         // 当前全局是中文，焦点到 game.exe → 同步切英文并回传。
-        let (chinese, _) = c.get_current_mode(token(100));
+        let (chinese, _) = c.get_current_mode(token(100), "");
         assert!(!chinese);
         assert!(!c.state.lock().unwrap().chinese_mode);
         // 未缓存的 pid（首次聚焦）：保持现状不误切。
-        let (chinese, _) = c.get_current_mode(token(999));
+        let (chinese, _) = c.get_current_mode(token(999), "");
         assert!(!chinese, "未知进程应回传当前状态");
     }
 
@@ -6536,7 +6541,7 @@ mod initial_mode_tests {
     fn get_current_mode_global_scope_passthrough() {
         let c = coord_with(|_| {});
         c.state.lock().unwrap().chinese_mode = false;
-        let (chinese, _) = c.get_current_mode(token(100));
+        let (chinese, _) = c.get_current_mode(token(100), "");
         assert!(!chinese);
     }
 
@@ -6635,13 +6640,13 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert(100, "everything.exe".to_string());
-        let (chinese, _) = c.get_current_mode(token(100));
+        let (chinese, _) = c.get_current_mode(token(100), "");
         assert!(!chinese, "跨进程切入规则应用 → 同步段即回传英文");
 
         // 重型段已把 active_compat.pid 更新为 100；用户随后手切回中文。
         c.active_compat.lock().unwrap().pid = 100;
         c.state.lock().unwrap().chinese_mode = true;
-        let (chinese, _) = c.get_current_mode(token(100));
+        let (chinese, _) = c.get_current_mode(token(100), "");
         assert!(
             chinese,
             "同应用内跳转不得把手切的中文拉回规则的英文——规则是初始值不是锁定"
@@ -7135,6 +7140,7 @@ mod focus_ownership_tests {
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
+            window_class: String::new(),
         });
         assert!(!c.state.lock().unwrap().menu_open);
     }

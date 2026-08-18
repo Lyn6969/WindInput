@@ -80,6 +80,10 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
                 // ——那边没有 TSF，不适用 CARET_SRC_* 的分级。
                 caret_source: fg.caret_source,
                 bundle_id: wind_ipc::codec::decode_focus_gained_bundle_id(&payload).to_string(),
+                // macOS `.app` 目前不发窗口类段（那边没有「一个进程多种壳窗口」的等价
+                // 问题）；解一次是为了两平台走同一条路径，将来 `.app` 补发即刻生效。
+                window_class: wind_ipc::codec::decode_focus_gained_window_class(&payload)
+                    .to_string(),
             });
         }
     }

@@ -105,21 +105,43 @@ pub fn decode_ext(payload: &[u8]) -> Option<(&str, &[u8])> {
 ///
 /// Windows DLL 不发该段；段缺失 / 长度越界 / 非法 UTF-8 一律返回空串——「取不到宿主名」
 /// 与「宿主名为空」在下游是同一语义（跳过按应用逻辑），不必区分。
-pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
-    const OFF: usize = FocusGainedPayload::BUNDLE_ID_OFFSET;
-    if payload.len() < OFF + 4 {
-        return "";
+/// 读取 `off` 处的一个「`u32` 长度 + UTF-8 内容」变长段。
+///
+/// 返回 `(内容, 下一段起始偏移)`；段残缺（长度域不全、内容不足、非法 UTF-8）一律
+/// 返回空串。**残缺不是错误**——变长段是纯追加的可选信息，旧 DLL 压根不发。
+/// 第二个返回值为 `None` 表示「本段都没走完，后面不可能有东西」，用于串联下一段。
+fn read_len_prefixed(payload: &[u8], off: usize) -> (&str, Option<usize>) {
+    if payload.len() < off + 4 {
+        return ("", None);
     }
     let n = u32::from_le_bytes([
-        payload[OFF],
-        payload[OFF + 1],
-        payload[OFF + 2],
-        payload[OFF + 3],
+        payload[off],
+        payload[off + 1],
+        payload[off + 2],
+        payload[off + 3],
     ]) as usize;
-    let start = OFF + 4;
+    let start = off + 4;
     match payload.get(start..start + n) {
-        Some(b) => std::str::from_utf8(b).unwrap_or(""),
-        None => "",
+        Some(b) => (std::str::from_utf8(b).unwrap_or(""), Some(start + n)),
+        None => ("", None),
+    }
+}
+
+pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
+    read_len_prefixed(payload, FocusGainedPayload::BUNDLE_ID_OFFSET).0
+}
+
+/// 焦点所在**顶层窗口**的类名；旧 DLL / 段缺失时返回空串。
+///
+/// ⚠ 必须**顺序走过 bundleId 段**再读，不能用固定偏移：bundleId 变长，macOS 上非空。
+/// Windows DLL 发 `bundleIdLen=0` 占位，故两平台共用这一条走法。
+///
+/// 空串的语义是「不知道焦点在哪」而非「窗口不在清单里」——消费端
+/// (`AppCompat::initial_mode_applies_to_window`) 据此保持现状，不按 per-app 规则重算。
+pub fn decode_focus_gained_window_class(payload: &[u8]) -> &str {
+    match read_len_prefixed(payload, FocusGainedPayload::BUNDLE_ID_OFFSET) {
+        (_, Some(next)) => read_len_prefixed(payload, next).0,
+        (_, None) => "",
     }
 }
 
@@ -897,6 +919,56 @@ mod tests {
         q.extend_from_slice(&2u32.to_le_bytes());
         q.extend_from_slice(&[0xFF, 0xFE]);
         assert_eq!(decode_focus_gained_bundle_id(&q), "");
+    }
+
+    /// 两个变长段的组合：`[39][bundleIdLen][bundleId][classLen][class]`。
+    fn focus_payload_with_sections(bundle: &str, class: &str) -> Vec<u8> {
+        let mut p = vec![0u8; 39];
+        p.extend_from_slice(&(bundle.len() as u32).to_le_bytes());
+        p.extend_from_slice(bundle.as_bytes());
+        p.extend_from_slice(&(class.len() as u32).to_le_bytes());
+        p.extend_from_slice(class.as_bytes());
+        p
+    }
+
+    #[test]
+    fn focus_gained_window_class_roundtrip_on_both_platform_shapes() {
+        // Windows 形态：bundleId 空占位 + 类名。
+        let win = focus_payload_with_sections("", "Shell_TrayWnd");
+        assert_eq!(decode_focus_gained_window_class(&win), "Shell_TrayWnd");
+        assert_eq!(decode_focus_gained_bundle_id(&win), "");
+
+        // macOS 形态：两段都非空。★ 这条钉住「类名段必须顺序走过 bundleId」——
+        // 若哪天有人改回固定偏移，非空 bundleId 会让它读到垃圾，而定长字段全对、
+        // 编译与其它测试都不会有任何信号。
+        let mac = focus_payload_with_sections("com.apple.TextEdit", "NSWindow");
+        assert_eq!(decode_focus_gained_bundle_id(&mac), "com.apple.TextEdit");
+        assert_eq!(decode_focus_gained_window_class(&mac), "NSWindow");
+
+        // 定长段不受影响
+        assert!(decode_focus_gained(&win).is_ok());
+        assert!(decode_focus_gained(&mac).is_ok());
+    }
+
+    #[test]
+    fn focus_gained_window_class_absent_or_malformed_is_empty() {
+        // 旧 DLL 的 39 字节包：两段都没有。
+        assert_eq!(decode_focus_gained_window_class(&[0u8; 39]), "");
+        // 只有 bundleId 段（本次改动之前的 macOS 包）。
+        assert_eq!(
+            decode_focus_gained_window_class(&focus_payload_with_bundle("com.apple.TextEdit")),
+            ""
+        );
+        // bundleId 段自身越界 ⇒ 后面不可能有东西，不得 panic。
+        let mut p = vec![0u8; 39];
+        p.extend_from_slice(&999u32.to_le_bytes());
+        p.extend_from_slice(b"abc");
+        assert_eq!(decode_focus_gained_window_class(&p), "");
+        // 类名段长度越界。
+        let mut q = focus_payload_with_sections("", "");
+        q.truncate(q.len() - 4);
+        q.extend_from_slice(&999u32.to_le_bytes());
+        assert_eq!(decode_focus_gained_window_class(&q), "");
     }
 
     #[test]

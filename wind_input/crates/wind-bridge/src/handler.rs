@@ -218,6 +218,15 @@ pub struct FocusData {
     /// `.app` 告知。服务端小写后填进 `pid_names` 缓存，compat.toml 规则匹配与 per-app
     /// 中英记忆都从那里取名——两平台在缓存之后的路径完全一致。
     pub bundle_id: String,
+    /// 焦点所在**顶层窗口**的类名；拿不到时为空串（旧 DLL、macOS 暂未上报）。
+    ///
+    /// 存在的理由：per-app 规则的身份是进程映像名，而 `explorer.exe` 一个名字同时承载
+    /// 桌面与任务栏 / Alt+Tab / 溢出区两类语义相反的焦点。只有窗口类能把它们分开，
+    /// 见 `AppCompat::initial_mode_applies_to_window`。
+    ///
+    /// ⚠ 空串的语义是「不知道焦点在哪」。消费端据此**保持现状**（不重算初始模式）；
+    /// 未配作用域的进程不受影响，故旧 DLL / macOS 上一切照旧。
+    pub window_class: String,
 }
 
 /// 光标位置数据
@@ -397,7 +406,14 @@ pub trait MessageHandler: Send + Sync {
     /// `client_token`（PID<<32|instance）标识焦点进程：state_scope="app" 时按进程切换记忆状态。
     /// 必须极轻量（仅锁+内存查询），不得有任何阻塞/跨进程调用——DLL 正同步阻塞等本值。
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。
-    fn get_current_mode(&self, _client_token: u64) -> (bool, bool) {
+    ///
+    /// `window_class`：焦点顶层窗口类，语义同 [`FocusData::window_class`]，用于跳过 shell
+    /// 过渡窗口的初始模式套用。
+    ///
+    /// ⚠ **这是「按应用套用初始模式」的第二个落点**，与重型段 `handle_focus_gained` 各算
+    /// 各的（本方法早于它执行，DLL 正阻塞等回传值）。两处的门控条件必须同步改——只改一处
+    /// 时症状是「日志显示跳过了、图标照样切」，因为真正把状态改掉的是先跑的这一个。
+    fn get_current_mode(&self, _client_token: u64, _window_class: &str) -> (bool, bool) {
         (true, false)
     }
 

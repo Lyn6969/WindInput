@@ -3,6 +3,8 @@
 #include <sstream>
 #include <cstdarg>
 #include <cstring>
+#include <vector>
+#include <string>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -822,7 +824,8 @@ BOOL CIPCClient::SendCompositionTerminated()
 }
 
 BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64 inputScopeMask,
-                                  bool disabled, uint8_t reason, int caretSource)
+                                  bool disabled, uint8_t reason, int caretSource,
+                                  const wchar_t* windowClass)
 {
     if (!_ShouldAttemptOperation())
     {
@@ -857,7 +860,31 @@ BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64
     // 本调用在 OnSetFocus 内同步拿到模式并立即写入 _bChineseMode/_bFullWidth，使首个
     // OnTestKeyDown 之前模式必然就绪，消除"切过来首键上屏英文"。
     // 重型 HandleFocusGained 仍由 Go 在写响应之后异步执行，宿主 UI 线程不为重活阻塞。
-    if (!_SendBinaryMessage(CMD_FOCUS_GAINED, &payload, sizeof(payload), false /* sync */))
+    // 拼上两个变长段：[定长 39][bundleIdLen=0][windowClassLen][windowClass]。
+    // bundleIdLen 的 0 是**必须发的占位**，不是冗余：服务端按顺序走段，少了它窗口类段
+    // 的偏移就与 macOS 不一致，而逐段兼容的解码不会报错、只会解出垃圾。
+    std::vector<uint8_t> frame(sizeof(payload));
+    memcpy(frame.data(), &payload, sizeof(payload));
+    const uint32_t kNoBundleId = 0;
+    frame.insert(frame.end(), (const uint8_t*)&kNoBundleId,
+                 (const uint8_t*)&kNoBundleId + sizeof(kNoBundleId));
+
+    std::string classUtf8;
+    if (windowClass != nullptr && windowClass[0] != L'\0')
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, windowClass, -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) // n 含结尾 NUL
+        {
+            classUtf8.resize((size_t)(n - 1));
+            WideCharToMultiByte(CP_UTF8, 0, windowClass, -1, classUtf8.data(), n, nullptr, nullptr);
+        }
+    }
+    const uint32_t classLen = (uint32_t)classUtf8.size();
+    frame.insert(frame.end(), (const uint8_t*)&classLen,
+                 (const uint8_t*)&classLen + sizeof(classLen));
+    frame.insert(frame.end(), classUtf8.begin(), classUtf8.end());
+
+    if (!_SendBinaryMessage(CMD_FOCUS_GAINED, frame.data(), (uint32_t)frame.size(), false /* sync */))
     {
         return FALSE;
     }

@@ -385,8 +385,11 @@ fn handle_client(
                 disabled: fg.disabled != 0,
                 reason: fg.reason,
                 caret_source: fg.caret_source,
-                // Windows DLL 不发 bundleID 段（那边由服务进程 OpenProcess 反查进程名）。
+                // Windows DLL 不发 bundleID 段（那边由服务进程 OpenProcess 反查进程名），
+                // 但为了让窗口类段能按同一条线性走法解析，它会发一个 bundleIdLen=0 占位。
                 bundle_id: String::new(),
+                window_class: wind_ipc::codec::decode_focus_gained_window_class(payload)
+                    .to_string(),
             };
             handler.handle_focus_gained(&data);
         }
@@ -533,7 +536,12 @@ pub(crate) fn dispatch_command(
                 let token = decode_focus_gained(payload)
                     .map(|fg| fg.client_token)
                     .unwrap_or(0);
-                let (chinese_mode, full_width) = handler.get_current_mode(token);
+                // 窗口类同样要给同步路径：按应用套用初始模式在这里也算一次，且**早于**
+                // 重型段 handle_focus_gained。只给后者会让门控看起来生效、状态却已被改。
+                let (chinese_mode, full_width) = handler.get_current_mode(
+                    token,
+                    wind_ipc::codec::decode_focus_gained_window_class(payload),
+                );
                 Some(encode_mode_push(chinese_mode, full_width))
             }
         }

@@ -1827,7 +1827,7 @@ impl MessageHandler for Coordinator {
         // 焦点。真正离开时随后的 DocChanged / Thread 会收口。
     }
 
-    fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
+    fn get_current_mode(&self, client_token: u64, _window_class: &str) -> (bool, bool) {
         // FocusGained 同步路径回传 ModePush：DLL 正同步阻塞等本值，仅允许锁+HashMap 查询，
         // 严禁 OpenProcess 等跨进程调用。
         // 命中规则表 / 记忆表 → 先切到目标状态再回传，消除首键竞态；都未命中（进程首次聚焦

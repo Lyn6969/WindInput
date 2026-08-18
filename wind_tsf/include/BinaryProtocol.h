@@ -632,6 +632,19 @@ struct FocusGainedPayload
     // 兼容：尾部追加，既有字段偏移全不变。服务端按长度分支——<39 字节落 UNKNOWN（旧 DLL），
     // ≥39 读本字段。故新旧两侧可任意组合。
     uint8_t      caretSource;    // 1 byte: CARET_SRC_*
+    //
+    // ⚠ 本结构之后还有**两个前后相接的变长段**（不在结构体里，由 SendFocusGained 手工拼接）：
+    //
+    //   [本结构 39 字节][bundleIdLen:u32][bundleId][windowClassLen:u32][windowClass]
+    //
+    //   ① bundleId    macOS `.app` 专属。**Windows 发 len=0 占位**——不是冗余，是让两个
+    //                 平台共用同一条线性走法，否则窗口类段的偏移会因平台而异。
+    //   ② windowClass 焦点所在顶层窗口的类名（UTF-8）。服务端据此把 explorer.exe 的过渡型
+    //                 窗口（任务栏 / Alt+Tab）与停留型窗口（桌面 / 文件管理器）分开——
+    //                 二者进程名相同，仅凭进程名无法区分。
+    //
+    // ⚠ 再加新段一律接在最后，并同步 Rust 侧 `FocusGainedPayload` 的那张布局图。
+    // 两处各自往尾部追加而互不知情时，字节偏移会错位，而逐段兼容的解码**不报错、只解出垃圾**。
 };
 static_assert(sizeof(FocusGainedPayload) == 39, "FocusGainedPayload must be 39 bytes");
 

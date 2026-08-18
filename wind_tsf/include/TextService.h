@@ -281,6 +281,12 @@ public:
     // 采集本身要查三次窗口类名 + band，只有排查时才值得付这个开销。
     // docMgrChanged 由调用方给出（只有 OnSetFocus 知道自己是不是换了文档）。
     void SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMgrChanged);
+
+    // 焦点窗口解析（TSF view → GUI thread，**不含**前台窗口兜底）。诊断快照与
+    // focus_gained 的窗口类上报共用它——同一判据写两处必漂移。详见实现处注释。
+    HWND _ResolveFocusWindow(ITfDocumentMgr* pDocMgr, uint8_t* pSrcOut, uint64_t* pCtxIdOut);
+    // 焦点所在顶层窗口的类名，随 focus_gained 上报，供服务端区分壳的过渡型 / 停留型窗口。
+    std::wstring _QueryFocusRootWindowClass(ITfDocumentMgr* pDocMgr);
     ULONGLONG GetFocusSessionId() const { return _focusSessionId; }
     // 记录 CapsLock 按键活动时刻（物理按键或服务端 cancel_on_mode_switch 的注入）。
     // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；

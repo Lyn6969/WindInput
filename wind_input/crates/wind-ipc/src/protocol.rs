@@ -587,15 +587,27 @@ pub struct FocusGainedPayload {
     ///
     /// 旧 DLL 只发 38 字节，落 [`caret_source::UNKNOWN`]。
     pub caret_source: i32,
-    // ⚠ 第 39 字节起还有一段 darwin 专属的 `bundleIdLen:u32 + bundleId`（宿主 app 的
-    // bundle id，服务端当作「进程名」用于 compat.toml 匹配与 per-app 记忆）。它是变长的，
-    // 放进本结构会让 `Copy` 失效并波及全部既有调用点，故单独由
-    // [`crate::codec::decode_focus_gained_bundle_id`] 解析。Windows DLL 不发该段。
+    // ⚠ 第 39 字节起是**两个前后相接的变长段**，都不在本结构里（放进来会让 `Copy` 失效
+    // 并波及全部既有调用点），各由 `crate::codec` 的解码函数单独取：
+    //
+    //   [0..39 定长][bundleIdLen:u32][bundleId][windowClassLen:u32][windowClass]
+    //
+    //   ① bundleId    darwin 专属：宿主 app 的 bundle id，服务端当「进程名」用于
+    //                 compat.toml 匹配与 per-app 记忆。见 `decode_focus_gained_bundle_id`。
+    //   ② windowClass 焦点所在**顶层窗口**的类名（UTF-8）。服务端据此把 shell 的过渡型
+    //                 窗口（任务栏 / Alt+Tab 切换器）与停留型窗口（桌面 / 文件管理器）
+    //                 分开——它们同属 explorer.exe，仅凭进程名无法区分。
+    //                 见 `decode_focus_gained_window_class`。
+    //
+    // ⚠ **窗口类段必须按顺序走，不能用固定偏移**：bundleId 是变长的，macOS 上非空。
+    // Windows DLL 因此要发 `bundleIdLen=0` 占位，让两个平台共用同一条线性走法。
+    // ⚠ **再追加新段一律接在最后**，且要在这张图上补一行——两个人同时往尾部加字段而
+    // 各自不知情时，字节偏移会互相错位，而逐段 `>=` 兼容的解码**不会报错，只会解出垃圾**。
 }
 
 impl FocusGainedPayload {
     pub const SIZE: usize = 39;
-    /// darwin bundleID 段的起始偏移（`bundleIdLen:u32` 的首字节）。
+    /// 第一个变长段（`bundleIdLen:u32` 的首字节）的偏移。其后各段按顺序紧接。
     pub const BUNDLE_ID_OFFSET: usize = 39;
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {

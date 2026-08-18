@@ -2358,12 +2358,24 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             // 密码框（context 级）不走这个字段，它已折进 mask 的 IS_PASSWORD 位——此前这里
             // 传 _focusIsPassword，让 core 把「密码框」误读成「键已放行」，抑制被自我否决。
             uint8_t inputReason = ComputeInputReason(_bKeyboardDisabled != FALSE, inputScopeMask);
+            // 焦点顶层窗口类：服务端据此区分 explorer.exe 的过渡型窗口（任务栏 /
+            // Alt+Tab 切换器，用户点它是为了去别处）与停留型窗口（桌面 / 文件管理器）。
+            // 二者进程名相同，per-app 规则仅凭进程名分不开。
+            // 成本＝GetTop + GetActiveView + GetWnd + GetAncestor + GetClassNameW，
+            // 全是进程内调用，与紧随其后的同步 IPC 往返不在一个量级；且同分支上方已经
+            // 有一次 _DocMgrHasEditableContext（GetTop + GetStatus），量级相当。
+            const std::wstring focusRootClass = _QueryFocusRootWindowClass(pDocMgrFocus);
+            // 独立日志行：与同分支的 compat.focus.foreground_host（打的是**前台**窗口类）
+            // 配对，就能在日志里直接比对「焦点顶层窗口」与「前台窗口」是否同一个——
+            // 判据该取哪一个，此前从来没有记录过，只能靠这两行对照。
+            WIND_LOG_DEBUG_FMT(L"compat.focus.rootclass focusSession=%llu class=%ls",
+                               _focusSessionId, focusRootClass.c_str());
             // 单独计时这一段：它是本函数里唯一会阻塞在别的进程上的调用，
             // 需要能和 COM/日志开销分开归因。
             const LONGLONG focusIpcT0 = WindLog::PerfNow();
             const BOOL focusSent = _pIPCClient->SendFocusGained(
                 caretX, caretY, caretHeight, inputScopeMask, _bKeyboardDisabled != FALSE, inputReason,
-                caretSource);
+                caretSource, focusRootClass.c_str());
             focusIpcMs += WindLog::PerfMsSince(focusIpcT0);
             // 排队档的异步回调据此判定"该补发 caret_update"。**必须在这里置位而非发送前**：
             // 内联档的回调早已在上面跑完，那时它读到的是旧值（≠本会话），于是正确地选择"不补发"。
@@ -4230,6 +4242,70 @@ static std::wstring _QueryWindowClass(HWND hwnd)
     return n > 0 ? std::wstring(buf, (size_t)n) : std::wstring();
 }
 
+// ── 焦点窗口：两条通路按可信度依次尝试，并回报**实际用了哪条** ──
+// 不记来源的话，「焦点窗口」在不同宿主下会是语义完全不同的东西，读者无从分辨。
+//
+// ⚠ 刻意**不含** GetForegroundWindow 兜底：那一级在 WebView 类多进程宿主下会返回
+// **别的进程**的窗口（前台窗口在渲染进程、TSF 在另一进程），当「本次焦点在哪个窗口里」
+// 的答案是错的。诊断快照另有它自己的 fg 兜底（那里的语义是「诊断时尽量给个值」，
+// 与本函数的「窗口身份判据」不是同一个问题）。同类教训见 _hasThreadFocus /
+// _isProcessForeground 的拆分。
+//
+// pCtxIdOut 可为 nullptr；非空时顺带回填 top context 的指针值（诊断快照用）。
+HWND CTextService::_ResolveFocusWindow(ITfDocumentMgr* pDocMgr, uint8_t* pSrcOut, uint64_t* pCtxIdOut)
+{
+    if (pSrcOut != nullptr)
+        *pSrcOut = WND_SRC_NONE;
+
+    HWND hwndFocus = nullptr;
+    ITfContext* pContext = nullptr;
+    if (pDocMgr != nullptr && SUCCEEDED(pDocMgr->GetTop(&pContext)) && pContext != nullptr)
+    {
+        if (pCtxIdOut != nullptr)
+            *pCtxIdOut = (uint64_t)(uintptr_t)pContext;
+        ITfContextView* pView = nullptr;
+        if (SUCCEEDED(pContext->GetActiveView(&pView)) && pView != nullptr)
+        {
+            HWND h = nullptr;
+            // 受限宿主（SearchHost 等）这里常返回 S_OK + null，故必须判 h 本身。
+            if (SUCCEEDED(pView->GetWnd(&h)) && h != nullptr)
+            {
+                hwndFocus = h;
+                if (pSrcOut != nullptr)
+                    *pSrcOut = WND_SRC_TSF_VIEW;
+            }
+            pView->Release();
+        }
+        pContext->Release();
+    }
+
+    if (hwndFocus == nullptr)
+    {
+        GUITHREADINFO gti = {};
+        gti.cbSize = sizeof(GUITHREADINFO);
+        if (GetGUIThreadInfo(GetCurrentThreadId(), &gti) && gti.hwndFocus != nullptr)
+        {
+            hwndFocus = gti.hwndFocus;
+            if (pSrcOut != nullptr)
+                *pSrcOut = WND_SRC_GUI_THREAD;
+        }
+    }
+    return hwndFocus;
+}
+
+// 焦点所在**顶层**窗口的类名，随 focus_gained 上报。空串 = 拿不到（服务端回落既有行为）。
+//
+// 取顶层（GA_ROOT）而不是焦点窗口本身：要回答的是「这次焦点落在哪一种壳窗口里」，
+// 而任务栏 / 切换器的身份写在顶层窗口的类名上（Shell_TrayWnd 等），子控件类名五花八门。
+std::wstring CTextService::_QueryFocusRootWindowClass(ITfDocumentMgr* pDocMgr)
+{
+    HWND hwndFocus = _ResolveFocusWindow(pDocMgr, nullptr, nullptr);
+    if (hwndFocus == nullptr)
+        return std::wstring();
+    HWND hwndRoot = GetAncestor(hwndFocus, GA_ROOT);
+    return _QueryWindowClass(hwndRoot != nullptr ? hwndRoot : hwndFocus);
+}
+
 // 采集并上报一次诊断快照。见 TextService.h 的声明注释。
 void CTextService::SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMgrChanged)
 {
@@ -4245,41 +4321,9 @@ void CTextService::SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMg
     head.flags = docMgrChanged ? DIAG_FLAG_DOCMGR_CHANGED : (uint8_t)0;
     head.docMgrId = (uint64_t)(uintptr_t)pDocMgr;
 
-    // ── 焦点窗口：三条通路按可信度依次尝试，并记下**实际用了哪条** ──
-    // 不记来源的话，"焦点窗口"这一格在不同宿主下会是语义完全不同的三种东西
-    // （其中 FOREGROUND 甚至可能不属于本进程），而 HUD 的读者无从分辨。
-    HWND hwndFocus = nullptr;
+    // 焦点窗口解析与 focus_gained 的窗口类上报共用同一个函数，见 _ResolveFocusWindow。
     uint8_t src = WND_SRC_NONE;
-
-    ITfContext* pContext = nullptr;
-    if (pDocMgr != nullptr && SUCCEEDED(pDocMgr->GetTop(&pContext)) && pContext != nullptr)
-    {
-        head.contextId = (uint64_t)(uintptr_t)pContext;
-        ITfContextView* pView = nullptr;
-        if (SUCCEEDED(pContext->GetActiveView(&pView)) && pView != nullptr)
-        {
-            HWND h = nullptr;
-            // 受限宿主（SearchHost 等）这里常返回 S_OK + null，故必须判 h 本身。
-            if (SUCCEEDED(pView->GetWnd(&h)) && h != nullptr)
-            {
-                hwndFocus = h;
-                src = WND_SRC_TSF_VIEW;
-            }
-            pView->Release();
-        }
-        pContext->Release();
-    }
-
-    if (hwndFocus == nullptr)
-    {
-        GUITHREADINFO gti = {};
-        gti.cbSize = sizeof(GUITHREADINFO);
-        if (GetGUIThreadInfo(GetCurrentThreadId(), &gti) && gti.hwndFocus != nullptr)
-        {
-            hwndFocus = gti.hwndFocus;
-            src = WND_SRC_GUI_THREAD;
-        }
-    }
+    HWND hwndFocus = _ResolveFocusWindow(pDocMgr, &src, &head.contextId);
 
     HWND hwndFg = GetForegroundWindow();
     if (hwndFocus == nullptr && hwndFg != nullptr)

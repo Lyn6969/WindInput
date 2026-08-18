@@ -176,9 +176,11 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_host_render_failed(reason))
     }
 
-    fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
+    fn get_current_mode(&self, client_token: u64, window_class: &str) -> (bool, bool) {
         // 未就绪时回中文模式（安全默认）；就绪后委派真实处理器读权威模式。
-        self.with_handler((true, false), |h| h.get_current_mode(client_token))
+        self.with_handler((true, false), |h| {
+            h.get_current_mode(client_token, window_class)
+        })
     }
 
     /// TSF 侧英文模式统计上报（CMD_INPUT_STATS）。必须转发——trait 默认实现是空的，
