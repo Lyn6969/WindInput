@@ -290,7 +290,17 @@ pub const CMD_SHELL_EXEC: u16 = 0x020E;
 pub const CMD_REFRESH_ICON: u16 = 0x0216;
 pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 
-/// 配置同步键名（对齐 C++ BinaryProtocol.h CONFIG_KEY_*）
+/// 配置同步键名（对齐 C++ BinaryProtocol.h CONFIG_KEY_*）。
+///
+/// ⚠ 名为 config，实为**服务端 → DLL 的单向键值推送通道**，承载的不止「配置」：
+/// `CONFIG_KEY_LANGBAR_TOOLTIP` 就是随状态变化的**显示内容**。判断一个东西该不该走
+/// 这里，看的不是「它是不是配置」，而是这两条：
+///   ① 需要**广播**给所有宿主（状态推送是定向的，见 `push_activation_status`）；
+///   ② 变化频率**低于**状态推送（否则每次状态变化都要多发一条）。
+/// 两条都满足才走这里；只满足①不满足②的，应当考虑并进状态推送而不是在这里高频刷。
+///
+/// 沿用 config 这个名字是因为两侧 + C++ 回调链（`SyncConfigCallback`）都已叫它，
+/// 改名要动的地方远多于收益——但语义得在这里写清楚，否则下一个人会按字面意思判断。
 pub const CONFIG_KEY_ENGLISH_PAIRS: &str = "en_pairs";
 /// 配对跳出键（VK 码集合）同步键名。TSF 端英文模式配对跳出直接消费；
 /// 中文模式仅用于「有待跳出配对时」放行转发（真正裁决在协调器）。
@@ -327,9 +337,13 @@ pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
 /// 量，判不出「密码框」「已禁用」这些成因，删掉那些分支后 tooltip 就只能说个大概；
 /// 而这些成因服务端全都有。
 ///
-/// **刻意走 sync_config 而不是并进 activation status push**：后者的 `icon_label` 是
-/// 尾部不定长段（无长度前缀，占满剩余 payload），后面再追加字段就没有边界可解析——
-/// 要么给 label 补长度前缀（改格式、旧 DLL 当场读乱），要么另开通道。这里选后者。
+/// **刻意走 sync_config 而不是并进 activation status push**，决定性理由是**推送范围**：
+/// 那条推送是定向的（`hostRenderAvail` 按事件源 pid 算，广播会污染无关客户端，真机
+/// 踩过 SearchHost 的 Band 重建循环），而 tooltip 必须广播——非事件源的宿主悬停时
+/// 同样要看到最新文案。**所以它即使能塞进去也不该塞，格式修好了也不该迁回去。**
+///
+/// 次要理由：那条消息的 `icon_label` 是尾部不定长段（无长度前缀、占满剩余 payload），
+/// 本来也加不进去，见 `encode_status_update_ex`。
 ///
 /// 变化频率低于状态变化（tooltip 只有几种取值，全半角/标点变化不影响它），
 /// 故服务端只在**文本真的变了**时才推。
@@ -624,8 +638,12 @@ pub struct FocusGainedPayload {
 
 impl FocusGainedPayload {
     pub const SIZE: usize = 39;
-    /// 第一个变长段（`bundleIdLen:u32` 的首字节）的偏移。其后各段按顺序紧接。
-    pub const BUNDLE_ID_OFFSET: usize = 39;
+    /// **变长段区的起点**（第一段是 `bundleIdLen:u32`，其后各段按顺序紧接）。
+    ///
+    /// 刻意不叫 `BUNDLE_ID_OFFSET`：段不止一个了，那个名字会让下一个加段的人以为
+    /// 「从 bundleId 的偏移开始走」是巧合而另找起点，而**所有段都必须从这里线性走过**
+    /// ——中间任何一段变长，后面全部错位。
+    pub const VAR_SECTION_OFFSET: usize = 39;
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         // 向后兼容：至少要有旧 36 字节；disabled/reason/caret_source 缺省 0

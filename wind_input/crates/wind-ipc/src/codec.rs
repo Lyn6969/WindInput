@@ -128,7 +128,7 @@ fn read_len_prefixed(payload: &[u8], off: usize) -> (&str, Option<usize>) {
 }
 
 pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
-    read_len_prefixed(payload, FocusGainedPayload::BUNDLE_ID_OFFSET).0
+    read_len_prefixed(payload, FocusGainedPayload::VAR_SECTION_OFFSET).0
 }
 
 /// 焦点所在**顶层窗口**的类名；旧 DLL / 段缺失时返回空串。
@@ -139,7 +139,7 @@ pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
 /// 空串的语义是「不知道焦点在哪」而非「窗口不在清单里」——消费端
 /// (`AppCompat::initial_mode_applies_to_window`) 据此保持现状，不按 per-app 规则重算。
 pub fn decode_focus_gained_window_class(payload: &[u8]) -> &str {
-    match read_len_prefixed(payload, FocusGainedPayload::BUNDLE_ID_OFFSET) {
+    match read_len_prefixed(payload, FocusGainedPayload::VAR_SECTION_OFFSET) {
         (_, Some(next)) => read_len_prefixed(payload, next).0,
         (_, None) => "",
     }
@@ -526,6 +526,18 @@ pub fn encode_state_push(
 }
 
 /// 状态编码公共逻辑（StatusUpdate / StatePush / ActivationStatusPush 共用）
+///
+/// ⚠ **本消息不能再追加字段**：`icon_label` 是尾部不定长段，没有长度前缀，C++ 侧读的是
+/// 「structuredSize 到 payload 末尾」的全部字节（`IPCClient.cpp` 的 iconLabel 解析）。
+/// 在它后面加任何东西都会被当成标签内容——**不会报错，只会让标签变成一串垃圾**。
+///
+/// 真要加变长字段时，唯一正确的做法是先给 `icon_label` 补一个 `labelLen:u32` 前缀、
+/// 两侧同步改，再往后追加；这是破坏性变更，DLL 与服务端必须同版本发布（开发期混用
+/// 会解出垃圾，靠新旧 DLL 指纹辨认）。**不要为了绕开这一步而把状态塞进别的通道**——
+/// 除非那个字段本来就该走别的通道（如 `CONFIG_KEY_LANGBAR_TOOLTIP`：它需要广播，
+/// 而本消息是定向的，那是设计选择而非妥协）。
+///
+/// 加**布尔**字段则无此限制：`flags` 还有空位，加位不影响布局。
 #[allow(clippy::too_many_arguments)]
 fn encode_status_update_ex(
     command: u16,
