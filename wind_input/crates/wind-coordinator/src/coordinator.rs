@@ -706,6 +706,17 @@ impl InputBlock {
         matches!(self, Self::KeyboardDisabled | Self::Password)
     }
     /// 是否该变淡。**只留给线程级禁用**，理由同上。
+    ///
+    /// 唯一的生产调用点在 `langbar_icon.rs`，而那整个模块是
+    /// `cfg(all(feature = "desktop-ui", windows))`——语言栏图标是 Windows 独有形态，
+    /// macOS 的 IMKit 与 headless/Android 形态都没有对应物。故在别的平台上 lib 单独
+    /// 编译时它确实无人调用：本文件的断言在 `#[cfg(test)]` 里，`--all-targets` 的 lib
+    /// 那一趟看不见它们。
+    ///
+    /// 判据取「调用点的 cfg」而非笼统的 `not(windows)`：关掉 `desktop-ui` 的 Windows
+    /// 构建同样没有这个调用点，写成后者会在那个组合下重新变成硬错误。
+    /// 与 `wind-ui/sys.rs` 的 `clamp_content_in_bounds` 同一既定写法。
+    #[cfg_attr(not(all(feature = "desktop-ui", windows)), allow(dead_code))]
     pub(crate) fn dims_icon(self) -> bool {
         matches!(self, Self::KeyboardDisabled)
     }
