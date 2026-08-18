@@ -275,16 +275,9 @@ function Sync-Tree ([string]$src, [string]$remoteDir, [string]$label) {
         $ex = @()
         foreach ($d in $ExcludeDirs)  { $ex += "--exclude=./$d"; $ex += "--exclude=*/$d" }
         foreach ($f in $ExcludeFiles) { $ex += "--exclude=$f" }
-        # ⚠️ --format=gnutar 不是风格偏好, 是绕开 libarchive 的一个误判 (实测稳定复现):
-        #    解压时 bsdtar 会做「拒绝覆盖归档自身」的保护, 判据是
-        #      归档条目里记录的 dev+ino  ==  归档文件自身的 dev+ino
-        #    但这两个数来自【两台不同的机器】—— 前者是打包时本机磁盘上的源文件, 后者是编译机
-        #    上那个 .tar.gz。撞上纯属巧合, 可一旦撞上就是确定性的: 归档里那个 ino 固定不变,
-        #    而每次同步都删旧包、新包又复用同一条刚释放的 MFT 记录 ⇒ 每次都撞, 报
-        #      "<某个源文件>: Refusing to overwrite archive: No error"  (errno=0, 纯逻辑判断)
-        #    默认的 pax 格式会写 SCHILY.dev / SCHILY.ino, gnutar 格式不写 —— 条目没有这两个
-        #    字段时 archive_entry_dev_is_set() 为假, 整个检查直接跳过。
-        #    gnutar 也没有 ustar 的 255 字符路径与 8 GB 大小限制, 对本仓是安全替换。
+        # gnutar 格式没有 ustar 的 255 字符路径与 8 GB 大小限制, 对本仓是安全的默认替换。
+        # (2026-08-18 更正: 曾以为 --format=gnutar 能绕开下面这个「拒绝覆盖归档自身」的
+        # 报错, 判断依据错了 —— 详见本函数下方解压那段的说明, 真正的绕法在解压那一侧。)
         Push-Location $src
         try { & tar -czf $tgz --format=gnutar @ex . } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tgz)) { ErrMsg "  打包 $label 失败 (tar rc=$LASTEXITCODE)"; return $false }
@@ -337,8 +330,32 @@ function Sync-Tree ([string]$src, [string]$remoteDir, [string]$label) {
 
         # 不加 -Quiet: tar 正常解压本就静默, 一旦出错 (占用/权限/损坏) 那几行才是唯一线索。
         # 静默吞掉它等于把「解压失败」变成一个无法排查的黑盒。
+        #
+        # ⚠️ 解压必须走【管道】喂给 tar 的 stdin, 不能 `tar -xzf <命名文件>`——
+        #    后者会稳定复现 "<某个源文件>: Refusing to overwrite archive: No error"。
+        #    真实机制 (libarchive/archive_read_open_filename.c 的 S_ISREG 分支, 已读源码确认):
+        #    bsdtar 打开【具名】归档文件时会 stat() 它自己, 把这份 dev+ino 记成
+        #    "skip_file" —— 解压时任何一个目标路径的 dev+ino 撞上它就报这个错, 本意是防止
+        #    「解压目录里正好包含归档自身」时把还在读的归档文件覆盖掉。
+        #    这两个数在我们的场景里纯属巧合碰撞: temp 目录 (C:\Windows\Temp) 文件churn 高,
+        #    NTFS 的 MFT 记录被快速复用, 归档文件的 dev+ino 偶尔会和 $remoteDir 下某个【已存在】
+        #    的旧文件相同 —— 与文件名/内容无关, 每次撞上的文件都不一样。
+        #    (2026-08-18 更正: 上面 --format=gnutar 的注释把这个错误归因到 SCHILY.dev/ino 这份
+        #    完全不相关的 pax 硬链接元数据上, 已用 libarchive 源码证伪, 那次「修好了」是巧合。)
+        #    绕法: 把归档从 stdin 喂给 tar, 而不是让它按文件名自己打开。stdin 是管道
+        #    (S_ISFIFO) 不是具名文件 (S_ISREG), skip_file 检查的前置条件就不成立。
+        #    PowerShell 里唯一能拿到【真管道】而非「重定向到同一个文件」的写法, 是让管道
+        #    两端都是【原生命令】(cmd.exe 与 tar.exe) —— cmdlet(如 Get-Content) 在中间会把
+        #    字节流按对象/文本重新编码, 达不到效果。
+        # cmd.exe 内置的 type 命令不认正斜杠路径 (跟 echo/dir 等基于 Win32 API 的命令不同,
+        # 会直接报 "The syntax of the command is incorrect." 且不产出任何字节) —— 而 $rTgz
+        # 全篇都是正斜杠 (scp/ssh 目标路径的写法), 这里必须单独转成反斜杠再喂给 type。
+        # ⚠️ 实测踩过: type 失败时管道另一端的 tar 拿到空 stdin 照样 exit 0 (0 字节的合法
+        #    gzip? 不合法但 tar 未必硬失败), $LASTEXITCODE 只反映管道最后一个命令 tar 的退出码,
+        #    于是"远程解压成功"是假的——目标目录里的旧文件原封不动, 且没有任何报错浮出来。
+        $rTgzBS = $rTgz -replace '/', '\'
         $inner = "New-Item -ItemType Directory -Force -Path '$remoteDir' | Out-Null; " +
-                 "tar -xzf '$rTgz' -C '$remoteDir'; `$c=`$LASTEXITCODE; " +
+                 "cmd /c type '$rTgzBS' | tar -xz -C '$remoteDir'; `$c=`$LASTEXITCODE; " +
                  $prune +
                  "Remove-Item '$rTgz' -Force -EA SilentlyContinue; exit `$c"
         if (-not (Invoke-RemotePs $inner)) { ErrMsg "  远程解压 $label 失败 (退出码见上)"; return $false }
@@ -384,7 +401,9 @@ function Receive-Artifacts ([string]$cmd, [string]$outName, [string]$localOut) {
         if (-not (Invoke-RemotePs $inner -Quiet)) { ErrMsg "  远程打包产物失败"; return $false }
         & scp @SshOpts -q "${Target}:$rTgz" $tgz
         if ($LASTEXITCODE -ne 0) { ErrMsg "  scp 下载产物失败"; return $false }
-        & tar -xzf $tgz -C $ProductRoot
+        # 同上 (Sync-Tree 里的说明): 具名文件解压会偶发撞上 bsdtar 的 skip_file 误判,
+        # 改走 cmd/tar 两个原生命令之间的管道, stdin 是 S_ISFIFO 而非 S_ISREG。
+        cmd /c type $tgz | tar -xz -C $ProductRoot
         if ($LASTEXITCODE -ne 0) { ErrMsg "  本地解压产物失败"; return $false }
         Gray "  - 整目录 $outName\ 已回传 ($([math]::Round((Get-Item $tgz).Length/1MB,2)) MB)"
         Invoke-RemotePs "Remove-Item '$rTgz' -Force -EA SilentlyContinue" -Quiet | Out-Null
