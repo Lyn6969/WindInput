@@ -124,7 +124,7 @@ fn dpi_scale_for_point(_x: i32, _y: i32) -> f32 {
 /// OpenProcess(QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW，取末段文件名。
 /// 失败（进程已退出/权限不足）返回空串。
 #[cfg(windows)]
-fn process_name(pid: u32) -> String {
+pub(crate) fn process_name(pid: u32) -> String {
     use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -136,7 +136,10 @@ fn process_name(pid: u32) -> String {
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(h) => h,
-            Err(_) => return String::new(),
+            // ★ 提权进程（任务管理器、注册表编辑器、以管理员身份运行的任何程序）在这里
+            //   必定 ACCESS_DENIED：本服务是中完整性，目标是高完整性，`PROCESS_QUERY_
+            //   LIMITED_INFORMATION` 也过不去。走快照兜底，见 process_name_via_snapshot。
+            Err(_) => return process_name_via_snapshot(pid),
         };
         let mut buf = [0u16; MAX_PATH as usize];
         let mut size = buf.len() as u32;
@@ -148,16 +151,79 @@ fn process_name(pid: u32) -> String {
         );
         let _ = CloseHandle(handle);
         if ok.is_err() {
-            return String::new();
+            return process_name_via_snapshot(pid);
         }
         let full = String::from_utf16_lossy(&buf[..size as usize]);
         full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string()
     }
 }
 
+/// 进程名兜底：系统进程快照。**只在 `OpenProcess` 失败时调用**。
+///
+/// 为什么需要它：`OpenProcess` 需要对目标进程持句柄权限，跨完整性级别（本服务中完整性 →
+/// 提权进程高完整性）一律拒绝。而快照 API 只是读系统进程表，不需要对任何进程有权限，
+/// 提权进程的映像名照样读得到。
+///
+/// 实测症状（用户报告，2026-08-18）：任务管理器聚焦时进程名取空 ⇒ 匹配不到任何
+/// per-app 规则、`mode_scope` 也无从推进 ⇒ 沿用上一个应用（常常是桌面）的英文策略，
+/// 表现为「任务管理器套上了桌面的配置」。取空与「这个进程确实没配规则」在日志里同形，
+/// 是这个缺陷难以归因的原因，故失败时补一条 WARN。
+///
+/// 代价：一次全系统进程枚举（实测数百微秒到数毫秒）。正常路径永不触发；且调用方
+/// (`cached_proc_name`) 缓存优先，同一 pid 至多走一次。
+#[cfg(windows)]
+fn process_name_via_snapshot(pid: u32) -> String {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("进程名取空：pid={pid} 快照创建失败 {e:?}（per-app 规则将不匹配）");
+                return String::new();
+            }
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = String::new();
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let n = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    found = String::from_utf16_lossy(&entry.szExeFile[..n]);
+                    break;
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        if found.is_empty() {
+            // 进程刚退出（pid 已不在表里）也会走到这，与权限失败无法区分——两者对调用方
+            // 的后果相同（规则不匹配），一条 WARN 足够定位，不必细分。
+            tracing::warn!("进程名取空：pid={pid} 不在进程快照中（per-app 规则将不匹配）");
+        } else {
+            tracing::debug!(
+                "进程名经快照兜底取得：pid={pid} name={found}（OpenProcess 被拒，通常是提权进程）"
+            );
+        }
+        found
+    }
+}
+
 /// 非 Windows（测试/交叉编译）下无进程名概念，返回空串 → 不命中任何兼容规则。
 #[cfg(not(windows))]
-fn process_name(_pid: u32) -> String {
+pub(crate) fn process_name(_pid: u32) -> String {
     String::new()
 }
 
@@ -1744,6 +1810,43 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(pid, name.to_lowercase());
+        }
+    }
+
+    /// 客户端连接时校正 `pid_names` 缓存：现查一次真名，与缓存不符即覆盖并记 WARN。
+    ///
+    /// 为什么需要：`pid_names` 是**一次写入、永不失效**的 pid→名字缓存，而
+    /// `cached_proc_name` / `update_active_compat` 都是缓存优先。Windows 会复用已退出
+    /// 进程的 PID，于是「A 退出 → B 拿到同一个 pid」之后，B 会被永久当成 A——整条
+    /// per-app 链一起错：compat 规则（`initial_mode` / `caret_*` / `auto_pair` /
+    /// `smart_method` / `first_show_mode`）与中英记忆表。而且**没有任何自愈路径**：
+    /// `update_active_compat` 对同 pid 直接早退，连重查的机会都没有。
+    ///
+    /// 选连接时机校正，是因为新进程必然连一次，而同进程多次连接（多 TSF 实例、管道抖动
+    /// 后重连）重查一次也只是几微秒的 `OpenProcess`，宁可多查不可不查。
+    ///
+    /// ⚠ 现查为空时**保留缓存**：macOS 的服务进程 `process_name` 恒返回空串，那边的名字
+    /// 由 `.app` 随焦点事件送进缓存。清掉会让 compat 规则在下一次 focus_gained 之前全部失配。
+    #[cfg(any(windows, test))]
+    pub(crate) fn revalidate_pid_name(&self, pid: u32, live_name: &str) {
+        if pid == 0 || live_name.is_empty() {
+            return;
+        }
+        let live = live_name.to_lowercase();
+        let mut names = self.pid_names.lock().unwrap_or_else(|e| e.into_inner());
+        match names.get(&pid) {
+            Some(cached) if *cached == live => {}
+            Some(cached) => {
+                // 这条 WARN 就是 PID 复用的现场证据。缓存过一个名字、现查却是另一个，
+                // 只可能是那个 pid 换了进程——在此之前它一直是静默错配。
+                tracing::warn!(
+                    "pid_names 校正：pid={pid} 缓存={cached} 实际={live}（PID 已被复用，此前按缓存匹配的 per-app 规则是错的）"
+                );
+                names.insert(pid, live);
+            }
+            None => {
+                names.insert(pid, live);
+            }
         }
     }
 
@@ -7152,6 +7255,43 @@ mod initial_mode_tests {
 
         c.state.lock().unwrap().focus_no_edit_ctx = false;
         assert_eq!(c.input_block(), InputBlock::None);
+    }
+
+    /// `pid_names` 是一次写入、永不失效的缓存，而 Windows 会复用已退出进程的 PID。
+    /// 连接时校正是它唯一的自愈时机——没有它，「B 复用了 A 的 pid」之后 B 会被永久
+    /// 当成 A，整条 per-app 链（compat 规则 + 中英记忆）一起错且无任何自愈路径。
+    #[test]
+    fn pid_name_cache_is_corrected_on_reconnect() {
+        let c = coord_with(|_| {});
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(4242, "everedit.exe".into());
+
+        // 同一个 pid 换了进程：必须以现查为准。
+        c.revalidate_pid_name(4242, "WindowsTerminal.exe");
+        assert_eq!(
+            c.pid_names.lock().unwrap().get(&4242).map(String::as_str),
+            Some("windowsterminal.exe"),
+            "PID 复用后必须纠正，否则新进程会一直套用旧进程的 per-app 配置"
+        );
+
+        // ⚠ 现查为空时**保留缓存**：macOS 的 process_name 恒为空串，名字由 `.app`
+        // 随焦点事件送进来。清掉会让 compat 规则在下一次 focus_gained 之前全部失配。
+        c.revalidate_pid_name(4242, "");
+        assert_eq!(
+            c.pid_names.lock().unwrap().get(&4242).map(String::as_str),
+            Some("windowsterminal.exe"),
+            "查不到名字不等于名字变了——不许把已有的清掉"
+        );
+
+        // 首次见到该 pid 时照常落缓存。
+        c.revalidate_pid_name(777, "Notepad.exe");
+        assert_eq!(
+            c.pid_names.lock().unwrap().get(&777).map(String::as_str),
+            Some("notepad.exe"),
+            "缓存键与查询都按小写，与 update_active_compat 同口径"
+        );
     }
 
     /// ★★ 噪声层的 `CtxLost` **不得**让图标显「英」，只有权威的 `NoEditCtx` 才可以。

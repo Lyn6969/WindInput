@@ -113,7 +113,12 @@ impl MessageHandler for Coordinator {
     /// 仅为满足 trait 签名。
     fn handle_client_connected(&self, pid: u32) {
         #[cfg(windows)]
-        self.apply_connected_pid_compat(pid, crate::foreground_pid());
+        {
+            // ⚠ **必须先校正名字再刷规则**：下面那步是缓存优先的，缓存错了它照错的抄。
+            // 新进程必然连一次，这是 pid_names 唯一的自愈时机（详见 revalidate_pid_name）。
+            self.revalidate_pid_name(pid, &crate::coordinator::process_name(pid));
+            self.apply_connected_pid_compat(pid, crate::foreground_pid());
+        }
         #[cfg(not(windows))]
         let _ = pid;
     }
