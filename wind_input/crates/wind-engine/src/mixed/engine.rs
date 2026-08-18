@@ -942,7 +942,8 @@ impl Engine for MixedEngine {
     /// - ⓪ `pinyin_only_overflow` 且整串有拼音候选 → 超码长即纯拼音语境，抑制顶码（见下）。
     ///   例外：`codetable_owns_overflow`（前 N 码是精确全码 + 拼音主张不了整串）时放行；
     /// - ① `auto_commit_block_on_pinyin` 且整串有拼音候选 → 抑制顶码（打开时 wangba/aipu 等含拼音
-    ///   读法的串都让路拼音）；
+    ///   读法的串都让路拼音）。**与 ⓪ 共用例外口 `codetable_owns_overflow`**：归属已判给码表时
+    ///   不再让路（`cety` + 第 5 键 → 顶出「通往」，`ty` 构不成音节、拼音只解释 2/5 键）；
     /// - ② `block_commit_on_pinyin_word` 且整串是强拼音词（wangba→网吧）→ 抑制顶码；
     /// - ③ `auto_commit_block_on_english` 且整串有英文候选 → 抑制顶码（github→GitHub，见下）；
     /// - `top_code_override_pinyin` 开启 = 顶码优先，**无视**上述全部否决强制倒向五笔。
@@ -1001,10 +1002,30 @@ impl Engine for MixedEngine {
                 // 与 ① 的分工：① 不限超码长（满码时同样生效）、由 `auto_commit_block_on_pinyin`
                 // 驱动；⓪ 只在本函数成立（此处已确认 `input_len > max_code_len`）、由
                 // `pinyin_only_overflow` 驱动。两者独立配置，任一命中即否决。
-                if self.pinyin_only_overflow && has_pinyin && !self.codetable_owns_overflow(input) {
+                //
+                // ★ 归属结论由 ⓪① **共用**：`codetable_owns_overflow` 一旦成立，① 也不得再以
+                // 「有拼音候选」为由否决顶码。此前它只豁免 ⓪，于是同一次按键里候选侧已把码表词
+                // 回捞到首位、顶码侧却仍被 ① 拦下 —— 两处对同一个归属问题给出相反处置。真机
+                // `cety`（唯一全码「通往」）+ 第 5 键即此漏：`ce` 是合法音节但 `ty` 连音节前缀
+                // 都不是，拼音只解释 2/5 键，归属明明在码表。
+                //
+                // ⚠️ 这**反转**了「⓪ 的例外口不是上屏放行口」那条旧决定（原
+                // `default_guards_reclaim_candidates_but_still_block_commit` 及其注释）。旧决定把
+                // 「出厂 ① 开 ⇒ 回捞但不上屏」记为默认安全，而用户报的正是这一格：顶码在出厂
+                // 配置下等于失效。反转依据是语义 —— ① 是「让路给拼音」，让路的前提是拼音确实
+                // 接得住这一串，而 `codetable_owns_overflow` 已判定它接不住。
+                //
+                // ② `block_commit_on_pinyin_word` **不**豁免：它判的是「整串是强拼音词」（词强度），
+                // 与「归属」正交，且两者判据基本互斥（成词要求整串是完整音节序列，本例外口却要求
+                // 拼音主张不了整串）。故只削弱 `pinyin_vetoes_commit` 的 ① 那一半。
+                //
+                // `has_pinyin == false` 时本结论恒为 false（第四条判据 `pinyin_has_any` 与
+                // `has_pinyin` 同口径），故短路求值 —— 纯五笔溢出串上省掉一次码表 + 拼音查询。
+                let codetable_owns = has_pinyin && self.codetable_owns_overflow(input);
+                if self.pinyin_only_overflow && has_pinyin && !codetable_owns {
                     return None;
                 }
-                if self.pinyin_vetoes_commit(input, has_pinyin) {
+                if self.pinyin_vetoes_commit(input, has_pinyin && !codetable_owns) {
                     return None;
                 }
             }

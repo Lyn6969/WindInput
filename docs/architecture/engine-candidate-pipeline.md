@@ -360,6 +360,13 @@ convert(input):
 **默认开**（三处同源：`MixConfig::default()` / `MixGlobal::default()` / `data/config.toml`）。
 它同时是**满码空码清空**的总闸（见下方「空码清空」），关闭 = 拼音一律不干预码表处置。
 
+⚠️ **① 在顶码通路上有一个例外口**：超码长且 `codetable_owns_overflow(input)` 成立时，① 不再
+以「有拼音候选」为由否决（与 ⓪ 共用同一个归属结论，见 §7.5）。语义依据是 ① 的含义为**让路给
+拼音**，而让路的前提是拼音接得住这一串 —— 归属判据已判定它接不住。没有这个例外口时，同一次
+按键里候选侧已把码表词回捞到首位、顶码侧却仍被 ① 拦下，两处对同一个归属问题给出相反处置。
+真机实例：`cety`（唯一全码「通往」）+ 第 5 键，`ce` 是完整音节而 `ty` 连音节前缀都不是，拼音
+只解释 2/5 键。**② 不享受该豁免**（词强度与归属正交，两者判据也基本互斥）。
+
 **② 拼音词拦截 `is_ambiguous_pinyin_word()`**（engine.rs:134-163，`block_commit_on_pinyin_word`
 控制，默认**开**），命中任一即判「用户意图是拼音」：
 
@@ -376,7 +383,7 @@ convert(input):
 | 通路 | 位置 | 否决方式 |
 |---|---|---|
 | 满码自动上屏 | `convert()` engine.rs:441-450 | 取码表意向后：`!has_english && !pinyin_vetoes_commit(...)` 且上屏目标在合并结果中**存活**才放行；否决短路求值（仅码表确有意向时才跑拼音转换） |
-| 顶码上屏 | `handle_top_code()` engine.rs:512-531 | 超码长时先查整串拼音得 has_pinyin，`pinyin_vetoes_commit` 命中 → 返回 None（放弃顶码继续组合）；`top_code_override_pinyin=true` 时**无视否决**强制倒向码表 |
+| 顶码上屏 | `handle_top_code()` engine.rs:961+ | 超码长时先查整串拼音得 has_pinyin，`pinyin_vetoes_commit(input, has_pinyin && !codetable_owns)` 命中 → 返回 None（放弃顶码继续组合）；`codetable_owns` 即 ⓪ 的例外口 `codetable_owns_overflow`，**⓪① 共用**；`top_code_override_pinyin=true` 时**无视否决**强制倒向码表 |
 | 显示态复评 | `recheck_auto_commit()` engine.rs:485-502 | 先按显示候选来源算 has_pinyin/has_english 走同一套否决（复评**不绕过**否决），再仅取 `source==CodeTable` 的候选委托主码表判唯一 |
 
 配套：**英文守护** `auto_commit_block_on_english`（默认关）——满码上屏时合并结果存在英文候选则否决
@@ -432,6 +439,16 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
 判据 3、4 命中时候选保持为空（无英文库的情况下），用户空格/回车直接上屏原码，这是 249f486
 之前的行为。判据 4 对**顶码通路无影响**：⓪ 是 `pinyin_only_overflow && has_pinyin && !ct_owns`，
 `has_pinyin=false` 时整条本就不成立；顶码侧的英文场景另由 ③ `auto_commit_block_on_english` 管。
+
+★ **这个归属结论由 ⓪ 与 ① 共用**（`handle_top_code` 里求值一次，两处同读）。曾有一版只豁免 ⓪，
+于是 `cety`+第 5 键在**出厂配置**下候选侧回捞了「通往」、顶码侧却被 ① 拦死 —— 而 ⓪ 对应的设置项
+「超码长时仅查拼音」是 `hidden`，用户在设置页里一个开关都关不掉。修正后 ① 同享豁免，② 不享。
+
+⚠️ **简拼是这条例外口的已知边界**：`enable_pinyin_abbrev`（出厂**开**）时，简拼整句候选的
+`consumed_length` 覆盖整串 ⇒ 判据 2 `pinyin_claims_overflow` 成立 ⇒ 例外口不成立 ⇒ ⓪ 独立拦下
+顶码。这是**有意保留**的取舍：简拼几乎能主张任何字母串，若让它不算「主张」，长简拼词
+（`zgrmghg` 之类）会被前 4 码的五笔全码顶码截胡。取舍为「习惯混输顶码的用户多半关简拼，
+不牺牲简拼用户」。改这条前先重估两类用户的碰撞面。
 
 回捞的前缀候选有两处归一化，都因为它**只解释得了前 N 码**：
 - `is_exact_code = false`（下游一律以完整输入为准，见 §7.5 / `freq_tier`）；

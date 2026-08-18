@@ -37,6 +37,12 @@ fn wubi() -> Box<dyn Engine> {
     // `word`：英文用例主角。选它是因为 `words` 的拼音**交得出候选**（`wo`→我）却**主张不了整串**
     // （`rds` 不成音节），三条判据里只有「英文主张」那条会否决 —— 唯一变量得以隔离。
     d.merge_single("word".into(), "叉".into(), 900, 3);
+    // `cety`＝真机主角「通往」（`wubi86_jidian.dict.yaml:7013`，全库唯一该码）。
+    // 选它是因为拼音侧 `ce` 是合法音节、`ty` 连音节前缀都不是 —— 与 `yijg` 同侧但更贴真机。
+    d.merge_single("cety".into(), "通往".into(), 1442, 4);
+    // `wang`：② 的隔离对照专用。它同时满足「前 N 码是精确全码」（例外口成立）与
+    // 「前 N 码恰是 1 个完整拼音音节」（② 的判据 b 命中），是唯一能把 ② 单独测出来的形状。
+    d.merge_single("wang".into(), "王".into(), 900, 5);
     let dm = DictManager::new();
     dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
     Box::new(CodeTableEngine::new(
@@ -55,6 +61,8 @@ fn pinyin() -> PinyinEngine {
     d.merge_single("you".into(), "悠".into(), 9000, 1);
     d.merge_single("ni".into(), "你".into(), 9000, 2);
     d.merge_single("wo".into(), "我".into(), 9000, 3);
+    d.merge_single("ce".into(), "策".into(), 9000, 4);
+    d.merge_single("wang".into(), "网".into(), 9000, 5);
     PinyinEngine::new(PinyinConfig::default(), CachedDict::Memory(d))
 }
 
@@ -291,17 +299,24 @@ fn overflow_off_path_unchanged() {
     assert_eq!(texts(&e, "yijga").first().map(String::as_str), Some("就是"));
 }
 
-/// ★ 出厂默认下的完整表现：**候选回捞、但不上屏**。这是本修复「默认安全」的全部依据。
+/// ★ 出厂默认下的完整表现：**候选回捞 + 顶码放行**。归属结论 ⓪① 共用后的新语义。
 ///
-/// `handle_top_code` 里 ⓪ 通过后还要过 ①②（`pinyin_vetoes_commit`），而 ①
-/// `auto_commit_block_on_pinyin` 出厂即开 + `yijga` 确有拼音候选 ⇒ 顶码仍被拦下。
-/// 于是默认用户看到的只是「就是」回到候选首位，按空格才上屏；只有像本文件其余用例那样
-/// **主动关掉 ①** 的用户（即报这个 bug 的场景）才会拿到顶码直接上屏。
+/// ⚠️⚠️ **本用例反转了一条旧决定，别当回归修回去。** 它原名
+/// `default_guards_reclaim_candidates_but_still_block_commit`，断言的是「① 出厂即开 ⇒ 顶码
+/// 仍被拦」，并在注释里把「⓪ 的例外口不是上屏放行口」写成红线。那条红线的依据是「默认安全」，
+/// 但真机反馈证明这一格恰恰是缺陷：`cety`（唯一全码「通往」）+ 第 5 键在**出厂配置**下不顶码，
+/// 而 `ty` 根本构不成音节 —— 顶码在默认配置下等于失效，用户在设置页里也关不掉 ⓪（`hidden`）。
 ///
-/// ⚠️ 反过来说：⓪ 的例外口**不是**上屏放行口。若日后有人为了「让五笔更爽快」把这条例外
-/// 挪到 ①② 之后或让它压制 ①②，默认配置下的顶码行为就会突变，务必先重估此例。
+/// 反转依据是语义而非「让五笔更爽快」：① 的含义是**让路给拼音**，让路的前提是拼音接得住
+/// 这一串；`codetable_owns_overflow` 的四条判据已经判定它接不住（前 N 码是码表精确全码、
+/// 拼音与英文都主张不了整串、拼音尚能交出候选）。同一次按键里候选侧已把「就是」回捞到首位，
+/// 顶码侧却仍拦下 —— 那是两处对同一个归属问题给出相反处置，本就是缺陷形态。
+///
+/// ⚠️ 边界仍然由下面两条对照守住：拼音**主张得了**整串时 ① 照拦
+/// （`pinyin_veto_still_applies_when_pinyin_claims_the_string`）、② 完全不受豁免
+/// （`pinyin_word_veto_is_not_exempted_by_the_claim`）。
 #[test]
-fn default_guards_reclaim_candidates_but_still_block_commit() {
+fn default_guards_reclaim_and_now_also_commit() {
     let e = mixed(MixConfig::default());
 
     let c = texts(&e, "yijga");
@@ -314,8 +329,119 @@ fn default_guards_reclaim_candidates_but_still_block_commit() {
 
     assert_eq!(
         e.handle_top_code("yijga"),
+        Some(("就是".to_string(), "a".to_string())),
+        "归属判给码表后 ① 不得再以「有拼音候选」为由否决顶码"
+    );
+}
+
+/// 真机主角（内存复刻）：`cety` = 唯一全码「通往」，第 5 键应顶码上屏 —— **出厂配置下**。
+///
+/// 与 `yijga` 是同一条判据的两个实例，分开写是因为它们的拼音形状不同：`yijg` 的 `jg` 从第 3 键
+/// 起就不成音节，而 `cety` 的 `ce` 是**完整音节**、`ty` 才断掉。后者更贴近用户直觉里的
+/// 「前面像拼音、后面不像」，也是 ① 那个粗粒度 `has_pinyin` 最容易误判的形状。
+#[test]
+fn cety_top_commits_under_factory_defaults() {
+    let py = pinyin();
+    // 前置：确认本例真落在「拼音主张不了整串」那一侧，否则测的是别的分支。
+    assert!(
+        !py.is_possible_pinyin_sequence("cetya"),
+        "前置：ty 不是音节前缀 ⇒ 拼音没在打这串"
+    );
+    assert_eq!(
+        py.convert("cetya", 1).unwrap().candidates[0].consumed_length,
+        2,
+        "前置：拼音首选只解释 ce（2/5），够不上接管整串"
+    );
+    // 前置：`has_pinyin` 确实为真 —— 否则 ① 本就不触发，本用例退化成假绿。
+    assert!(
+        !py.convert("cetya", 1).unwrap().candidates.is_empty(),
+        "前置：裸 convert 确有候选（① 的 has_pinyin 正是这么算的）"
+    );
+
+    let e = mixed(MixConfig::default());
+    assert_eq!(
+        e.handle_top_code("cetya"),
+        Some(("通往".to_string(), "a".to_string())),
+        "出厂配置下 cety + 第 5 键应顶出「通往」+ 余码 a"
+    );
+}
+
+/// 反向锁 ①：拼音**主张得了**整串时，① 照旧否决顶码 —— 豁免只覆盖归属判给码表的那条窄带。
+///
+/// 单一变量：⓪ 显式关（否则拦截来自 ⓪，测不到 ①），① 显式开，串用 `youyo`
+/// （`you` + `yo`，`yo` 是合法音节前缀 ⇒ 拼音还在打）。前 N 码 `youy` 同样是精确全码，
+/// 与 `yijga` 只差「拼音主张与否」这一位。
+#[test]
+fn pinyin_veto_still_applies_when_pinyin_claims_the_string() {
+    assert!(
+        pinyin().is_possible_pinyin_sequence("youyo"),
+        "前置：拼音还在打这串（与 yijga 的唯一差别）"
+    );
+    assert!(
+        wubi().has_full_input_match("youy"),
+        "前置：前 N 码是精确全码，例外口的第一条对两例同时成立"
+    );
+
+    let e = mixed(MixConfig {
+        auto_commit_block_on_pinyin: true,
+        block_commit_on_pinyin_word: false,
+        pinyin_only_overflow: false,
+        ..Default::default()
+    });
+    assert_eq!(
+        e.handle_top_code("youyo"),
         None,
-        "① 出厂即开 ⇒ 顶码仍被 pinyin_vetoes_commit 拦下，默认用户不会遭遇自动上屏"
+        "拼音主张整串 ⇒ 归属不成立 ⇒ ① 必须照拦（否则「悠悠的」被顶成「变凉」）"
+    );
+}
+
+/// 反向锁 ②：`block_commit_on_pinyin_word` **不**享受豁免 —— 它判「整串是强拼音词」（词强度），
+/// 与「归属」正交，只有 ① 那一半被削弱。
+///
+/// `wangjg` 是唯一能把 ② 单独测出来的形状：前 N 码 `wang` 既是码表精确全码（例外口第一条成立）
+/// 又恰是 1 个完整拼音音节（② 的判据 b 命中），而尾巴 `jg` 不成音节前缀 ⇒ 拼音主张不了整串
+/// （例外口第二条成立）。⓪ 与 ① 都会被豁免放行，拦下它的只可能是 ②。
+///
+/// ⚠️ 尾巴必须 ≥2 个不成前缀的字母：只多**一个**字母时（`wangb`）该字母恒是某音节的合法前缀，
+/// 拼音就主张得了整串，例外口不成立，拦截来源退回 ⓪/① —— 那样本用例就变成假绿。
+#[test]
+fn pinyin_word_veto_is_not_exempted_by_the_claim() {
+    let py = pinyin();
+    assert!(
+        py.is_whole_syllable_pinyin("wang") && py.completed_syllable_count("wang") == 1,
+        "前置：前 N 码恰是 1 个完整音节 ⇒ ② 的判据 (b) 命中"
+    );
+    assert!(
+        !py.is_possible_pinyin_sequence("wangjg"),
+        "前置：jg 不成前缀 ⇒ 拼音主张不了整串，例外口成立、①被豁免"
+    );
+    assert!(
+        wubi().has_full_input_match("wang"),
+        "前置：前 N 码是码表精确全码，例外口第一条成立"
+    );
+
+    // ① 显式关：把变量收敛到 ② 一个。②（出厂即开）应独立拦下顶码。
+    let e = mixed(MixConfig {
+        auto_commit_block_on_pinyin: false,
+        block_commit_on_pinyin_word: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        e.handle_top_code("wangjg"),
+        None,
+        "② 与归属正交，不得被例外口豁免"
+    );
+
+    // 对照：把 ② 也关掉 ⇒ 顶码放行，证明上面那条拦截确实来自 ②。
+    let off = mixed(MixConfig {
+        auto_commit_block_on_pinyin: false,
+        block_commit_on_pinyin_word: false,
+        ..Default::default()
+    });
+    assert_eq!(
+        off.handle_top_code("wangjg"),
+        Some(("王".to_string(), "jg".to_string())),
+        "② 关掉后应放行 —— 否则上一条断言的拦截来源另有其人"
     );
 }
 
@@ -470,4 +596,86 @@ fn topcode_on_english_word_is_still_governed_by_the_english_guard() {
         None,
         "③ 开 ⇒ 顶码被英文守护拦下，这才是顶码侧的正解"
     );
+}
+
+/// 真实词库端到端验收（用户诉求的落点）：内存 fixture 测得了判据，测不出真机首选与真机词库。
+///
+/// 真机数据：`cety` 在 `wubi86_jidian.dict.yaml:7013` 是 `cety 通往 1442`、**全库唯一**该码；
+/// 拼音侧 `ce` 有 6 个同音单字（侧/测/册/策/厕/…），`ty` 不成音节前缀。改动前第 5 键
+/// `handle_top_code` 恒返回 `None`，改动后顶出「通往」+ 余码。
+///
+/// ⚠️ **必须显式关简拼**。出厂 `schema.mix.enable_pinyin_abbrev = true` 时 `cetya` 的拼音首选是
+/// 简拼整句「从而同样啊」（`consumed_length = 5` = 整串）⇒ `pinyin_claims_overflow` 成立 ⇒
+/// 例外口第二条不成立 ⇒ **⓪ 独立拦下顶码，本修复够不着**。这是一个**已知且有意保留**的边界：
+/// 简拼几乎能主张任何字母串，若让它不算「主张」，长简拼词（`zgrmghg` 之类）会被前 4 码的五笔
+/// 全码顶码截胡 —— 用户拍板取舍为「习惯混输顶码的多半关简拼，不牺牲简拼用户」。
+/// 勿把本用例的 `enable_pinyin_abbrev = false` 当成可有可无的样板照抄删掉。
+///
+/// ⚠️ 缺 `build_dev/data` 时静默跳过（全仓惯例）。判据是耗时与下方 eprintln。
+#[test]
+fn real_dict_cety_top_commits_on_the_fifth_key() {
+    use std::path::PathBuf;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../build_dev/data")
+        .canonicalize()
+        .ok()
+        .filter(|p| p.join("schemas/pinyin/cn_dicts/base.dict.yaml").exists());
+    let Some(dir) = dir else {
+        eprintln!("跳过 real_dict_cety_top_commits_on_the_fifth_key：build_dev/data 不存在");
+        return;
+    };
+
+    let mgr = |tag: &str| {
+        let mut cfg = wind_config::Config::default();
+        cfg.schema.available = vec![
+            "wubi86".to_string(),
+            "pinyin".to_string(),
+            "wubi86_pinyin".to_string(),
+        ];
+        cfg.schema.active = "wubi86_pinyin".to_string();
+        // 对齐出厂 `data/config.toml`：`Config::default()`（L1）的 top_code_commit 是 false，
+        // 不覆写的话顶码通路整个不启用，全部断言都会退化成假绿。
+        cfg.schema.codetable.top_code_commit = true;
+        cfg.schema.mix.enable_pinyin_abbrev = false;
+        let root = std::env::temp_dir().join(format!("wind_cety_topcode_{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        wind_engine::EngineManager::with_store_override(
+            &cfg,
+            Some(&dir),
+            None,
+            Some(root.join("overrides")),
+        )
+    };
+
+    let m = mgr("default");
+    // 前置：4 码本身不受影响，「通往」是首选。
+    let c4 = m.convert("cety", 10);
+    assert_eq!(
+        c4.candidates.first().map(|c| c.text.as_str()),
+        Some("通往"),
+        "前置：满码时五笔精确全码应排第一，实际 {:?}",
+        c4.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
+
+    // 前置：`has_pinyin` 在真实词库下确实为真（① 正是靠它否决的），否则本用例是假绿。
+    let py_side = m.convert("cetya", 10);
+    assert!(
+        py_side.candidates.iter().any(|c| c.code == "ce"),
+        "前置：拼音残码候选确实在场，实际 {:?}",
+        py_side
+            .candidates
+            .iter()
+            .map(|c| format!("{}({})", c.text, c.code))
+            .collect::<Vec<_>>()
+    );
+
+    // 核心：出厂开关（① 与 ⓪ 均为 true）下第 5 键应顶码上屏。
+    for tail in "abcdefghijklmnopqrstuvwxyz".chars() {
+        let s = format!("cety{tail}");
+        assert_eq!(
+            m.handle_top_code(&s),
+            Some(("通往".to_string(), tail.to_string())),
+            "{s}: 第 5 键应顶出「通往」+ 余码 {tail}"
+        );
+    }
 }
