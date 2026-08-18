@@ -1351,7 +1351,11 @@ impl Default for MixGlobal {
             // ⚠️ 同属「三处同源」：本处 / `MixConfig::default()` / `data/config.toml`。
             pinyin_partial_candidates: false,
             pinyin_partial_candidates_overflow: true,
-            enable_pinyin_abbrev: true,
+            // 出厂**关**：简拼几乎能主张任何字母串，开着时超码长归属恒判给拼音，
+            // 五笔顶码上屏基本不会发生（`pinyin_only_overflow` 独立拦下，且它是隐藏项，
+            // 用户把两个否决开关都关掉也无济于事）。混输用户以码表为主，默认让顶码可用；
+            // 需要简拼的用户显式打开即可。详见 `data/config.toml` 同名项注释。
+            enable_pinyin_abbrev: false,
         }
     }
 }
@@ -6108,6 +6112,47 @@ smart_method = "delete_replace"
         let toml = r#"smart_mode = true"#;
         let cfg: SymbolConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.smart_method, SmartMethod::DeleteReplace);
+    }
+
+    /// 混输简拼**出厂关**。它决定超码长顶码上屏可不可用（简拼候选「消费整串」会让归属恒判给
+    /// 拼音，`pinyin_only_overflow` 随即独立拦下顶码），所以这个取值是一项产品决策，不是随手
+    /// 挑的默认——没有守门测试的话改回去不会有任何测试变红（实测：只翻这一个值，全量 2754 条
+    /// 无一失败）。
+    #[test]
+    fn mix_pinyin_abbrev_defaults_off() {
+        assert!(
+            !MixGlobal::default().enable_pinyin_abbrev,
+            "简拼出厂应为关；改它前先读 data/config.toml 同名项的注释"
+        );
+    }
+
+    /// 同源守门：L1（`MixGlobal::default()`）与 L2（`data/config.toml`）必须给出同一个值。
+    /// 两者漂移的后果分两层：引擎单测跑在**现实中不存在的配置**下（全绿但保护实际是反的）、
+    /// 以及 `preset_for_pruning` 拿 L1⊕L2 判「用户值是否等于默认」时开始吃用户配置。
+    /// 缺 `data/` 时静默跳过（全仓惯例）。
+    #[test]
+    fn mix_pinyin_abbrev_l1_and_l2_agree() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data");
+        let path = dir.join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "跳过 mix_pinyin_abbrev_l1_and_l2_agree：{} 不存在",
+                path.display()
+            );
+            return;
+        };
+        let v: toml::Value = toml::from_str(&text).expect("data/config.toml 应能解析");
+        let l2 = v
+            .get("schema")
+            .and_then(|s| s.get("mix"))
+            .and_then(|m| m.get("enable_pinyin_abbrev"))
+            .and_then(toml::Value::as_bool)
+            .expect("data/config.toml 应显式写出 schema.mix.enable_pinyin_abbrev");
+        assert_eq!(
+            l2,
+            MixGlobal::default().enable_pinyin_abbrev,
+            "L1 与 L2 的简拼默认值漂移了"
+        );
     }
 
     #[test]

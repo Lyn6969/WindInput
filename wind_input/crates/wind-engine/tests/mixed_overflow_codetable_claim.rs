@@ -604,11 +604,12 @@ fn topcode_on_english_word_is_still_governed_by_the_english_guard() {
 /// 拼音侧 `ce` 有 6 个同音单字（侧/测/册/策/厕/…），`ty` 不成音节前缀。改动前第 5 键
 /// `handle_top_code` 恒返回 `None`，改动后顶出「通往」+ 余码。
 ///
-/// ⚠️ **必须显式关简拼**。出厂 `schema.mix.enable_pinyin_abbrev = true` 时 `cetya` 的拼音首选是
-/// 简拼整句「从而同样啊」（`consumed_length = 5` = 整串）⇒ `pinyin_claims_overflow` 成立 ⇒
-/// 例外口第二条不成立 ⇒ **⓪ 独立拦下顶码，本修复够不着**。这是一个**已知且有意保留**的边界：
-/// 简拼几乎能主张任何字母串，若让它不算「主张」，长简拼词（`zgrmghg` 之类）会被前 4 码的五笔
-/// 全码顶码截胡 —— 用户拍板取舍为「习惯混输顶码的多半关简拼，不牺牲简拼用户」。
+/// ⚠️ **简拼必须是关的**（`enable_pinyin_abbrev`，出厂已改为 `false`，这里仍显式写出以免
+/// 出厂值再变时本用例静默换了被测分支）。简拼**开**时 `cetya` 的拼音首选是简拼整句
+/// 「从而同样啊」（`consumed_length = 5` = 整串）⇒ `pinyin_claims_overflow` 成立 ⇒ 例外口第二条
+/// 不成立 ⇒ **⓪ 独立拦下顶码，本修复够不着**。这是一个**已知且有意保留**的边界：简拼几乎能
+/// 主张任何字母串，若让它不算「主张」，长简拼词（`zgrmghg` 之类）会被前 4 码的五笔全码顶码
+/// 截胡 —— 取舍为「默认关简拼让顶码可用，需要简拼的用户显式打开并接受失去顶码」。
 /// 勿把本用例的 `enable_pinyin_abbrev = false` 当成可有可无的样板照抄删掉。
 ///
 /// ⚠️ 缺 `build_dev/data` 时静默跳过（全仓惯例）。判据是耗时与下方 eprintln。
@@ -678,4 +679,59 @@ fn real_dict_cety_top_commits_on_the_fifth_key() {
             "{s}: 第 5 键应顶出「通往」+ 余码 {tail}"
         );
     }
+}
+
+/// ★ 默认值守门（行为层）：**不碰任何 `schema.mix` 开关**，仅靠出厂默认，`cety` 第 5 键就该顶码。
+///
+/// 与上一条的分工：上一条显式关简拼、测的是**判据**；本条刻意**什么都不设**、测的是
+/// **出厂默认值本身**（`enable_pinyin_abbrev` 出厂改为 `false` 正是为了让顶码可用）。
+/// 把简拼默认值翻回 `true`，本用例即红——`wind-config` 那两条（`mix_pinyin_abbrev_defaults_off`
+/// / `..._l1_and_l2_agree`）只钉取值，钉不住「这个取值换来了什么行为」。
+///
+/// ⚠️ `top_code_commit` 仍须显式对齐 L2：它在 `Config::default()`（L1）里是 `false`，
+/// 不设的话顶码通路整个不启用，断言会退化成假绿。
+#[test]
+fn factory_defaults_alone_are_enough_for_cety_topcode() {
+    use std::path::PathBuf;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../build_dev/data")
+        .canonicalize()
+        .ok()
+        .filter(|p| p.join("schemas/pinyin/cn_dicts/base.dict.yaml").exists());
+    let Some(dir) = dir else {
+        eprintln!("跳过 factory_defaults_alone_are_enough_for_cety_topcode：build_dev/data 不存在");
+        return;
+    };
+
+    let mut cfg = wind_config::Config::default();
+    cfg.schema.available = vec![
+        "wubi86".to_string(),
+        "pinyin".to_string(),
+        "wubi86_pinyin".to_string(),
+    ];
+    cfg.schema.active = "wubi86_pinyin".to_string();
+    cfg.schema.codetable.top_code_commit = true;
+    // ↑ 到此为止。schema.mix 的任何一项都不设——本用例测的就是它们的出厂值。
+    assert!(
+        !cfg.schema.mix.enable_pinyin_abbrev,
+        "前置：简拼出厂应为关，否则本用例测的是别的配置"
+    );
+    assert!(
+        cfg.schema.mix.auto_commit_block_on_pinyin && cfg.schema.mix.pinyin_only_overflow,
+        "前置：两道否决出厂都开着 —— 顶码能放行是靠归属例外口，不是靠守护没开"
+    );
+
+    let root = std::env::temp_dir().join("wind_cety_factory_defaults");
+    let _ = std::fs::remove_dir_all(&root);
+    let m = wind_engine::EngineManager::with_store_override(
+        &cfg,
+        Some(&dir),
+        None,
+        Some(root.join("overrides")),
+    );
+    assert_eq!(
+        m.handle_top_code("cetya"),
+        Some(("通往".to_string(), "a".to_string())),
+        "出厂默认下 cety + 第 5 键应顶出「通往」"
+    );
 }
