@@ -50,8 +50,21 @@ macOS 目前仅支持从源码构建，暂未提供安装包。
 | `wind_tsf` | C++ | Windows TSF 输入法框架接口，键盘事件捕获 |
 | `wind_macos` | Swift | macOS IMKit 输入法客户端 |
 
-配套的设置程序、便携启动器与安装器目前未开源，完整成品请从
-[下载页](https://windinput.com/download)获取。核心部分可独立构建和运行。
+发布版安装包还需要以下配套项目，它们在各自的独立仓库中维护：
+
+| 仓库 | 技术 | 职责 | 开源状态 |
+|------|------|------|----------|
+| [wind-installer](https://github.com/huanfeng/wind-installer) | Rust | Windows 安装器与卸载器（清单驱动的通用打包器） | 已开源 |
+| [wind-portable](https://github.com/huanfeng/wind-portable) | Rust | 便携版（绿色版）启动器，免安装就地运行 | 已开源 |
+| [wind-ui-rust](https://github.com/huanfeng/wind-ui-rust) | Rust | 跨平台轻量 GUI 库，安装器 / 便携版 / 设置程序的界面基础 | 已开源 |
+| wind-setting | Rust | 图形设置程序 | 暂未开源 |
+
+这些配套项目都是可选的：与本仓库放在同级目录时构建脚本会一并构建，缺失则自动跳过，
+核心输入法本身可独立构建和运行。完整成品请从[下载页](https://windinput.com/download)获取。
+
+wind-installer 与 wind-portable 通过 crates.io 上发布的 `windui` 使用 GUI 库，无需本地检出
+wind-ui-rust；只有 wind-setting 是 path 依赖（`windui = { path = "../wind-ui-rust" }`），
+构建它时才需要把 wind-ui-rust 一并放到同级目录。
 
 ## 从源码构建
 

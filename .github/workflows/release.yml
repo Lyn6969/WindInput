@@ -22,8 +22,15 @@ name: Release
 #   第三方宿主进程,故【发布产物】必须由与生态一致的原生 MSVC 构建。CI 门禁(ci.yml)仍用
 #   ubuntu + xwin 交叉编译做快速校验(只验能否编过),不受影响。
 #
-# 依赖私有仓(wind-installer/wind-setting/wind-portable)经 secrets.WIND_REPOS_TOKEN 检出,
-# 故本 workflow 只能在本仓库运行;fork 无 token 发版会失败,但 ci.yml 不碰私有仓,fork 的 CI 正常。
+# 兄弟仓检出已不再需要 PAT:wind-installer / wind-portable / wind-ui-rust 均已开源,
+# 用 actions/checkout 默认的 GITHUB_TOKEN 即可拉取。仅设置程序 wind-setting 仍是私有仓 ——
+# 它与 wind-ui-rust 的检出绑在一起,按 secrets.WIND_REPOS_TOKEN 是否配置来开关
+# (wind-ui-rust 只是 wind-setting 的 path 依赖;installer/portable 用 crates.io 上的
+#  windui,不看本地仓,故不检出 wind-setting 时也没必要拉它):
+#   配了(本仓)    → 正常检出,产物含设置程序;检出失败即中止,不会静默少东西。
+#   没配(fork 等) → 跳过检出并告警。dev.ps1 / mac 的 dev.sh 本就把设置程序当可选模块
+#                   (仓库不存在则跳过),故构建照常完成,只是产物里没有 wind_setting。
+# 于是 fork 既能跑 CI,也能跑通完整的发版流程。
 on:
   push:
     tags: ['v*']
@@ -65,10 +72,13 @@ jobs:
     runs-on: windows-2022
     env:
       BUILD_VERSION: ${{ needs.prep.outputs.version }}
+      # secrets 上下文在 step 的 if: 里不可用,只能在 job 级 env 里先求值。
+      # 这里存的是布尔结果而非 token 本身,避免把密文散布到每个 step 的环境变量里。
+      HAS_SETTING_TOKEN: ${{ secrets.WIND_REPOS_TOKEN != '' && 'true' || 'false' }}
     steps:
-      # 多仓库需为同级目录:wind-setting 依赖 ../wind-ui-rust 和 ../WindInput;
-      # dev.ps1 用 ../wind-installer / ../wind-portable。均 checkout 到 $GITHUB_WORKSPACE 下平级。
-      # 其中 wind-installer / wind-setting / wind-portable 为私有仓,必须经 WIND_REPOS_TOKEN 检出。
+      # 多仓库需为同级目录:dev.ps1 用 ../wind-installer / ../wind-portable;
+      # wind-setting 另需 ../wind-ui-rust 与 ../WindInput。均 checkout 到 $GITHUB_WORKSPACE 下平级。
+      # 下面三个仓已开源,checkout 走默认 GITHUB_TOKEN,无需额外 PAT。
       - name: 检出 WindInput
         uses: actions/checkout@v4
         with:
@@ -78,26 +88,34 @@ jobs:
         with:
           repository: huanfeng/wind-installer
           path: wind-installer
-          token: ${{ secrets.WIND_REPOS_TOKEN }}
-      - name: 检出 wind-ui-rust (installer/setting GUI 依赖)
-        uses: actions/checkout@v4
-        with:
-          repository: huanfeng/wind-ui-rust
-          path: wind-ui-rust
-          # 公开仓库,token 非必需;沿用同一 PAT 以统一速率限额。
-          token: ${{ secrets.WIND_REPOS_TOKEN }}
-      - name: 检出 wind-setting
-        uses: actions/checkout@v4
-        with:
-          repository: huanfeng/wind-setting
-          path: wind-setting
-          token: ${{ secrets.WIND_REPOS_TOKEN }}
       - name: 检出 wind-portable
         uses: actions/checkout@v4
         with:
           repository: huanfeng/wind-portable
           path: wind-portable
+
+      # 设置程序仍是私有仓:配了 PAT 才检出,失败即中止(不允许官方发版悄悄少个设置程序);
+      # 没配则整步跳过,Build-Setting 会因 ../wind-setting 不存在而自行跳过。
+      #
+      # wind-ui-rust 同组门控:它只被 wind-setting 以 path 依赖引用
+      # (windui = { path = "../wind-ui-rust" });wind-installer / wind-portable 依赖的是
+      # crates.io 上发布的 windui,不看本地仓 —— 故不检出 wind-setting 时拉它纯属白拉。
+      - name: 检出 wind-ui-rust (wind-setting 的 path 依赖)
+        if: env.HAS_SETTING_TOKEN == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-ui-rust
+          path: wind-ui-rust
+      - name: 检出 wind-setting (私有仓,需 WIND_REPOS_TOKEN)
+        if: env.HAS_SETTING_TOKEN == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-setting
+          path: wind-setting
           token: ${{ secrets.WIND_REPOS_TOKEN }}
+      - name: 提示跳过设置程序
+        if: env.HAS_SETTING_TOKEN != 'true'
+        run: echo "::warning::未配置 secrets.WIND_REPOS_TOKEN,跳过私有仓 wind-setting(及其 path 依赖 wind-ui-rust);本次产物不含设置程序 wind_setting.exe。"
 
       # windows-2022 镜像自带 VS2022(含 C++ 工具链)+ CMake + Rust(stable-msvc),
       # 故不再需要 clang/lld/xwin。仍显式钉 Rust stable 以稳定缓存键与工具链版本。
@@ -105,12 +123,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          # workspaces 是单一多行输入,没法条件性增删某一行;留空行的行为未经验证
+          # (很可能被解析成仓库根),故 wind-setting / wind-ui-rust 缺席时改成重复列一次
+          # 主仓工作区 —— 重复项对缓存键无副作用,比赌空行的解析行为稳。
           workspaces: |
             WindInput/wind_input
             wind-installer
-            wind-ui-rust
-            wind-setting
             wind-portable
+            ${{ env.HAS_SETTING_TOKEN == 'true' && 'wind-ui-rust' || 'WindInput/wind_input' }}
+            ${{ env.HAS_SETTING_TOKEN == 'true' && 'wind-setting' || 'WindInput/wind_input' }}
 
       - name: 写入 docs/VERSION
         shell: bash
@@ -156,25 +177,32 @@ jobs:
     env:
       BUILD_VERSION: ${{ needs.prep.outputs.version }}
       WIND_MAC_UNIVERSAL: '1'          # app / service / 设置 app 三者统一产 arm64+x86_64
+      HAS_SETTING_TOKEN: ${{ secrets.WIND_REPOS_TOKEN != '' && 'true' || 'false' }}
     steps:
-      # 目录布局同 Windows:wind-setting 依赖 ../wind-ui-rust 与 ../WindInput。
+      # 目录布局同 Windows:wind-setting 以 path 依赖引用 ../wind-ui-rust,并需要 ../WindInput。
       # macOS 侧不需要 wind-installer / wind-portable(打包由 scripts/mac/dev.sh 的 pkgbuild 完成)。
       - name: 检出 WindInput
         uses: actions/checkout@v4
         with:
           path: WindInput
-      - name: 检出 wind-ui-rust (设置程序 GUI 依赖)
+      # 同 Windows 侧:私有仓,有 PAT 才检出;没有则 build_setting 自行跳过,.pkg 不含设置 app。
+      # wind-ui-rust 是 wind-setting 的 path 依赖,同组门控 —— macOS 侧它没有别的消费者。
+      - name: 检出 wind-ui-rust (wind-setting 的 path 依赖)
+        if: env.HAS_SETTING_TOKEN == 'true'
         uses: actions/checkout@v4
         with:
           repository: huanfeng/wind-ui-rust
           path: wind-ui-rust
-          token: ${{ secrets.WIND_REPOS_TOKEN }}
-      - name: 检出 wind-setting
+      - name: 检出 wind-setting (私有仓,需 WIND_REPOS_TOKEN)
+        if: env.HAS_SETTING_TOKEN == 'true'
         uses: actions/checkout@v4
         with:
           repository: huanfeng/wind-setting
           path: wind-setting
           token: ${{ secrets.WIND_REPOS_TOKEN }}
+      - name: 提示跳过设置程序
+        if: env.HAS_SETTING_TOKEN != 'true'
+        run: echo "::warning::未配置 secrets.WIND_REPOS_TOKEN,跳过私有仓 wind-setting(及其 path 依赖 wind-ui-rust);本次 .pkg 不含设置 app。"
 
       # x86_64-apple-darwin 是通用二进制的另一半;缺它 dev.sh 的 cargo_build_universal 会直接失败。
       - uses: dtolnay/rust-toolchain@stable
@@ -185,8 +213,8 @@ jobs:
         with:
           workspaces: |
             WindInput/wind_input
-            wind-ui-rust
-            wind-setting
+            ${{ env.HAS_SETTING_TOKEN == 'true' && 'wind-ui-rust' || 'WindInput/wind_input' }}
+            ${{ env.HAS_SETTING_TOKEN == 'true' && 'wind-setting' || 'WindInput/wind_input' }}
 
       - name: 写入 docs/VERSION
         working-directory: WindInput
