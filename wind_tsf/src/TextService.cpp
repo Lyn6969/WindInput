@@ -1366,13 +1366,40 @@ static constexpr UINT     kFocusCheckIntervalMs = 500;
 // 不会被常规切换触发，又能抓住宿主 churn 焦点导致的堆积。
 static constexpr double kSlowFocusWarnMs = 20.0;
 
-// XamlIsland / transient locked DocMgr 标志：dynFlags 的 0x20 位稳定标记 Explorer 的
-// XamlIsland 容器 DocMgr（RequestEditSession 对它返回 TF_E_NOLOCK）。OnSetFocus 对这类
-// DocMgr 跳过 focus_gained（防 composition replay 到不稳定文档）。
-// 提为文件级常量是因为 OnSetFocus 里有**两处**要判它：跳过 focus_gained 的守卫本身，
-// 以及 doc_changed 收口——后者必须预判前者会不会命中，否则会发出一个没有配对
-// focus_gained 的 focus_lost（详见两处注释）。
-static constexpr DWORD kXamlIslandLockedFlag = 0x20;
+// locked/transient DocMgr 判据：XamlIsland 之类的**容器**文档，RequestEditSession 对它
+// 返回 TF_E_NOLOCK，OnSetFocus 对这类 DocMgr 跳过 focus_gained（防 composition replay
+// 到不稳定文档）。**两位必须同时置**才算命中。
+//
+// ★ 为什么不能只判 dynFlags 0x20：那是 `TS_SD_UIINTEGRATIONENABLE`，语义为「宿主支持
+//   IME UI 集成」——一个**能力位**，不回答「这个文档是什么」。初版只判它，2026-08-18
+//   被实测推翻：Win11 任务管理器（WinUI 3 重写）的搜索框**主** DocMgr 天生
+//   dynFlags=0x30 statFlags=0x40（0x40 = TS_SS_UWPCONTROL，TS_SS_TRANSITORY 一位没置），
+//   用户长期停在上面正常打字，却被判成 transient ⇒ 该进程从头到尾一次 focus_gained 都
+//   发不出去，服务端焦点归属永远停在上一个应用。症状是三合一的：per-app 模式不跟随、
+//   切走再切回工具栏不显示、右键菜单里的应用名还是上一个进程。全量日志统计：守卫命中
+//   100% 出自 taskmgr.exe，而 WinUI 3 只会越来越多。
+//
+// ★ 为什么也不能只判 statFlags 0x4（`TS_SS_TRANSITORY`，真正的身份位）：Chrome /
+//   JetBrains 会在**有真实文本输入**的 context 上置它（见 _DocMgrHasEditableContext 内
+//   的注释），单判必然误伤一大批正常宿主；且 explorer 任务栏（dynFlags=0x80000000
+//   statFlags=0x4）目前是照发 focus_gained 的，单判会连它一起改掉。
+//
+// 合取两位是唯一同时避开这两类误伤的写法，且**命中集必为原判据的子集** —— 本次改动
+// 只可能让原本被跳过的文档恢复上报，不可能新增跳过。真正的 XamlIsland 容器
+// （explorer 地址栏，实测 dynFlags 含 0x20 且 statFlags 含 0x4）仍照旧命中。
+//
+// 提为文件级常量/函数是因为 OnSetFocus 里有**三处**要判它：跳过 focus_gained 的守卫
+// 本身、doc_changed 收口的预判（否则会发出没有配对 focus_gained 的 focus_lost）、以及
+// _pLastActiveDocMgr 的入缓存条件。三处必须同源，任何一处漏改都会让 lost/gained 失配。
+static constexpr DWORD kUiIntegrationDynFlag = 0x20; // TS_SD_UIINTEGRATIONENABLE（能力位）
+static constexpr DWORD kTransitoryStatFlag   = 0x04; // TS_SS_TRANSITORY（身份位）
+
+static inline BOOL IsLockedTransientDocMgr(DWORD dynFlags, DWORD statFlags)
+{
+    return ((dynFlags & kUiIntegrationDynFlag) != 0 && (statFlags & kTransitoryStatFlag) != 0)
+               ? TRUE
+               : FALSE;
+}
 
 // 激活静默期：ActivateEx 之后这段时间内的 compartment 变化视为系统初始化同步而非用户
 // 操作。实测激活后 ~96ms 出现一次 CONVERSION 变化，取 250ms 留 2.6 倍余量。
@@ -2136,8 +2163,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             // _DocMgrHasEditableContext 是纯查询（GetTop + GetStatus），提前问一次无副作用；
             // 只在真正换文档时多查一次，不在焦点热路径上。
             DWORD incomingDynFlags = 0;
-            _DocMgrHasEditableContext(pDocMgrFocus, &incomingDynFlags);
-            const BOOL willSkipFocusGained = (incomingDynFlags & kXamlIslandLockedFlag) != 0;
+            DWORD incomingStatFlags = 0;
+            _DocMgrHasEditableContext(pDocMgrFocus, &incomingDynFlags, &incomingStatFlags);
+            const BOOL willSkipFocusGained =
+                IsLockedTransientDocMgr(incomingDynFlags, incomingStatFlags);
             CleanupInputStateForDocChange(_pLastActiveDocMgr, FOCUS_LOST_REASON_DOC_CHANGED,
                                           !willSkipFocusGained);
         }
@@ -2179,7 +2208,9 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // (JetBrains/Java Swing). Chrome marks its "no text field" context as TF_SD_READONLY,
         // which is the correct TSF-standard signal for "no writable text input".
         DWORD docMgrDynFlags = 0;
-        _hasTextInputContext = _DocMgrHasEditableContext(pDocMgrFocus, &docMgrDynFlags);
+        DWORD docMgrStatFlags = 0;
+        _hasTextInputContext =
+            _DocMgrHasEditableContext(pDocMgrFocus, &docMgrDynFlags, &docMgrStatFlags);
         WIND_LOG_DEBUG_FMT(L"OnSetFocus: hasTextCtx=%d focusSession=%llu", _hasTextInputContext, _focusSessionId);
 
         // 读取焦点控件的 InputScope（密码框/邮箱/URL 等语义），随 focus_gained 上报给 Go 决策。
@@ -2213,9 +2244,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // WIND_LOG_DEBUG_FMT 直接展开为 OutputFmt(4, ...)），参数会在级别判定**之前**求值，
         // 在焦点热路径上拼字符串即是无条件开销。
         WIND_LOG_DEBUG_FMT(
-            L"compat.focus.signals focusSession=%llu hasTextCtx=%d dynFlags=0x%X rawScope=0x%llX "
-            L"scopePassword=%d ctxKbdDisabled=%d threadKbdDisabled=%d",
-            _focusSessionId, _hasTextInputContext ? 1 : 0, docMgrDynFlags, rawScopeMask,
+            L"compat.focus.signals focusSession=%llu hasTextCtx=%d dynFlags=0x%X statFlags=0x%X "
+            L"rawScope=0x%llX scopePassword=%d ctxKbdDisabled=%d threadKbdDisabled=%d",
+            _focusSessionId, _hasTextInputContext ? 1 : 0, docMgrDynFlags, docMgrStatFlags,
+            rawScopeMask,
             (rawScopeMask & kPasswordScopeBits) != 0 ? 1 : 0,
             _focusIsPassword ? 1 : 0, _bKeyboardDisabled ? 1 : 0);
 
@@ -2268,23 +2300,33 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         _lastFocusCaretHeight = caretHeight > 0 ? caretHeight : DEFAULT_CARET_HEIGHT;
         _lastFocusCaretSource = caretSource;
 
-        // XamlIsland/transient locked DocMgr guard: dynFlags=0x20 consistently
-        // marks Explorer's XamlIsland container DocMgrs where RequestEditSession
-        // returns TF_E_NOLOCK. Sending focus_gained would cause the service to replay
-        // composition into this unstable DocMgr; when the user then clicks away
-        // the composition text is committed at screen position (0,0).
-        // Skip focus_gained for these DocMgrs.
+        // XamlIsland/transient locked DocMgr guard: 这类**容器**文档上 RequestEditSession
+        // 返回 TF_E_NOLOCK，发 focus_gained 会让服务端把 composition replay 进去；用户随后
+        // 点走时，组合中的文字会在屏幕 (0,0) 处上屏。故对它们跳过 focus_gained。
+        // 命中条件见 IsLockedTransientDocMgr —— **能力位 dynFlags 0x20 必须与身份位
+        // statFlags 0x4 合取**，只判前者会把 WinUI 3 宿主（任务管理器）整个吞掉。
         //
         // ⚠ 旧注释断言「the subsequent stable DocMgr focus_gained will arrive」——**实测
         // 不成立**：explorer 地址栏点击后用户就停在这个 transient DocMgr 上正常打字，
         // 4 秒内再无第二个 focus_gained（2026-07-26 实测）。依赖它补配对是错的，因此
         // 上面的 doc_changed 收口会预判本守卫是否命中、命中则不发 focus_lost。
         // **改动本守卫的命中条件时，必须同步那一处的预判。**
-        if (docMgrDynFlags & kXamlIslandLockedFlag)
+        // 本条是「能力位不等于身份位」这次修复的现场证据行：WinUI 3 宿主（任务管理器等）
+        // 天生带 UI 集成能力位却不是 transient，旧判据在这里会把它整个吞掉。留一行日志，
+        // 下次再出现「某宿主焦点归属对不上」时能一眼看出守卫有没有介入。
+        // 参数都是已算好的标量，日志宏无级别短路也没有额外开销。
+        if ((docMgrDynFlags & kUiIntegrationDynFlag) && !(docMgrStatFlags & kTransitoryStatFlag))
         {
             WIND_LOG_INFO_FMT(
-                L"OnSetFocus: skipping focus_gained for locked/transient DocMgr dynFlags=0x%X focusSession=%llu",
-                docMgrDynFlags, _focusSessionId);
+                L"OnSetFocus: dynFlags 含 UI 集成能力位但非 transient（statFlags=0x%X），照常上报 focus_gained focusSession=%llu",
+                docMgrStatFlags, _focusSessionId);
+        }
+
+        if (IsLockedTransientDocMgr(docMgrDynFlags, docMgrStatFlags))
+        {
+            WIND_LOG_INFO_FMT(
+                L"OnSetFocus: skipping focus_gained for locked/transient DocMgr dynFlags=0x%X statFlags=0x%X focusSession=%llu",
+                docMgrDynFlags, docMgrStatFlags, _focusSessionId);
             // Fall through — sinks and LangBar are already set up above.
             // Do not send focus_gained IPC.
         }
@@ -2381,7 +2423,8 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 旧 DocMgr 释放后新对象可能落在同一地址，"换了文档"会被误判成抖动而漏清理。
         // locked/transient（XamlIsland）不入缓存——上面已对其跳过 focus_gained 视作非事件，
         // 若缓存它，紧随其后的真实文档就会被判成"换了文档"，反而清掉刚输入的内容。
-        if (!(docMgrDynFlags & kXamlIslandLockedFlag) && _pLastActiveDocMgr != pDocMgrFocus)
+        if (!IsLockedTransientDocMgr(docMgrDynFlags, docMgrStatFlags) &&
+            _pLastActiveDocMgr != pDocMgrFocus)
         {
             if (_pLastActiveDocMgr != nullptr)
                 _pLastActiveDocMgr->Release();
@@ -4307,10 +4350,13 @@ void CTextService::SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMg
                                   _QueryWindowClass(hwndFg));
 }
 
-BOOL CTextService::_DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDynFlagsOut)
+BOOL CTextService::_DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDynFlagsOut,
+                                             DWORD* pStatFlagsOut)
 {
     if (pDynFlagsOut)
         *pDynFlagsOut = 0;
+    if (pStatFlagsOut)
+        *pStatFlagsOut = 0;
 
     if (pDocMgr == nullptr)
         return FALSE;
@@ -4333,11 +4379,16 @@ BOOL CTextService::_DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDy
         // input". Chrome dynamically sets/clears this bit when text fields gain/lose focus.
         // TF_SS_TRANSITORY (0x4 of dwStaticFlags) is NOT a reliable signal — Chrome and
         // JetBrains both set it on contexts that do have real text input.
+        // ⚠ 上面这条只否掉「拿 TS_SS_TRANSITORY **单独**判可编辑性」。它作为
+        // locked/transient 判据的**一半**仍然有效（与 dynFlags 的能力位合取），
+        // 见 IsLockedTransientDocMgr —— 两个判据回答的是不同的问题，别互相引用来否定。
         WIND_LOG_DEBUG_FMT(L"_DocMgrHasEditableCtx: dynFlags=0x%X statFlags=0x%X", status.dwDynamicFlags, status.dwStaticFlags);
         if (status.dwDynamicFlags & TF_SD_READONLY)
             result = FALSE;
         if (pDynFlagsOut)
             *pDynFlagsOut = status.dwDynamicFlags;
+        if (pStatFlagsOut)
+            *pStatFlagsOut = status.dwStaticFlags;
     }
     else
     {

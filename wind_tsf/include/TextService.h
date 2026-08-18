@@ -567,8 +567,11 @@ private:
 
     // Returns TRUE if pDocMgr has a non-null, writable, non-transitory top context.
     // Used to set _hasTextInputContext in OnSetFocus and RefreshTextInputContext.
-    // Optional pDynFlagsOut receives dwDynamicFlags from TF_STATUS (0 if unavailable).
-    BOOL _DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDynFlagsOut = nullptr);
+    // Optional pDynFlagsOut / pStatFlagsOut receive dwDynamicFlags / dwStaticFlags from
+    // TF_STATUS (0 if unavailable). 两者要一起取才判得了 locked/transient —— 见
+    // IsLockedTransientDocMgr：dynFlags 那一位只是能力位，单独用会误伤 WinUI 3 宿主。
+    BOOL _DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDynFlagsOut = nullptr,
+                                   DWORD* pStatFlagsOut = nullptr);
 
     // 读取焦点文档的 TSF InputScope 集合并编码为 bitmask（bit N = 枚举值 N 存在）。
     // 失败或无 InputScope 时返回 0。随 focus_gained 上报给 Go 端做密码框等决策。
