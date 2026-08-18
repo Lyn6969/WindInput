@@ -318,6 +318,23 @@ pub const CONFIG_KEY_PAIR_STATE_TTL: &str = "pair_state_ttl";
 /// （关）起步，只在切换时推会让重连后的宿主永远不采集（`push_connect_fix` 记过同型）。
 pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
 
+/// 语言栏按钮的悬停提示文本。格式：`[ch:u16(LE)]...`（UTF-16LE，无长度前缀，
+/// `value` 本身就是整段）。与 `CONFIG_KEY_CUSTOM_EN_PUNCT` 同惯例——C++ 侧照此可以
+/// 直接构造 `std::wstring`，不必再跨类去借编码转换函数。
+///
+/// 文案与选择逻辑都在服务端：DLL 只存一份字符串，`GetTooltipString` 原样返回。
+/// 收归的理由与 `InputBlock` 同一条——DLL 本地只有 `_bChineseMode` / `_bCapsLock` 两个
+/// 量，判不出「密码框」「已禁用」这些成因，删掉那些分支后 tooltip 就只能说个大概；
+/// 而这些成因服务端全都有。
+///
+/// **刻意走 sync_config 而不是并进 activation status push**：后者的 `icon_label` 是
+/// 尾部不定长段（无长度前缀，占满剩余 payload），后面再追加字段就没有边界可解析——
+/// 要么给 label 补长度前缀（改格式、旧 DLL 当场读乱），要么另开通道。这里选后者。
+///
+/// 变化频率低于状态变化（tooltip 只有几种取值，全半角/标点变化不影响它），
+/// 故服务端只在**文本真的变了**时才推。
+pub const CONFIG_KEY_LANGBAR_TOOLTIP: &str = "langbar_tooltip";
+
 // 消费确认
 pub const CMD_CONSUMED: u16 = 0x0401;
 

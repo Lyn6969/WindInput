@@ -6,6 +6,7 @@
 // 反向不成立（CaretEditSession.h 只前置声明 CTextService），故无循环包含。
 #include "CaretEditSession.h"
 #include <string>
+#include <mutex>
 #include <vector>
 #include <utility>
 
@@ -277,6 +278,23 @@ public:
     void SetPasswordSuppressEnabled(BOOL bEnabled) { _passwordSuppressEnabled = bEnabled; }
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；默认关）。
     void SetDiagSnapshotEnabled(BOOL bEnabled) { _diagSnapshotEnabled = bEnabled; }
+
+    // 语言栏悬停提示（core 经 CONFIG_KEY_LANGBAR_TOOLTIP 推）。文案与选择逻辑全在服务端，
+    // 这里只存一份原样交给 CLangBarItemButton::GetTooltipString。
+    //
+    // ⚠ 必须加锁：config 回调跑在 IPC 读线程，而 GetTooltipString 由系统在 TSF 线程调用。
+    // 同类的 SetPasswordSuppressEnabled 之所以裸赋值，是因为 BOOL 的读写天然原子——
+    // std::wstring 不是，跨线程裸写会让读方拿到半个字符串。
+    void SetLangBarTooltip(const std::wstring& text)
+    {
+        std::lock_guard<std::mutex> lk(_langBarTooltipMutex);
+        _langBarTooltip = text;
+    }
+    std::wstring GetLangBarTooltip() const
+    {
+        std::lock_guard<std::mutex> lk(_langBarTooltipMutex);
+        return _langBarTooltip;
+    }
     // 采集并上报一次诊断快照。开关关闭时**立即返回**，一次 Win32 调用都不做——
     // 采集本身要查三次窗口类名 + band，只有排查时才值得付这个开销。
     // docMgrChanged 由调用方给出（只有 OnSetFocus 知道自己是不是换了文档）。
@@ -398,6 +416,10 @@ private:
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；**默认关**）。
     // 默认关是硬要求：每次焦点切换都查三次类名 + band 的开销，不该由不排查的用户承担。
     BOOL  _diagSnapshotEnabled;
+    // 语言栏悬停提示文本与它的锁。空 = 尚未收到服务端推送（GetTooltipString 回落到本地
+    // 默认文案）；握手时服务端必推一次，故空只出现在连接建立前的极短窗口。
+    std::wstring _langBarTooltip;
+    mutable std::mutex _langBarTooltipMutex;
     // 已注册的加词热键 (RegisterHotKey id, raw hash)。raw hash 高16位=KEYMOD、低16位=VK，
     // 供 UnregisterHotKey 与 WM_HOTKEY 分发反解。最多两项（add_word / open_add_word_dialog）。
     std::vector<std::pair<int, uint32_t>> _addWordHotkeyIds;

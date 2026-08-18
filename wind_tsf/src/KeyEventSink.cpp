@@ -2429,6 +2429,15 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         _pTextService->SetPasswordSuppressEnabled(enabled);
         WIND_LOG_INFO_FMT(L"Password suppress policy updated: enabled=%d\n", enabled);
     }
+    else if (key == CONFIG_KEY_LANGBAR_TOOLTIP)
+    {
+        // 格式：[ch:u16(LE)]...（对齐 Rust push_langbar_tooltip）。value 即整段文本。
+        // 空 value 是合法的：服务端从不发空串，但真收到就当作「没有文本」，
+        // GetTooltipString 会回落到本地默认文案。
+        std::wstring text(reinterpret_cast<const wchar_t*>(value.data()), value.size() / 2);
+        _pTextService->SetLangBarTooltip(text);
+        WIND_LOG_DEBUG_FMT(L"LangBar tooltip updated: %ls\n", text.c_str());
+    }
     else if (key == CONFIG_KEY_DIAG_SNAPSHOT)
     {
         // 格式：enabled(u8)（对齐 Rust encode_diag_snapshot_value）

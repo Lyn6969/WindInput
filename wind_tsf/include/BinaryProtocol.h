@@ -737,6 +737,10 @@ constexpr const char* CONFIG_KEY_CUSTOM_EN_PUNCT = "custom_en_punct";
 // 吃键闸门（_pairPendingDepth）在本 DLL，故陈旧判据也必须在本地：若只有 core 过期而这边
 // 照吃跳出键，core 回 PassThrough 已太晚（「吃了再吐」，不补发 WM_KEYDOWN 的宿主会丢键）。
 constexpr const char* CONFIG_KEY_PAIR_STATE_TTL = "pair_state_ttl";
+// 语言栏按钮的悬停提示文本。格式：[ch:u16(LE)]...（UTF-16LE，无长度前缀，value 即整段）。
+// 文案与选择逻辑全在服务端，本 DLL 只存一份原样返回——本地只有中英态与 CapsLock 两个量，
+// 判不出「密码框」「已禁用」这些成因，而图标只能表达「不可用」，说清是哪一种全靠 tooltip。
+constexpr const char* CONFIG_KEY_LANGBAR_TOOLTIP = "langbar_tooltip";
 
 // Calculate key hash for hotkey matching
 // Format: (modifiers << 16) | keyCode

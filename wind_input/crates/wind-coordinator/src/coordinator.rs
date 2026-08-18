@@ -1116,6 +1116,11 @@ pub struct Coordinator {
     /// · 进入（→ 不可输入）延迟 [`INPUT_BLOCK_DELAY`]——晚一点显「英」用户察觉不到。
     /// 实测 QQ 密码框场景这两个量每约 180ms 翻转两次，不做迟滞就是图标闪烁源。
     pub(crate) input_block_gate: Mutex<InputBlockGate>,
+    /// 上次广播出去的语言栏悬停提示文本，用于去重。
+    ///
+    /// tooltip 只有几种取值，而状态推送远比它频繁（全半角、标点、方案切换都会推状态却
+    /// 不改 tooltip）。不去重的话每次状态变化都白发一条 IPC 给所有宿主。
+    pub(crate) last_langbar_tooltip: Mutex<String>,
     /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
@@ -1665,6 +1670,7 @@ impl Coordinator {
             host_render: std::sync::OnceLock::new(),
             last_input_diag: Mutex::new(Default::default()),
             input_block_gate: Mutex::new(InputBlockGate::default()),
+            last_langbar_tooltip: Mutex::new(String::new()),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
             password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -7409,6 +7415,120 @@ mod initial_mode_tests {
             c.effective_input_block(),
             InputBlock::None,
             "恢复必须立即——迟滞只该拖慢「变英」，不该拖慢「变回来」"
+        );
+    }
+
+    /// 语言栏悬停提示的六个分支。文案是 DLL 唯一的信息来源（它那边已改成原样返回），
+    /// 写错不会有任何编译或运行期信号——只有用户悬停时看到胡话。
+    #[test]
+    fn langbar_tooltip_covers_every_branch() {
+        let c = coord_with(|_| {});
+        {
+            let mut s = c.state.lock().unwrap();
+            s.ime_active = true;
+            s.focus_no_edit_ctx = false;
+        }
+        let set = |chinese: bool, caps: bool| {
+            let mut s = c.state.lock().unwrap();
+            s.chinese_mode = chinese;
+            s.caps_lock = caps;
+        };
+
+        set(true, false);
+        assert_eq!(c.langbar_tooltip(), "清风输入法 - 中文模式");
+        set(true, true);
+        assert_eq!(
+            c.langbar_tooltip(),
+            "清风输入法 - 英文大写 (中文模式, Caps Lock)"
+        );
+        set(false, true);
+        assert_eq!(c.langbar_tooltip(), "清风输入法 - 英文模式 (Caps Lock 开)");
+        set(false, false);
+        assert_eq!(c.langbar_tooltip(), "清风输入法 - 英文模式 (Caps Lock 关)");
+
+        // ★★ 不可输入那两档要先稳够 INPUT_BLOCK_DELAY 才呈现——tooltip 与图标读**同一个**
+        // effective_input_block，所以文案也跟着迟滞。这是对的：图标还显着方案标签、
+        // tooltip 却已经说「密码框」，那才是错位。第一次调用起计时，等到期后再断言。
+        c.password_suppress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        set(true, false);
+        assert_eq!(
+            c.langbar_tooltip(),
+            "清风输入法 - 中文模式",
+            "迟滞期内仍说旧文案，与图标同步"
+        );
+        std::thread::sleep(INPUT_BLOCK_DELAY + std::time::Duration::from_millis(30));
+        assert_eq!(c.langbar_tooltip(), "清风输入法 - 密码框，已切英文");
+        c.password_suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            c.langbar_tooltip(),
+            "清风输入法 - 中文模式",
+            "恢复方向不迟滞，立即回到常态文案"
+        );
+
+        c.last_input_diag.lock().unwrap().disabled = true;
+        let _ = c.langbar_tooltip(); // 起计时
+        std::thread::sleep(INPUT_BLOCK_DELAY + std::time::Duration::from_millis(30));
+        assert_eq!(c.langbar_tooltip(), "清风输入法 - 已禁用");
+        c.last_input_diag.lock().unwrap().disabled = false;
+        // 先让闸门回到 None 再测下一档：从「已禁用」直接转向另一个非 None 档走的是
+        // **进入**方向，仍会呈现旧值——那是闸门的正确行为，不是本条要测的东西。
+        assert_eq!(c.langbar_tooltip(), "清风输入法 - 中文模式");
+
+        // NoEditContext 刻意**不**单独成档：它已不再让图标显「英」（是日常状态），
+        // tooltip 再提就与看到的对不上。**必须等稳够之后再断言**——迟滞期内不变是
+        // 闸门的功劳，证明不了这一档没被单独处理。
+        c.state.lock().unwrap().focus_no_edit_ctx = true;
+        set(true, false);
+        std::thread::sleep(INPUT_BLOCK_DELAY + std::time::Duration::from_millis(30));
+        assert_eq!(
+            c.input_block(),
+            InputBlock::NoEditContext,
+            "档位确实已落到 NoEditContext"
+        );
+        assert_eq!(
+            c.langbar_tooltip(),
+            "清风输入法 - 中文模式",
+            "无可编辑上下文不该改变文案——图标此时也没变"
+        );
+    }
+
+    /// tooltip 推送要去重：状态推送远比 tooltip 变化频繁（全半角、标点、方案切换都推状态
+    /// 却不改文案），不去重就是每次状态变化都白发一条 IPC 给所有宿主。
+    #[test]
+    fn langbar_tooltip_push_is_deduped_but_handshake_is_forced() {
+        let c = coord_with(|_| {});
+        {
+            let mut s = c.state.lock().unwrap();
+            s.ime_active = true;
+            s.chinese_mode = true;
+        }
+        // 首次广播：缓存为空 ⇒ 必发
+        c.push_langbar_tooltip(0);
+        let first = c.last_langbar_tooltip.lock().unwrap().clone();
+        assert_eq!(first, "清风输入法 - 中文模式");
+
+        // 文案没变 ⇒ 缓存不动（下游是否真的发送由 push_server 决定，这里钉的是判据）
+        c.push_langbar_tooltip(0);
+        assert_eq!(*c.last_langbar_tooltip.lock().unwrap(), first);
+
+        // 文案变了 ⇒ 缓存更新
+        c.state.lock().unwrap().chinese_mode = false;
+        c.push_langbar_tooltip(0);
+        assert_eq!(
+            *c.last_langbar_tooltip.lock().unwrap(),
+            "清风输入法 - 英文模式 (Caps Lock 关)"
+        );
+
+        // 握手（token != 0）绕过去重、也不写缓存：新连接手里没有任何文本，被全局去重
+        // 挡掉就会一直显示本地回落值。push_connect_fix 与 diag_snapshot 都栽过这形状。
+        let before = c.last_langbar_tooltip.lock().unwrap().clone();
+        c.push_langbar_tooltip(token(100));
+        assert_eq!(
+            *c.last_langbar_tooltip.lock().unwrap(),
+            before,
+            "定向推送不该污染广播用的去重缓存"
         );
     }
 

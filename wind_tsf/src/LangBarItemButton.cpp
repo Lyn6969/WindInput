@@ -242,41 +242,27 @@ STDAPI CLangBarItemButton::GetTooltipString(BSTR* pbstrToolTip)
     if (pbstrToolTip == nullptr)
         return E_INVALIDARG;
 
-    // 三种「打不了中文」的成因分别措辞——图标只能表达「不可用」，说清是哪一种要靠这里。
-    if (_bKeyboardDisabled)
+    // 文案与选择逻辑全在服务端（Rust `langbar_tooltip`），经 CONFIG_KEY_LANGBAR_TOOLTIP
+    // 推来，这里只负责原样返回。
+    //
+    // 收归的理由：本 DLL 手里只有 _bChineseMode / _bCapsLock 两个量，判不出「密码框」
+    // 「输入法被系统禁用」这些成因——而图标只能表达「不可用」，说清是哪一种正是 tooltip
+    // 的职责。那些成因服务端全都有（见 Rust 侧 InputBlock），留在这边只会让同一件事有
+    // 两个负责者、各说各话。
+    if (_pTextService != nullptr)
     {
-        *pbstrToolTip = SysAllocString(L"清风输入法 - 已禁用");
-        return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
-    }
-
-    // 「密码框 / 焦点不在可编辑控件里」的区分已随判定一起收归服务端（见 Rust 侧
-    // InputBlock）：图标主字由服务端渲成「英」，DLL 这边不再持有成因、也就无从分档。
-    // 线程级禁用那一档保留——它由本 DLL 自己的 compartment sink 驱动，仍是本地事实。
-
-    // Use effective mode: Chinese mode + CapsLock ON = English Upper (temporary)
-    BOOL effectiveChinese = _bChineseMode && !_bCapsLock;
-
-    if (effectiveChinese)
-    {
-        *pbstrToolTip = SysAllocString(L"清风输入法 - 中文模式");
-    }
-    else if (_bCapsLock)
-    {
-        if (_bChineseMode)
+        const std::wstring text = _pTextService->GetLangBarTooltip();
+        if (!text.empty())
         {
-            // Chinese mode with CapsLock = temporary English uppercase
-            *pbstrToolTip = SysAllocString(L"清风输入法 - 英文大写 (中文模式, Caps Lock)");
-        }
-        else
-        {
-            *pbstrToolTip = SysAllocString(L"清风输入法 - 英文模式 (Caps Lock 开)");
+            *pbstrToolTip = SysAllocString(text.c_str());
+            return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
         }
     }
-    else
-    {
-        *pbstrToolTip = SysAllocString(L"清风输入法 - 英文模式 (Caps Lock 关)");
-    }
 
+    // 回落：仅在「连接建立前」这段极短窗口内走到（服务端握手时必推一次）。
+    // 刻意只给一个中性文案而不在这里重建那套分支——留一份简化版判定，就是留一个会与
+    // 服务端漂移的第二真相源，而漂移了也没有任何信号。
+    *pbstrToolTip = SysAllocString(L"清风输入法");
     return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
 }
 

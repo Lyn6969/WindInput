@@ -71,6 +71,9 @@ impl Coordinator {
             // 无 token 的旧路径（不应出现于当前 DLL）：保持原广播行为
             self.push_server.push_to_active(&encoded);
         }
+        // tooltip 走**广播**而非跟着上面定向发：它不含 per-pid 的量，广播安全，且非
+        // 事件源的宿主同样需要最新文案（悬停到别的窗口上时不该看到陈旧的）。内部去重。
+        self.push_langbar_tooltip(0);
     }
 
     /// push 客户端完成 token 握手后的补推握手（仅 Windows；由 main.rs 注册到 PushServer）。
@@ -97,6 +100,7 @@ impl Coordinator {
         // 诊断采集开关：DLL 每次重连都从默认值（关）起步，握手不推则 HUD 开着也收不到
         // 新连接宿主的快照——而最需要它的 SearchHost 恰恰是最常重连的那类。
         self.push_diag_snapshot_config(client_token);
+        self.push_langbar_tooltip(client_token); // 握手强推：新连接手里没有任何文本
 
         let Some(mgr) = self.host_render() else {
             return;
@@ -287,6 +291,68 @@ impl Coordinator {
         self.push_server.push_to_token(token, &encoded);
     }
 
+    /// 语言栏按钮的悬停提示文本。**文案与选择逻辑的唯一产地**（DLL 只负责原样返回）。
+    ///
+    /// 收归的理由与 `InputBlock` 同一条：DLL 本地只有中英态与 CapsLock 两个量，判不出
+    /// 「密码框」「输入法被系统禁用」这些成因——图标只能表达「不可用」，说清是哪一种
+    /// 全靠 tooltip，而成因在服务端。密码框那一档正是本轮从 DLL 删掉后又在这里补回来的。
+    ///
+    /// ⚠ `effective_input_block()` 必须在取 state 锁**之前**调：它内部要取 state 与 gate
+    /// 两把锁，`std::sync::Mutex` 不可重入。同类事故在 notify_toolbar 上真机卡死过一次。
+    pub(crate) fn langbar_tooltip(&self) -> String {
+        let block = self.effective_input_block();
+        let (chinese, caps) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.chinese_mode, s.caps_lock)
+        };
+        const NAME: &str = "清风输入法";
+        match block {
+            crate::coordinator::InputBlock::KeyboardDisabled => format!("{NAME} - 已禁用"),
+            crate::coordinator::InputBlock::Password => format!("{NAME} - 密码框，已切英文"),
+            // NoEditContext 不进这里：它已不再让图标显「英」（是日常状态，见 shows_english），
+            // tooltip 自然也不该提，否则悬停时说的与看到的对不上。
+            _ if chinese && !caps => format!("{NAME} - 中文模式"),
+            _ if chinese => format!("{NAME} - 英文大写 (中文模式, Caps Lock)"),
+            _ if caps => format!("{NAME} - 英文模式 (Caps Lock 开)"),
+            _ => format!("{NAME} - 英文模式 (Caps Lock 关)"),
+        }
+    }
+
+    /// 下发语言栏悬停提示。
+    ///
+    /// `client_token != 0`：握手场景，**定向且强推**（绕过去重）。新连接的 DLL 手里没有
+    /// 任何文本，若被全局去重挡掉就会一直显示本地回落值——`push_connect_fix` 与
+    /// `diag_snapshot` 都栽过这个形状。
+    ///
+    /// `client_token == 0`：状态变化场景，**广播且去重**。广播是安全的：tooltip 不含
+    /// 任何 per-pid 的量（这正是 activation status 不能广播的原因——那里的
+    /// `hostRenderAvail` 是按事件源 pid 算的）。不广播的话，非事件源的宿主会一直悬停
+    /// 出陈旧文案，与 compartment 陈旧是同一个形状。
+    pub(crate) fn push_langbar_tooltip(&self, client_token: u64) {
+        let text = self.langbar_tooltip();
+        // UTF-16LE：C++ 侧 wchar_t 即 UTF-16，照此可直接构造 wstring。
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_LANGBAR_TOOLTIP,
+            &utf16,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+            return;
+        }
+        {
+            let mut last = self
+                .last_langbar_tooltip
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *last == text {
+                return;
+            }
+            *last = text;
+        }
+        self.push_server.push_to_active(&msg);
+    }
+
     pub(crate) fn push_state_update(&self) {
         // 图标位图与状态推送同源同时机，且**发布必须先于推送**——顺序的理由与保证方式
         // 见 status_with_icon_published。
@@ -300,5 +366,8 @@ impl Coordinator {
             &s.icon_label,
         );
         self.push_server.push_to_active(&encoded);
+        // 状态变化同样可能改变 tooltip（切中英、CapsLock）。内部去重，绝大多数
+        // 状态推送（全半角、标点、方案切换）不会真的发出去。
+        self.push_langbar_tooltip(0);
     }
 }
