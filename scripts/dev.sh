@@ -202,15 +202,22 @@ do_clippy() {
     # 传 "deny" 时把警告升为错误(CI 走这条)。本地 `dev.sh l` 不传, 迭代中途的 warning
     # 不该直接中断; 门禁只在 CI 上生效。
     # --all-targets 不可省: 不带它连测试代码都不检查, 而测试里同样会长出警告。
+    # --keep-going 同样不可省: cargo 默认在首个 crate 失败后就不再调度新任务, 一轮只
+    # 报得出一个错误。实测同一份代码, 不带它报 1 条, 带上报 22 条(分五层, 层与层之间
+    # 是 crate 依赖关系, 前一层不修后一层根本不被检查)。缺了它 CI 一红就是"推一次修
+    # 一个", 8 月中连红 8 次即此。加上它仍需多轮, 但一轮能推进一整层。
     local deny_args=()
     [ "${1:-}" = "deny" ] && deny_args=(-- -D warnings)
     say "\n正在运行 cargo clippy ($TARGET, 全工作区含测试)..."
-    cd "$PROJECT_ROOT" && cargo_xwin clippy --target "$TARGET" --workspace --all-targets "${deny_args[@]}"
+    cd "$PROJECT_ROOT" && cargo_xwin clippy --keep-going --target "$TARGET" --workspace --all-targets "${deny_args[@]}"
 }
 
 do_test() {
+    # --no-fail-fast: 默认首个失败的 test binary 就停, 排在它后面的整个不跑。本机
+    # Windows 有 113 个 test binary, CI 的 Linux job 曾在第 84 个(wind-ui)停下 ——
+    # 中间 29 个在 CI 上从未执行过。代价是失败时更慢, 换来一次看全所有失败点。
     say "\n正在运行 cargo test (本机, 全工作区)..."
-    cd "$PROJECT_ROOT" && cargo test --workspace
+    cd "$PROJECT_ROOT" && cargo test --workspace --no-fail-fast
 }
 
 do_fmt() {

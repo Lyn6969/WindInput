@@ -128,10 +128,13 @@ jobs:
 
       # 与 Linux job 的 dev.sh ci 同一门禁口径：--all-targets 覆盖测试代码，-D warnings 挂新警告。
       # darwin 与 windows 走的 cfg 分支不同，本条是 macOS-only 代码的唯一 lint 关卡。
+      # --keep-going 与下一步的 --no-fail-fast 同理由：两者默认都是首错即停，一轮只报得出
+      # 一个问题，于是「推一次修一个」。macOS 是 darwin 侧代码的唯一关卡（上面的 check job
+      # 全程跑 windows target），没有第二条路能提前发现剩下的，这里尤其需要一次看全。
       - name: Clippy wind_input (darwin)
         working-directory: wind_input
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --keep-going --workspace --all-targets -- -D warnings
 
       - name: Test wind_input (Rust core, darwin)
         working-directory: wind_input
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
