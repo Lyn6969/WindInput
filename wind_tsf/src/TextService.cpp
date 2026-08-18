@@ -5371,11 +5371,26 @@ STDAPI CTextService::OnLayoutChange(ITfContext* pContext, TfLayoutCode lCode, IT
                         &probeCaret, &probeCs, &probeHasCs, 0, &probeUsedCs))
                 {
                     // 与 SendCaretPositionUpdate 同口径：y 取 bottom、height 由 rect 高度算。
+                    LONG px = probeCaret.left;
+                    LONG py = probeCaret.bottom;
                     LONG ph = probeCaret.bottom - probeCaret.top;
                     LONG csx = probeHasCs ? probeCs.left : 0;
                     LONG csy = probeHasCs ? probeCs.bottom : 0;
+                    // ★ DPI 归一必须在此**单独**做一次。本路径刻意不走 _EmitCaretUpdate：那个
+                    // 出口除归一外还做两件探针不能做的事——写 _lastKnownCaret*（权威兜底缓存，
+                    // 喂进 reflow 前的试探值会让 50ms timer 兜底取到未经验证的坐标），以及发
+                    // CMD_CARET_UPDATE（服务端据此当权威坐标，首显闸门直接失效）。故两条路径
+                    // 只共用「归一化」这一步，不共用出口。
+                    //
+                    // ⚠ 漏掉这一步的后果只在 **DPI-unaware 宿主 + 缩放≠100% 的显示器** 上显形，
+                    // 双屏异缩放是最常见的触发场景：GetTextExt 返回的是虚拟化 96-DPI 逻辑坐标，
+                    // 未换算就发出去 = 把逻辑坐标当物理坐标。实测 200% 缩放副屏上（QQ/TIM），
+                    // 探针 y/height 恰为权威值的 2 倍（839→1678、19→38），候选窗被定位到屏幕外。
+                    // 症状是「第一个字正常、后续字能打但候选窗不显示、停顿一下又恢复」——因为
+                    // 第一个字走的是长等待（拒绝探针、只认权威坐标），后续字才吃这份错误采样。
+                    ConvertToPhysicalCoordinates(px, py, ph, csx, csy);
                     const int probeSrc = probeUsedCs ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
-                    _pIPCClient->SendCaretProbe(probeCaret.left, probeCaret.bottom, ph, csx, csy, probeSrc);
+                    _pIPCClient->SendCaretProbe(px, py, ph, csx, csy, probeSrc);
                 }
             }
             WIND_LOG_DEBUG(L"OnLayoutChange (first show): debouncing caret flush\n");
