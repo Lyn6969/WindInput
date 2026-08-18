@@ -322,6 +322,25 @@ pub(crate) struct State {
     /// 与 [`Self::ime_active`] 正交：应用还在前台、输入法仍激活，但焦点可能落在
     /// 不可输入的地方（文件列表、日志面板），此时工具栏应当隐藏。
     pub(crate) has_edit_context: bool,
+    /// 「焦点确实落在一个**没有可编辑上下文**的文档上」——比 `has_edit_context` 权威。
+    ///
+    /// ⚠ 两者的差别是**信号权威度**，不是又多了一个负责者：
+    /// · `has_edit_context` 被 `CtxLost`（DocMgr 级失焦）置假。那是**噪声层**——它回答的是
+    ///   「DocMgr 走了」，不是「用户进了不可输入的地方」。用于工具栏可见性没问题：翻错了
+    ///   UI 层 50ms 防抖能吸收，漏隐藏的代价也只是碍眼。
+    /// · 本字段只由两个**权威**信号改写：`focus_lost(NoEditCtx)`（DLL 判定新文档确实没有
+    ///   可编辑上下文）与 `focus_gained`（有可编辑上下文才会发）。
+    ///
+    /// 为什么必须分开：语言栏图标是持续可见的全局指示，误显「英」很刺眼，代价与工具栏
+    /// 完全不对称。实测（2026-08-18）用 `has_edit_context` 驱动图标的后果——
+    ///   `handle_focus_lost reason=CtxLost` → 200ms 后 `input_block → NoEditContext` → 图标变「英」，
+    /// 而那次焦点根本没离开可编辑控件。这正是 C++ 那版最终学会的事（只在 gaining 分支
+    /// 推进状态），我把判定收归 Rust 时**没有把这条一起带过来**。
+    ///
+    /// ⚠ 后续（同日）：本字段仍然维护，但 `InputBlock::NoEditContext` 已**不再让图标显英**
+    /// （见 `shows_english`）——即使只由权威信号驱动，它在 Electron 类宿主上也是每分钟
+    /// 数次的日常事件。字段保留是因为 tooltip 与未来的权威状态上报仍要用它。
+    pub(crate) focus_no_edit_ctx: bool,
     pub(crate) caps_lock: bool,
     pub(crate) input_buffer: String,
     /// `input_buffer` 的「原始大小写」影子串：用户按 Shift+字母打出的大写只存在这里。
@@ -572,6 +591,72 @@ pub(crate) struct ActiveCompat {
     /// 应用时按目标点所在显示器的 DPI 换算成物理像素，见 [`Coordinator::apply_caret_compat`]。
     pub(crate) caret_offset_x: i32,
     pub(crate) caret_offset_y: i32,
+}
+
+/// 「当前焦点为什么打不出中文」——全局**唯一**的判定结果。
+///
+/// 2026-08-18 起由协调器独占。此前判据分散在两侧：C++ 侧算 `_bNoEditContext` /
+/// `IsPasswordSuppressActive()` 驱动语言栏图标（还自带一份 200ms 迟滞），Rust 侧算
+/// `password_suppress` / `has_edit_context` 驱动工具栏与输入闸——**两个负责者、两份迟滞，
+/// 必然漂移**，实测出现过「图标说英文、工具栏说中文」的错位。
+///
+/// ⚠ **只管「显示什么」，不管「吃不吃键」**：吃键闸门必须留在 DLL 本地
+/// （`CTextService::IsPasswordSuppressActive`），因为它要在 IPC **之前**给出答案。
+/// 把它也搬过来就会重现「吃了再吐」丢键——DLL 吃下键、core 回 PassThrough，而
+/// Chrome/Electron 一类严格 TSF 宿主不回退合成 `WM_CHAR`，那个键直接消失。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum InputBlock {
+    /// 能正常输入。
+    #[default]
+    None,
+    /// 线程级 `GUID_COMPARTMENT_KEYBOARD_DISABLED`：系统把输入法整个禁用了。
+    /// 罕见且严重，是唯一配得上「图标变淡」这种呈现的一档。
+    KeyboardDisabled,
+    /// 密码框：context 级 KEYBOARD_DISABLED 或 `IS_PASSWORD` InputScope。
+    Password,
+    /// 焦点不在可编辑控件里（CAD 绘图区、浏览器非输入区、QQ 的 READONLY DocMgr）。
+    NoEditContext,
+}
+
+impl InputBlock {
+    /// 是否该把模式格 / 图标主字覆盖成「英」。
+    ///
+    /// ★★★ **`NoEditContext` 刻意不在内**。它与另外两档看着都是「敲键盘不出中文」，
+    /// 但成因的**发生频率差三个数量级**：密码框与线程级禁用是罕见事件，而「焦点不在
+    /// 可编辑控件里」是日常——实测 VS Code 里 8 分钟发了 35 次 `NoEditCtx`（每换一次
+    /// docMgr 就一次：点标签页、点侧边栏、点终端面板）。每次都翻一下图标，用户看到的
+    /// 是图标自己在抖，而不是任何有用的信息。
+    ///
+    /// 而且此刻图标显示什么都不影响功能：焦点不在输入控件上时，敲键盘本来就没有落点。
+    /// 与 2026-08-04（ce167f37）否掉「用变淡表示无可编辑上下文」是同一条理由，那次也是
+    /// 「日常状态不配强呈现」。桌面显示「英」不受本决定影响——那走的是 initial_mode 规则
+    /// （`chinese_mode` 真的变了），不是本闸门。
+    ///
+    /// ⚠ 另一半原因：`NoEditCtx` 这个 `FocusLostReason` 回答的是「**这个 docMgr** 有没有
+    /// 可编辑 context」，而不是「输入法现在可不可用」。用事件推断状态本身就不严谨——
+    /// C++ 侧表达后者的是 `_hasTextInputContext`，且它在 `OnSetThreadFocus` 里会**重新
+    /// 权威查询**。真要恢复这一档，得让 DLL 把那个状态如实上报，而不是从失焦事件反推。
+    pub(crate) fn shows_english(self) -> bool {
+        matches!(self, Self::KeyboardDisabled | Self::Password)
+    }
+    /// 是否该变淡。**只留给线程级禁用**，理由同上。
+    pub(crate) fn dims_icon(self) -> bool {
+        matches!(self, Self::KeyboardDisabled)
+    }
+}
+
+/// 进入「不可输入」呈现前要求状态稳定的时长。恢复方向不受此限（立即生效）。
+pub(crate) const INPUT_BLOCK_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// [`Coordinator::input_block_gate`] 的内部状态。
+#[derive(Default)]
+pub(crate) struct InputBlockGate {
+    /// 当前**已呈现**的档位。不变量：图标与工具栏显示的恒等于它。
+    shown: InputBlock,
+    /// 「已经想切到某个非 None 档，但还没稳够 `INPUT_BLOCK_DELAY`」的起始时刻。
+    pending_since: Option<std::time::Instant>,
+    /// 复查线程在途（单飞）。churn 期间每次焦点事件都 spawn 一个线程是没有意义的。
+    probing: bool,
 }
 
 /// 焦点切换时是否需要重算初始状态（即是否调用 `apply_initial_mode`）。
@@ -958,6 +1043,13 @@ pub struct Coordinator {
     /// 而键已被全放行，用户无从知道自己打不出中文。
     /// ⚠ 呈现与输入闸是两条独立的路：改这里的展示**不会**改变是否抑制，反之亦然。
     pub(crate) password_suppress: std::sync::atomic::AtomicBool,
+    /// 「不可输入」**呈现**的迟滞闸门（判定本身见 [`Coordinator::input_block`]）。
+    ///
+    /// 两个方向不对称，取值与理由继承自已删除的 C++ 版：
+    /// · 恢复（→ 可输入）**立即**生效——误显「英」很刺眼；
+    /// · 进入（→ 不可输入）延迟 [`INPUT_BLOCK_DELAY`]——晚一点显「英」用户察觉不到。
+    /// 实测 QQ 密码框场景这两个量每约 180ms 翻转两次，不做迟滞就是图标闪烁源。
+    pub(crate) input_block_gate: Mutex<InputBlockGate>,
     /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
@@ -1365,6 +1457,7 @@ impl Coordinator {
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
                 has_edit_context: false, // 同上：焦点尚未落到任何可编辑控件
+                focus_no_edit_ctx: false, // 尚无权威判定，不表态
                 caps_lock: false,
                 input_buffer: String::new(),
                 input_buffer_cased: String::new(),
@@ -1505,6 +1598,7 @@ impl Coordinator {
             #[cfg(windows)]
             host_render: std::sync::OnceLock::new(),
             last_input_diag: Mutex::new(Default::default()),
+            input_block_gate: Mutex::new(InputBlockGate::default()),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
             password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -2157,6 +2251,104 @@ impl Coordinator {
         if let Some(p) = rule_punct {
             s.chinese_punct = p.is_chinese();
         }
+    }
+
+    /// 「当前焦点为什么打不出中文」的**真值**（未过迟滞）。呈现请用
+    /// [`Self::effective_input_block`]。
+    ///
+    /// 三个信号源都已由 DLL 上报到位，无需新增 IPC：
+    /// · 线程级禁用 → `focus_gained` 的 `disabled` 字段（DLL 注释写明该字段**统一是线程级**，
+    ///   密码框那一层折在 mask 的 IS_PASSWORD 位里，两者不可混为一谈）；
+    /// · 密码框     → `apply_input_diag` 据 mask 置位的 `password_suppress`，与输入闸同源；
+    /// · 无编辑上下文 → `focus_lost(NoEditCtx/CtxLost)` / `focus_gained` 维护的 `has_edit_context`。
+    ///
+    /// ⚠ `ime_active` 为假时一律返回 `None`：那说明本输入法根本没在服务任何宿主
+    /// （用户切到了别的输入法），此时 `has_edit_context` 恒假，不早退就会把图标永久钉成「英」。
+    pub(crate) fn input_block(&self) -> InputBlock {
+        let (ime_active, no_edit_ctx) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // ⚠ 读 `focus_no_edit_ctx` 而**不是** `has_edit_context`：后者被噪声层的
+            // CtxLost 置假，拿它驱动图标会在焦点根本没离开输入框时显「英」（实测见字段注释）。
+            (s.ime_active, s.focus_no_edit_ctx)
+        };
+        if !ime_active {
+            return InputBlock::None;
+        }
+        if self
+            .last_input_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .disabled
+        {
+            return InputBlock::KeyboardDisabled;
+        }
+        if self
+            .password_suppress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return InputBlock::Password;
+        }
+        if no_edit_ctx {
+            return InputBlock::NoEditContext;
+        }
+        InputBlock::None
+    }
+
+    /// 过了迟滞闸门之后**该呈现**的档位。图标与工具栏都只许读这一个。
+    ///
+    /// 未到期时返回旧值并安排一次复查——否则 churn 停下后没有任何事件会再驱动它，
+    /// 状态会永久停在「差一点就该变」。
+    pub(crate) fn effective_input_block(&self) -> InputBlock {
+        let now = self.input_block();
+        let mut g = self
+            .input_block_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now == g.shown {
+            // 回到已呈现的状态 ⇒ 撤销待定。churn 期间来回翻转会次次撤销，图标因此稳定不动。
+            g.pending_since = None;
+            return g.shown;
+        }
+        if now == InputBlock::None {
+            // 恢复方向：立即。
+            g.shown = now;
+            g.pending_since = None;
+            return now;
+        }
+        // 进入方向：要求稳定 INPUT_BLOCK_DELAY。
+        // ⚠ 用 `get_or_insert` 而非直接赋值：每次事件都重置起点的话，churn 下永远等不到到期。
+        let t0 = *g.pending_since.get_or_insert(std::time::Instant::now());
+        let waited = t0.elapsed();
+        if waited >= INPUT_BLOCK_DELAY {
+            g.shown = now;
+            g.pending_since = None;
+            tracing::debug!("input_block → {:?}（已稳定 {:?}）", now, waited);
+            return now;
+        }
+        if !g.probing {
+            g.probing = true;
+            let remaining = INPUT_BLOCK_DELAY - waited;
+            let weak = self.self_weak.get().cloned();
+            let spawned = std::thread::Builder::new()
+                .name("input-block-gate".into())
+                .spawn(move || {
+                    std::thread::sleep(remaining);
+                    if let Some(c) = weak.and_then(|w| w.upgrade()) {
+                        c.input_block_gate
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .probing = false;
+                        // 走收口点重新评估：它会再调 effective_input_block，
+                        // 那时若状态仍不变就到期落地，变回去了则被上面的撤销分支吃掉。
+                        c.notify_toolbar();
+                    }
+                });
+            if spawned.is_err() {
+                // 线程没起来就把闸放回去，否则此后永远不再复查。
+                g.probing = false;
+            }
+        }
+        g.shown
     }
 
     /// 热重载用户配置：从磁盘重读 Config 并原子替换 bundle（轻量设置即时生效），
@@ -6917,6 +7109,166 @@ mod initial_mode_tests {
         assert!(
             sync_chinese,
             "记事本无规则应回落到配置默认（中文），而不是沿用桌面留下的英文"
+        );
+    }
+
+    /// 三档的优先级与「未激活时不表态」。
+    ///
+    /// 优先级不是随意排的：线程级禁用时引擎压根收不到键，密码框次之，两者都不成立才轮到
+    /// 「焦点不在可编辑控件里」。排错了不会有编译或测试信号，只会让 tooltip / 变淡呈现错档。
+    #[test]
+    fn input_block_priority_and_inactive_short_circuit() {
+        let c = coord_with(|_| {});
+
+        // 未激活：一律不表态。否则 has_edit_context 恒假会把图标永久钉成「英」。
+        {
+            let mut s = c.state.lock().unwrap();
+            s.ime_active = false;
+            // 用权威信号，不用 has_edit_context——后者被噪声层驱动，不是图标的判据。
+            s.focus_no_edit_ctx = true;
+        }
+        c.password_suppress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        c.last_input_diag.lock().unwrap().disabled = true;
+        assert_eq!(c.input_block(), InputBlock::None, "未激活时不该表态");
+
+        c.state.lock().unwrap().ime_active = true;
+        assert_eq!(
+            c.input_block(),
+            InputBlock::KeyboardDisabled,
+            "线程级禁用最高"
+        );
+
+        c.last_input_diag.lock().unwrap().disabled = false;
+        assert_eq!(c.input_block(), InputBlock::Password, "其次密码框");
+
+        c.password_suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            c.input_block(),
+            InputBlock::NoEditContext,
+            "最后无编辑上下文"
+        );
+
+        c.state.lock().unwrap().focus_no_edit_ctx = false;
+        assert_eq!(c.input_block(), InputBlock::None);
+    }
+
+    /// ★★ 噪声层的 `CtxLost` **不得**让图标显「英」，只有权威的 `NoEditCtx` 才可以。
+    ///
+    /// 实测缺陷（2026-08-18，本重构自己引入的）：
+    ///   `handle_focus_lost reason=CtxLost` → 200ms 后 `input_block → NoEditContext`
+    ///   → 图标发布「英」，而那次焦点根本没离开可编辑控件。
+    /// 根子是我把判定收归 Rust 时直接读了 `has_edit_context`——那个量被 CtxLost 置假，
+    /// 用于工具栏可以（翻错了 50ms 防抖吸收），用于持续可见的图标就是误报。
+    ///
+    /// 这条测试同时钉住「工具栏仍然要跟着 CtxLost 隐藏」，防止有人把两者又合并回去。
+    #[test]
+    fn ctx_lost_is_noise_for_icon_but_still_hides_toolbar() {
+        use wind_bridge::handler::FocusLostReason;
+
+        let c = coord_with(|_| {});
+        {
+            let mut s = c.state.lock().unwrap();
+            s.ime_active = true;
+            s.has_edit_context = true;
+            s.focus_no_edit_ctx = false;
+        }
+
+        // 噪声层：DocMgr 级失焦。
+        c.handle_focus_lost(0, FocusLostReason::CtxLost);
+        {
+            let s = c.state.lock().unwrap();
+            assert!(!s.has_edit_context, "工具栏仍应隐藏——这一档的既有语义不变");
+            assert!(
+                !s.focus_no_edit_ctx,
+                "但图标不许据此表态：CtxLost 回答的是「DocMgr 走了」而非「进了不可输入的地方」"
+            );
+        }
+        assert_eq!(
+            c.input_block(),
+            InputBlock::None,
+            "CtxLost 之后图标必须仍显方案标签"
+        );
+
+        // 权威层：新文档确实没有可编辑上下文。
+        c.handle_focus_lost(0, FocusLostReason::NoEditCtx);
+        assert_eq!(
+            c.input_block(),
+            InputBlock::NoEditContext,
+            "NoEditCtx 才是「确实打不进去」的权威信号"
+        );
+    }
+
+    /// ★★★ 三个档位里**只有罕见的两档**该把图标覆盖成「英」。
+    ///
+    /// `NoEditContext` 是日常状态：实测 VS Code 8 分钟发 35 次 `NoEditCtx`（每换一次
+    /// docMgr 一次）。让它翻图标，用户看到的是图标自己在抖。且此刻图标显示什么都不影响
+    /// 功能——焦点不在输入控件上，敲键盘本来就没有落点。
+    ///
+    /// 这条与 `ctx_lost_is_noise_for_icon_but_still_hides_toolbar` 分工不同：那条钉的是
+    /// **档位判定**（哪个信号能置位），这条钉的是**呈现映射**（置位了要不要变英）。
+    /// 两者都写对才不闪，只测一层会漏。
+    #[test]
+    fn only_rare_blocks_show_english_on_icon() {
+        assert!(!InputBlock::None.shows_english());
+        assert!(
+            !InputBlock::NoEditContext.shows_english(),
+            "无可编辑上下文是日常状态，不配翻图标（2026-08-18 实测：VS Code 里每点一下就翻一次）"
+        );
+        assert!(
+            InputBlock::Password.shows_english(),
+            "密码框必须显英——用户要能一眼看出这里敲进去的不是中文"
+        );
+        assert!(
+            InputBlock::KeyboardDisabled.shows_english(),
+            "输入法被系统整个禁用同理"
+        );
+        // 变淡仍然只留给线程级禁用，不因本次改动而放宽。
+        assert!(InputBlock::KeyboardDisabled.dims_icon());
+        assert!(!InputBlock::Password.dims_icon());
+        assert!(!InputBlock::NoEditContext.dims_icon());
+    }
+
+    /// 呈现档位的**两个方向不对称**：进入要稳够 INPUT_BLOCK_DELAY，恢复立即。
+    ///
+    /// 这条钉的是「误显英很刺眼、晚显英无感」这个取舍本身。写成对称迟滞会让
+    /// QQ 密码框那种 180ms churn 把图标打得一闪一闪，那正是当初加迟滞的起因。
+    #[test]
+    fn effective_input_block_is_asymmetric() {
+        let c = coord_with(|_| {});
+        {
+            let mut s = c.state.lock().unwrap();
+            s.ime_active = true;
+            s.focus_no_edit_ctx = false;
+        }
+        assert_eq!(c.effective_input_block(), InputBlock::None);
+
+        // 进入方向：真值已变，但没稳够 ⇒ 呈现仍是旧值。
+        c.state.lock().unwrap().focus_no_edit_ctx = true;
+        assert_eq!(c.input_block(), InputBlock::NoEditContext, "真值立刻就变了");
+        assert_eq!(
+            c.effective_input_block(),
+            InputBlock::None,
+            "呈现要等稳定，否则一次抖动就闪一下"
+        );
+
+        // churn：中途变回去，应撤销待定，之后再变也要重新计时。
+        c.state.lock().unwrap().focus_no_edit_ctx = false;
+        assert_eq!(c.effective_input_block(), InputBlock::None);
+
+        // 稳够之后落地。
+        c.state.lock().unwrap().focus_no_edit_ctx = true;
+        let _ = c.effective_input_block(); // 起计时
+        std::thread::sleep(INPUT_BLOCK_DELAY + std::time::Duration::from_millis(30));
+        assert_eq!(c.effective_input_block(), InputBlock::NoEditContext);
+
+        // 恢复方向：立即，不等迟滞。
+        c.state.lock().unwrap().focus_no_edit_ctx = false;
+        assert_eq!(
+            c.effective_input_block(),
+            InputBlock::None,
+            "恢复必须立即——迟滞只该拖慢「变英」，不该拖慢「变回来」"
         );
     }
 

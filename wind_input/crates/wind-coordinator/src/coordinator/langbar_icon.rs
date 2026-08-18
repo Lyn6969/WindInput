@@ -327,6 +327,14 @@ impl Coordinator {
         // effective_chinese），此时不该显示中文标点角标。
         let effective_chinese = s.chinese_mode && !s.caps_lock;
 
+        // 「不可输入」由协调器单点判定（见 InputBlock）。此前这一档在 DLL 本地算、
+        // 本地绘制，服务端渲的图根本不参与——于是同一件事有两个负责者、各带一份迟滞。
+        //
+        // ⚠ 必须在取发布器锁**之前**算：它内部要取 state 与 gate 两把锁，持着发布器锁
+        // 再去拿别的锁就是给自己留一条反向持有序。同类事故刚在 notify_toolbar 里发生过
+        // （在 state 锁内调它 → Mutex 不可重入 → 当场卡死）。
+        let block = self.effective_input_block();
+
         let Ok(mut guard) = cell.lock() else {
             return false;
         };
@@ -335,10 +343,17 @@ impl Coordinator {
         };
 
         let spec = IconSpec {
-            label: s.icon_label.clone(),
+            // 覆盖成「英」而**不动 `icon_label` 本身**：后者是「当前方案标签」的单一语义，
+            // 且会经 StatusUpdate 下发写进 TSF 的 `_inputTypeLabel`（持久值）。把这种随焦点
+            // 来去的临时态烧进标签，离开时就得指望下一次状态推送改回来，漏一次即长期卡「英」。
+            label: if block.shows_english() {
+                "英".to_string()
+            } else {
+                s.icon_label.clone()
+            },
             // 英文模式下标点恒为半角且不可切换（`toolbar.rs` 的渲染同样这么处理），
             // 角标此时没有信息量，故不画。
-            punct: if !effective_chinese {
+            punct: if !effective_chinese || block.shows_english() {
                 PunctBadge::None
             } else if s.chinese_punct {
                 PunctBadge::Chinese
@@ -347,10 +362,11 @@ impl Coordinator {
             },
             // 全角标记（右上角小方点）。与标点角标不同，它**不看 effective_chinese**：
             // 全半角在英文模式下同样生效（英文全角是真实可用的状态），所以只要是全角就画。
-            full_width: s.full_width,
-            // 密码框 / 无编辑上下文 / 键盘禁用都是 **DLL 本地判定**的状态，服务端无从得知；
-            // 那几种情况下 DLL 根本不读 SHM，直接本地绘制。故这里恒为 false。
-            dimmed: false,
+            full_width: s.full_width && !block.shows_english(),
+            // 变淡**只留给线程级 KEYBOARD_DISABLED**（输入法整个被禁用）：那才配得上
+            // 「输入法本身不可用」这种强呈现。无可编辑上下文是日常状态（点按钮/列表/桌面
+            // 都会进），2026-08-04 实测让它变淡被否——图标频繁变灰，用户无从理解。
+            dimmed: block.dims_icon(),
             // 相位取发布器持有的当前值，**不写死 0**：演示动画开着时，一次普通的状态推送
             // （切中英/切标点）也会走到这里，若在此归零，跑马灯每被状态变化打断一次就
             // 跳回起点。相位归发布器所有、只由动画定时器推进，是这两件事互不干扰的前提。

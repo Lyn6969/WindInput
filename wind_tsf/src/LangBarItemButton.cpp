@@ -141,8 +141,6 @@ CLangBarItemButton::CLangBarItemButton(CTextService* pTextService)
     , _bChinesePunct(TRUE)
     , _bToolbarVisible(FALSE)
     , _bKeyboardDisabled(FALSE)
-    , _bNoEditContext(FALSE)
-    , _bPasswordField(FALSE)
     , _bDarkMode(IsSystemDarkMode() ? TRUE : FALSE)
     , _hMsgWnd(NULL)
 {
@@ -251,17 +249,9 @@ STDAPI CLangBarItemButton::GetTooltipString(BSTR* pbstrToolTip)
         return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
     }
 
-    if (_bNoEditContext)
-    {
-        *pbstrToolTip = SysAllocString(L"清风输入法 - 当前位置不可输入");
-        return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
-    }
-
-    if (_bPasswordField)
-    {
-        *pbstrToolTip = SysAllocString(L"清风输入法 - 密码框，已切换为英文");
-        return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
-    }
+    // 「密码框 / 焦点不在可编辑控件里」的区分已随判定一起收归服务端（见 Rust 侧
+    // InputBlock）：图标主字由服务端渲成「英」，DLL 这边不再持有成因、也就无从分档。
+    // 线程级禁用那一档保留——它由本 DLL 自己的 compartment sink 驱动，仍是本地事实。
 
     // Use effective mode: Chinese mode + CapsLock ON = English Upper (temporary)
     BOOL effectiveChinese = _bChineseMode && !_bCapsLock;
@@ -603,22 +593,27 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
 
     // ── 优先取服务端预渲染的图标 ──
     //
-    // ⚠ 例外：下面三种状态是**本 DLL 本地判定**的（_bPasswordField / _bNoEditContext
-    // 来自 DocMgr 与 compartment，_bKeyboardDisabled 来自线程级 compartment），
-    // 服务端压根不知道当前宿主处于哪种，它渲染的始终是常规状态。
-    // 这几种情况必须走下面的本地绘制，否则密码框里会显示「中」、禁用态不会变淡。
-    const BOOL localOnlyState = _bPasswordField || _bNoEditContext || _bKeyboardDisabled;
-    if (!localOnlyState)
+    // 无条件优先取服务端预渲染图标。
+    //
+    // 这里曾有一道 localOnlyState 旁路：密码框 / 无可编辑上下文 / 键盘禁用三档改走本地
+    // 绘制，理由是「服务端无从得知」。判定收归服务端之后该前提不再成立——那三档现在由
+    // 服务端渲进 SHM（含变淡），本地绘制只剩「服务没起来」这一个用途。
+    // 留着旁路的代价是同一件事有两个渲染实现，迟早各说各话。
     {
         std::vector<BYTE> shmPixels;
         int shmSize = 0;
-        if (_iconShm.ReadVariant(iconSize, _bDarkMode != FALSE, shmPixels, shmSize))
+        uint32_t shmSeq = 0;
+        if (_iconShm.ReadVariant(iconSize, _bDarkMode != FALSE, shmPixels, shmSize, &shmSeq))
         {
             HICON hIcon = _CreateIconFromBgra(shmPixels.data(), shmSize);
             if (hIcon != NULL)
             {
                 ReleaseDC(NULL, hdcScreen);
-                WIND_LOG_DEBUG_FMT(L"GetIcon: from SHM, want=%d got=%d dark=%d\n",
+                // seq 是判断「这一帧是不是最新版」的唯一可靠依据：与服务端
+                // 「语言栏图标已发布 seq=N」直接对号。此前只能按两侧时间戳去凑，
+                // 而毫秒级的陈旧读恰恰是时间戳最凑不准的场合（见 ReadVariant 注释）。
+                WIND_LOG_DEBUG_FMT(L"GetIcon: from SHM seq=%u want=%d got=%d dark=%d\n",
+                                   shmSeq,
                                    iconSize, shmSize, _bDarkMode);
                 *phIcon = hIcon;
                 return S_OK;
@@ -685,7 +680,8 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
     // ⚠ **只改这一处呈现**：_inputTypeLabel 与 _bChineseMode 的持久值一概不动。
     // 真正的英文闸在别处（C++ 的吃键放行 + core 的 password_suppress 透传），把状态
     // 烧进标签本身，会让「图标变英、中文照样输入」的老毛病换个地方复发。
-    const wchar_t* text = (_bPasswordField || _bNoEditContext) ? L"英" : _inputTypeLabel;
+    // 本地绘制只在服务不可用时发生，此时没有任何「不可输入」信息可用，照常画方案标签。
+    const wchar_t* text = _inputTypeLabel;
 
     // Draw white text on black using DirectWrite GDI-interop path
     // (IDWriteBitmapRenderTarget + IDWriteTextRenderer — same as Go-side candidate window)
@@ -1321,22 +1317,6 @@ void CLangBarItemButton::UpdateKeyboardDisabled(BOOL bDisabled)
     }
 }
 
-void CLangBarItemButton::UpdateInputAvailability(BOOL bNoEditContext, BOOL bPasswordField)
-{
-    // 翻转沿去重：OnUpdate 会让系统回调 GetIcon 重建位图，而这两个量随 DocMgr 抖动
-    // 高频变化（实测 QQ 密码框每约 180ms 翻转两次），每次焦点事件都发即是图标闪烁源。
-    // 调用方另有 200ms 迟滞（_ScheduleLangBarStateSync），本处是第二道保险。
-    if (_bNoEditContext == bNoEditContext && _bPasswordField == bPasswordField)
-        return;
-
-    _bNoEditContext = bNoEditContext;
-    _bPasswordField = bPasswordField;
-
-    if (_pLangBarItemSink != nullptr)
-    {
-        _pLangBarItemSink->OnUpdate(TF_LBI_ICON | TF_LBI_TEXT | TF_LBI_TOOLTIP);
-    }
-}
 
 void CLangBarItemButton::UpdateState(BOOL bChineseMode, BOOL bCapsLock)
 {

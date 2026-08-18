@@ -62,11 +62,6 @@ public:
     // Update the button when keyboard disabled state changes
     void UpdateKeyboardDisabled(BOOL bDisabled);
 
-    // 输入可用性（与中英模式**正交**）：语言栏图标据此显示禁用态/强制英文。
-    // 两者都在 TSF 侧本地判定、不经 IPC——判据源就在 DLL 内（_hasTextInputContext
-    // 与 IsPasswordSuppressActive），绕一圈 IPC 反而引入陈旧窗口。
-    // 调用方须先做迟滞：这两个量随 DocMgr 抖动高频翻转，详见 _ScheduleLangBarStateSync。
-    void UpdateInputAvailability(BOOL bNoEditContext, BOOL bPasswordField);
 
     // Update both mode and Caps Lock state
     void UpdateState(BOOL bChineseMode, BOOL bCapsLock);
@@ -189,14 +184,6 @@ private:
     BOOL _bChinesePunct;       // Chinese punctuation mode (中文标点)
     BOOL _bToolbarVisible;     // Toolbar visibility
     BOOL _bKeyboardDisabled;   // Keyboard disabled by system (线程级 compartment)
-    // 焦点不在可编辑控件里（CAD 绘图区、浏览器非输入区、QQ 密码框那种 READONLY DocMgr）。
-    // 呈现上与 _bPasswordField 一致（图标显「英」），**不变淡**——变淡留给线程级
-    // KEYBOARD_DISABLED，理由见 GetIcon 里的说明。差异靠 tooltip 区分。
-    BOOL _bNoEditContext;
-    // 密码框：已被强制英文（判据 = IsPasswordSuppressActive，含策略开关与线程级早退）。
-    // 实测 Chrome/Edge 网页登录页会置 context 级 KEYBOARD_DISABLED 从而命中；
-    // QQ 密码框**不**走这条路（它让焦点落到 READONLY DocMgr，命中的是 _bNoEditContext）。
-    BOOL _bPasswordField;
     BOOL _bDarkMode;           // System dark mode state (cached, updated on status change)
 
     // Input method type label for Chinese mode display

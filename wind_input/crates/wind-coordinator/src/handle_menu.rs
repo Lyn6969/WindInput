@@ -1762,6 +1762,9 @@ impl Coordinator {
             drop(s);
             let _ = self.ui_tx.send(UiCommand::HideToolbar);
             self.push_input_diag_hud_if_visible(); // 见函数末尾同一行的说明
+            // 语言栏图标同样收口于此，且**两个出口都要**——「不可输入」恰恰走的是本分支，
+            // 只在下面那个出口补的话，图标永远等不到变「英」。同 HUD 刷新的理由。
+            self.publish_langbar_icon_now();
             return;
         }
         let (chinese_mode, caps_lock) = (s.chinese_mode, s.caps_lock);
@@ -1781,6 +1784,10 @@ impl Coordinator {
         } else {
             "英".to_string()
         };
+        // ⚠ **必须在取 state 锁之前算**：effective_input_block() 内部要读 state，
+        // 而 std::sync::Mutex 不可重入——写在下面的初始化式里就是当场自死锁
+        // （工具栏一显示就走到这里，表现为输入法整个卡住）。
+        let input_blocked = self.effective_input_block().shows_english();
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let tb = ToolbarState {
             chinese_mode,
@@ -1791,11 +1798,10 @@ impl Coordinator {
             s2t_enabled: s.s2t_enabled,
             // 简繁格：已启用时才在工具栏显示（默认 false 不显示）
             s2t_shown: s.s2t_enabled,
-            // 密码框强制英文：仅供工具栏呈现（模式格显 "英"）。取的就是输入闸读的那个
-            // 原子量，两处同源，不会出现「图标说英文、实际打中文」的错位。
-            password_suppress: self
-                .password_suppress
-                .load(std::sync::atomic::Ordering::Relaxed),
+            // 不可输入（密码框 / 无编辑上下文 / 系统禁用）：模式格显 "英" 且不高亮。
+            // 与语言栏图标读**同一个** effective_input_block，不会再出现「图标说英文、
+            // 工具栏说中文」的错位——那正是把判据分给两个负责者的代价。
+            input_blocked,
         };
         drop(s);
         // 焦点换屏则先把工具栏挪到那块屏（内部按显示器 key 去重，未换屏时零下发）。
@@ -1809,6 +1815,9 @@ impl Coordinator {
         // 之外的路径（CtxLost 等）改了状态却不刷新，HUD 一直显示上一次的快照。
         // 在此调用是安全的：state 锁已 drop，且 HUD 关闭时该函数首行即返回，零开销。
         self.push_input_diag_hud_if_visible();
+        // 语言栏图标收口（与上面那个出口成对）。内部对相同位图跳过重渲与刷新推送，
+        // 故多调无副作用；漏调则是「状态变了图标不跟」。
+        self.publish_langbar_icon_now();
     }
 }
 

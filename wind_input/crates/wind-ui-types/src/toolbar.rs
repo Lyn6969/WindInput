@@ -14,13 +14,14 @@ pub struct ToolbarState {
     pub s2t_enabled: bool,
     /// 是否显示简繁格（默认 false；用户开启简繁功能后显示）
     pub s2t_shown: bool,
-    /// 密码框强制英文生效中：仅影响**呈现**（模式格显 "英" 且不高亮）。
+    /// 当前打不出中文（密码框 / 焦点不在可编辑控件里 / 系统级禁用）：仅影响**呈现**
+    /// （模式格显 "英" 且不高亮）。取值来自协调器的 `effective_input_block()`——
+    /// 语言栏图标读的是**同一个**判定，两者不会再各说各话。
     ///
     /// 独立于 `icon_label` 而非直接改写它：后者是「当前方案标签」的单一语义，且会经
     /// StatusUpdate 下发写入 TSF 的 `_inputTypeLabel`（持久值）。把这种随焦点来去的
-    /// 临时态烧进标签，离开密码框时就得指望下一次状态推送把它改回来，漏一次图标即
-    /// 长期卡在 "英"。
-    pub password_suppress: bool,
+    /// 临时态烧进标签，离开时就得指望下一次状态推送把它改回来，漏一次图标即长期卡 "英"。
+    pub input_blocked: bool,
 }
 
 impl Default for ToolbarState {
@@ -33,7 +34,7 @@ impl Default for ToolbarState {
             chinese_punct: true,
             s2t_enabled: false,
             s2t_shown: false,
-            password_suppress: false,
+            input_blocked: false,
         }
     }
 }

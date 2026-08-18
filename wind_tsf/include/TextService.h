@@ -488,26 +488,9 @@ private:
     // 不去重会造成 IPC 洪泛。
     BOOL _editCtxReported;
 
-    // ── 语言栏「输入可用性」的同步（**不对称**：进入慢、恢复快） ──
-    // 已推给语言栏的取值。不变量：这两个量恒等于按钮当前**显示**的状态，
-    // 因此「冻结不更新」时它们也必须原样不动（去重才不会把该纠正的一次吞掉）。
-    BOOL _langBarNoEditCtxReported;
-    BOOL _langBarPasswordReported;
-    BOOL _langBarSyncPending;         // 迟滞计时进行中
-    // 焦点状态变化后调用。**只在能拿出权威判据的地方调**：
-    //   · OnSetFocus 的 gaining 分支（_DocMgrHasEditableContext 的结论）
-    //   · OnSetThreadFocus（冻结期结束，重新落定）
-    // ⚠ **不要**在 OnSetFocus 的 losing 分支调——那里的 _hasTextInputContext=FALSE
-    // 回答的是「DocMgr 走了」而非「进了不可输入的地方」，实测会产出 100% 假阳性
-    // （2026-08-18：hasTextCtx=0 零次，却驱动出 10 次 noEditCtx=1、26 次错画「英」）。
-    // 那条路只该 _CancelLangBarStateSync()。
-    // 三条规则（恢复零迟滞不门控 / 进入迟滞且要线程焦点 / 计时中不重设）与其实测依据
-    // 都写在 .cpp 的函数头注释里。
-    void _ScheduleLangBarStateSync();
-    // 迟滞到期或立即恢复：按**当时**的状态更新语言栏（不是起计时那刻的快照）。
-    void _ApplyLangBarStateSync();
-    // 只撤销待定计时，**不碰已上报值**——用于「拿不出权威判据」与「无资格改图标」两种场合。
-    void _CancelLangBarStateSync();
+    // 「不可输入」的判定与呈现已收归 Rust 协调器单点负责（见 InputBlock）。
+    // DLL 只上报原始信号，不再持有 _bNoEditContext / 迟滞计时这类第二份状态。
+    // ⚠ 保留 IsPasswordSuppressActive()：那是**吃键闸门**，必须在 IPC 之前本地算出。
 
     // Composition
     ITfComposition* _pComposition;

@@ -357,10 +357,10 @@ impl Toolbar {
         // 密码框强制英文时同样不算「有效中文」——此刻键已全部透传给宿主，高亮着中文格
         // 会与实际行为相反。⚠ 这是纯呈现判断，输入闸在 coordinator 的 password_suppress
         // 分支，两者各管各的，勿把本行的结论回灌给任何状态。
-        let effective_chinese = state.chinese_mode && !state.caps_lock && !state.password_suppress;
+        let effective_chinese = state.chinese_mode && !state.caps_lock && !state.input_blocked;
         // 显示标签由协调器预计算存入 icon_label；此处直接使用。
         // 密码框例外：覆盖为 "英"，与该状态下的实际输入行为一致（见 password_suppress 注释）。
-        let mode_text: &str = if state.password_suppress {
+        let mode_text: &str = if state.input_blocked {
             "英"
         } else {
             &state.icon_label

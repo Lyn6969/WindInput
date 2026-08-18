@@ -1687,6 +1687,9 @@ impl MessageHandler for Coordinator {
             // 分支），故收到本命令即等价于"焦点在可编辑控件里"。这是 has_edit_context
             // 唯一的置真路径之一，另一处是 handle_ime_activated 的兜底。
             state.has_edit_context = true;
+            // 权威信号：DLL 只在确有可编辑上下文时才发 focus_gained（没有则改发
+            // focus_lost(NoEditCtx)），故这里可以放心清掉「不可输入」判定。
+            state.focus_no_edit_ctx = false;
         }
         // 撤销上屏计数复位：进入新文本框，光标前是新上下文，下次 undo 退化删 1
         // （首次聚焦无配对 focus_lost 时，本处兜底）。
@@ -1814,6 +1817,12 @@ impl MessageHandler for Coordinator {
                 // 由随后的 focus_gained（可编辑）或 NoEditCtx（不可编辑）重新定夺。
                 s.has_edit_context = false;
             }
+            // ⚠ 语言栏图标只认 **NoEditCtx** 这一档：它才表示「新文档确实没有可编辑上下文」。
+            // CtxLost 是 DocMgr 级失焦的噪声（"DocMgr 走了"≠"进了不可输入的地方"），
+            // 拿它驱动图标就是 2026-08-18 实测到的误显「英」。详见 State::focus_no_edit_ctx。
+            if matches!(reason, FocusLostReason::NoEditCtx) {
+                s.focus_no_edit_ctx = true;
+            }
             if clears_input {
                 // 焦点切换后旧 composition 上下文已失效，清理输入态，避免候选残留到新焦点。
                 s.input_buffer.clear();
@@ -1938,6 +1947,7 @@ impl MessageHandler for Coordinator {
             // has_edit_context 将永远停在 false —— 工具栏再也不显示。
             // 该字段的失效方向不对称：多显示只是碍眼，永不显示是功能失效，故取宽松侧。
             s.has_edit_context = true;
+            s.focus_no_edit_ctx = false;
         }
         let status = self.build_status();
         self.push_activation_status(client_token);
@@ -1962,6 +1972,7 @@ impl MessageHandler for Coordinator {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.ime_active = false;
             s.has_edit_context = false; // 切走本输入法：谈不上焦点在不在可编辑控件里
+            s.focus_no_edit_ctx = false; // 同上：不表态（input_block 也会因 ime_active 早退）
             s.input_buffer.clear();
             s.preedit.clear();
             s.candidates.clear();
