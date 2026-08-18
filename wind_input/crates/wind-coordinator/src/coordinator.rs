@@ -587,13 +587,28 @@ pub(crate) struct ActiveCompat {
 ///   两者**取或**，使规则同时覆盖「进入规则应用」和「离开规则应用」两个方向：只看 new
 ///   会让从 Everything 切出去后英文状态残留给下一个应用；而放宽成「规则表非空」又会让
 ///   任意两个无规则应用之间的切换也重算，把用户手切的状态冲掉。
+/// - `out_of_scope`：切入的窗口是否落在该进程的**初始模式作用域**之外
+///   （见 `InitialModeScopeRule`；未配作用域的进程恒 false）。
+///   **一票否决，压过上面全部条件**。
+///
+///   为什么必须一票否决而不是并进那个「或」：`explorer.exe` 一个进程名同时承载桌面
+///   （用户就是冲它配的 `initial_mode = "english"`）与任务栏 / Alt+Tab / 溢出区，
+///   `new_has_rule` 对两者恒同真，光靠它分不开。判据只能来自窗口类。
+///   实测样本（2026-08-18）：非桌面焦点 169 次、桌面 12 次——**14:1** 的误切代价。
+///
+///   ★★★ 该参数曾是 `new_is_transient`（黑名单：这个类是不是过渡窗口），当天被实测
+///   推翻。窗口类取不到时黑名单恒 false ⇒ 放行 ⇒ 照样套规则，而「拿不到窗口类」恰恰
+///   是 explorer 新起 TSF 连接时的常态（17:24:08 现场：焦点刚建连，caret 都还是
+///   last_known，图标当场闪英）。反转成作用域白名单后，「不知道在哪」自动落在作用域外
+///   = 保持现状。**信息缺失时的正确答案是"别动"，不是"按默认动"。**
 pub(crate) fn should_reapply_initial(
     crossed: bool,
     per_app: bool,
     old_has_rule: bool,
     new_has_rule: bool,
+    out_of_scope: bool,
 ) -> bool {
-    crossed && (per_app || old_has_rule || new_has_rule)
+    !out_of_scope && crossed && (per_app || old_has_rule || new_has_rule)
 }
 
 /// 中央协调器
@@ -816,6 +831,22 @@ pub struct Coordinator {
     /// pid → 进程名（小写）缓存，`update_active_compat` 填充，会话级只增不清。
     /// 供 FOCUS_GAINED 同步路径（`get_current_mode`）免 OpenProcess 查询进程名。
     pub(crate) pid_names: Mutex<HashMap<u32, String>>,
+    /// 「上一次**真正参与**初始模式决策的宿主」：`(pid, 该宿主是否配了初始状态规则)`。
+    ///
+    /// ⚠ 必须与 `active_compat.pid` **分开**，尽管两者绝大多数时候相同。
+    /// `active_compat` 记的是「当前焦点在哪个进程」——过渡窗口（任务栏）也要更新它，
+    /// 因为任务栏搜索框同样需要 caret 兼容项。而本字段记的是「初始模式该按谁算」，
+    /// 过渡窗口**不更新**它。
+    ///
+    /// 合用一个变量的后果实测过（2026-08-18）：点任务栏时虽然正确跳过了模式重算，
+    /// 但那次焦点仍把 `active_compat.pid` 变成了 explorer，于是紧接着**真正回到桌面**时
+    /// `crossed` 恒为假（同一个 explorer pid），桌面配的 `initial_mode = "english"`
+    /// 再也不会生效——过渡窗口把「跨进程切入」这个一次性事件提前消费掉了。
+    ///
+    /// 同源教训见 `_hasFocus` / `_hasThreadFocus`（TSF 侧）与
+    /// `ime_active` / `has_edit_context` 的拆分：一个变量同时回答两个问题，
+    /// 迟早会遇到两个答案相反的场景。
+    pub(crate) mode_scope: Mutex<(u32, bool)>,
     /// 按应用独立中英状态表（`input.default.state_scope = "app"` 时启用）：
     /// 进程名（小写）→ chinese_mode，会话级记忆（服务重启即清，见计划决策）。
     mode_states: Mutex<HashMap<String, bool>>,
@@ -1447,6 +1478,7 @@ impl Coordinator {
             ),
             active_compat: Mutex::new(ActiveCompat::default()),
             pid_names: Mutex::new(HashMap::new()),
+            mode_scope: Mutex::new((0, false)),
             mode_states: Mutex::new(HashMap::new()),
             runtime_last: Mutex::new((init_chinese, init_full, init_punct)),
             last_caps_inject: Mutex::new(None),
@@ -6430,9 +6462,15 @@ mod initial_mode_tests {
     }
 
     /// 注入焦点进程（headless 下 OpenProcess 取不到真实进程名，手动填缓存）。
+    /// 夹具语义＝「焦点与**模式归属**都已落在这个进程上」，即真实 focus_gained 跑完之后
+    /// 的稳态。两个字段都要设：`active_compat.pid` 是「焦点在哪」，`mode_scope` 是
+    /// 「初始模式该按谁算」，生产里由重型段一起推进（过渡窗口除外）。
+    /// 只设前者会让 `crossed` 判据读到陈旧的 `mode_scope`，测试便不再对应任何真实状态。
     fn set_focus_proc(c: &Arc<Coordinator>, pid: u32, name: &str) {
         c.active_compat.lock().unwrap().pid = pid;
         c.pid_names.lock().unwrap().insert(pid, name.to_string());
+        let has_rule = c.rule_initial_mode(name).is_some() || c.rule_initial_punct(name).is_some();
+        *c.mode_scope.lock().unwrap() = (pid, has_rule);
     }
 
     fn token(pid: u32) -> u64 {
@@ -6594,17 +6632,188 @@ mod initial_mode_tests {
     #[test]
     fn reapply_gate_matrix() {
         // 同应用内焦点跳转（Everything 搜索框 ↔ 结果列表）：一律不重算，保住用户手切。
-        assert!(!should_reapply_initial(false, true, true, true));
+        assert!(!should_reapply_initial(false, true, true, true, false));
         // 跨进程、无 per_app、两边都没规则（Word → Chrome）：不动。放宽成「规则表非空」
         // 就会在这里重算，把用户在 Word 手切的英文冲成配置默认。
-        assert!(!should_reapply_initial(true, false, false, false));
+        assert!(!should_reapply_initial(true, false, false, false, false));
         // 进入规则应用（Word → Everything）。
-        assert!(should_reapply_initial(true, false, false, true));
+        assert!(should_reapply_initial(true, false, false, true, false));
         // **离开**规则应用（Everything → Word）：只看 new_has_rule 会漏掉这条，
         // 表现为 Everything 的英文残留给之后的每一个应用。
-        assert!(should_reapply_initial(true, false, true, false));
+        assert!(should_reapply_initial(true, false, true, false, false));
         // per_app 既有语义不受规则影响。
-        assert!(should_reapply_initial(true, true, false, false));
+        assert!(should_reapply_initial(true, true, false, false, false));
+
+        // ── 壳过渡窗口一票否决（2026-08-18）──
+        // 点任务栏 / Alt+Tab 切入 explorer.exe：即便它配了 initial_mode 规则、也确实是
+        // 跨进程切入，仍不重算——用户点它是为了去别处。上面每一条为真的组合都要被否掉，
+        // 否则「一票否决」就退化成了「参与投票」。
+        assert!(!should_reapply_initial(true, false, false, true, true));
+        assert!(!should_reapply_initial(true, false, true, false, true));
+        assert!(!should_reapply_initial(true, true, false, false, true));
+        assert!(!should_reapply_initial(true, true, true, true, true));
+    }
+
+    /// 端到端：作用域外窗口的 focus_gained 不得改动中英状态，桌面窗口必须照改。
+    ///
+    /// 单测 `reapply_gate_matrix` 只锁住纯判据；这条锁住**接线**——判据写对了但取错窗口类、
+    /// 或压根没把 `window_class` 传进来，矩阵测试照样全绿。本仓已有多次「门控退化后测试
+    /// 仍全绿」的先例，两层都要有。
+    #[test]
+    fn out_of_scope_window_skips_initial_mode_but_desktop_does_not() {
+        use wind_config::app_compat::{
+            AppCompat, AppCompatRule, InitialMode as IM, InitialModeScopeRule,
+        };
+
+        let build = || {
+            let c = coord_with(|cfg| cfg.input.default.chinese_mode = true);
+            *c.app_compat.lock().unwrap() = AppCompat::from_parts(
+                vec![AppCompatRule {
+                    process: "explorer.exe".into(),
+                    initial_mode: Some(IM::English),
+                    ..Default::default()
+                }],
+                vec![InitialModeScopeRule {
+                    process: "explorer.exe".into(),
+                    comment: String::new(),
+                    classes: vec!["Progman".into()],
+                }],
+            );
+            // 先停在别的进程上、中文态，下面才构成「跨进程切入 explorer」。
+            set_focus_proc(&c, 100, "notepad.exe");
+            c.state.lock().unwrap().chinese_mode = true;
+            c.pid_names
+                .lock()
+                .unwrap()
+                .insert(200, "explorer.exe".into());
+            c
+        };
+
+        let focus = |class: &str| FocusData {
+            x: 0,
+            y: 0,
+            height: 0,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: token(200),
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: 0,
+            bundle_id: String::new(),
+            window_class: class.into(),
+        };
+
+        // 任务栏（作用域外）：规则不套用，保持切入前的中文。
+        let c = build();
+        c.handle_focus_gained(&focus("Shell_TrayWnd"));
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "作用域外的窗口不该触发 initial_mode 重算"
+        );
+
+        // 桌面（作用域内）：规则照常生效，切成英文。用户配 explorer.exe=english 就是为了它。
+        let c = build();
+        c.handle_focus_gained(&focus("Progman"));
+        assert!(
+            !c.state.lock().unwrap().chinese_mode,
+            "桌面必须照常套用 initial_mode=english"
+        );
+
+        // ★★★ 拿不到窗口类：**保持现状**。
+        // 这是 2026-08-18 17:24:08 现场的直接钉子——explorer 新起 TSF 连接后的头一个
+        // focus_gained 没有窗口类（caret 也退到 last_known），旧判据（黑名单）把它放行、
+        // 当场套上英文规则，用户看到图标闪「英」。信息缺失时的正确答案是「别动」。
+        let c = build();
+        c.handle_focus_gained(&focus(""));
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "窗口类为空 = 不知道焦点在哪，必须保持现状而不是按规则重算"
+        );
+
+        // ★★ 按**生产真实顺序**再走一遍：同步段 get_current_mode 先跑（DLL 正阻塞等它），
+        // 重型段 handle_focus_gained 后跑。上面那三条只调了重型段，于是「同步段没挡」这个
+        // 缺陷可以全程不被发现——实测就是这样：日志显示重型段已跳过，图标照样切成英文，
+        // 因为真正改掉状态的是先跑的那一个。
+        //
+        // 「按应用套用初始模式」有**两个落点**，测试必须两个都走，否则等于只测了一半。
+        let c = build();
+        let (chinese, _) = c.get_current_mode(token(200), "Shell_TrayWnd");
+        assert!(chinese, "同步段也必须跳过作用域外的窗口");
+        c.handle_focus_gained(&focus("Shell_TrayWnd"));
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "两个落点都跳过后，状态才真的不变"
+        );
+
+        // 对照：桌面走同一条顺序，规则必须照常生效（防过度修复）。
+        let c = build();
+        let (chinese, _) = c.get_current_mode(token(200), "Progman");
+        assert!(!chinese, "桌面的 initial_mode=english 必须在同步段就生效");
+        c.handle_focus_gained(&focus("Progman"));
+        assert!(!c.state.lock().unwrap().chinese_mode);
+    }
+
+    /// ★★ 作用域外的窗口**不得消费掉「跨进程切入」这个一次性事件**。
+    ///
+    /// 真实序列：记事本 → 点任务栏（作用域外，跳过）→ 真正回到桌面。两次焦点是**同一个
+    /// explorer 进程**，若用 `active_compat.pid` 判 `crossed`，第一次就把它变成 explorer，
+    /// 第二次便成了「同进程」，桌面配的 initial_mode 永远不生效——这正是修完作用域门控
+    /// 之后冒出来的第二级缺陷（2026-08-18 实测：DLL 报了 Progman，服务端毫无反应）。
+    #[test]
+    fn out_of_scope_window_does_not_consume_the_cross_process_transition() {
+        use wind_config::app_compat::{
+            AppCompat, AppCompatRule, InitialMode as IM, InitialModeScopeRule,
+        };
+
+        let c = coord_with(|cfg| cfg.input.default.chinese_mode = true);
+        *c.app_compat.lock().unwrap() = AppCompat::from_parts(
+            vec![AppCompatRule {
+                process: "explorer.exe".into(),
+                initial_mode: Some(IM::English),
+                ..Default::default()
+            }],
+            vec![InitialModeScopeRule {
+                process: "explorer.exe".into(),
+                comment: String::new(),
+                classes: vec!["Progman".into()],
+            }],
+        );
+        set_focus_proc(&c, 100, "notepad.exe");
+        c.state.lock().unwrap().chinese_mode = true;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(200, "explorer.exe".into());
+
+        let focus = |class: &str| FocusData {
+            x: 0,
+            y: 0,
+            height: 0,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: token(200),
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: 0,
+            bundle_id: String::new(),
+            window_class: class.into(),
+        };
+
+        // ① 点任务栏（作用域外）：跳过，状态不变。
+        c.get_current_mode(token(200), "Shell_TrayWnd");
+        c.handle_focus_gained(&focus("Shell_TrayWnd"));
+        assert!(c.state.lock().unwrap().chinese_mode, "任务栏不该改模式");
+
+        // ② 真正回到桌面：**同一个 explorer pid**，仍必须算作跨进程切入并套用英文。
+        let (chinese, _) = c.get_current_mode(token(200), "Progman");
+        assert!(
+            !chinese,
+            "桌面必须仍被判为跨进程切入——作用域外的窗口不能提前消费掉这次切换"
+        );
+        c.handle_focus_gained(&focus("Progman"));
+        assert!(!c.state.lock().unwrap().chinese_mode);
     }
 
     /// 显式 `initial_punct` 压过 `follow_mode` 的推导。
@@ -6643,13 +6852,71 @@ mod initial_mode_tests {
         let (chinese, _) = c.get_current_mode(token(100), "");
         assert!(!chinese, "跨进程切入规则应用 → 同步段即回传英文");
 
-        // 重型段已把 active_compat.pid 更新为 100；用户随后手切回中文。
-        c.active_compat.lock().unwrap().pid = 100;
+        // 重型段已把焦点与模式归属都更新为 100；用户随后手切回中文。
+        set_focus_proc(&c, 100, "everything.exe");
         c.state.lock().unwrap().chinese_mode = true;
         let (chinese, _) = c.get_current_mode(token(100), "");
         assert!(
             chinese,
             "同应用内跳转不得把手切的中文拉回规则的英文——规则是初始值不是锁定"
+        );
+    }
+
+    /// ★★ 同步段与重型段对「初始模式」必须给出**同一个**答案。
+    ///
+    /// 真实场景：桌面配 `initial_mode = "english"`，从桌面切到无规则的记事本。
+    /// 同步段曾只处理「规则表/记忆表命中」，两者都没命中就保持现状——而现状正是桌面留下的
+    /// 英文，于是 DLL 先拿到「英」、3~5ms 后才被重型段改成「中」。后果：DLL 据此写
+    /// OPENCLOSE compartment，系统语言指示器闪一下；且这几毫秒里到达的首键按英文处理，
+    /// 而同步回传的全部意义就是消除这个首键竞态。
+    ///
+    /// 断言写成「两者相等」而不是「等于某个具体值」：要钉的是**一致性**这个不变量，
+    /// 钉死具体值会让将来调整默认模式时这条测试变成噪声。
+    #[test]
+    fn sync_and_heavy_paths_agree_on_initial_mode() {
+        use wind_config::app_compat::InitialMode as IM;
+
+        let c = coord_with(|cfg| {
+            cfg.input.default.chinese_mode = true;
+            cfg.input.default.remember_last_state = false;
+        });
+        // 上一个应用：桌面，规则强制英文，且已经把全局状态带成英文。
+        set_rule(&c, "explorer.exe", Some(IM::English), None);
+        set_focus_proc(&c, 200, "explorer.exe");
+        c.apply_initial_mode(token(200), false);
+        assert!(!c.state.lock().unwrap().chinese_mode, "前提：现状是英文");
+
+        // 切到无任何规则、无记忆的记事本。
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(300, "notepad.exe".into());
+        let (sync_chinese, _) = c.get_current_mode(token(300), "Notepad");
+
+        // 重型段随后落地的值。
+        c.handle_focus_gained(&FocusData {
+            x: 0,
+            y: 0,
+            height: 0,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: token(300),
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: 0,
+            bundle_id: String::new(),
+            window_class: "Notepad".into(),
+        });
+        let heavy_chinese = c.state.lock().unwrap().chinese_mode;
+
+        assert_eq!(
+            sync_chinese, heavy_chinese,
+            "同步段回传值必须等于重型段落地值，否则 DLL 会先按前者写 compartment 再被改回"
+        );
+        assert!(
+            sync_chinese,
+            "记事本无规则应回落到配置默认（中文），而不是沿用桌面留下的英文"
         );
     }
 

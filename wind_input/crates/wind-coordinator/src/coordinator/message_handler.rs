@@ -1636,10 +1636,10 @@ impl MessageHandler for Coordinator {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(new_pid, data.bundle_id.to_lowercase());
         }
-        let (old_pid, old_has_rule) = {
-            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
-            (ac.pid, ac.has_initial_rule)
-        };
+        // ⚠ 取自 `mode_scope` 而非 `active_compat`：后者会被过渡窗口（任务栏）更新，
+        // 拿它当「上一个模式归属宿主」会让紧随其后的桌面焦点被判成同进程、规则不再生效。
+        // 详见 `mode_scope` 字段注释。
+        let (old_pid, old_has_rule) = *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner());
         self.update_active_compat(data.client_token);
         let new_has_rule = self
             .active_compat
@@ -1717,11 +1717,43 @@ impl MessageHandler for Coordinator {
         // record_app_mode 与当前状态保持同步，重算结果恒等于现值，故语义无变化；代价是失去了
         // 一条隐式的 compartment 脏事件自愈路径，该自愈在 IME_ACTIVATED 路径仍然保留。
         let crossed = new_pid != 0 && old_pid != new_pid;
+        // 作用域一票否决：任务栏 / Alt+Tab 切换器与桌面同属 explorer.exe，仅凭进程名
+        // 分不开，判据只能来自窗口类。名字取 update_active_compat 刚填好的缓存（此刻必已
+        // 就绪）。未配作用域的进程恒放行 ⇒ 绝大多数应用零变化。
+        // 详见 `InitialModeScopeRule` 与 should_reapply_initial 注释。
+        let proc_name = self.cached_proc_name(data.client_token);
+        let out_of_scope = !self
+            .app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .initial_mode_applies_to_window(&proc_name, &data.window_class);
+        // ★ 无条件打印窗口类：此前只在命中时打，于是「没打日志」同时意味着
+        //   「没配作用域」「窗口类为空」「类不在清单里」三种情况，而它们的排查方向不同。
+        //   本轮缺陷（空窗口类被放行）之所以要靠旁证推断，就是因为这行当时只打一半。
+        tracing::debug!(
+            "focus_gained: proc={proc_name} class={:?} 作用域内={}",
+            data.window_class,
+            !out_of_scope
+        );
+        if out_of_scope {
+            // 独立日志行：不打的话「模式没跟着切」在日志里与「压根没发生跨进程切换」
+            // 完全同形，而两者的排查方向相反。
+            tracing::debug!(
+                "focus_gained: 窗口在初始模式作用域外 class={:?} → 跳过重算（mode_scope 不推进）",
+                data.window_class
+            );
+        } else if new_pid != 0 {
+            // 只有**真正参与决策**的焦点才推进模式归属。过渡窗口跳过这一步，是为了不把
+            // 「跨进程切入」这个一次性事件提前消费掉——否则点任务栏再回桌面时，桌面就成了
+            // 「同进程」，它配的 initial_mode 永远不会生效（实测缺陷，见字段注释）。
+            *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = (new_pid, new_has_rule);
+        }
         if should_reapply_initial(
             crossed,
             self.rt().config.input.default.per_app_scope(),
             old_has_rule,
             new_has_rule,
+            out_of_scope,
         ) {
             self.apply_initial_mode(data.client_token, false);
         }
@@ -1827,60 +1859,61 @@ impl MessageHandler for Coordinator {
         // 焦点。真正离开时随后的 DocChanged / Thread 会收口。
     }
 
-    fn get_current_mode(&self, client_token: u64, _window_class: &str) -> (bool, bool) {
+    fn get_current_mode(&self, client_token: u64, window_class: &str) -> (bool, bool) {
         // FocusGained 同步路径回传 ModePush：DLL 正同步阻塞等本值，仅允许锁+HashMap 查询，
-        // 严禁 OpenProcess 等跨进程调用。
-        // 命中规则表 / 记忆表 → 先切到目标状态再回传，消除首键竞态；都未命中（进程首次聚焦
-        // 且无规则）保持现状，由重型段 handle_focus_gained 修正。
+        // 严禁 OpenProcess 等跨进程调用。`should_reapply_initial` / `apply_initial_mode` /
+        // `cached_proc_name` / `rule_initial_*` 全部满足该约束（纯锁 + 表查询）。
         //
-        // 本段早于重型段的 update_active_compat，此刻 active_compat.pid 仍是**上一个**进程，
-        // 正好用来判断本次是否跨进程切入。同应用内跳转不重算，理由同 handle_focus_gained：
-        // 否则用户手切的模式会在换个输入框时被拉回初始值。
+        // ★★ 判据与落地**必须与重型段 `handle_focus_gained` 逐字同源**——就是下面这两个
+        // 函数调用，不再另写一份。
+        //
+        // 此处曾手抄过一份简化版：只处理「规则表 / 记忆表命中」，两者都没命中就**保持现状**，
+        // 留给重型段修正。那个"保持现状"在上一个应用被规则强制成英文时是错的——现状就是
+        // 那个英文。实测（2026-08-18，桌面配 initial_mode=english）：
+        //     ModePush (focus sync) chineseMode=0   ← 同步段回传上一个应用的「英」
+        //     ActivationStatusPush  mode=1 label=中 ← 3~5ms 后重型段纠正
+        // 三个宿主逐一复现（notepad ×2、EverEdit ×1）。后果有两条：DLL 据此写
+        // OPENCLOSE compartment，系统语言指示器跟着翻一下（用户看到的「闪」）；且这几毫秒里
+        // 若首键已到，会按英文处理——而同步回传的**全部意义**就是消除这个首键竞态。
+        //
+        // 旧注释只叮嘱两处「必须同序」，没料到差异会出在**兜底层级**上：重型段的
+        // `initial_chinese_mode_for` 在规则/记忆之外还有 remember_last_state 与配置默认两层。
+        // 同源调用之后，这类漂移在结构上不可能再发生。
         let new_pid = (client_token >> 32) as u32;
-        let crossed = new_pid != 0
-            && self
-                .active_compat
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pid
-                != new_pid;
+        let (old_pid, old_has_rule) = *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner());
+        let crossed = new_pid != 0 && old_pid != new_pid;
         if crossed {
             let proc = self.cached_proc_name(client_token);
-            if !proc.is_empty() {
-                // 规则表优先于记忆表，与 `initial_chinese_mode_for` **必须同序**：两处顺序不
-                // 一致会让同步回传值与重型段的落地值不同，表现为首键按 A 上屏、随后被 push 成 B。
-                let target = self
-                    .rule_initial_mode(&proc)
-                    .map(|m| m.is_chinese())
-                    .or_else(|| {
-                        if self.rt().config.input.default.per_app_scope() {
-                            self.mode_states
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get(&proc)
-                                .copied()
-                        } else {
-                            None
-                        }
-                    });
-                let rule_punct = self.rule_initial_punct(&proc);
-                if target.is_some() || rule_punct.is_some() {
-                    let follow = self.rt().config.input.punct.follow_mode;
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(chinese) = target
-                        && s.chinese_mode != chinese
-                    {
-                        s.chinese_mode = chinese;
-                        if follow {
-                            s.chinese_punct = chinese;
-                        }
-                    }
-                    // 与 apply_initial_mode 同序：显式标点规则最后落地，压过 follow 推导。
-                    if let Some(p) = rule_punct {
-                        s.chinese_punct = p.is_chinese();
-                    }
-                    return (s.chinese_mode, s.full_width);
+            // 作用域一票否决，判据与重型段完全同源。
+            // ⚠ **两处都要有**：本方法先跑且 DLL 正阻塞等它的回传值，只挡住重型段的话，
+            // 状态早在这里就被改掉了，日志上却显示「已跳过」——实测就栽在这一步。
+            let out_of_scope = !proc.is_empty()
+                && !self
+                    .app_compat
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .initial_mode_applies_to_window(&proc, window_class);
+            if out_of_scope {
+                tracing::debug!(
+                    "get_current_mode: 窗口在初始模式作用域外 proc={proc} class={window_class:?} → 保持现状"
+                );
+            } else if !proc.is_empty() {
+                let new_has_rule = self.rule_initial_mode(&proc).is_some()
+                    || self.rule_initial_punct(&proc).is_some();
+                let per_app = self.rt().config.input.default.per_app_scope();
+                if crate::coordinator::should_reapply_initial(
+                    crossed,
+                    per_app,
+                    old_has_rule,
+                    new_has_rule,
+                    out_of_scope,
+                ) {
+                    // reset_aux=false：与重型段的调用逐字一致。随后重型段会用同样的入参
+                    // 再调一次，`apply_initial_mode` 是幂等的（每次都按当前表重算目标）。
+                    self.apply_initial_mode(client_token, false);
                 }
+                let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                return (s.chinese_mode, s.full_width);
             }
         }
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());

@@ -314,9 +314,17 @@ pub fn set_caret_offset(rules: &mut Vec<AppCompatRule>, process: &str, dx: i32, 
 }
 
 /// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
-pub fn render_user_compat(rules: &[AppCompatRule]) -> Result<String, toml::ser::Error> {
+///
+/// ⚠ `initial_mode_scope` 必须原样带回：本函数是**整份重写**，漏掉哪一段哪一段就没了。
+/// 用户手写的 `[[initial_mode_scope]]` 覆盖会在下一次菜单开关时静默消失，而那种缺陷
+/// 「配置改了不生效」的现场与写回路径隔着一次重启，极难归因。
+pub fn render_user_compat(
+    rules: &[AppCompatRule],
+    initial_mode_scope: &[InitialModeScopeRule],
+) -> Result<String, toml::ser::Error> {
     let file = AppCompatFile {
         apps: rules.to_vec(),
+        initial_mode_scope: initial_mode_scope.to_vec(),
     };
     Ok(format!("{USER_COMPAT_HEADER}{}", toml::to_string(&file)?))
 }
@@ -332,9 +340,10 @@ pub fn update_user_rule(
     edit: impl FnOnce(&mut AppCompatRule),
 ) -> Result<(), std::io::Error> {
     let path = user_dir.join(COMPAT_FILE_NAME);
-    let mut rules = load_file(&path).unwrap_or_default();
-    upsert_rule(&mut rules, process, edit);
-    let text = render_user_compat(&rules)
+    let mut file = load_file(&path).unwrap_or_default();
+    upsert_rule(&mut file.apps, process, edit);
+    // initial_mode_scope 原样透传：菜单只管 [[apps]]，另一段不属于它，不能顺手抹掉。
+    let text = render_user_compat(&file.apps, &file.initial_mode_scope)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::create_dir_all(user_dir)?;
     std::fs::write(&path, text)?;
@@ -408,30 +417,100 @@ pub fn set_user_caret_offset(
     })
 }
 
+/// 「初始模式作用域」规则：某进程的 per-app **初始模式**只在哪些**窗口类**上重算。
+///
+/// 为什么需要它：per-app 规则（`[[apps]]`）的身份是**进程映像名**，而 `explorer.exe`
+/// 一个名字同时承载语义相反的两类焦点——桌面是「停留型」，任务栏 / Alt+Tab / 任务视图 /
+/// 溢出区 / 资源管理器是「路过或另有用途」。用户为桌面配 `initial_mode = "english"`
+/// 时，那些窗口会被一并命中，而它们恰是每次切换应用的必经之路。
+/// 实测样本（2026-08-18）：非桌面焦点 169 次、桌面 12 次，**14:1**。
+///
+/// ★★★ **判据方向必须是白名单「规则在哪生效」，不能是黑名单「哪些是过渡窗口」**。
+/// 本段初版正是黑名单（`shell_transient`，列出任务栏那几个类），当天即被实测推翻：
+///   17:24:08.579  Client connected to bridge pipe        ← explorer 新起一个 TSF 连接
+///   17:24:08.581  handle_focus_gained token=…0002  caret src=last_known
+///   17:24:08.583  语言栏图标已发布 label=英             ← 闪
+/// 新连接的头一个 focus_gained 拿不到窗口类（TSF 此刻还没有 view，连 caret 都退到
+/// last_known），空类名不在黑名单里 ⇒ 判成「不是过渡窗口」⇒ 套上 explorer 的英文规则。
+/// 黑名单还有第二个失效面：Windows 每个版本都在新增 XAML 岛窗口类，漏一个就套错一次。
+/// 反过来做白名单，两种失效同时消失——「不知道在哪」与「新出现的类」都自动落在作用域外，
+/// 也就是**保持现状**，而保持现状恰是这两种情况下唯一安全的答案。
+///
+/// ⚠ **刻意独立成段，不做成 `[[apps]]` 的字段**：`merge_rules` 是「同名进程整条覆盖」
+/// 而非字段级合并，塞进 apps 的话，用户只要为 `explorer.exe` 写任何一条自己的规则
+/// （哪怕只调 `caret_offset`），内置的作用域清单就会整条消失、症状复发且极难查。
+/// 两段各自独立合并，互不牵连。同类前车之鉴见 project_dict_override_sparse_merge。
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct InitialModeScopeRule {
+    /// 进程映像名（不区分大小写），如 `explorer.exe`。
+    pub process: String,
+    /// 说明（仅文档用途）。与 `AppCompatRule::comment` 同理**必须存在于结构体里**：
+    /// serde 默认静默忽略未知字段，只声明在 TOML 注释里的话，用户层写回时会被丢掉。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    /// 该进程下**允许重算初始模式**的顶层窗口类名（不区分大小写）。
+    /// 空清单 = 该进程的初始模式规则在任何窗口上都不重算。
+    #[serde(default)]
+    pub classes: Vec<String>,
+}
+
 /// 所有应用兼容性规则 + 运行时查找表。
 #[derive(Debug, Clone, Default)]
 pub struct AppCompat {
     apps: Vec<AppCompatRule>,
     /// 小写进程名 → `apps` 下标。
     lookup: HashMap<String, usize>,
+    /// 小写进程名 → 该进程允许重算初始模式的窗口类名集合（小写）。
+    /// **进程不在表内 = 不受限制**（绝大多数应用走这条路，零行为变化）。
+    mode_scope: HashMap<String, std::collections::HashSet<String>>,
 }
 
-/// 序列化中间体：仅承载 `[[apps]]` 数组，避免把 `lookup` 暴露给 TOML。
+/// 序列化中间体：承载 TOML 的两个顶层数组表，避免把 `lookup` 暴露给 TOML。
 #[derive(Debug, Deserialize, Serialize, Default)]
 struct AppCompatFile {
     #[serde(default)]
     apps: Vec<AppCompatRule>,
+    /// ⚠ 用户层 compat.toml 由右键菜单**整份重写**（`render_user_compat`），本字段
+    /// 必须一并渲染回去，否则用户写的覆盖会在下一次菜单开关时被静默删掉。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    initial_mode_scope: Vec<InitialModeScopeRule>,
 }
 
 impl AppCompat {
-    /// 从一组规则构建（含查找表）。
+    /// 从一组规则构建（含查找表）。作用域清单为空 ⇒ 所有进程都不受限。
     pub fn from_rules(apps: Vec<AppCompatRule>) -> Self {
+        Self::from_parts(apps, Vec::new())
+    }
+
+    /// 从两段规则构建（含查找表）。
+    pub fn from_parts(apps: Vec<AppCompatRule>, scope: Vec<InitialModeScopeRule>) -> Self {
         let mut c = AppCompat {
             apps,
             lookup: HashMap::new(),
+            mode_scope: HashMap::new(),
         };
         c.build_lookup();
+        c.build_mode_scope(scope);
         c
+    }
+
+    /// 该焦点窗口是否落在「允许重算 per-app 初始模式」的作用域内。
+    ///
+    /// 返回 false 表示调用方应**保持现状**（不重算初始模式、不推进模式归属）。
+    ///
+    /// 三种取值来源，必须一并理解：
+    /// - 该进程**没配**作用域 ⇒ true。绝大多数应用走这条，行为与本机制引入前完全一致。
+    /// - 配了且窗口类命中 ⇒ true。
+    /// - 配了但窗口类不命中，**含窗口类为空** ⇒ false。空类名是「拿不到窗口标识」，
+    ///   不是「窗口不在清单里」，但对本函数要回答的问题，两者的正确答案都是「别重算」。
+    ///   曾把空类名当作「不是过渡窗口」放行，实测当场闪英，见 `InitialModeScopeRule` 注释。
+    pub fn initial_mode_applies_to_window(&self, process_name: &str, window_class: &str) -> bool {
+        match self.mode_scope.get(&process_name.to_ascii_lowercase()) {
+            None => true,
+            Some(set) => {
+                !window_class.is_empty() && set.contains(&window_class.to_ascii_lowercase())
+            }
+        }
     }
 
     /// 按进程名（不区分大小写）查规则，未匹配返回 None。
@@ -462,29 +541,49 @@ impl AppCompat {
             .collect();
     }
 
+    fn build_mode_scope(&mut self, rules: Vec<InitialModeScopeRule>) {
+        self.mode_scope = rules
+            .into_iter()
+            .filter(|r| !r.process.is_empty())
+            .map(|r| {
+                (
+                    r.process.to_ascii_lowercase(),
+                    r.classes
+                        .iter()
+                        .map(|c| c.to_ascii_lowercase())
+                        .collect::<std::collections::HashSet<_>>(),
+                )
+            })
+            .collect();
+    }
+
     /// 加载兼容规则：系统层（`{data_dir}/compat.toml`）+ 用户层覆盖
     /// （`{user_dir}/compat.toml`）。任一文件缺失/解析失败均静默跳过。
     pub fn load(data_dir: Option<&Path>, user_dir: Option<&Path>) -> Self {
         let mut apps: Vec<AppCompatRule> = Vec::new();
+        let mut scope: Vec<InitialModeScopeRule> = Vec::new();
         if let Some(d) = data_dir
             && let Some(sys) = load_file(&d.join(COMPAT_FILE_NAME))
         {
-            apps = sys;
+            apps = sys.apps;
+            scope = sys.initial_mode_scope;
         }
         if let Some(u) = user_dir
             && let Some(user) = load_file(&u.join(COMPAT_FILE_NAME))
         {
-            apps = merge_rules(apps, user);
+            // 两段**各自独立**合并：用户为某进程写 [[apps]] 规则不会连带丢掉系统层给
+            // 该进程配的 [[initial_mode_scope]]，反之亦然。合并语义相同（同名进程整条覆盖）。
+            apps = merge_rules(apps, user.apps);
+            scope = merge_mode_scope(scope, user.initial_mode_scope);
         }
-        Self::from_rules(apps)
+        Self::from_parts(apps, scope)
     }
 }
 
 /// 解析单个 compat.toml；文件不存在或解析失败返回 None。
-fn load_file(path: &Path) -> Option<Vec<AppCompatRule>> {
+fn load_file(path: &Path) -> Option<AppCompatFile> {
     let text = std::fs::read_to_string(path).ok()?;
-    let parsed: AppCompatFile = toml::from_str(&text).ok()?;
-    Some(parsed.apps)
+    toml::from_str::<AppCompatFile>(&text).ok()
 }
 
 /// 合并两组规则：user 中同名进程（不区分大小写）覆盖 base，其余 base 规则保留，
@@ -498,6 +597,30 @@ fn merge_rules(base: Vec<AppCompatRule>, user: Vec<AppCompatRule>) -> Vec<AppCom
         .map(|r| r.process.to_ascii_lowercase())
         .collect();
     let mut merged: Vec<AppCompatRule> = base
+        .into_iter()
+        .filter(|r| !user_keys.contains(&r.process.to_ascii_lowercase()))
+        .collect();
+    merged.extend(user);
+    merged
+}
+
+/// 合并两组初始模式作用域规则：语义与 [`merge_rules`] 完全一致（同名进程整条覆盖）。
+///
+/// 「整条覆盖」意味着用户想在内置清单上**增删一项**时要把整份 `classes` 抄一遍。
+/// 这是刻意与 `[[apps]]` 保持一致——两段用两套合并语义会更难解释，而系统层
+/// `data/compat.toml` 里已把内置值完整列出，抄一遍的成本很低。
+fn merge_mode_scope(
+    base: Vec<InitialModeScopeRule>,
+    user: Vec<InitialModeScopeRule>,
+) -> Vec<InitialModeScopeRule> {
+    if user.is_empty() {
+        return base;
+    }
+    let user_keys: std::collections::HashSet<String> = user
+        .iter()
+        .map(|r| r.process.to_ascii_lowercase())
+        .collect();
+    let mut merged: Vec<InitialModeScopeRule> = base
         .into_iter()
         .filter(|r| !user_keys.contains(&r.process.to_ascii_lowercase()))
         .collect();
@@ -555,7 +678,7 @@ mod tests {
         set_auto_pair(&mut rules, "EXCEL.EXE", Some(false));
         set_caret_offset(&mut rules, "WindowsTerminal.exe", 0, -4);
 
-        let out = render_user_compat(&rules).unwrap();
+        let out = render_user_compat(&rules, &[]).unwrap();
         assert!(out.contains("auto_pair = false"));
         assert!(out.contains("caret_offset_y = -4"));
         // dx 为 0：不落盘。
@@ -569,7 +692,7 @@ mod tests {
 
         // 清除规则（回到跟随全局）后该字段整个消失，而不是写成 auto_pair = true。
         set_auto_pair(&mut rules, "EXCEL.EXE", None);
-        let cleared = render_user_compat(&rules).unwrap();
+        let cleared = render_user_compat(&rules, &[]).unwrap();
         assert!(
             !cleared.contains("auto_pair"),
             "清除后不应残留该键: {cleared}"
@@ -760,7 +883,7 @@ mod tests {
             first_show_mode: FirstShowMode::Fast,
             ..Default::default()
         }];
-        let text = render_user_compat(&rules).expect("渲染失败");
+        let text = render_user_compat(&rules, &[]).expect("渲染失败");
         assert!(text.contains(r#"first_show_mode = "fast""#), "产物: {text}");
         assert!(
             !text.contains("caret_use_top"),
@@ -819,7 +942,7 @@ mod tests {
             initial_mode: Some(InitialMode::English),
             ..Default::default()
         }];
-        let text = render_user_compat(&rules).expect("渲染失败");
+        let text = render_user_compat(&rules, &[]).expect("渲染失败");
         assert!(text.contains(r#"initial_mode = "english""#), "产物: {text}");
         assert!(!text.contains("initial_punct"), "None 字段不应写出: {text}");
 
@@ -842,7 +965,7 @@ mod tests {
             process: "Foo.exe".into(),
             ..Default::default()
         }];
-        let text = render_user_compat(&rules).expect("渲染失败");
+        let text = render_user_compat(&rules, &[]).expect("渲染失败");
         assert!(!text.contains("host_render"), "false 开关不应写出: {text}");
     }
 
@@ -886,11 +1009,176 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let text = render_user_compat(&rules).expect("渲染失败");
+        let text = render_user_compat(&rules, &[]).expect("渲染失败");
         assert!(text.contains("host_render = true"), "产物: {text}");
 
         let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
         let compat = AppCompat::from_rules(parsed.apps);
         assert_eq!(compat.host_render_processes(), vec!["A.exe".to_string()]);
+    }
+
+    // ── [[initial_mode_scope]] ──
+
+    fn sample_scope() -> Vec<InitialModeScopeRule> {
+        vec![InitialModeScopeRule {
+            process: "explorer.exe".into(),
+            comment: String::new(),
+            classes: vec!["Progman".into(), "WorkerW".into()],
+        }]
+    }
+
+    #[test]
+    fn mode_scope_match_is_case_insensitive_on_both_keys() {
+        let c = AppCompat::from_parts(Vec::new(), sample_scope());
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+        assert!(c.initial_mode_applies_to_window("EXPLORER.EXE", "progman"));
+        // 作用域外：任务栏 / Alt+Tab / 溢出区 —— 保持现状
+        assert!(!c.initial_mode_applies_to_window("explorer.exe", "Shell_TrayWnd"));
+        assert!(!c.initial_mode_applies_to_window("explorer.exe", "ForegroundStaging"));
+    }
+
+    /// ★★★ 未配作用域的进程**完全不受影响**。这条守的是「引入本机制不会波及其它应用」，
+    /// 也是把判据从黑名单反转成白名单后唯一可能出的新缺陷（把所有人都关进作用域）。
+    #[test]
+    fn process_without_scope_entry_is_unrestricted() {
+        let c = AppCompat::from_parts(Vec::new(), sample_scope());
+        assert!(c.initial_mode_applies_to_window("notepad.exe", "Notepad"));
+        // 连窗口类都拿不到时也照常生效——没配作用域就没有任何限制
+        assert!(c.initial_mode_applies_to_window("notepad.exe", ""));
+        // 空进程名同理（macOS / 取名失败）
+        assert!(c.initial_mode_applies_to_window("", ""));
+    }
+
+    /// ★★★ 本轮缺陷的钉子：作用域内的进程，窗口类为空时必须**保持现状**。
+    ///
+    /// 实测现场（2026-08-18 17:24:08）：explorer 新起一个 TSF 连接，其首个 focus_gained
+    /// 拿不到窗口类（caret 也退到 last_known），旧的黑名单判据把空类名放行 ⇒ 套上
+    /// explorer 的 `initial_mode = "english"` ⇒ 语言栏图标闪英。
+    #[test]
+    fn empty_window_class_stays_outside_scope() {
+        let c = AppCompat::from_parts(Vec::new(), sample_scope());
+        assert!(!c.initial_mode_applies_to_window("explorer.exe", ""));
+    }
+
+    /// 空 classes = 该进程的初始模式规则在任何窗口上都不重算（不是"不受限"）。
+    #[test]
+    fn empty_class_list_blocks_everything_for_that_process() {
+        let c = AppCompat::from_parts(
+            Vec::new(),
+            vec![InitialModeScopeRule {
+                process: "explorer.exe".into(),
+                comment: String::new(),
+                classes: Vec::new(),
+            }],
+        );
+        assert!(!c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+        assert!(c.initial_mode_applies_to_window("notepad.exe", "Notepad"));
+    }
+
+    /// ★ 本文件最重要的一条回归：两段**独立合并**。
+    ///
+    /// 用户只为 explorer.exe 写了一条 `[[apps]]`（比如调 caret_offset），系统层给
+    /// explorer.exe 配的 `[[initial_mode_scope]]` 必须原样保留。若哪天有人把作用域清单
+    /// 挪进 `[[apps]]` 的字段里，本测试会红——那正是要防的设计退化。
+    #[test]
+    fn user_apps_override_does_not_drop_system_mode_scope() {
+        let apps = merge_rules(
+            vec![AppCompatRule {
+                process: "explorer.exe".into(),
+                caret_use_top: true,
+                ..Default::default()
+            }],
+            vec![AppCompatRule {
+                process: "explorer.exe".into(),
+                caret_offset_x: 3,
+                ..Default::default()
+            }],
+        );
+        let scope = merge_mode_scope(sample_scope(), Vec::new());
+        let c = AppCompat::from_parts(apps, scope);
+
+        // [[apps]] 确实被用户层整条覆盖了（caret_use_top 丢失是既有的预期语义）
+        let rule = c.get_rule("explorer.exe").expect("规则应存在");
+        assert_eq!(rule.caret_offset_x, 3);
+        assert!(!rule.caret_use_top);
+        // 但 [[initial_mode_scope]] 毫发无损
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+    }
+
+    #[test]
+    fn user_mode_scope_overrides_whole_entry_for_that_process() {
+        let merged = merge_mode_scope(
+            sample_scope(),
+            vec![InitialModeScopeRule {
+                process: "EXPLORER.EXE".into(),
+                comment: String::new(),
+                classes: vec!["CabinetWClass".into()],
+            }],
+        );
+        let c = AppCompat::from_parts(Vec::new(), merged);
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "CabinetWClass"));
+        // 整条覆盖：内置那两项不再保留（语义与 [[apps]] 一致，见 merge_mode_scope 注释）
+        assert!(!c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+    }
+
+    /// 菜单写回是**整份重写**，漏渲染哪一段哪一段就没了。
+    #[test]
+    fn user_writeback_preserves_mode_scope() {
+        let rules = vec![AppCompatRule {
+            process: "notepad.exe".into(),
+            caret_use_top: true,
+            ..Default::default()
+        }];
+        let text = render_user_compat(&rules, &sample_scope()).expect("渲染失败");
+        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
+        assert_eq!(parsed.initial_mode_scope, sample_scope());
+
+        let c = AppCompat::from_parts(parsed.apps, parsed.initial_mode_scope);
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "WorkerW"));
+    }
+
+    /// 没有作用域时不该在用户层文件里留下空的 `[[initial_mode_scope]]` 噪声。
+    #[test]
+    fn empty_mode_scope_is_not_serialized() {
+        let text = render_user_compat(&[], &[]).expect("渲染失败");
+        assert!(!text.contains("initial_mode_scope"), "产物: {text}");
+    }
+
+    /// 守随发布的系统层 `data/compat.toml`（路径写法同 config.rs 的既有先例）。
+    ///
+    /// 必要性：`load_file` 解析失败是**静默跳过整份文件**——一个 TOML 笔误就会让所有
+    /// 应用的所有兼容规则一起失效，且日志里毫无痕迹。这条测试是那种缺陷唯一的早期信号。
+    /// 同时钉住内置作用域的两侧：桌面在内（用户为桌面配的 initial_mode 必须生效，那正是
+    /// 他们配它的目的），任务栏与"拿不到窗口类"在外。
+    #[test]
+    fn shipped_system_compat_parses_and_scopes_explorer_to_desktop() {
+        let data_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data"));
+        let file = load_file(&data_dir.join(COMPAT_FILE_NAME))
+            .expect("随发布的 data/compat.toml 必须能解析（失败会静默吞掉全部规则）");
+        let c = AppCompat::from_parts(file.apps, file.initial_mode_scope);
+
+        // 桌面：规则必须照常生效
+        for class in ["Progman", "WorkerW"] {
+            assert!(
+                c.initial_mode_applies_to_window("explorer.exe", class),
+                "{class} 是桌面，排除它会让用户为桌面配的 initial_mode 彻底失效"
+            );
+        }
+        // 作用域外：路过型窗口 + 拿不到窗口类
+        for class in [
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "XamlExplorerHostIslandWindow",
+            "ForegroundStaging",
+            "TopLevelWindowForOverflowXamlIsland",
+            "",
+        ] {
+            assert!(
+                !c.initial_mode_applies_to_window("explorer.exe", class),
+                "class={class:?} 不该重算初始模式（每次切应用的必经之路）"
+            );
+        }
+        // 其它进程不受任何影响
+        assert!(c.initial_mode_applies_to_window("notepad.exe", ""));
     }
 }
