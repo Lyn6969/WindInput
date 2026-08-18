@@ -155,7 +155,7 @@ pub struct RvViews {
     /// 菜单最小宽度（None→渲染层兜底 90）。
     pub menu_min_width: Option<Dim>,
 
-    /// 仅 index：主题定义的序号槽位字符（≤10）。空槽/越界回退。
+    /// 仅 index：主题定义的序号槽位标签，一槽一项（≤10）。空槽/越界回退。
     /// 优先级由协调器裁决：用户配置 index_labels > 本字段 > 默认数字。
     pub index_labels: Vec<String>,
 

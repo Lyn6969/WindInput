@@ -693,7 +693,7 @@ flip_when_above = false          # 反转候选项排列顺序（仅竖排 layou
 swap_preedit_when_above = false  # 交换编码栏与候选栏位置（编码沉底贴光标）
 # 完全不显示候选窗（与上翻无关的独立开关；盲打用）。
 hide_window = false
-index_labels = ""
+index_labels = []
 pager_bar_display = ""
 page_number_display = ""
 pager_in_preedit = false         # 翻页栏并入编码栏行右对齐（竖排省一行；仅 candidate_top 生效）

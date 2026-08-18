@@ -3182,9 +3182,17 @@ pub struct UiCandidateConfig {
     /// 默认 0：本项引入前注释段从无长度限制，非 0 的默认值会让存量用户的注释突然变短。
     #[serde(default)]
     pub comment_max_chars: usize,
-    /// 自定义序号标签（如 "asdfg"；空=默认 1-9）。每字符一个槽位。
+    /// 自定义序号标签，一槽一项（如 `["a","s","d"]`、`["Ⅰ","Ⅱ","Ⅲ"]`；空表=全部默认 1-9）。
+    ///
+    /// **每槽是一个字符串而非一个字符**：序号标签本就有多字符形态（`(1)`、罗马数字、
+    /// 带 ZWJ 的组合 emoji），按 `char` 切会把它们拆散。这与主题侧
+    /// `views.index.labels` 同型——两者由协调器 `resolve_index_label` 三级裁决，
+    /// 类型必须一致，否则用户层永远表达不出主题层已支持的形态。
+    ///
+    /// 槽内**空串 = 该槽让位**（落到主题层，主题也没有才回退数字），故中间空槽有意义，
+    /// 不可在写回时按「遇空即停」截断。
     #[serde(default)]
-    pub index_labels: String,
+    pub index_labels: Vec<String>,
     /// 候选窗在光标上方时反转候选排列顺序。**仅竖排生效**：横排候选左右并列，
     /// 反转与窗口在上在下无关，只会把读序倒过来，故对横排一律忽略。
     ///
@@ -3310,7 +3318,7 @@ impl Default for UiCandidateConfig {
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),
             comment_max_chars: 0,
-            index_labels: String::new(),
+            index_labels: Vec::new(),
             flip_when_above: false,
             swap_preedit_when_above: false,
             pager_in_preedit: false,
@@ -3332,20 +3340,16 @@ impl UiCandidateConfig {
         PreeditDisplay::from_config(&self.preedit_display)
     }
 
-    /// 第 `i` 个候选（0 基）的序号标签：有 index_labels 则取对应槽位，否则用 (i+1)。
-    /// 槽位不足时回退数字。
-    pub fn index_label(&self, i: usize) -> String {
-        // index_labels 为空时 nth 直接 None，无需额外空判
-        if let Some(ch) = self.index_labels.chars().nth(i) {
-            return ch.to_string();
-        }
-        (i + 1).to_string()
-    }
-
-    /// 用户配置的第 `i` 个序号槽位（0 基）：仅当用户显式设置了 index_labels 且槽位存在
-    /// 时返回该字符，否则 None。供协调器裁决「用户 > 主题 > 默认」优先级（主题层在 None 时接手）。
+    /// 用户配置的第 `i` 个序号槽位（0 基）：仅当该槽位存在**且非空**时返回，否则 None。
+    /// 供协调器 `resolve_index_label` 裁决「用户 > 主题 > 默认」（None 时主题层接手）。
+    ///
+    /// 空串按 None 处理，与主题层同判据——这是「中间空槽让位」的落点：用户只想改第 1、
+    /// 第 4 槽时写 `["a","","","f"]`，中间两槽仍走主题。
+    ///
+    /// 此处刻意**不提供**「跳过主题直接回退数字」的便捷方法：那会让调用方绕开主题层，
+    /// 而三级裁决只有协调器持有主题槽位，是唯一有资格作答的地方。
     pub fn user_index_label(&self, i: usize) -> Option<String> {
-        self.index_labels.chars().nth(i).map(|c| c.to_string())
+        self.index_labels.get(i).filter(|s| !s.is_empty()).cloned()
     }
 
     /// 竖排最小行数的**生效值**：按每页候选数封顶（0=不补）。
@@ -3675,6 +3679,7 @@ impl Config {
 
         Self::migrate_enable_english_value(&mut merged);
         Self::migrate_force_vertical_value(&mut merged);
+        Self::migrate_index_labels_value(&mut merged);
         let mut config: Config = merged.try_into()?;
         config.normalize();
         Ok(config)
@@ -3713,6 +3718,37 @@ impl Config {
             }
         }
         info!("Migrated quick_input.enable_english=false into quick_mix members");
+    }
+
+    /// 存量迁移（**须在反序列化前**跑）：`ui.candidate.index_labels` 由「字符串，每 char
+    /// 一槽」改为「字符串数组，每项一槽」，旧值按 char 拆成数组。
+    ///
+    /// 这条迁移不可省。类型不匹配不是「这一项失效」而是 [`Self::load`] 里
+    /// `merged.try_into()?` **整体返回 Err**，而调用方多为 `unwrap_or_default()`
+    /// （`construct.rs`、repl、wind-mobile）——配过此项的用户会连方案、词库、按键
+    /// 一起静默回落出厂值，只留一行日志。
+    ///
+    /// 拆分按 `char` 而非字素簇：旧形态本就只能表达单 char 槽位，按 char 拆是对旧值的
+    /// **无损**还原；用字素簇反而会把旧配置里被拆散的组合序列错误地粘回一槽，改变行为。
+    fn migrate_index_labels_value(merged: &mut toml::Value) {
+        let Some(cand) = merged
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("candidate"))
+            .and_then(|c| c.as_table_mut())
+        else {
+            return;
+        };
+        // 只认字符串——已是数组说明是新格式（或本次默认值），不动。
+        let Some(old) = cand.get("index_labels").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let split: Vec<toml::Value> = old
+            .chars()
+            .map(|c| toml::Value::String(c.to_string()))
+            .collect();
+        let n = split.len();
+        cand.insert("index_labels".to_string(), toml::Value::Array(split));
+        info!("Migrated ui.candidate.index_labels string → {n} 个槽位数组");
     }
 
     /// 存量迁移（**须在反序列化前**跑，字段已从 [`QuickInputConfig`] 移除）：
@@ -5937,8 +5973,8 @@ active = "x"
         assert!(c.font_size_follow_theme, "默认跟随主题");
         assert_eq!(c.max_chars, 16, "默认最大 16 字");
         assert!(c.index_labels.is_empty() && !c.flip_when_above);
-        // index_label：默认数字
-        assert_eq!(c.index_label(0), "1");
+        // 未配置 → 全部让位（主题/默认数字由协调器裁决）
+        assert_eq!(c.user_index_label(0), None);
         // truncate：0=不限
         assert_eq!(
             c.truncate_display("这是一个很长的候选"),
@@ -5948,11 +5984,17 @@ active = "x"
 
     #[test]
     fn test_candidate_index_labels_and_truncate() {
-        let cfg = merged_with("[ui.candidate]\nindex_labels = \"asdf\"\nmax_chars = 4\n");
+        let cfg = merged_with(
+            "[ui.candidate]\nindex_labels = [\"a\", \"s\", \"d\", \"f\"]\nmax_chars = 4\n",
+        );
         let c = cfg.ui.candidate;
-        assert_eq!(c.index_label(0), "a");
-        assert_eq!(c.index_label(2), "d");
-        assert_eq!(c.index_label(9), "10", "槽位不足回退数字");
+        assert_eq!(c.user_index_label(0), Some("a".to_string()));
+        assert_eq!(c.user_index_label(2), Some("d".to_string()));
+        assert_eq!(
+            c.user_index_label(9),
+            None,
+            "槽位不足→None（让位主题/默认）"
+        );
         assert_eq!(
             c.truncate_display("一二三四五六"),
             "一二三四…",
@@ -5964,7 +6006,7 @@ active = "x"
     #[test]
     fn test_user_index_label_optional() {
         // 用户显式设置：已配槽位返回 Some，越界返回 None（主题层可接手）。
-        let cfg = merged_with("[ui.candidate]\nindex_labels = \"asdf\"\n");
+        let cfg = merged_with("[ui.candidate]\nindex_labels = [\"a\", \"s\", \"d\", \"f\"]\n");
         let c = cfg.ui.candidate;
         assert_eq!(c.user_index_label(0), Some("a".to_string()));
         assert_eq!(c.user_index_label(3), Some("f".to_string()));
@@ -5972,6 +6014,79 @@ active = "x"
         // 未配置：全 None，优先级完全交给主题/默认。
         let d = merged_with("").ui.candidate;
         assert_eq!(d.user_index_label(0), None);
+    }
+
+    #[test]
+    fn test_index_label_slot_holds_multiple_chars() {
+        // 本次重构的核心判据：**一槽一串**，不再按 char 切。
+        // 三种旧形态下必被拆散的标签：括号数字、罗马数字、带 ZWJ 的组合 emoji。
+        let cfg = merged_with(
+            "[ui.candidate]\nindex_labels = [\"(1)\", \"Ⅱ\", \"👨\\u200D👩\\u200D👧\"]\n",
+        );
+        let c = cfg.ui.candidate;
+        assert_eq!(c.user_index_label(0), Some("(1)".to_string()));
+        assert_eq!(c.user_index_label(1), Some("Ⅱ".to_string()));
+        assert_eq!(
+            c.user_index_label(2),
+            Some("👨\u{200D}👩\u{200D}👧".to_string()),
+            "ZWJ 组合序列整体占一槽，不被拆成 5 个 char"
+        );
+    }
+
+    #[test]
+    fn test_index_label_empty_slot_yields_to_theme() {
+        // 第二项恢复的能力：中间空槽 = 该槽让位主题（旧的字符串形态表达不出来）。
+        // 判据是 None 而非 Some("")——协调器只在 None 时才去问主题层。
+        let cfg = merged_with("[ui.candidate]\nindex_labels = [\"a\", \"\", \"\", \"f\"]\n");
+        let c = cfg.ui.candidate;
+        assert_eq!(c.user_index_label(0), Some("a".to_string()));
+        assert_eq!(c.user_index_label(1), None, "空槽让位，不是 Some(\"\")");
+        assert_eq!(c.user_index_label(2), None);
+        assert_eq!(
+            c.user_index_label(3),
+            Some("f".to_string()),
+            "空槽之后仍生效"
+        );
+    }
+
+    #[test]
+    fn test_migrate_index_labels_string_to_array() {
+        // 存量迁移：旧的字符串形态按 char 拆成数组。不迁移的话 `try_into` 整体失败，
+        // 调用方 `unwrap_or_default()` 会把**全部**配置回落出厂值。
+        let mut v: toml::Value =
+            toml::from_str("[ui.candidate]\nindex_labels = \"asdf\"\n").unwrap();
+        Config::migrate_index_labels_value(&mut v);
+        assert_eq!(
+            v["ui"]["candidate"]["index_labels"],
+            toml::Value::try_from(["a", "s", "d", "f"]).unwrap()
+        );
+        // 幂等：已是数组则原样不动（每次启动都会跑一遍）。
+        let before = v.clone();
+        Config::migrate_index_labels_value(&mut v);
+        assert_eq!(v, before, "对新格式二次迁移须无变化");
+        // 迁移后能落进结构体，且旧值语义不变。
+        let cfg = merged_with("[ui.candidate]\nindex_labels = [\"a\", \"s\", \"d\", \"f\"]\n");
+        assert_eq!(cfg.ui.candidate.user_index_label(1), Some("s".to_string()));
+    }
+
+    #[test]
+    fn test_load_survives_legacy_string_index_labels() {
+        // 迁移的真正把关点在 `Config::load` 的 `merged.try_into()?` 上：
+        // 这里复刻那条链路（默认值 ⊕ 旧格式用户层 → 迁移 → 反序列化）。
+        // 没有迁移这一步，try_into 会 Err，整个配置无声回落出厂值。
+        let mut merged = toml::Value::try_from(Config::default()).unwrap();
+        let legacy: toml::Value =
+            toml::from_str("[ui.candidate]\nindex_labels = \"asdf\"\n").unwrap();
+        merge_value(&mut merged, legacy);
+        Config::migrate_index_labels_value(&mut merged);
+        let cfg: Config = merged
+            .try_into()
+            .expect("旧字符串经迁移后须能反序列化，否则全盘配置丢失");
+        assert_eq!(
+            cfg.ui.candidate.index_labels,
+            vec!["a", "s", "d", "f"],
+            "旧的单字符标签原样保留，用户无需重配"
+        );
     }
 
     #[test]

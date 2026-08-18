@@ -247,7 +247,8 @@ pub struct ViewNode {
     pub font_size: Option<i32>,
     pub font_weight: Option<i32>,
     pub color: Option<Ld>,
-    /// 仅 index：序号槽位字符（≤10）。
+    /// 仅 index：序号槽位标签，一槽一项（≤10）。**每项是字符串不是字符**——
+    /// `(1)`、罗马数字、带 ZWJ 的组合 emoji 都是多 char 的合法标签。
     #[serde(default)]
     pub labels: Vec<String>,
     /// z 层级覆盖图。

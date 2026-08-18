@@ -337,7 +337,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.comment_template_horizontal", Str),
     f("ui.candidate.comment_max_chars", Int),
     f("ui.comment_dicts", StructList),
-    f("ui.candidate.index_labels", Str),
+    f("ui.candidate.index_labels", StrList),
     f("ui.candidate.flip_when_above", Bool),
     f("ui.candidate.swap_preedit_when_above", Bool),
     f("ui.candidate.pager_in_preedit", Bool),
