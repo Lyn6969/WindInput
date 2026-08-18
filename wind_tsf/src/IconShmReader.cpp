@@ -83,7 +83,8 @@ void CIconShmReader::_Close()
 }
 
 bool CIconShmReader::ReadVariant(int desiredSizePx, bool darkTheme,
-                                 std::vector<BYTE>& outPixels, int& outSizePx)
+                                 std::vector<BYTE>& outPixels, int& outSizePx,
+                                uint32_t* outSeq)
 {
     if (!_EnsureOpen())
         return false;
@@ -182,6 +183,8 @@ bool CIconShmReader::ReadVariant(int desiredSizePx, bool darkTheme,
         {
             outPixels.swap(tmp);
             outSizePx = bestSize;
+            if (outSeq != nullptr)
+                *outSeq = seq1;
             return true;
         }
         // 序号变了：拷到的可能是新旧混合的字节，丢弃重来。

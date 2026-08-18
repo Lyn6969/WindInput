@@ -34,8 +34,13 @@ public:
     //
     // 返回 false 的全部情形都意味着「这次用不了预渲染图标」，调用方应退回本地绘制：
     // 服务未启动 / SHM 尚未发布过内容 / 头部校验不过 / 拷贝期间被并发发布打断。
+    // outSeq（可选）：本次取到的**发布序号**。用来排查「图标落后一帧」——
+    // 服务端每次发布都记 seq，两边序号一对即可直接判定取到的是不是最新版。
+    // ⚠ 此前只能靠两侧日志的**时间戳**去凑，而正是毫秒级的陈旧读最需要它、
+    // 时间戳也最不可能凑准（2026-08-18 排查「快到看不清的一闪」即卡在这里）。
     bool ReadVariant(int desiredSizePx, bool darkTheme,
-                     std::vector<BYTE>& outPixels, int& outSizePx);
+                     std::vector<BYTE>& outPixels, int& outSizePx,
+                     uint32_t* outSeq = nullptr);
 
 private:
     // 懒打开。失败不记忆——服务可能晚于宿主进程启动，下次 GetIcon 再试即可自愈。

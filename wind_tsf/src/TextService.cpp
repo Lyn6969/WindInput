@@ -2880,6 +2880,14 @@ BOOL CTextService::_SetOpenCloseCompartment(BOOL bOpen)
 
     _bInCompartmentChange = FALSE;
 
+    // ⚠ 这条日志此前**不存在**，是 2026-08-18 排查「快到看不清的一闪」时补的。
+    // OPENCLOSE 是 Windows 自己那个语言指示器的数据源（不是我们画进 SHM 的图标），
+    // 没有它就无法回答「系统指示器被翻了几次」——而那恰恰是我们画的图标全程正确、
+    // 用户却仍看到闪烁时唯一剩下的解释。上面的幂等守卫会吃掉同值写入，
+    // 所以能走到这里的**每一条都是真的翻转**。
+    WIND_LOG_DEBUG_FMT(L"compat.openclose.write value=%d hr=0x%08X tid=%lu inst=0x%p",
+                       (int)desired, (uint32_t)hr, GetCurrentThreadId(), this);
+
     return SUCCEEDED(hr);
 }
 
