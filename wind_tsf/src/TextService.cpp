@@ -1412,10 +1412,45 @@ STDAPI CTextService::OnSetThreadFocus()
     // tid/inst 与 compat.openclose.onchange 对齐，用于确认两者是否同一实例。
     WIND_LOG_DEBUG_FMT(L"OnSetThreadFocus called tid=%lu inst=0x%p\n", GetCurrentThreadId(), this);
     _hasThreadFocus = TRUE;
+
+    // ── 重新取一次「当前焦点文档有没有可编辑上下文」 ──
+    // ⚠ **必须先查再用**：此刻手上的 _hasTextInputContext 很可能是 OnSetFocus 失焦分支
+    // 留下的陈旧 FALSE。那个 FALSE 是给加词热键门卫用的（"DocMgr 走了"），**不是**
+    // "用户进了不可输入的地方"的判据——与失焦分支同一条原则：「没有文档」≠「不可输入」。
+    //
+    // 直接拿它驱动语言栏的后果实测过（2026-08-18 修复后复测，新 DLL 上 4/4 次全中）：
+    //   39.987 DocMgr focus lost → 40.089 OnSetThreadFocus → 40.287 noEditCtx=1
+    //   → 40.350 GetIcon text=英 → 41.282 下一次 gaining(hasTextCtx=1) 才恢复
+    // 图标错显「英」1.02 秒，比修复前那版的 202ms 还久，症状是「Alt+Tab / 点任务栏时
+    // 闪英文」。同一段日志里 hasTextCtx=0 出现 0 次 ⇒ 这 4 次没有一次是真的。
+    //
+    // GetFocus 拿不到文档时**什么都不做**（保持冻结），等 gaining 分支给权威判据——
+    // 过渡态不该有结论。
+    BOOL langBarJudgeable = FALSE;
+    if (_pThreadMgr != nullptr)
+    {
+        ITfDocumentMgr* pFocusDoc = nullptr;
+        if (SUCCEEDED(_pThreadMgr->GetFocus(&pFocusDoc)) && pFocusDoc != nullptr)
+        {
+            _hasTextInputContext = _DocMgrHasEditableContext(pFocusDoc);
+            pFocusDoc->Release();
+            langBarJudgeable = TRUE;
+        }
+    }
+    WIND_LOG_DEBUG_FMT(L"OnSetThreadFocus: judgeable=%d hasTextCtx=%d",
+                       langBarJudgeable ? 1 : 0, _hasTextInputContext ? 1 : 0);
+
     // 拿回 thread focus：候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动，
     // 这里不主动补——切焦点时候选窗通常已经消失。
     // 加词热键不依赖候选，重新评估（若当前中文+文本框则重新注册）。
+    // 放在上面的重查**之后**：门卫读的就是 _hasTextInputContext，读陈旧值会少注册一次。
     _ReevaluateAddWordHotkey();
+
+    // 语言栏可用性重新落定：失去线程焦点期间本实例被禁止改图标（见
+    // _ScheduleLangBarStateSync 规则 ②），冻结的状态要在拿回焦点后重新评估一次，
+    // 否则真的停在不可输入控件上时图标永远不会变「英」。
+    if (langBarJudgeable)
+        _ScheduleLangBarStateSync();
     return S_OK;
 }
 
@@ -1424,6 +1459,9 @@ STDAPI CTextService::OnKillThreadFocus()
 {
     WIND_LOG_DEBUG_FMT(L"OnKillThreadFocus called tid=%lu inst=0x%p\n", GetCurrentThreadId(), this);
     _hasThreadFocus = FALSE;
+    // 语言栏冻结在最后显示值：本实例已不是前台，无权把托盘图标改成「英」。
+    // 待定计时在此撤销（_ApplyLangBarStateSync 里还有第二道门兜住竞态）。
+    _CancelLangBarStateSync();
     // 立即让出所有热键，让前台应用的 IME 实例能注册成功。
     if (_hotkeysActive)
     {
@@ -2142,11 +2180,9 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         WindLogCurrentProcessInfo(4, L"compat.focus.current_host");
         WindLogForegroundProcessInfo(4, L"compat.focus.foreground_host");
 
-        // Force refresh the language bar button to ensure it's visible
-        if (_pLangBarItemButton != nullptr)
-        {
-            _pLangBarItemButton->ForceRefresh();
-        }
+        // ⚠ 语言栏的 ForceRefresh **不在这里**：它会让系统回调 GetIcon 重绘，而此刻
+        // _hasTextInputContext 还是上一段焦点的值（下面才算），重绘出来的就是陈旧状态。
+        // 已搬到 _ScheduleLangBarStateSync 之后，见那一处的注释与实测时序。
 
         // Reset composing state on focus gained to ensure clean state
         // This prevents stale composition state from affecting new input
@@ -2206,6 +2242,22 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             _focusSessionId, _hasTextInputContext ? 1 : 0, docMgrDynFlags, rawScopeMask,
             (rawScopeMask & kPasswordScopeBits) != 0 ? 1 : 0,
             _focusIsPassword ? 1 : 0, _bKeyboardDisabled ? 1 : 0);
+
+        // ── 语言栏输入可用性：必须在 ForceRefresh **之前** ──
+        // 这两行的顺序是本轮修复的核心。原先 ForceRefresh 在本函数上部（算出
+        // _hasTextInputContext 之前 22 行），于是切入应用的那一帧必定用上一段焦点的
+        // 陈旧值重绘图标。实测（2026-08-18 wind_tsf.log，全程 mode=1/label=中）：
+        //   13.055 ForceRefresh → 13.057 hasTextCtx=1 → 13.120 GetIcon text=英
+        //   → 13.258 noEditCtx=0 → 13.322 GetIcon text=中     共 202ms 的错字
+        // 四次独立测量 202/201/207/205ms，正好是 kLangBarSyncDelayMs 原样兑现。
+        // 先同步、后重绘之后，ForceRefresh 拿到的就是本次焦点的真值。
+        _ScheduleLangBarStateSync();
+
+        // Force refresh the language bar button to ensure it's visible
+        if (_pLangBarItemButton != nullptr)
+        {
+            _pLangBarItemButton->ForceRefresh();
+        }
 
         // 焦点 caret。**先发异步 edit session 请求，再走同步回退链** —— 顺序是有意的：
         // 内联执行的宿主（记事本实测 hrSession=S_OK）会在下面这行里把回调跑完，
@@ -2412,16 +2464,29 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         _focusIsPassword = false;
         // 掩码随焦点走：不清会把上个控件的密码位带到新焦点，令抑制门控误放行。
         _focusInputScopeMask = 0;
+
+        // ⚠ 语言栏**只取消待定计时，不推进状态**。
+        // 上面这个 FALSE 回答的是「DocMgr 走了」，不是「用户进了不可输入的地方」——
+        // 后者只有 gaining 分支的 _DocMgrHasEditableContext 才有资格判定。
+        // 实测（2026-08-18 wind_tsf.log）：整段日志 `hasTextCtx=0` **0 次**（用户从未
+        // 进过不可输入控件），而本分支驱动出 10 次 `noEditCtx=1`、26 次 GetIcon 画「英」，
+        // 全部是假阳性。DocMgr 级失焦是噪声层（另见本函数上方与 OnKillThreadFocus 注释），
+        // 判据落在噪声层时，迟滞只能延后症状、消不掉它。
+        //
+        // 代价（已知并接受）：宿主把 DocMgr 焦点置空、又长期不给新 DocMgr、同时保持线程
+        // 焦点——这种场景不再显「英」。实测该形态不存在：日志里凡是空焦点持续超过 ~600ms
+        // 的，线程焦点都在约 100ms 后随之丢失（由 OnKillThreadFocus 冻结兜住）。
+        _CancelLangBarStateSync();
     }
 
     // 焦点/文本框上下文变化后重新评估加词热键（gaining/losing 两分支汇合于此）。
     _ReevaluateAddWordHotkey();
 
-    // 语言栏输入可用性同步挂同一个收口点：gaining 分支算出 _hasTextInputContext /
-    // _focusInputScopeMask，losing 分支把它们清零，两条路都必经此处。
-    // **刻意不在各分支里分别调用**——那要枚举所有出口，漏一个就是「图标卡在旧状态」，
-    // 而这个函数本身带迟滞与去重，多调一次无副作用。
-    _ScheduleLangBarStateSync();
+    // ⚠ 语言栏可用性同步**曾经**挂在这个收口点（gaining/losing 汇合处），理由是
+    // 「不逐分支调用就不会漏出口」。2026-08-18 推翻：两个分支要做的**根本不是同一件事**
+    // ——gaining 分支推进状态（它有权威判据），losing 分支只能取消（它拿到的是噪声）。
+    // 合用一个收口点等于强迫两者共用语义，正是 26 次错画「英」的来源。
+    // 现已各自调用：gaining 见 _ScheduleLangBarStateSync 调用处，losing 见 _CancelLangBarStateSync。
 
     // 慢焦点探针收口（gaining/losing 两分支都经过这里）。见函数开头的说明。
     const double focusTotalMs = WindLog::PerfMsSince(focusProbeT0);
@@ -4238,6 +4303,33 @@ void CTextService::SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMg
                                   _QueryWindowClass(hwndFg));
 }
 
+void CTextService::_CancelLangBarStateSync()
+{
+    if (_hHotkeyWnd != nullptr)
+        KillTimer(_hHotkeyWnd, kLangBarSyncTimerId);
+    _langBarSyncPending = FALSE;
+}
+
+// ⚠ 本函数的两个方向**不对称**，三条规则都由实测驱动，改之前先读 wind_tsf.log 那组数据。
+//
+// ① 恢复方向（→ 可输入）零迟滞、且**不受线程焦点门控**。
+//    迟滞当初按 QQ 密码框 ~180ms 的 DocMgr 抖动标定，是对称的；但两个方向的代价差得远：
+//    晚 200ms 显「英」用户察觉不到，早 200ms 误显「英」是刺眼的闪烁。
+//    不门控线程焦点是必须的：实测 DocMgr 级获焦**早于** OnSetThreadFocus 约 110ms
+//    （13.053 gained → 13.167 OnSetThreadFocus），门控会把恢复推迟到那时，
+//    而紧随其后的 ForceRefresh 就又画出陈旧的「英」了。恢复成正常图标永远是安全的。
+//
+// ② 进入方向（→ 不可输入）保留迟滞，**并且要求本实例持有线程焦点**。
+//    实测同一个宿主进程里有两个 CTextService 实例（TotalCMD: tid=44024/6408），
+//    实例 A 失焦起了计时、200ms 后到期时焦点早已交给实例 B，A 却照样把托盘图标改成「英」：
+//      03.269 [A] OnSetFocus NULL → 03.317 [B] gained hasTextCtx=1
+//      → 03.381 [A] OnKillThreadFocus → 03.476 [A] noEditCtx=1 → 03.540 GetIcon text=英
+//    托盘只有一个图标而语言栏项是每实例一份，不门控就是**后台实例覆盖前台实例**。
+//    同一个洞还有第二种表现：explorer 实例被陈旧值钉在「英」后，去重早退让它再也排不上
+//    纠正（实测此后 5 次 GetIcon 全是「英」，一次都没恢复）。
+//
+// ③ 已在计时中则**不重设**：SetTimer 用同一 id 会重新开始计时，churn 下每轮都重设就
+//    永远等不到到期，图标再也不更新。同 Rust 侧 toolbar_gate 用 get_or_insert 的理由。
 void CTextService::_ScheduleLangBarStateSync()
 {
     if (_pLangBarItemButton == nullptr || _hHotkeyWnd == nullptr)
@@ -4252,18 +4344,32 @@ void CTextService::_ScheduleLangBarStateSync()
         // 这一步是抗抖的关键：churn 期间「离开可编辑上下文」与「回到可编辑上下文」交替
         // 出现，每次回到原状态都把计时取消，图标因此稳定在抖动前的取值。churn 停下后
         // 最后那个状态不会再被撤销，计时到期，图标一次到位。
-        if (_langBarSyncPending)
-        {
-            KillTimer(_hHotkeyWnd, kLangBarSyncTimerId);
-            _langBarSyncPending = FALSE;
-        }
+        _CancelLangBarStateSync();
         return;
     }
 
-    // 与已显示的状态不同 ⇒ 起迟滞计时。
-    // ⚠ 已在计时中则**不重设**：SetTimer 用同一 id 会重新开始计时，churn 下每轮都重设
-    // 就永远等不到到期，图标再也不更新。同 Rust 侧 toolbar_gate 用 get_or_insert 而非
-    // 直接赋值的理由（那里的注释记着同一个坑）。
+    // 判据取「两个维度都不挡」而非逐维度比较：图标只有「英」和「正常」两态，
+    // 密码框↔无上下文之间的换因不改变显示，不该当成恢复而立即生效。
+    const BOOL nowAvailable = (!noEditCtx && !password);
+    const BOOL wasAvailable = (!_langBarNoEditCtxReported && !_langBarPasswordReported);
+
+    if (nowAvailable && !wasAvailable)
+    {
+        // 规则 ①：恢复，立即生效。
+        _ApplyLangBarStateSync();
+        return;
+    }
+
+    if (!_hasThreadFocus)
+    {
+        // 规则 ②：非前台实例无权把图标改成「英」，冻结在最后显示值。
+        // 用 _hasThreadFocus（ITfThreadFocusSink 驱动）而**不是** _isProcessForeground：
+        // 后者在 WebView 类多进程宿主下恒假，用它会让那些宿主的图标永不更新。
+        _CancelLangBarStateSync();
+        return;
+    }
+
+    // 规则 ③
     if (!_langBarSyncPending)
     {
         SetTimer(_hHotkeyWnd, kLangBarSyncTimerId, kLangBarSyncDelayMs, nullptr);
@@ -4273,9 +4379,7 @@ void CTextService::_ScheduleLangBarStateSync()
 
 void CTextService::_ApplyLangBarStateSync()
 {
-    if (_hHotkeyWnd != nullptr)
-        KillTimer(_hHotkeyWnd, kLangBarSyncTimerId);
-    _langBarSyncPending = FALSE;
+    _CancelLangBarStateSync();
 
     if (_pLangBarItemButton == nullptr)
         return;
@@ -4284,6 +4388,19 @@ void CTextService::_ApplyLangBarStateSync()
     // 该显示的是现在的状态而非触发计时的那一个。
     const BOOL noEditCtx = _hasTextInputContext ? FALSE : TRUE;
     const BOOL password  = IsPasswordSuppressActive();
+
+    // 第二道线程焦点门（第一道在 _ScheduleLangBarStateSync）：计时**期间**可能刚好把
+    // 线程焦点交出去，那一刻本实例就失去了改托盘图标的资格。少了这道门，规则 ② 只挡住
+    // 「起计时时已是后台」，挡不住「计时中变成后台」——而实测的串台正是后一种形状
+    // （03.269 起计时 → 03.381 OnKillThreadFocus → 03.476 到期）。
+    // 只挡「进入不可输入」方向；恢复方向与 Schedule 里的规则 ① 一致，永远放行。
+    if (!_hasThreadFocus && (noEditCtx || password))
+    {
+        WIND_LOG_DEBUG_FMT(L"langbar.availability skipped (no thread focus) noEditCtx=%d password=%d",
+                           noEditCtx, password);
+        return;
+    }
+
     _langBarNoEditCtxReported = noEditCtx;
     _langBarPasswordReported  = password;
 
@@ -5029,6 +5146,13 @@ BOOL CTextService::_InitLangBarButton()
         _pLangBarItemButton = nullptr;
         return FALSE;
     }
+
+    // 去重变量必须跟着新按钮的初值走。不变量是「_langBar*Reported 恒等于按钮当前**显示**
+    // 的状态」，而本函数与 _UninitLangBarButton 成对、可重入（Deactivate → Activate），
+    // 新按钮的 _bNoEditContext/_bPasswordField 都是 FALSE。不复位的话，上一轮留下的 TRUE
+    // 会让 _ScheduleLangBarStateSync 的去重早退把「该显英」的那一次吞掉，图标从此卡住。
+    _langBarNoEditCtxReported = FALSE;
+    _langBarPasswordReported  = FALSE;
 
     return TRUE;
 }
