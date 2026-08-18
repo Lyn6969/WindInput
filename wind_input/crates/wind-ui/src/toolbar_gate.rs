@@ -103,6 +103,19 @@ impl ToolbarGate {
         self.show_at.is_some() || self.hide_at.is_some()
     }
 
+    /// 下一次需要 [`Self::tick_at`] 的时刻；`None` = 闸门空闲，无需为它安排唤醒。
+    ///
+    /// 消息循环据此决定睡多久。两个迟滞窗口本来就只有几十到一百多毫秒，睡过头就是
+    /// 「工具栏该显示时没显示」。
+    pub fn deadline(&self) -> Option<Instant> {
+        // 类型文档的不变式保证两者不同时为 `Some`。仍取较早者而非任选其一：这样即便将来
+        // 不变式被放松，最坏结果也只是多醒一次，而不是漏掉一次迟滞到期。
+        match (self.show_at, self.hide_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// 推进闸门。到期则清空对应计时并返回动作。
     pub fn tick_at(&mut self, now: Instant) -> GateTick {
         if let Some(d) = self.show_at

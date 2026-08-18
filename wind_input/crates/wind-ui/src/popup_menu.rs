@@ -601,6 +601,21 @@ impl PopupMenu {
     }
 
     /// UI 循环每轮调用：轮询菜单外点击；脏则协调重绘；请求关闭则隐藏。
+    /// 下一次需要 [`Self::tick`] 的时刻；菜单不可见时 `None`。
+    ///
+    /// ⚠ **菜单是整个 UI 里唯一仍需定期轮询的部分**，因为 [`Self::poll_outside_press`]
+    /// 读的是 `GetAsyncKeyState` 这个瞬时状态，没有对应的消息可以等——理由见那个函数的
+    /// 文档：菜单显示期间服务进程从来不是前台进程，`SetCapture` 收不到菜单外的鼠标消息。
+    ///
+    /// 周期沿用消息循环改事件驱动之前的 8ms，使点击响应与那时完全一致。这不影响本次改动
+    /// 的目标：菜单打开是短暂的主动交互，而要消灭的是**静态时**的持续唤醒。
+    pub fn next_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        if !self.visible {
+            return None;
+        }
+        Some(now + std::time::Duration::from_millis(8))
+    }
+
     pub fn tick(&mut self) {
         if !self.visible {
             return;

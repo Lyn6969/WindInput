@@ -28,6 +28,7 @@ pub use wind_ui_types::{
 /// UI 管理器（在独立线程中运行）
 pub struct UiManager {
     cmd_tx: mpsc::Sender<UiCommand>,
+    waker: crate::wake::UiWaker,
     event_rx: Option<mpsc::Receiver<UiEvent>>,
     _thread: std::thread::JoinHandle<()>,
 }
@@ -36,15 +37,18 @@ impl UiManager {
     pub fn new() -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel::<UiCommand>();
         let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
+        // UI 线程等的是「消息队列 ∪ 本唤醒事件 ∪ 最近的计时器到期」，见 `wake` 模块。
+        let (waker, wait_port) = crate::wake::channel();
 
         let thread = std::thread::Builder::new()
             .name("ui-manager".into())
             .spawn(move || {
-                Self::ui_thread(rx, ev_tx);
+                Self::ui_thread(rx, ev_tx, wait_port);
             })?;
 
         Ok(Self {
             cmd_tx: tx,
+            waker,
             event_rx: Some(ev_rx),
             _thread: thread,
         })
@@ -52,6 +56,16 @@ impl UiManager {
 
     pub fn sender(&self) -> mpsc::Sender<UiCommand> {
         self.cmd_tx.clone()
+    }
+
+    /// 唤醒 UI 线程的句柄。
+    ///
+    /// ⚠ **必须与 [`Self::sender`] 配对**：投递命令后要调用 `wake()`，否则 UI 线程会一直
+    /// 睡到下一个计时器到期（可能永不到期）才看见那条命令。裸用这两者容易漏，故生产路径
+    /// 一律经 `wind_coordinator::UiSender` —— 它把「先投递、再唤醒」固化进一次 `send`，
+    /// 调用方无从写错。
+    pub fn waker(&self) -> crate::wake::UiWaker {
+        self.waker.clone()
     }
 
     /// 取出 UI 事件接收端（仅可取一次）；协调器据此处理鼠标交互。
@@ -66,7 +80,11 @@ impl UiManager {
     /// 而候选窗/工具栏/托盘/状态气泡**全部消失**。开机早期窗口站尚未就绪时
     /// `CreateWindowExW` 失败正是这种场景，且唯一痕迹是下面那条 `error!`——
     /// 偏偏主日志的 non_blocking worker 也可能已经死了。故这些分支同时写启动轨迹。
-    fn ui_thread(rx: mpsc::Receiver<UiCommand>, event_tx: mpsc::Sender<UiEvent>) {
+    fn ui_thread(
+        rx: mpsc::Receiver<UiCommand>,
+        event_tx: mpsc::Sender<UiEvent>,
+        wait_port: crate::wake::UiWaitPort,
+    ) {
         wind_config::startup_trace::stage("ui-thread-begin");
 
         // 创建候选窗口
@@ -96,6 +114,9 @@ impl UiManager {
         let mut tip_hide_at: Option<std::time::Instant> = None;
         // 最近一次显示所用的自动隐藏时长（毫秒），交互结束后据此重新计时。
         let mut tip_duration_ms: u64 = 0;
+        // 上一轮气泡是否处于交互中，用于识别「交互刚结束」这一沿——理由同
+        // `auto_hide` 的 `was_engaged` 字段，见下方使用处。
+        let mut tip_was_interacting = false;
 
         // 输入诊断 HUD（惰性创建：首次 ShowInputDiag 时构造，best-effort）
         let mut input_diag_hud: Option<crate::input_diag_hud::InputDiagHud> = None;
@@ -172,7 +193,13 @@ impl UiManager {
             // 否则气泡会在被操作的过程中凭空消失。交互结束后重新获得完整一份时长。
             if let Some(deadline) = tip_hide_at {
                 let interacting = status_tip.as_ref().is_some_and(|t| t.interacting());
-                if interacting {
+                // 「交互刚结束」这一沿：也要重新给满一份时长。轮询年代两次 tick 只差 ~8ms，
+                // 「交互期间每轮顺延」自然就让结束时刻成了计时起点；事件驱动下 tick 变稀疏，
+                // 不显式处理就会按**最后一次唤醒**的时刻算，气泡提前消失。
+                // 与 `auto_hide` 的 `was_engaged` 同构。
+                let just_ended = tip_was_interacting && !interacting;
+                tip_was_interacting = interacting;
+                if interacting || just_ended {
                     tip_hide_at = Some(
                         std::time::Instant::now()
                             + std::time::Duration::from_millis(tip_duration_ms.max(1)),
@@ -984,8 +1011,39 @@ impl UiManager {
                 break 'main;
             }
             if !had_cmd {
-                // 无命令，短暂休眠避免 CPU 空转
-                std::thread::sleep(std::time::Duration::from_millis(8));
+                // 本循环唯一的休眠点：睡到「最近的计时器到期」，或被唤醒（新命令 /
+                // Win32 消息）提前叫醒。
+                //
+                // 取代的是原先无条件的 8ms 休眠。那一版让 UI 线程在完全空闲时也每秒醒
+                // 64~125 次（`Sleep` 被对齐到系统时钟粒度，而本进程不调 `timeBeginPeriod`，
+                // 故实际频率还随别的进程改动全局粒度而浮动），是服务静态 CPU 占用的唯一
+                // 来源，也让 CPU 无法进入深度 C-state。
+                //
+                // ⚠ **新增任何「靠每轮被调用才能推进」的状态，都必须在下面登记它的到期
+                // 时刻**。漏登记的后果不是变慢，而是它在这里睡下去就再也不会被推进——
+                // 除非碰巧有别的事把线程叫醒。这类 bug 表现为「偶尔不生效」，极难复现。
+                let now = std::time::Instant::now();
+                let next_deadline = [
+                    // 状态气泡自动隐藏
+                    tip_hide_at,
+                    // toast 自动隐藏
+                    toast_hide_at,
+                    // 工具栏显隐迟滞（50 / 120ms 两侧）
+                    toolbar_gate.deadline(),
+                    // 状态提示防抖（60ms 尾沿）
+                    tip_debounce.deadline(),
+                    // 候选窗悬停激活闸门
+                    candidate_window.next_deadline(),
+                    // 工具栏自动隐藏（含淡出动画的逐帧推进）
+                    toolbar.as_ref().and_then(|t| t.next_deadline(now)),
+                    // 菜单外点击轮询——唯一仍需定期唤醒者，且仅在菜单可见时
+                    popup_menu.as_ref().and_then(|m| m.next_deadline(now)),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                // 全为 None ⇒ 无限等待，线程真正零开销地停下，直到有命令或消息到来。
+                wait_port.wait(next_deadline.map(|d| d.saturating_duration_since(now)));
             }
         }
 

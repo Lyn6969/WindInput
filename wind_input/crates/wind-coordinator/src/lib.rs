@@ -45,10 +45,13 @@ pub(crate) mod short_code_yield;
 pub mod stats;
 pub mod theme_query;
 pub mod theme_style;
+/// UI 命令发送端：把「投递 + 唤醒 UI 线程」绑成一次操作，见模块文档。
+pub mod ui_sender;
 pub mod watchdog;
 pub mod web_host;
 
 pub use coordinator::{Coordinator, request_restart, restart_signal, set_settings_url_provider};
+pub use ui_sender::UiSender;
 
 /// 前台窗口的类名（诊断用，最长 63 字符）。只取类名不取标题——标题常含文件名等用户信息。
 #[cfg(windows)]

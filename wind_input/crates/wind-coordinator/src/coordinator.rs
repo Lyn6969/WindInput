@@ -769,7 +769,11 @@ pub struct Coordinator {
     /// 配置 + 轻量派生缓存快照（RwLock<Arc<>> 原子替换支持热重载）。
     /// 访问统一经 `self.rt()`。
     rt: std::sync::RwLock<std::sync::Arc<ConfigBundle>>,
-    pub(crate) ui_tx: std::sync::mpsc::Sender<UiCommand>,
+    /// UI 命令发送端。
+    ///
+    /// 不是裸的 `mpsc::Sender`：UI 线程是事件驱动的，投递之后还得把它叫醒，而这里有 50 余处
+    /// 发送点——[`crate::UiSender`] 把这两步绑成一次 `send`，漏不掉。详见其模块文档。
+    pub(crate) ui_tx: crate::UiSender,
     pub(crate) engine_mgr: EngineManager,
     /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
     pub(crate) store: Option<Arc<Store>>,
@@ -1328,7 +1332,7 @@ impl Coordinator {
         config: Config,
         data_dir: Option<&Path>,
         push_server: Arc<PushServer>,
-        ui_tx: std::sync::mpsc::Sender<UiCommand>,
+        ui_tx: crate::UiSender,
         user_dir: Option<std::path::PathBuf>,
         store: Option<Arc<Store>>,
         override_dir: Option<std::path::PathBuf>,

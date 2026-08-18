@@ -663,6 +663,18 @@ impl Toolbar {
 
     /// UI 循环每轮调用：消费鼠标处理器的悬停脏标记（由 WM_MOUSEMOVE/WM_MOUSELEAVE 事件置位），
     /// 仅在悬停格变化时本地重绘（无需协调器往返、不轮询光标）。与菜单 dirty→tick 重绘模式一致。
+    /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无需为工具栏安排唤醒。
+    ///
+    /// 只转发自动隐藏的计时。**悬停重绘不在此列**：`dirty` 由 `WM_MOUSEMOVE` /
+    /// `WM_MOUSELEAVE` 置位，那两条消息本身就会唤醒消息循环，而 `tick` 排在消息泵之后，
+    /// 同一轮即可消费——不需要额外的到期时刻。
+    pub fn next_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        if !self.visible {
+            return None;
+        }
+        self.auto_hide.next_deadline(now)
+    }
+
     pub fn tick(&mut self) {
         if !self.visible {
             return;

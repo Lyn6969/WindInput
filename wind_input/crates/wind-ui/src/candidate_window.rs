@@ -2463,6 +2463,15 @@ impl CandidateWindow {
         self.mouse.borrow_mut().flush();
     }
 
+    /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无待到期的悬停闸门。
+    ///
+    /// 消息循环据此安排唤醒。唯一的到期源是悬停激活闸门（`engage_at`）：它在用户首次真实
+    /// 移动鼠标到候选窗上时武装，到期后悬停才开始响应。激活之后悬停走 `on_message` 即时
+    /// 发出，不再需要唤醒。
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.mouse.borrow().engage_deadline()
+    }
+
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -2528,7 +2537,18 @@ pub struct CandidateMouse {
 }
 
 impl CandidateMouse {
-    /// 由 UI 循环每轮调用：未激活时检查激活闸门到期，激活瞬间补发当前悬停。
+    /// 激活闸门的到期时刻；已激活或未武装时为 `None`。
+    ///
+    /// 已激活后返回 `None` 与 [`Self::flush`] 的首行早退同源：那之后悬停由 `on_message`
+    /// 即时发出，没有任何东西等着到期。
+    fn engage_deadline(&self) -> Option<Instant> {
+        if self.engaged {
+            return None;
+        }
+        self.engage_at
+    }
+
+    /// 悬停激活闸门到期时由 UI 循环调用：激活并补发当前悬停。
     fn flush(&mut self) {
         if self.engaged {
             return; // 已激活：悬停在 on_message 内即时发出

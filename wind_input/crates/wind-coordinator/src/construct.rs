@@ -52,20 +52,28 @@ impl Coordinator {
             {
                 warn!("Failed to spawn macOS host-render forwarder: {}", e);
             }
-            (tx, Some(ev_rx))
+            // forwarder 线程阻塞在 `recv()` 上，命令到达本身即唤醒它，无需额外的唤醒通路。
+            (crate::UiSender::without_wake(tx), Some(ev_rx))
         };
         #[cfg(not(target_os = "macos"))]
         let (ui_tx, event_rx) = match UiManager::new() {
             Ok(mut ui) => {
-                let tx = ui.sender();
+                // UI 线程是事件驱动的（睡到有事发生），投递命令后必须唤醒它，否则那条命令
+                // 要等下一个计时器到期才被看见。`UiSender` 把两步绑成一次 send。
+                //
+                // waker 先于 `mem::forget` 取出：它内部持 `Arc`，UiManager 被 forget 之后
+                // 唤醒事件照样存活。
+                let waker = ui.waker();
+                let tx = crate::UiSender::new(ui.sender(), Arc::new(move || waker.wake()));
                 let rx = ui.take_event_rx();
                 std::mem::forget(ui); // 进程生命周期内保持 UI 线程存活
                 (tx, rx)
             }
             Err(e) => {
                 warn!("Failed to create UI manager: {}", e);
+                // UI 线程没起来，通道无人接收 → 无从唤醒，也无需唤醒。
                 let (tx, _rx) = std::sync::mpsc::channel();
-                (tx, None)
+                (crate::UiSender::without_wake(tx), None)
             }
         };
 
@@ -229,6 +237,8 @@ impl Coordinator {
     pub fn new_headless(config: Config, data_dir: Option<&Path>) -> Arc<Self> {
         // 无头模式无 UI 消费端：丢弃 rx，notify_ui_* 的 send 会静默失败（已用 `let _ =` 忽略）
         let (ui_tx, _rx) = std::sync::mpsc::channel();
+        // 接收端当场丢弃，没有 UI 线程可唤醒。
+        let ui_tx = crate::UiSender::without_wake(ui_tx);
         drop(_rx);
         // PushServer::new 零副作用（不起线程不开管道，副作用全在 start()，headless
         // 从不调）；无客户端时 push_* 全是遍历空表的 no-op。勿为 headless 把它
@@ -251,6 +261,8 @@ impl Coordinator {
         override_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         let (ui_tx, _rx) = std::sync::mpsc::channel();
+        // 接收端当场丢弃，没有 UI 线程可唤醒。
+        let ui_tx = crate::UiSender::without_wake(ui_tx);
         drop(_rx);
         let push_server = Arc::new(PushServer::new(PushConfig {
             suffix: String::new(),
@@ -292,6 +304,8 @@ impl Coordinator {
         user_dir: Option<&Path>,
     ) -> (Arc<Self>, std::sync::mpsc::Receiver<UiCommand>) {
         let (ui_tx, rx) = std::sync::mpsc::channel();
+        // rx 交给测试直接读命令，不经 UI 线程，故无需唤醒通路。
+        let ui_tx = crate::UiSender::without_wake(ui_tx);
         let push_server = Arc::new(PushServer::new(PushConfig {
             suffix: String::new(),
             write_timeout_ms: 30_000,
@@ -342,6 +356,8 @@ impl Coordinator {
         override_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         let (ui_tx, _rx) = std::sync::mpsc::channel();
+        // 接收端当场丢弃，没有 UI 线程可唤醒。
+        let ui_tx = crate::UiSender::without_wake(ui_tx);
         drop(_rx);
         let push_server = Arc::new(PushServer::new(PushConfig {
             suffix: String::new(),

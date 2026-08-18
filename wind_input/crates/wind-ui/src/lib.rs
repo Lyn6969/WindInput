@@ -52,6 +52,8 @@ pub mod toolbar;
 pub mod toolbar_gate;
 pub mod tooltip;
 pub mod view;
+/// UI 线程唤醒原语：消息循环据此「睡到有事发生」，取代原先的固定周期轮询。
+pub mod wake;
 pub mod window;
 
 pub use manager::UiManager;
