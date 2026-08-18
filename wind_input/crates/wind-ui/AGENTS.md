@@ -13,6 +13,7 @@
 |------|-------------|
 | `src/lib.rs` | 模块导出 + 仅 re-export `UiManager`；顶部注释定义跨平台可测性三层（必读） |
 | `src/manager.rs` | `UiManager` + UI 线程主循环。协议类型（`UiCommand`/`UiEvent`/菜单族）**定义已下沉 wind-ui-types**，此处 `pub use` 再导出保持原路径；加变体时两边同步（见 wind-ui-types/AGENTS.md） |
+| `src/wake.rs` | UI 线程唤醒原语：Windows＝auto-reset 事件 + `MsgWaitForMultipleObjectsEx`，非 Windows＝条件变量。消息循环据此「睡到有事发生」，取代早先的固定 8ms 轮询 |
 | `src/window.rs` | `LayeredWindow`：Win32 `UpdateLayeredWindow` 封装 + `WindowMouse` 鼠标 trait + 非 Windows mock；wnd_proc 鼠标分发 |
 | `src/view.rs` | **实际盒模型引擎**：measure→arrange→paint + 命中矩形提取；圆角/边框/阴影/渐变/九宫格背景图/z 层。各窗口共用 |
 | `src/candidate_window.rs` | 候选窗：从候选构建 View 树、布局、绘制、鼠标命中/悬停防抖、翻页；含 `CandidateWindowConfig`（`CandidateItem` 已下沉 wind-ui-types，原路径再导出） |
@@ -36,7 +37,11 @@
 ## For AI Agents
 
 ### Working In This Directory
-- **线程模型**：`UiManager::new()` 启 `ui-manager` 线程跑 `manager::ui_thread`；协调器持 `Sender<UiCommand>` 下发、`take_event_rx()`（仅一次）取 `Receiver<UiEvent>` 收鼠标事件。**所有窗口/缓存（`thread_local` 鼠标处理表、image cache）只在该 UI 线程存活**，禁止跨线程触碰窗口。
+- **线程模型**：`UiManager::new()` 启 `ui-manager` 线程跑 `manager::ui_thread`；协调器持 `wind_coordinator::UiSender` 下发（**不是裸 `Sender<UiCommand>`**，见下条）、`take_event_rx()`（仅一次）取 `Receiver<UiEvent>` 收鼠标事件。**所有窗口/缓存（`thread_local` 鼠标处理表、image cache）只在该 UI 线程存活**，禁止跨线程触碰窗口。
+- **循环是事件驱动的，不再轮询**：`ui_thread` 空闲时阻塞在 `wake::UiWaitPort::wait`（Windows 等「消息队列 ∪ 唤醒事件 ∪ 最近到期时刻」），到期源全空即无限等待。两条硬约束由此而来：
+  - **投递命令必须唤醒**，故协调器侧一律经 `UiSender`（把投递 + 唤醒绑成一次 `send`，编译器守门），别用裸 `Sender`。
+  - ⚠ **新增任何「靠每轮被调用才能推进」的状态，必须在循环末尾的 deadline 数组里登记到期时刻**。漏登记不是变慢，是它**永不推进**——只在碰巧有别的事唤醒线程时才动一下，表现为「偶尔不生效」，极难复现。现有登记项：气泡 / toast 自动隐藏、`toolbar_gate`、`tip_debounce`、候选窗悬停闸门、工具栏 `auto_hide`（含淡出逐帧）、菜单外点击轮询。
+  - 另注意：靠「每轮顺延」表达的计时（工具栏 `auto_hide` 的 `was_engaged`、气泡的 `tip_was_interacting`）真实语义是「某状态**结束时**才起算」。轮询年代 tick 密集，二者无从区分；事件驱动下必须显式做边沿检测，否则一移开就立刻到期。
 - **渲染管线统一**：每个窗口都 build `view::View` 树 → `measure`/`arrange` → `paint` 到 `LayeredWindow` 的 BGRA buffer → `update()`（`UpdateLayeredWindow`，预乘 alpha BGRA）。文本走 `text::dwrite`。新增窗口类型照此模式，别另起渲染路径。
 - **跨平台三层（见 lib.rs，改前必读）**：① 纯 Rust 真实可测——`view` 盒模型布局/形状光栅化、`viewbox`、`debounce`、`image_cache`；② mock 近似——`text::dwrite` 非 Windows 返回等宽近似；③ 仅占位——Layered Window、DirectWrite 字形、剪贴板、消息泵在非 Windows 是空实现。动到 ② ③ 必须 Windows 实测。
 - **命令循环要点**：`ui_thread` 大 `match` 消费 `UiCommand`；连续 `UpdateCandidates` 会被合并只渲染最新帧，`HideToolbar`/状态泡走防抖（消除 Alt+Tab、连按切换的闪烁）。加功能 = 加 `UiCommand` 变体 + 加 `match` 分支（缺分支编译过但静默无效）。

@@ -16,6 +16,7 @@
 | `src/coordinator/push_config.rs` | **子模块**：push 通道推送（activation status / 各配置帧 / `push_state_update`） |
 | `src/coordinator/langbar_icon.rs` | **子模块**：语言栏图标 SHM 发布（`ICON_PUBLISHER` 进程级单例 + 状态角标） |
 | `src/construct.rs` | 构造器族：生产构造 `new`（desktop-ui）+ headless 家族（`new_headless*`）+ `open_user_store`；装配核心 `build` 留在 coordinator.rs |
+| `src/ui_sender.rs` | `UiSender`：`ui_tx` 的类型。把「投递 `UiCommand` + 唤醒 UI 线程」绑成一次 `send`——UI 线程是事件驱动的（`wind_ui::wake`），只投递不唤醒 = 那条命令躺到下一个计时器到期才被看见。50+ 处发送点靠类型守门，不靠纪律 |
 | `src/config_bundle.rs` | `ConfigBundle`（配置 + 轻量派生缓存快照，热重载整体原子替换）+ `parse_pairs`/`parse_jump_out_*` 配置解析 |
 | `src/key_convert.rs` | 键位换算纯函数：`punct_char`/`printable_char`/`numpad_*`/`full_width_source_char`/`en_case_variants`/`wind_mods_to_win32` |
 | `src/candidate_nav.rs` | 候选视图导航：分页/高亮移动/悬停清除/末页检索范围临时放宽（`try_relax_scope_on_page_end`） |
