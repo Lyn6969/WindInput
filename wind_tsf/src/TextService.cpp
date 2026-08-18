@@ -1493,6 +1493,18 @@ STDAPI CTextService::OnKillThreadFocus()
     // 不传则可能落到 forced cleanup，把残留文本提交进文档（Excel/WPS 表格的 'd' 漏字）。
     // 实测本回调在 Chrome/VSCode/Edge 各 5/5、5/5、11/11 次触发零漏，仅比 DocMgr
     // 级失焦晚约 100ms —— 该延迟用户不可感知，且远优于 500ms 自检定时器兜底。
+    // ⚠ 这里**刻意不做** doc_changed 那样的 willSkipFocusGained 对称预判（2026-08-18 评估后
+    // 决定不做，别再"补齐"它）。三条理由，任一条单独成立：
+    //   1. 判据跨层：locked/transient 守卫是 **DocMgr 级**判据，而线程失焦是**进程级**事件；
+    //      服务端的 client token 也是进程级（同进程多 DocMgr 共用一个）。拿前者挡后者，
+    //      与 [三层判据不可跨层复用] 是同一个错误。
+    //   2. 会造成净回归：真 transient 场景（explorer 地址栏）里，该进程此前必定有过正常
+    //      DocMgr 的 focus_gained，此刻进程确实失焦了，这条 lost 是**对的**。挡掉它，
+    //      切到非 TSF 宿主时工具栏就永远不隐藏。
+    //   3. 服务端已有结构性防线：`is_stale_focus_event` 只放行 token == active 的失焦，
+    //      而 active 只能由 focus_gained / ime_activated 设置 ⇒ 从未获焦的 token 发来的
+    //      lost 必被丢弃。真正漏网的只有「active 由 ime_activated 设、gained 全被吃掉」
+    //      一种，那一种已由服务端的 gained_token 探针记 WARN（见 handle_focus_lost）。
     CleanupInputStateForDocChange(_pLastActiveDocMgr, FOCUS_LOST_REASON_THREAD);
     // 注意：失焦时**不**销毁 HostWindow。SearchHost/任务管理器等用 XamlIsland
     // locked/transient DocMgr，OnSetFocus 对其跳过 focus_gained（防 composition

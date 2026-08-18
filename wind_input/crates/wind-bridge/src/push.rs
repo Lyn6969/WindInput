@@ -88,6 +88,16 @@ pub struct PushServer {
     clients: Arc<Mutex<Vec<PushClient>>>,
     /// 当前活动（有焦点）客户端 token；commit 仅投递给它，避免广播多发
     active_token: Arc<AtomicU64>,
+    /// 最近一次**真正上报过 `focus_gained`** 的客户端 token（0 = 还没有过）。
+    ///
+    /// 与 `active_token` 分开存，是因为后者有**两个**来源：`focus_gained` 与
+    /// `ime_activated`，而后者每进程只发一次。两者一旦分叉，就意味着某个宿主的
+    /// `focus_gained` 在上游被吃掉了——2026-08-18 任务管理器正是如此（DLL 的
+    /// locked/transient 守卫把 WinUI 3 宿主的 gained 全判成 transient），表现为
+    /// 「切走再切回工具栏不显示 / per-app 模式不跟随 / 菜单里的应用名是上一个进程」。
+    /// 那种缺口逃得过 `is_stale_focus_event`（token 恰等于 active，照常放行），
+    /// 只能靠这个字段抓；诊断时它是唯一能把「守卫吃了 gained」与「正常失焦」分开的信号。
+    gained_token: Arc<AtomicU64>,
     /// 客户端注册回调（可选，服务侧后置注入）
     connected_hook: Arc<Mutex<Option<ClientConnectedHook>>>,
 }
@@ -98,6 +108,7 @@ impl PushServer {
             config,
             clients: Arc::new(Mutex::new(Vec::new())),
             active_token: Arc::new(AtomicU64::new(0)),
+            gained_token: Arc::new(AtomicU64::new(0)),
             connected_hook: Arc::new(Mutex::new(None)),
         }
     }
@@ -153,6 +164,17 @@ impl PushServer {
     /// 刚建立的激活态（工具栏闪一下即消失）。
     pub fn active_token(&self) -> u64 {
         self.active_token.load(Ordering::Relaxed)
+    }
+
+    /// 记录「这个 token 真的上报过 `focus_gained`」。**只在 focus_gained 路径调用**，
+    /// `ime_activated` 不许调——两者分叉正是本字段要抓的东西（见 `gained_token`）。
+    pub fn note_focus_gained(&self, token: u64) {
+        self.gained_token.store(token, Ordering::Relaxed);
+    }
+
+    /// 最近一次上报过 `focus_gained` 的 token（0 = 还没有过）。
+    pub fn gained_token(&self) -> u64 {
+        self.gained_token.load(Ordering::Relaxed)
     }
 
     /// 是否有已连接的 TSF 客户端（用于决定是否经 IPC 让宿主执行前台操作）

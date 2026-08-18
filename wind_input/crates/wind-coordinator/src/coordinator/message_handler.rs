@@ -1707,6 +1707,10 @@ impl MessageHandler for Coordinator {
         // 记录活动客户端：鼠标点击的 commit 只推给它，避免广播多发
         if data.client_token != 0 {
             self.push_server.set_active_token(data.client_token);
+            // 与上一行分开记：`active_token` 也可能由 `ime_activated` 设置（每进程仅一次），
+            // 两者分叉即意味着某宿主的 focus_gained 被上游吃掉了。判据见 `gained_token`，
+            // 消费点在 handle_focus_lost 的 WARN。
+            self.push_server.note_focus_gained(data.client_token);
         }
         // per-app 状态：进程名已入缓存，按规则表/记忆表/默认值切换本应用中英状态。若与同步段
         // get_current_mode 回传值不同（该进程首次聚焦），随后的 push_activation_status 推送修正。
@@ -1796,6 +1800,29 @@ impl MessageHandler for Coordinator {
         self.menu_close_on_focus_change("focus_lost");
         if self.is_stale_focus_event(client_token, "handle_focus_lost") {
             return;
+        }
+        // ★ 探针：放行了一条「从未上报过 focus_gained 的 token」的失焦。
+        //
+        // `is_stale_focus_event` 挡不住它——`active_token` 有两个来源，`ime_activated`
+        // 那条每进程只发一次，于是「宿主的 focus_gained 全被上游吃掉」时 token 恰好
+        // **等于** active，照常放行，把 ime_active / has_edit_context 清掉后再没有任何
+        // 东西能置回来（focus_gained 才置，而它正是被吃掉的那个）。2026-08-18 任务管理器
+        // 就是这样：DLL 的 locked/transient 守卫把 WinUI 3 宿主判成 transient，症状是
+        // 「首次启动正常、切走再切回工具栏不显示」，排查时只能靠翻 DLL 日志反推。
+        //
+        // 用 WARN 而非 DEBUG：这不是可以正常发生的事，出现一次就说明上游有事件被吞。
+        // 不在此处做任何补救（照常执行清理）——补救等于对一个未知成因猜后果，先把它
+        // 变成可见的信号，成因由日志定位。
+        //
+        // ⚠ 附加 `active != 0` 一项不是可有可无的：`is_stale_focus_event` 对 `active == 0`
+        // （尚无任何客户端获焦）无条件放行，那种失焦压根没有归属可清，警告它纯属噪音。
+        // 能走到这里且 `active != 0`，则由 stale 校验反推必有 `client_token == active`
+        // ——正是「它就是当前活动客户端，却从未 gained 过」这一种。
+        let gained = self.push_server.gained_token();
+        if client_token != 0 && client_token != gained && self.push_server.active_token() != 0 {
+            tracing::warn!(
+                "handle_focus_lost: token={client_token:#x} 从未上报过 focus_gained（最近 gained={gained:#x}）——上游可能吞掉了它的 focus_gained，激活态被清后将无人恢复"
+            );
         }
         // 三项后果彼此独立，由 reason 决定各自是否发生（矩阵见 FocusLostReason）。
         // 一刀切地全做，就是 CtxLost 清输入态复发「首字符直接上屏」的由来；
