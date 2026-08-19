@@ -1016,10 +1016,16 @@ pub trait WebDataRpc: WebDataHost {
         let out = str_param(params, "path")?;
         let user = Self::user_schemas_dir()?;
         let system = Self::system_schemas_dir();
+        // 设置页方案定制层(schema_overrides/<id>.toml,见 write_schema_override):
+        // 导出必须带上,否则定制过的方案(如换过双拼布局)导出的是未定制版本,
+        // override 新指向的资源文件也会漏打包。
+        let override_dir =
+            wind_config::Config::user_config_dir().map(|d| d.join("schema_overrides"));
         let r = wind_transfer::scheme::export_package(
             id,
             &user,
             system.as_deref(),
+            override_dir.as_deref(),
             std::path::Path::new(out),
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -4932,6 +4938,7 @@ moved = [{ id = 'date.lunar', position = 0 }]
             "my",
             &user,
             Some(&system),
+            None,
             &pkg,
             "1.0.0",
             "windows",
