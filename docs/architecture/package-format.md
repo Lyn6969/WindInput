@@ -32,11 +32,22 @@
 - 逐键走 `set_user_value` 通路合并进用户层 config.toml：REGISTRY 类型/值域校验、等默认即删（prune）、类型迁移全部自动生效。**禁止整文件覆盖**（备份还原的 config 域整文件覆盖是备份专属语义，分发格式不得复用）。
 - **原子性**：预览阶段逐键报告（键 / 当前值 / 新值 / 错误原因）；应用阶段任何一键校验失败则**整片段拒绝**，不做半应用。
 - 应用必须经过与 `config.setItems` 相同的代码路径，保证运行时镜像回灌（改了即生效，不许出现「重启后才生效」）。
+- **Map 键逐条合并**（2026-08-19 定稿）：REGISTRY 登记为 `Map` 的键（`keys.key_actions` /
+  `keys.schema_hotkeys` / `keys.session_actions` / `input.punct.custom_mappings`），片段中其下的表
+  **恒为逐条合并**（upsert：并入当前生效表，同名条目覆盖，其余条目保留）。片段**不能**对 Map 键
+  整表替换或删除条目——分发包带整表替换会清掉用户既有绑定，这是本语义存在的理由；顺带消灭了
+  「空表 = 清空」的脚枪（空表 = 无条目 = no-op）。预览逐条目报告（条目名不并入点分键——
+  `custom_mappings` 的条目名可含 `.`，`PatchEntry` 用独立 `map_entry` 字段承载）。
+  `StructList` 键（如 `schema.mix_modes`）无此语义，仍为整值替换——**分发包不得携带 StructList 键**
+  （同样会覆盖用户数据），生成端与 cookbook 都要遵守。
 
-### 2.3 RPC 契约（新增，草案）
+### 2.3 RPC 契约（P0-P1 已实现；Map 合并与 written 为 2026-08-19 增补）
 
-- `config.previewPatch { text }` → `{ entries: [{ key, current, next, error? }], ok }`
-- `config.applyPatch { text }` → 成功 / 整体拒绝（错误列表）。内部复用 previewPatch 的校验结果。
+- `config.previewPatch { text }` → `{ entries: [{ key, mapEntry?, current?, next, error? }], ok }`。
+  Map 键的每个条目一行：`key` = 父 Map 键，`mapEntry` = 条目名，`current` = 当前表中该条目的值（缺席 = 新增）。
+- `config.applyPatch { text }` → `{ ok, applied, needsRestart, written: [{ key, value }] }` / 整体拒绝（错误列表）。
+  `written` 是**落盘后的最终键值**——Map 父键携带合并后的整表。设置端用它回灌配置镜像
+  （回声豁免比对的是整键值，Map 合并后客户端无法从 entries 自行拼出整表，必须由 core 回传）。
 
 ## 3. 分发包容器
 
@@ -72,6 +83,51 @@
 - `config_patch.toml` 的校验与应用 = §2 的片段管线，包不引入任何额外语义。
 - extras 目录解包必须走同一个 `validate_entry_rel` 守卫，不得另写守卫。
 
+config_patch 的实现决策（2026-08-19 定稿）：
+
+- **按名识别，不落盘**：根条目 `config_patch.toml` 由导入端识别为配置片段，**不写进 schemas 目录**
+  （它不是方案资源；落盘即死文件）。
+- **要求 `format_version ≥ 2`**：legacy（v1 / 无 package.toml）包中出现 `config_patch.toml` → 硬拒绝
+  并提示包需重新打包——v1 语义下它会被旧客户端当死文件，生成端必须声明版本。
+- **应用编排在设置端，两步走**：确认对话框展示片段逐键 diff（§2.3 previewPatch 结果）→ 用户确认 →
+  ① `scheme.import` 写方案文件 → ② `config.applyPatch` 应用片段（继承热重载与镜像回灌）。
+  预览有任一错误条目则**整包禁止导入**（分发侧应出厂前测过）。两步之间非原子：文件已装而片段失败时
+  如实报错（方案已导入、配置未应用），不回滚文件。core 侧不做跨域原子化——patch 管线的热重载与
+  事件广播都住在 RPC 分发层，在文件层复刻它们是第二份真相源。
+
+### 3.4 文本信封（`kind = "schema_text"`，2026-08-19 定稿）
+
+小方案（快符类：方案 + 小词库共 KB 级）的纯文本分发格式——一段 TOML 文本即一个完整分发包，
+剪贴板 / 文档站代码块即贴即装。**分发格式，不是存储格式**：导入端拆解落盘后，存储形态与
+zip 导入完全一致（方案文件 + 词库文件），引擎与缓存管线零感知。
+
+```toml
+[package]
+format_version = 2          # 必填。信封无 legacy——缺失即错，高于当前支持即拒绝
+kind = "schema_text"        # 必填。显式声明，侦测不做猜测
+
+[schema]                    # 可选冗余，免解析 files 即可显示 id/版本
+id = "kf"
+version = "1.00.0"
+
+[[files]]
+path = "kf.schema.toml"     # schemas 根相对路径，逐条过 validate_entry_rel
+content = '''…方案原文…'''   # 逐字内嵌；生成端负责选择不冲突的 TOML 字符串引法
+
+[[files]]
+path = "flypy/12_kf.dict.yaml"
+content = '''…词库原文…'''
+```
+
+- 根（path 无 `/`）必须含至少一个 `*.schema.toml`（与 zip 侦测规则 2 同构）。
+- `config_patch.toml` 可作为 files 条目出现，语义同 §3.3（按名识别、不落盘、设置端两步编排）。
+- **显式声明才走此路**：`[schema]` 是合法片段键前缀（config.toml 有 `schema.` 段），
+  裸方案 TOML 文本**不**自动识别为信封——没有 `kind = "schema_text"` 的文本一律进片段管线，
+  由「未知配置键」如实报错（侦测规则「不猜」的延伸）。
+- 限额：信封文本 ≤ 2 MB、files ≤ 64 条（超限即拒；大方案走 zip/.wpkg，信封只服务小方案）。
+- RPC：`scheme.previewImportText { text }` / `scheme.importText { text }`，返回形状与
+  `scheme.previewImport` / `scheme.import` 一致（复用同一确认对话框）。
+
 ## 4. 内容侦测规则（统一导入分派）
 
 导入入口收到内容后按序判定（规则顺序即优先级）：
@@ -79,8 +135,9 @@
 1. zip 且含 `manifest.toml` / `manifest.json` → 备份包 → 转备份还原流程（或提示去备份页）。
 2. zip 且根含 `*.schema.toml` → 分发包（方案包/配置包）→ `scheme.previewImport` 流程；若同时含 `config_patch.toml`，预览必须附带 §2.3 的逐键 diff。
 3. zip 且仅含 `config_patch.toml`（无方案文件）→ 纯配置包 → 片段流程。
-4. 非 zip 的合法 TOML 文本（文件或剪贴板）→ 配置片段流程。
-5. 均不匹配 → 明确报错，不猜。
+4. 非 zip 的合法 TOML 文本，且 `package.kind = "schema_text"` → 文本信封（§3.4）→ `scheme.previewImportText` 流程。
+5. 其余合法 TOML 文本（文件或剪贴板）→ 配置片段流程。
+6. 均不匹配 → 明确报错，不猜。
 
 生成端（WindInputTools / 手工打包）必须保证产物落进规则 2 或 3，否则视为无效包。
 
