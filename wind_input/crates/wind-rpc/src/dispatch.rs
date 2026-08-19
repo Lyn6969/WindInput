@@ -204,7 +204,12 @@ fn apply_writes(
 
 /// 解析 + 展平 + 校验配置片段（previewPatch / applyPatch 共用）。
 /// TOML 解析失败是整体错误；当前值与 `config.get` 同源（三层合并后的生效配置）。
-fn patch_entries(params: &Value) -> anyhow::Result<Vec<wind_config::patch::PatchEntry>> {
+///
+/// 一并返回当前配置树：applyPatch 折算 Map 键的落盘整表要用它作合并种子，
+/// 重新加载一次会引入「预览用 A 树、落盘用 B 树」的窗口。
+fn patch_entries(
+    params: &Value,
+) -> anyhow::Result<(Vec<wind_config::patch::PatchEntry>, toml::Value)> {
     let text = params
         .get("text")
         .and_then(|v| v.as_str())
@@ -212,12 +217,13 @@ fn patch_entries(params: &Value) -> anyhow::Result<Vec<wind_config::patch::Patch
     let fragment = wind_config::patch::parse_fragment(text)
         .map_err(|e| anyhow::anyhow!("invalid_patch: {e}"))?;
     let current = toml::Value::try_from(Config::load(Config::data_dir().as_deref())?)?;
-    Ok(wind_config::patch::preview(&fragment, &current))
+    let entries = wind_config::patch::preview(&fragment, &current);
+    Ok((entries, current))
 }
 
-/// `config.previewPatch { text }` → `{ ok, entries: [{ key, current?, next, error? }] }`，只读。
+/// `config.previewPatch { text }` → `{ ok, entries: [{ key, mapEntry?, current?, next, error? }] }`，只读。
 fn preview_patch(params: &Value) -> anyhow::Result<Value> {
-    let entries = patch_entries(params)?;
+    let (entries, _) = patch_entries(params)?;
     let ok = entries.iter().all(|e| e.error.is_none());
     Ok(json!({ "ok": ok, "entries": entries }))
 }
@@ -225,8 +231,13 @@ fn preview_patch(params: &Value) -> anyhow::Result<Value> {
 /// `config.applyPatch { text }`：先跑与 preview 相同的校验，任何一条有错 → 整体 Err、
 /// 不做半应用；全部合法 → 走 setItems 的批量落盘通路（继承 prune 与生效通知）。
 /// 0 条目视为成功 no-op（不落盘、不触发热重载）。
+///
+/// `written` = **落盘后的最终键值**，Map 父键携带合并后的整表。设置端用它回灌配置镜像：
+/// Map 合并后客户端无法从 entries 自行拼出整表（它手里没有 core 的当前表），必须由此回传。
+/// `applied` 计的是**片段条目数**（Map 逐条目各计一条），与 preview 的 entries 条数对得上；
+/// 落盘键数（`written.len()`）因 Map 合并而更少，两者刻意分开报。
 fn apply_patch(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
-    let entries = patch_entries(params)?;
+    let (entries, current) = patch_entries(params)?;
     let bad: Vec<String> = entries
         .iter()
         .filter_map(|e| e.error.as_ref().map(|err| format!("{}: {}", e.key, err)))
@@ -235,12 +246,23 @@ fn apply_patch(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
         anyhow::bail!("invalid_patch: {}", bad.join("; "));
     }
     if entries.is_empty() {
-        return Ok(json!({ "ok": true, "applied": 0, "needsRestart": false }));
+        return Ok(json!({ "ok": true, "applied": 0, "needsRestart": false, "written": [] }));
     }
-    let writes: Vec<(String, toml::Value)> = entries.into_iter().map(|e| (e.key, e.next)).collect();
-    let applied = writes.len();
+    let applied = entries.len();
+    let writes = wind_config::patch::writes(&entries, &current);
+    let written: Vec<Value> = writes
+        .iter()
+        .map(|(key, value)| -> anyhow::Result<Value> {
+            Ok(json!({ "key": key, "value": serde_json::to_value(value)? }))
+        })
+        .collect::<anyhow::Result<_>>()?;
     let needs_restart = apply_writes(state, writes, "applyPatch")?;
-    Ok(json!({ "ok": true, "applied": applied, "needsRestart": needs_restart }))
+    Ok(json!({
+        "ok": true,
+        "applied": applied,
+        "needsRestart": needs_restart,
+        "written": written,
+    }))
 }
 
 /// 把 config_schema 注册表序列化为 JSON（`{ fields: [{key, type, options?}] }`）。
@@ -525,6 +547,33 @@ mod tests {
         assert!(!core.config_applied.load(Ordering::SeqCst));
     }
 
+    /// Map 键在 RPC 面上逐条目呈现：`key` = 父 Map 键，条目名走 `mapEntry`（serde rename）。
+    /// 设置端的确认对话框据此逐条列出「哪个绑定改成了什么」。
+    #[test]
+    fn preview_patch_reports_map_entries_with_map_entry_field() {
+        let core = FakeCore::new();
+        let st = DispatchState::new(core.clone(), "dev").unwrap();
+        let resp = dispatch(
+            &st,
+            req(
+                "config.previewPatch",
+                json!({ "text": "[keys.key_actions]\nf4 = \"english\"\nf5 = \"半角\"\n" }),
+            ),
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert_eq!(r["ok"], json!(true));
+        let entries = r["entries"].as_array().expect("entries 应为数组");
+        assert_eq!(entries.len(), 2, "Map 两个条目应各占一行: {entries:?}");
+        for e in entries {
+            assert_eq!(e["key"], json!("keys.key_actions"), "key 恒为父 Map 键");
+            assert!(e.get("mapEntry").is_some(), "Map 条目须带 mapEntry: {e}");
+        }
+        assert_eq!(entries[0]["mapEntry"], json!("f4"));
+        assert_eq!(entries[0]["next"], json!("english"));
+        assert!(!core.config_applied.load(Ordering::SeqCst), "预览只读");
+    }
+
     #[test]
     fn preview_patch_flags_unknown_and_invalid_values() {
         let resp = dispatch(
@@ -585,6 +634,8 @@ mod tests {
         let r = resp.result.unwrap();
         assert_eq!(r["ok"], json!(true));
         assert_eq!(r["applied"], json!(0));
+        // written 恒在场（空数组），设置端回灌逻辑不必分「有没有这个字段」。
+        assert_eq!(r["written"], json!([]));
         assert!(
             !core.config_applied.load(Ordering::SeqCst),
             "no-op 不落盘也不热重载"
