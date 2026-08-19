@@ -29,7 +29,9 @@ jobs:
           path-to-signatures: "signatures/cla.json"
           path-to-document: "https://github.com/${{ github.repository }}/blob/main/CLA.md"
           branch: "main"
-          allowlist: "bot*,dependabot*"
+          # 仓库所有者：自己的提交进了 fork PR 时（评审重做后强推回贡献者分支）会被自家门禁
+          # 拦下，而「所有者给自己签 CLA」没有意义。对真正的外部贡献者仍照常生效。
+          allowlist: "bot*,dependabot*,huanfeng"
           custom-notsigned-prcomment: |
             感谢您的贡献！在我们合并此 PR 之前，您需要签署贡献者许可协议 (CLA)。
 
