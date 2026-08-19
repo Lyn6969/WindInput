@@ -83,6 +83,10 @@ pub struct PackageRefs {
 /// 涉及的方案 id(根在前)、根方案版本(schema.toml 未标注则空)。
 pub struct CollectPlan {
     pub pack: Vec<(String, PathBuf)>,
+    /// override 折叠产物:方案文件 rel → 合并后序列化的 TOML 内容。仅当该方案存在
+    /// `schema_overrides/{id}.toml` 时才有条目;写 zip 时此内容优先于读源文件字节——
+    /// 包自含定制后的方案,导入方无需 override 机制即得到定制后行为。
+    pub folded: Vec<(String, String)>,
     pub system_refs: Vec<String>,
     pub missing: Vec<String>,
     pub schema_ids: Vec<String>,
@@ -172,20 +176,47 @@ fn resource_rels(schema: &wind_config::schema::Schema) -> Vec<String> {
     rels
 }
 
+/// 读取 `override_dir/{id}.toml`(设置页方案定制层)。文件不存在 → `Ok(None)`;
+/// 存在但读不了/解析失败 → 硬报错。导出场景静默按无 override 处理 = 用户以为定制
+/// 随包带走了,实际导出的是未定制方案——宁可导出失败也不许无声丢定制。
+fn read_override_value(
+    id: &str,
+    override_dir: Option<&Path>,
+) -> anyhow::Result<Option<toml::Value>> {
+    let Some(dir) = override_dir else {
+        return Ok(None);
+    };
+    let path = dir.join(format!("{id}.toml"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("读取方案 override 失败 {}: {e}", path.display()))?;
+    let v: toml::Value = toml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("方案 override 无法解析 {}: {e}", path.display()))?;
+    Ok(Some(v))
+}
+
 /// 收集方案 `id` 的打包计划。根方案文件必打包(用户目录优先解析,系统命中也打包——
 /// 包必须自含方案文件);引用的用户方案递归(visited 防环)。
 ///
 /// `include_system` 控制系统目录命中的资源/子方案如何处理:
 /// - `true`(自包含导出):一并读源打包 → 产出的包在任何机器上都完整可用,不依赖目标机内置文件。
 /// - `false`(删除路径复用):系统命中只记 `system_refs` 且子方案不递归,维持"系统文件永不触碰"的语义。
+///
+/// `override_dir` = 用户配置目录下的 `schema_overrides`(设置页定制层)。给定时,每个方案
+/// (含 mixed 递归的子方案)各自与其 override 深合并后再收集——override 新指向的布局/词库/
+/// 字体因此被收集,合并结果记入 `folded` 供导出写包。删除路径传 `None`:删除收集语义不折叠。
 pub fn collect_package_files(
     id: &str,
     user_dir: &Path,
     system_dir: Option<&Path>,
+    override_dir: Option<&Path>,
     include_system: bool,
 ) -> anyhow::Result<CollectPlan> {
     let mut plan = CollectPlan {
         pack: Vec::new(),
+        folded: Vec::new(),
         system_refs: Vec::new(),
         missing: Vec::new(),
         schema_ids: Vec::new(),
@@ -198,18 +229,21 @@ pub fn collect_package_files(
         include_system,
         user_dir,
         system_dir,
+        override_dir,
         &mut plan,
         &mut visited,
     )?;
     Ok(plan)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_into(
     id: &str,
     is_root: bool,
     include_system: bool,
     user_dir: &Path,
     system_dir: Option<&Path>,
+    override_dir: Option<&Path>,
     plan: &mut CollectPlan,
     visited: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
@@ -238,10 +272,25 @@ fn collect_into(
         }
     };
     plan.schema_ids.push(id.to_string());
-    plan.pack.push((schema_rel, schema_abs.clone()));
+    plan.pack.push((schema_rel.clone(), schema_abs.clone()));
 
     let text = std::fs::read_to_string(&schema_abs)?;
-    let schema: wind_config::schema::Schema = toml::from_str(&text)?;
+    // override 折叠:存在则把设置页写的稀疏 diff 深合并进方案文件(与引擎加载
+    // `read_schema` 同一实现),资源收集与入包内容都以合并视图为准。无 override 时
+    // 不走 Value 往返,方案文件字节原样入包(既有测试守护字节级不变)。
+    let schema: wind_config::schema::Schema = match read_override_value(id, override_dir)? {
+        Some(ov) => {
+            let mut base: toml::Value = toml::from_str(&text)?;
+            wind_config::schema::merge_toml(&mut base, ov);
+            let folded_text = toml::to_string_pretty(&base)?;
+            let schema = base
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("方案 {id} 与 override 合并后解析失败: {e}"))?;
+            plan.folded.push((schema_rel, folded_text));
+            schema
+        }
+        None => toml::from_str(&text)?,
+    };
     if is_root {
         plan.root_version = schema.schema.version.clone();
     }
@@ -273,6 +322,7 @@ fn collect_into(
                 include_system,
                 user_dir,
                 system_dir,
+                override_dir,
                 plan,
                 visited,
             )?;
@@ -290,17 +340,22 @@ pub struct SchemeExportResult {
 }
 
 /// 导出方案包:收集 → 写 zip(package.toml 元信息 + 各文件按 schemas 相对路径直存)。
+///
+/// `override_dir` 见 [`collect_package_files`]:给定时各方案与 `schema_overrides/{id}.toml`
+/// 折叠后入包(自包含定制),无 override 的方案文件字节原样入包。
+#[allow(clippy::too_many_arguments)]
 pub fn export_package(
     id: &str,
     user_dir: &Path,
     system_dir: Option<&Path>,
+    override_dir: Option<&Path>,
     out_path: &Path,
     app_version: &str,
     platform: &str,
     created_at: &str,
 ) -> anyhow::Result<SchemeExportResult> {
     // 自包含导出:内置(系统目录)词库/拆字/字体一并打包,产出的包脱离目标机内置文件也完整可用。
-    let plan = collect_package_files(id, user_dir, system_dir, true)?;
+    let plan = collect_package_files(id, user_dir, system_dir, override_dir, true)?;
     let meta = PackageMeta {
         package: PackageInfo {
             format_version: PACKAGE_FORMAT_VERSION,
@@ -327,9 +382,18 @@ pub fn export_package(
     w.start_file(PACKAGE_META_NAME, opts)?;
     w.write_all(toml::to_string_pretty(&meta)?.as_bytes())?;
     let mut packed = Vec::new();
+    // 有 override 的方案文件写折叠后内容(定制随包自含),其余条目原样读源字节。
+    let folded: std::collections::HashMap<&str, &str> = plan
+        .folded
+        .iter()
+        .map(|(rel, content)| (rel.as_str(), content.as_str()))
+        .collect();
     for (rel, src) in &plan.pack {
         w.start_file(rel, opts)?;
-        w.write_all(&std::fs::read(src)?)?;
+        match folded.get(rel.as_str()) {
+            Some(content) => w.write_all(content.as_bytes())?,
+            None => w.write_all(&std::fs::read(src)?)?,
+        }
         packed.push(rel.clone());
     }
     w.finish()?;
@@ -516,14 +580,16 @@ pub fn delete_package(
     keep_ids: &[String],
 ) -> anyhow::Result<SchemeDeleteResult> {
     // 删除只关心用户目录文件,系统命中记引用即可(include_system=false),避免解析系统子方案。
-    let plan = collect_package_files(id, user_dir, system_dir, false)?;
+    // 不折叠 override(传 None):删除按方案文件本身的引用收集,语义与历史行为字节级一致;
+    // 与导出侧的折叠不对称是刻意的,这轮不动删除的收集语义。
+    let plan = collect_package_files(id, user_dir, system_dir, None, false)?;
     // 其余现存方案引用的文件集合(单个方案收集失败不阻断删除,跳过即可)。
     let mut kept: HashSet<String> = HashSet::new();
     for kid in keep_ids {
         if kid == id {
             continue;
         }
-        if let Ok(p) = collect_package_files(kid, user_dir, system_dir, false) {
+        if let Ok(p) = collect_package_files(kid, user_dir, system_dir, None, false) {
             kept.extend(p.pack.into_iter().map(|(rel, _)| rel));
         }
     }
@@ -632,7 +698,7 @@ path = "wb/main.dict.yaml"
         // 只投放 wdat，不放 yaml
         fs::write(user.join("wb/main.wdat"), b"binary").unwrap();
 
-        let plan = collect_package_files("wb", &user, Some(&system), false).unwrap();
+        let plan = collect_package_files("wb", &user, Some(&system), None, false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
             names.contains(&"wb/main.wdat"),
@@ -672,7 +738,7 @@ path = "wb/main.dict.yaml"
         fs::write(user.join("wb/main.dict.yaml"), "src").unwrap();
         fs::write(user.join("wb/main.wdat"), b"binary").unwrap();
 
-        let plan = collect_package_files("wb", &user, Some(&system), false).unwrap();
+        let plan = collect_package_files("wb", &user, Some(&system), None, false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"wb/main.dict.yaml"));
         assert!(!names.contains(&"wb/main.wdat"), "yaml 在场时不应改打 wdat");
@@ -684,7 +750,7 @@ path = "wb/main.dict.yaml"
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
-        let plan = collect_package_files("my", &user, Some(&system), false).unwrap();
+        let plan = collect_package_files("my", &user, Some(&system), None, false).unwrap();
         assert_eq!(
             plan.missing,
             vec!["my/ghost.dict.yaml"],
@@ -697,7 +763,7 @@ path = "wb/main.dict.yaml"
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
-        let plan = collect_package_files("my", &user, Some(&system), false).unwrap();
+        let plan = collect_package_files("my", &user, Some(&system), None, false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"my.schema.toml"), "根方案文件必打包");
         assert!(names.contains(&"my/main.dict.yaml"));
@@ -733,7 +799,7 @@ secondary_schema = "pinyin"
             "[schema]\nid=\"pinyin\"\n",
         )
         .unwrap();
-        let plan = collect_package_files("mix", &user, Some(&system), false).unwrap();
+        let plan = collect_package_files("mix", &user, Some(&system), None, false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"mix.schema.toml"));
         assert!(names.contains(&"my.schema.toml"), "用户引用方案递归打包");
@@ -752,7 +818,7 @@ secondary_schema = "pinyin"
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
-        let plan = collect_package_files("my", &user, Some(&system), true).unwrap();
+        let plan = collect_package_files("my", &user, Some(&system), None, true).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
             names.contains(&"sys/shared.dict.yaml"),
@@ -793,7 +859,7 @@ secondary_schema = "pinyin"
         .unwrap();
         fs::write(system.join("pinyin/main.dict.yaml"), "py").unwrap();
 
-        let plan = collect_package_files("mix", &user, Some(&system), true).unwrap();
+        let plan = collect_package_files("mix", &user, Some(&system), None, true).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"pinyin.schema.toml"), "系统子方案文件入包");
         assert!(
@@ -810,7 +876,17 @@ secondary_schema = "pinyin"
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
         let out = t.path().join("my.zip");
-        let r = export_package("my", &user, Some(&system), &out, "1.0.0", "windows", "t").unwrap();
+        let r = export_package(
+            "my",
+            &user,
+            Some(&system),
+            None,
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
         assert_eq!(r.path, out);
         // 自包含导出:用户资源 3 个 + 系统 sys/shared.dict.yaml 一并打包 = 4;系统引用清空。
         assert_eq!(r.packed.len(), 4);
@@ -835,13 +911,196 @@ secondary_schema = "pinyin"
         assert_eq!(meta.refs.missing, vec!["my/ghost.dict.yaml"]);
     }
 
+    /// 有 override 且换了双拼布局:导出按折叠视图收集(新布局文件入包),
+    /// 包内方案文件写合并结果——导入方无需 override 机制即得到定制后行为。
+    #[test]
+    fn export_folds_override_and_packs_new_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fs::create_dir_all(user.join("shuangpin")).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(
+            user.join("sp.schema.toml"),
+            r#"
+[schema]
+id = "sp"
+[engine]
+type = "pinyin"
+[engine.pinyin]
+scheme = "shuangpin"
+[engine.pinyin.shuangpin]
+layout = "old"
+"#,
+        )
+        .unwrap();
+        fs::write(user.join("shuangpin/old.toml"), "old-layout").unwrap();
+        fs::write(user.join("shuangpin/new.toml"), "new-layout").unwrap();
+        let ov_dir = t.path().join("schema_overrides");
+        fs::create_dir_all(&ov_dir).unwrap();
+        fs::write(
+            ov_dir.join("sp.toml"),
+            "[engine.pinyin.shuangpin]\nlayout = \"new\"\n",
+        )
+        .unwrap();
+
+        let out = t.path().join("sp.zip");
+        let r = export_package(
+            "sp",
+            &user,
+            Some(&system),
+            Some(&ov_dir),
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
+        assert!(
+            r.packed.contains(&"shuangpin/new.toml".to_string()),
+            "override 新指向的布局须入包,实际: {:?}",
+            r.packed
+        );
+        assert!(
+            !r.packed.contains(&"shuangpin/old.toml".to_string()),
+            "折叠后不再引用旧布局,不应入包"
+        );
+        // 包内方案文件 = 折叠结果,而非源文件字节
+        let bytes = crate::bundle::extract_entry(&out, "sp.schema.toml").unwrap();
+        let schema: wind_config::schema::Schema =
+            toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            schema.engine.pinyin.shuangpin.layout, "new",
+            "包内方案文件须含 override 值"
+        );
+    }
+
+    /// 无 override(目录给了但没有该方案的文件):方案文件字节原样入包,
+    /// 打包清单与不传 override 目录时逐条目一致。
+    #[test]
+    fn export_without_override_keeps_schema_bytes() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let ov_dir = t.path().join("schema_overrides");
+        fs::create_dir_all(&ov_dir).unwrap(); // 目录在场,但无 my.toml
+        let out = t.path().join("my.zip");
+        let r = export_package(
+            "my",
+            &user,
+            Some(&system),
+            Some(&ov_dir),
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
+        let baseline = collect_package_files("my", &user, Some(&system), None, true).unwrap();
+        let baseline_rels: Vec<String> = baseline.pack.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(r.packed, baseline_rels, "无 override 时打包清单不变");
+        // 字节级:包内方案文件 == 源文件原字节(不走 Value 序列化往返)
+        let in_zip = crate::bundle::extract_entry(&out, "my.schema.toml").unwrap();
+        let on_disk = fs::read(user.join("my.schema.toml")).unwrap();
+        assert_eq!(in_zip, on_disk, "无 override 的方案文件须字节级不变");
+    }
+
+    /// override 在场但解析失败 → 导出硬失败。静默按无 override 处理 = 用户以为
+    /// 定制随包带走了,实际导出的是未定制方案。
+    #[test]
+    fn export_fails_on_corrupt_override() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let ov_dir = t.path().join("schema_overrides");
+        fs::create_dir_all(&ov_dir).unwrap();
+        fs::write(ov_dir.join("my.toml"), "not toml at all {{{").unwrap();
+        let out = t.path().join("my.zip");
+        let err = export_package(
+            "my",
+            &user,
+            Some(&system),
+            Some(&ov_dir),
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("override"),
+            "错误须指明 override 层问题: {err}"
+        );
+    }
+
+    /// mixed 子方案的 override 同样折叠:子方案 override 新指向的资源入包,
+    /// 包内子方案文件写合并结果;无 override 的根方案文件字节不变。
+    #[test]
+    fn export_folds_mixed_subschema_override() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        fs::write(user.join("my/chaizi2.txt"), "c2").unwrap();
+        fs::write(
+            user.join("mix.schema.toml"),
+            "[schema]\nid=\"mix\"\n[engine]\ntype=\"mixed\"\n[engine.mixed]\nprimary_schema=\"my\"\n",
+        )
+        .unwrap();
+        let ov_dir = t.path().join("schema_overrides");
+        fs::create_dir_all(&ov_dir).unwrap();
+        fs::write(
+            ov_dir.join("my.toml"),
+            "[engine.chaizi]\ndb_path = \"my/chaizi2.txt\"\n",
+        )
+        .unwrap();
+
+        let out = t.path().join("mix.zip");
+        let r = export_package(
+            "mix",
+            &user,
+            Some(&system),
+            Some(&ov_dir),
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
+        assert!(
+            r.packed.contains(&"my/chaizi2.txt".to_string()),
+            "子方案 override 新指向的资源须入包,实际: {:?}",
+            r.packed
+        );
+        let bytes = crate::bundle::extract_entry(&out, "my.schema.toml").unwrap();
+        let sub: wind_config::schema::Schema =
+            toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            sub.engine.chaizi.db_path, "my/chaizi2.txt",
+            "包内子方案文件须含 override 值"
+        );
+        // 根方案无 override → 字节不变
+        let root_in_zip = crate::bundle::extract_entry(&out, "mix.schema.toml").unwrap();
+        assert_eq!(root_in_zip, fs::read(user.join("mix.schema.toml")).unwrap());
+    }
+
     #[test]
     fn import_roundtrip_into_fresh_dir() {
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
         let out = t.path().join("my.zip");
-        export_package("my", &user, Some(&system), &out, "1.0.0", "windows", "t").unwrap();
+        export_package(
+            "my",
+            &user,
+            Some(&system),
+            None,
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
 
         let dest = t.path().join("dest");
         std::fs::create_dir_all(&dest).unwrap();
@@ -872,7 +1131,17 @@ secondary_schema = "pinyin"
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
         let out = t.path().join("my.zip");
-        export_package("my", &user, Some(&system), &out, "1.0.0", "windows", "t").unwrap();
+        export_package(
+            "my",
+            &user,
+            Some(&system),
+            None,
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
 
         let dest = t.path().join("dest");
         std::fs::create_dir_all(dest.join("my")).unwrap();

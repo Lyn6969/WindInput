@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 use wind_candidate::CandidateSource;
 use wind_config::Config;
-use wind_config::schema::{DictSpec, Schema};
+use wind_config::schema::{DictSpec, Schema, merge_toml};
 use wind_dict::cached::{CachedDict, ReverseIndex};
 
 // 方案定义已统一到 wind_config::schema::Schema（取代此前的私有 SchemaFile）。
@@ -295,61 +295,9 @@ const MERGED_CACHE_TAG: &str = "merged/v1";
 /// 单字全码表缓存项：`(方案 id, 汉字 → 全码)`。见 `EngineManager::single_char_codes`。
 type SingleCharCodeCache = (String, Arc<HashMap<char, String>>);
 
-/// 深合并 TOML：`over` 覆盖到 `base` 之上。两侧皆为 table 时逐键递归；否则 over 整体替换。
-/// 数组按整体替换（如 encoder.rules 覆盖即替换全表）。
-///
-/// **例外：`dictionaries`** 走 [`merge_dict_overrides`] 的按 id 稀疏合并——词库的
-/// path/label/base_order 等结构定义必须始终以方案文件为准，override 层只表达用户开关。
-fn merge_toml(base: &mut toml::Value, over: toml::Value) {
-    match (base, over) {
-        (toml::Value::Table(b), toml::Value::Table(o)) => {
-            for (k, ov) in o {
-                match b.get_mut(&k) {
-                    Some(bv) if k == "dictionaries" => merge_dict_overrides(bv, &ov),
-                    Some(bv) => merge_toml(bv, ov),
-                    // base 无 dictionaries 时不接纳 override 的稀疏项（它们无 path，凭空
-                    // 造不出可用词库）；其余键正常新增。
-                    None if k == "dictionaries" => {}
-                    None => {
-                        b.insert(k, ov);
-                    }
-                }
-            }
-        }
-        (b, ov) => *b = ov,
-    }
-}
-
-/// `dictionaries` 的 override 合并：**按 `id` 匹配，且只接受 `enabled` 字段**。
-///
-/// 方案文件是词库结构（顺序/path/label/base_order/type…）的唯一权威，override 层仅记录
-/// 用户在设置页翻的开关。这么定的两个原因：
-/// 1. 数组整体替换会让 override 冻结整份词库定义——方案升级后新增的词库透不过来、
-///    改过的 path 仍指向旧文件、顺序也停在写快照那一刻。
-/// 2. 字段白名单顺带**净化历史遗留的整表快照**：老 override 里那些 path/label 副本
-///    会被直接忽略，无需单独写迁移代码。
-///
-/// override 里 id 在方案文件中找不到（词库已被方案删除）的条目静默丢弃。
-fn merge_dict_overrides(base: &mut toml::Value, over: &toml::Value) {
-    let (Some(base_arr), Some(over_arr)) = (base.as_array_mut(), over.as_array()) else {
-        return;
-    };
-    for ov in over_arr {
-        let (Some(id), Some(enabled)) = (
-            ov.get("id").and_then(|v| v.as_str()),
-            ov.get("enabled").and_then(|v| v.as_bool()),
-        ) else {
-            continue;
-        };
-        for b in base_arr.iter_mut() {
-            if b.get("id").and_then(|v| v.as_str()) == Some(id)
-                && let Some(t) = b.as_table_mut()
-            {
-                t.insert("enabled".to_string(), toml::Value::Boolean(enabled));
-            }
-        }
-    }
-}
+// merge_toml（schema ⊕ schema_overrides 的深合并，含 dictionaries 按 id 稀疏合并的例外）
+// 已上移至 wind_config::schema::merge_toml —— 方案包导出（wind-transfer）折叠 override 时
+// 必须与这里的引擎加载视图同源，故合并实现只允许存在一份。
 
 /// 源文件 → 缓存路径：`<cache>/<方案>/<文件名干>.<ext>`。
 ///
