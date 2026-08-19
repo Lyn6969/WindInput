@@ -20,7 +20,7 @@ pub fn specs() -> Vec<FuncSpec> {
         "ime.undo_commit" : Ime     (0, 0) effect => fn_undo_commit,"撤销最近一次上屏 (删刚上屏的字符数; 焦点变化或又输入其它内容后退化删 1 个)", "ime.undo_commit()";
         "ime.pair"        : Ime     (2, 2) effect => fn_ime_pair,   "上屏配对文本并激活配对状态, 光标落两段之间, 可用跳出键 (Tab/Enter) 越过右段", "ime.pair(\"《\", \"》\")"
             named(fn_ime_pair_named, "jump" = "跳出时光标右移的格数; 省略=按右段字符数");
-        "setting.open"    : Setting (1, 2) effect => fn_setting_open,"打开设置窗口的指定页面 (schema/input/keys/ui/dict/advanced/about; 空串=默认页); args 可选, 原样直通给设置程序", "setting.open(\"dict\", \"--schema=wubi86 --type=shadow\")";
+        "setting.open"    : Setting (1, 2) effect => fn_setting_open,"打开设置窗口的指定页面 (schema/input/keys/ui/dict/advanced/about/import; 空串=默认页); args 可选, 原样直通给设置程序", "setting.open(\"dict\", \"--schema=wubi86 --type=shadow\")";
         "setting.web"     : Setting (1, 2) effect => fn_setting_web, "打开设置页 (page 同 setting.open; --web 已废弃, 降级为原生设置页)", "setting.web(\"\")";
     }
 }
