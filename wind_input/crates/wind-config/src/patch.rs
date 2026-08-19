@@ -93,7 +93,14 @@ pub fn preview(fragment: &toml::Value, current: &toml::Value) -> Vec<PatchEntry>
         match &e.map_entry {
             // Map 条目：校验「父键 = 只含本条目的单元素表」，当前值取表内同名条目。
             Some(name) => {
-                e.error = validate_map_entry(&e.key, name, &e.next).err();
+                // 空条目名（`"" = "x"`）在 TOML 里合法，语义上却没有任何键能对应它
+                // （按键名/方案 id/源字符各自都不可能是空）。放行等于往用户配置里写一条
+                // 永远匹配不上、也删不掉的死条目，故当校验错误报出。
+                e.error = if name.is_empty() {
+                    Some("条目名不能为空".to_string())
+                } else {
+                    validate_map_entry(&e.key, name, &e.next).err()
+                };
                 e.current = crate::config::get_nested(current, &path)
                     .and_then(|v| v.as_table())
                     .and_then(|t| t.get(name))
@@ -213,6 +220,17 @@ fn validate_map_entry(key: &str, name: &str, value: &toml::Value) -> Result<(), 
 ///   每个父键**只产出一条**（整表写回是 `set_user_value` 唯一能表达的形态）。
 ///
 /// 顺序 = 条目首次出现顺序。调用方须先确认无 `error` 条目（半应用不被允许）。
+///
+/// ⚠️ **合并种子是「三层合并后的生效表」，不是「用户层已有的表」**——这是当前 4 个 Map 键
+/// 出厂值恒为空表（`= {}`）时唯一可行的取法，但它埋着一颗休眠的雷：若将来工厂层（L1/L2）
+/// 给这些键提供了非空默认条目，本函数会把那些默认条目连同片段条目一起写进用户层，
+/// 从此**冻结、不再跟随工厂层的后续更新**——与
+/// [`Config::set_user_value`](crate::config::Config::set_user_value) 文档里
+/// `schema.mix.auto_commit_block_on_pinyin` 那颗已引爆的雷同一机理（值等于出厂默认却照写，
+/// 用户就被永久钉死在旧默认上），只是那里靠 prune 收口，Map 整表写回没有等价收口。
+///
+/// 真要给这些键加工厂默认条目时，正确做法是让种子只取**用户层**的表、并对合并结果做
+/// 条目级 prune（等于工厂值的条目不写），而**不是**继续拿生效表当种子。
 pub fn writes(entries: &[PatchEntry], current: &toml::Value) -> Vec<(String, toml::Value)> {
     let mut out: Vec<(String, toml::Value)> = Vec::new();
     // 父 Map 键 → out 中的下标，保证同一 Map 键的多个条目并进同一张表。
@@ -313,6 +331,16 @@ mod tests {
             .unwrap();
         let err = bad.error.as_deref().expect("整数条目值应被拒绝");
         assert!(err.contains("类型或取值不合法"), "{err}");
+    }
+
+    /// 空条目名报错而不是当正常条目:没有任何按键名/方案 id/源字符会是空串,
+    /// 放行只会写进一条永远匹配不上、也删不掉的死条目。
+    #[test]
+    fn empty_map_entry_name_is_rejected() {
+        let entries = preview_text("[keys.key_actions]\n\"\" = \"english\"\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].map_entry.as_deref(), Some(""));
+        assert_eq!(entries[0].error.as_deref(), Some("条目名不能为空"));
     }
 
     /// Map 键下的空表 = no-op（不产出条目）。「空表 = 清空」是脚枪,片段没有删条目的语义。

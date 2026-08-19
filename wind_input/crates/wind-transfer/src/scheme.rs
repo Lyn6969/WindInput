@@ -416,11 +416,18 @@ pub fn export_package(
 /// 版本门禁也在这里:preview_import 与 import_package 都必经此函数,是两条导入
 /// 路径的共用点。门禁先于布局校验——更高版本的包布局可能已变,先报"版本过高"
 /// 比报"不是有效的方案包"对得上真实原因。
-fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
-    Ok(scan_package(package)?.0)
+/// 包内一个载荷条目。
+///
+/// `name` = zip 条目原名(取字节只能用它);`rel` = 归一化后的 schemas 相对路径
+/// (落盘、判根、取 id 只能用它)。两者仅在条目名含 `\` 的非规范包里不同——zip 规范
+/// 要求分隔符是 `/`,但确有打包器写反斜杠。混用其一即错:拿原名落盘会在类 Unix 平台
+/// 造出名字带字面 `\` 的文件,拿归一化名回查 zip 则找不到条目。
+pub(crate) struct PayloadEntry {
+    pub name: String,
+    pub rel: String,
 }
 
-/// 枚举包内条目,返回(落盘载荷条目, 是否含根 `config_patch.toml`)。
+/// 枚举包内条目,返回(落盘载荷条目, 根 `config_patch.toml` 的 zip 原名)。
 ///
 /// config_patch 按名识别后**从载荷里摘出去**:它既不进 will_add/conflicts,也不参与
 /// 「根下有没有 *.schema.toml」的判定(纯配置包由设置端的侦测规则 3 分派,不走这里),
@@ -428,7 +435,7 @@ fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
 ///
 /// 它还要求 `format_version ≥ 2`:legacy 语义下旧客户端会把它当死文件落盘,生成端
 /// 必须显式声明版本——硬拒绝比「装了但配置没生效」更早暴露问题。
-fn scan_package(package: &Path) -> anyhow::Result<(Vec<String>, bool)> {
+fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<String>)> {
     let meta = read_package_meta(package)?;
     if meta.package.format_version > PACKAGE_FORMAT_VERSION {
         anyhow::bail!(
@@ -439,9 +446,9 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<String>, bool)> {
     }
     let file = std::fs::File::open(package)?;
     let archive = zip::ZipArchive::new(file)?;
-    let mut rels = Vec::new();
+    let mut entries: Vec<PayloadEntry> = Vec::new();
     let mut has_root_schema = false;
-    let mut has_config_patch = false;
+    let mut config_patch_name: Option<String> = None;
     for name in archive.file_names() {
         if name == PACKAGE_META_NAME || name.ends_with('/') {
             continue;
@@ -449,17 +456,22 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<String>, bool)> {
         if name == "manifest.toml" || name == "manifest.json" {
             anyhow::bail!("该文件是整机备份包或旧格式归档,不是方案包");
         }
+        // 判根/落盘一律用归一化值:`sub\evil.schema.toml` 的 `contains('/')` 为 false,
+        // 拿原名判根会把子目录文件当成根方案文件。
         let rel = crate::bundle::validate_entry_rel(name, "")?;
         if rel == CONFIG_PATCH_NAME {
-            has_config_patch = true;
+            config_patch_name = Some(name.to_string());
             continue;
         }
         if !rel.contains('/') && rel.ends_with(".schema.toml") {
             has_root_schema = true;
         }
-        rels.push(rel.to_string());
+        entries.push(PayloadEntry {
+            name: name.to_string(),
+            rel,
+        });
     }
-    if has_config_patch && meta.package.format_version < 2 {
+    if config_patch_name.is_some() && meta.package.format_version < 2 {
         anyhow::bail!(
             "包内含 {CONFIG_PATCH_NAME} 却声明 format_version={},配置片段需 format_version = 2,请按新格式重新打包",
             meta.package.format_version
@@ -468,8 +480,8 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<String>, bool)> {
     if !has_root_schema {
         anyhow::bail!("不是有效的方案包(根目录缺少 *.schema.toml)");
     }
-    rels.sort();
-    Ok((rels, has_config_patch))
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok((entries, config_patch_name))
 }
 
 /// 读取包内可选元信息。宽容只给过去,不给未来:
@@ -520,18 +532,22 @@ pub struct SchemeImportPreview {
 }
 
 pub fn preview_import(package: &Path, user_dir: &Path) -> anyhow::Result<SchemeImportPreview> {
-    let (rels, has_config_patch) = scan_package(package)?;
+    let (entries, config_patch_name) = scan_package(package)?;
     let meta = read_package_meta(package)?;
-    let config_patch = if has_config_patch {
-        let bytes = crate::bundle::extract_entry(package, CONFIG_PATCH_NAME)?;
-        Some(
-            String::from_utf8(bytes)
-                .map_err(|_| anyhow::anyhow!("{CONFIG_PATCH_NAME} 不是 UTF-8 文本"))?,
-        )
-    } else {
-        None
-    };
+    let config_patch = read_config_patch(package, config_patch_name.as_deref())?;
+    let rels: Vec<String> = entries.into_iter().map(|e| e.rel).collect();
     Ok(build_preview(meta, &rels, user_dir, config_patch))
+}
+
+/// 取包内配置片段原文。按 **zip 原名**读——归一化后的名字回查 zip 会找不到条目。
+fn read_config_patch(package: &Path, name: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let bytes = crate::bundle::extract_entry(package, name)?;
+    Ok(Some(String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!("{CONFIG_PATCH_NAME} 不是 UTF-8 文本")
+    })?))
 }
 
 /// 由条目清单对目标目录算出 will_add/conflicts,组装预览。zip 与文本信封共用,
@@ -577,13 +593,15 @@ pub fn import_package(
     user_dir: &Path,
     strategy: crate::merge::Strategy,
 ) -> anyhow::Result<SchemeImportResult> {
-    let rels = list_payload_entries(package)?;
+    let (entries, _) = scan_package(package)?;
     // 读取阶段:全部载荷入内存,任何缺条目/坏条目在写盘前失败。
+    // 取字节按 zip 原名,落盘按归一化 rel——见 [`PayloadEntry`]。
     let mut staged: Vec<(String, Vec<u8>)> = Vec::new();
-    for rel in &rels {
-        let bytes = crate::bundle::extract_entry(package, rel)?;
-        staged.push((rel.clone(), bytes));
+    for e in &entries {
+        let bytes = crate::bundle::extract_entry(package, &e.name)?;
+        staged.push((e.rel.clone(), bytes));
     }
+    let rels: Vec<String> = entries.into_iter().map(|e| e.rel).collect();
     // 写入阶段:tmp+rename,Merge 跳过已存在。
     let (imported, conflicts) = write_staged(&staged, user_dir, strategy)?;
     Ok(SchemeImportResult {

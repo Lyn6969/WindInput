@@ -88,6 +88,17 @@ struct ParsedEnvelope {
 /// 再查版本门禁,最后才是限额与布局——对一段根本不是信封的文本报「files 超限」
 /// 会把人带偏。
 fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
+    // ★ 体积限额先于解析,且是**硬错误、不带回落前缀**。两条理由:
+    // 一、超 2 MB 的文本几乎必是超大信封而非配置片段(片段是手写配置,KB 量级),
+    //    报「信封超上限」比回落片段管线刷一屏「未知配置键」有用得多;
+    // 二、放在解析之后,就留下了「最大 16 MB(IPC 帧上限)的文本先被完整解析、再被拒绝」
+    //    的窗口——限额要挡的正是这份开销,挡在解析后等于没挡。
+    if text.len() > MAX_TEXT_BYTES {
+        anyhow::bail!(
+            "方案文本信封过大({} 字节,上限 {MAX_TEXT_BYTES}),请改用 .wpkg 分发",
+            text.len()
+        );
+    }
     // 非 TOML 文本同样不是信封:片段管线会给出更准确的解析错误。
     let value: toml::Value = toml::from_str(text)
         .map_err(|e| anyhow::anyhow!("{NOT_SCHEMA_TEXT} 不是合法 TOML 文本: {e}"))?;
@@ -111,12 +122,6 @@ fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
             "方案文本信封版本过高(format_version={format_version},当前支持 {PACKAGE_FORMAT_VERSION}),请升级 WindInput"
         );
     }
-    if text.len() > MAX_TEXT_BYTES {
-        anyhow::bail!(
-            "方案文本信封过大({} 字节,上限 {MAX_TEXT_BYTES}),请改用 .wpkg 分发",
-            text.len()
-        );
-    }
     if env.files.len() > MAX_FILES {
         anyhow::bail!(
             "方案文本信封文件过多({} 个,上限 {MAX_FILES}),请改用 .wpkg 分发",
@@ -128,9 +133,10 @@ fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
     let mut config_patch: Option<String> = None;
     let mut has_root_schema = false;
     for f in &env.files {
-        // 穿越守卫只此一处,与 zip 导入同一实现(components 白名单)。
+        // 穿越守卫只此一处,与 zip 导入同一实现(components 白名单)。返回值已把 `\`
+        // 归一为 `/`:判根与落盘都用它,否则 `sub\x.schema.toml` 会被当成根方案文件。
         let rel = crate::bundle::validate_entry_rel(&f.path, "")?;
-        if staged.iter().any(|(r, _)| r == rel)
+        if staged.iter().any(|(r, _)| *r == rel)
             || (rel == CONFIG_PATCH_NAME && config_patch.is_some())
         {
             anyhow::bail!("方案文本信封含重复路径: {rel}");
@@ -143,7 +149,7 @@ fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
         if !rel.contains('/') && rel.ends_with(".schema.toml") {
             has_root_schema = true;
         }
-        staged.push((rel.to_string(), f.content.clone().into_bytes()));
+        staged.push((rel, f.content.clone().into_bytes()));
     }
     if !has_root_schema {
         anyhow::bail!("不是有效的方案文本信封(根目录缺少 *.schema.toml)");
@@ -361,6 +367,57 @@ content = "a\t啊\n"
         assert!(preview_import_text(&only_patch, &d).is_err());
         let empty = "[package]\nformat_version = 2\nkind = \"schema_text\"\n";
         assert!(preview_import_text(empty, &d).is_err(), "无 files 也应拒绝");
+    }
+
+    /// 反斜杠路径归一化后不算根条目 → 该信封缺根方案文件被拒。
+    /// 拿未归一化的原始切片判根会让 `sub\x.schema.toml` 冒充根方案文件。
+    #[test]
+    fn backslash_path_does_not_count_as_root_schema() {
+        let (_t, d) = dest();
+        let text = "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+                    [[files]]\npath = \"sub\\\\x.schema.toml\"\ncontent = \"x\"\n";
+        let err = preview_import_text(text, &d).unwrap_err().to_string();
+        assert!(err.contains("缺少 *.schema.toml"), "{err}");
+
+        // 对照:同一个信封补一个真正的根方案文件 → 通过,且反斜杠条目落盘用 `/` 形态。
+        let ok = "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+                  [[files]]\npath = \"r.schema.toml\"\ncontent = \"x\"\n\
+                  [[files]]\npath = \"sub\\\\x.dict.yaml\"\ncontent = \"y\"\n";
+        let prev = preview_import_text(ok, &d).unwrap();
+        assert_eq!(prev.will_add, vec!["r.schema.toml", "sub/x.dict.yaml"]);
+        import_text(ok, &d, crate::merge::Strategy::Merge).unwrap();
+        assert!(d.join("sub").join("x.dict.yaml").is_file());
+    }
+
+    /// 超 2 MB → 硬错误(不带回落前缀),且在**解析之前**就拒掉。
+    /// 片段是手写配置、KB 量级,超限文本几乎必是超大信封;回落片段管线只会刷一屏
+    /// 「未知配置键」噪音。
+    #[test]
+    fn oversized_text_is_rejected_before_parsing() {
+        let (_t, d) = dest();
+        // 一形:合法信封但内容超限
+        let mut big = String::from(
+            "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+             [[files]]\npath = \"b.schema.toml\"\ncontent = \"",
+        );
+        big.push_str(&"x".repeat(MAX_TEXT_BYTES + 1));
+        big.push_str("\"\n");
+        let err = preview_import_text(&big, &d).unwrap_err().to_string();
+        assert!(err.contains("过大"), "{err}");
+        assert!(
+            !err.starts_with(NOT_SCHEMA_TEXT),
+            "超限是硬错误,不回落: {err}"
+        );
+
+        // 二形:纯垃圾(连 TOML 都不是)——同样按超限拒绝,证明限额先于解析。
+        let garbage = "\u{4e00}".repeat(MAX_TEXT_BYTES); // 每字 3 字节,必定超限
+        let err2 = preview_import_text(&garbage, &d).unwrap_err().to_string();
+        assert!(err2.contains("过大"), "限额须先于 TOML 解析: {err2}");
+        assert!(!err2.starts_with(NOT_SCHEMA_TEXT), "{err2}");
+
+        // 零落盘
+        assert!(import_text(&big, &d, crate::merge::Strategy::Merge).is_err());
+        assert!(!d.join("b.schema.toml").exists());
     }
 
     #[test]
