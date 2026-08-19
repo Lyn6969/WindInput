@@ -115,6 +115,10 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
             Ok(serde_json::to_value(v)?)
         }
         "config.setItems" => set_items(state, params),
+        // 配置片段（TOML 文本）逐键预览：键/当前值/新值/错误，只读不落盘。
+        "config.previewPatch" => preview_patch(params),
+        // 配置片段应用：与 previewPatch 同一套校验，任何一条有错即整体拒绝（不做半应用）。
+        "config.applyPatch" => apply_patch(state, params),
         // 配置字段注册表（key+type+enum options）：CLI/设置端据此校验与补全。
         "config.schema" => Ok(schema_json()),
         // 单字段当前值（含三层合并）：补 config.get 只能整份的缺口。
@@ -167,11 +171,6 @@ fn set_items(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
         }
     }
     let applied = writes.len();
-    // 第二遍：落盘合法项（IO 失败仍为硬错误）。
-    for (key, toml_val) in writes {
-        let parts: Vec<&str> = key.split('.').collect();
-        Config::set_user_value(&parts, toml_val)?;
-    }
     if !skipped.is_empty() {
         tracing::warn!(
             "config.setItems 跳过 {} 个无效项（未登记/类型/枚举）: {:?}",
@@ -179,13 +178,69 @@ fn set_items(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
             skipped
         );
     }
-    // 落盘后即时热重载：轻量字段立即生效，引擎结构性变更则 needsRestart=true。
+    // 第二遍：落盘合法项（IO 失败仍为硬错误）+ 热重载 + 事件广播。
+    let needs_restart = apply_writes(state, writes, "setItems")?;
+    Ok(json!({ "needsRestart": needs_restart, "applied": applied, "skipped": skipped }))
+}
+
+/// setItems / applyPatch 共用的落盘通路：逐键 `set_user_value`（继承「等出厂默认即删」
+/// 的 prune 收口），随后即时热重载（轻量字段立即生效，引擎结构性变更则 needsRestart=true）
+/// 并广播配置变更事件。返回 needsRestart。
+fn apply_writes(
+    state: &DispatchState,
+    writes: Vec<(String, toml::Value)>,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    for (key, toml_val) in writes {
+        let parts: Vec<&str> = key.split('.').collect();
+        Config::set_user_value(&parts, toml_val)?;
+    }
     let needs_restart = state.core.apply_config();
-    // 配置变更事件：通知订阅者（含 needsRestart 提示）。
     state
         .events
-        .emit_config_changed(json!({ "reason": "setItems", "needsRestart": needs_restart }));
-    Ok(json!({ "needsRestart": needs_restart, "applied": applied, "skipped": skipped }))
+        .emit_config_changed(json!({ "reason": reason, "needsRestart": needs_restart }));
+    Ok(needs_restart)
+}
+
+/// 解析 + 展平 + 校验配置片段（previewPatch / applyPatch 共用）。
+/// TOML 解析失败是整体错误；当前值与 `config.get` 同源（三层合并后的生效配置）。
+fn patch_entries(params: &Value) -> anyhow::Result<Vec<wind_config::patch::PatchEntry>> {
+    let text = params
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid_params: text missing"))?;
+    let fragment = wind_config::patch::parse_fragment(text)
+        .map_err(|e| anyhow::anyhow!("invalid_patch: {e}"))?;
+    let current = toml::Value::try_from(Config::load(Config::data_dir().as_deref())?)?;
+    Ok(wind_config::patch::preview(&fragment, &current))
+}
+
+/// `config.previewPatch { text }` → `{ ok, entries: [{ key, current?, next, error? }] }`，只读。
+fn preview_patch(params: &Value) -> anyhow::Result<Value> {
+    let entries = patch_entries(params)?;
+    let ok = entries.iter().all(|e| e.error.is_none());
+    Ok(json!({ "ok": ok, "entries": entries }))
+}
+
+/// `config.applyPatch { text }`：先跑与 preview 相同的校验，任何一条有错 → 整体 Err、
+/// 不做半应用；全部合法 → 走 setItems 的批量落盘通路（继承 prune 与生效通知）。
+/// 0 条目视为成功 no-op（不落盘、不触发热重载）。
+fn apply_patch(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
+    let entries = patch_entries(params)?;
+    let bad: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.error.as_ref().map(|err| format!("{}: {}", e.key, err)))
+        .collect();
+    if !bad.is_empty() {
+        anyhow::bail!("invalid_patch: {}", bad.join("; "));
+    }
+    if entries.is_empty() {
+        return Ok(json!({ "ok": true, "applied": 0, "needsRestart": false }));
+    }
+    let writes: Vec<(String, toml::Value)> = entries.into_iter().map(|e| (e.key, e.next)).collect();
+    let applied = writes.len();
+    let needs_restart = apply_writes(state, writes, "applyPatch")?;
+    Ok(json!({ "ok": true, "applied": applied, "needsRestart": needs_restart }))
 }
 
 /// 把 config_schema 注册表序列化为 JSON（`{ fields: [{key, type, options?}] }`）。
@@ -441,6 +496,99 @@ mod tests {
         );
         assert!(resp.error.is_none());
         assert!(skipped_keys(&resp).contains(&"ui.candidate.per_page".to_string()));
+    }
+
+    // ── config.previewPatch / applyPatch 契约（照 scheme.previewImport 先例：只测
+    // 只读与错误路径）。applyPatch 的成功写路径**刻意不在此测**——它会真写用户层
+    // config.toml（%APPDATA%），校验+展平的纯逻辑已在 wind-config::patch 层覆盖。
+
+    #[test]
+    fn preview_patch_reports_entries_readonly() {
+        let core = FakeCore::new();
+        let st = DispatchState::new(core.clone(), "dev").unwrap();
+        let resp = dispatch(
+            &st,
+            req(
+                "config.previewPatch",
+                json!({ "text": "[ui.candidate]\nper_page = 9\n" }),
+            ),
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert_eq!(r["ok"], json!(true));
+        let entries = r["entries"].as_array().expect("entries 应为数组");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["key"], json!("ui.candidate.per_page"));
+        assert_eq!(entries[0]["next"], json!(9));
+        assert!(entries[0].get("error").is_none(), "合法条目不应有 error");
+        // 只读：不得触发热重载（也证明未走落盘通路）。
+        assert!(!core.config_applied.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn preview_patch_flags_unknown_and_invalid_values() {
+        let resp = dispatch(
+            &state(),
+            req(
+                "config.previewPatch",
+                json!({ "text": "[ui.candidate]\nlayout = \"diagonal\"\n[input.foo]\nbar = 1\n" }),
+            ),
+        );
+        assert!(resp.error.is_none(), "逐键错误不是 RPC 错误");
+        let r = resp.result.unwrap();
+        assert_eq!(r["ok"], json!(false));
+        let entries = r["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries.iter().all(|e| e.get("error").is_some()),
+            "两条都应带 error: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn preview_patch_rejects_invalid_toml_as_whole() {
+        let resp = dispatch(
+            &state(),
+            req("config.previewPatch", json!({ "text": "= not toml =" })),
+        );
+        assert!(resp.result.is_none());
+        assert!(resp.error.is_some(), "整体解析失败应为 RPC 错误");
+    }
+
+    #[test]
+    fn apply_patch_rejects_fragment_with_any_error() {
+        let core = FakeCore::new();
+        let st = DispatchState::new(core.clone(), "dev").unwrap();
+        // 一条合法 + 一条未知键：整体拒绝，不做半应用。
+        let resp = dispatch(
+            &st,
+            req(
+                "config.applyPatch",
+                json!({ "text": "[ui.candidate]\nper_page = 9\nbogus = 1\n" }),
+            ),
+        );
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("应整体拒绝");
+        assert!(err.contains("bogus"), "错误应点名出错的键: {err}");
+        assert!(
+            !core.config_applied.load(Ordering::SeqCst),
+            "整体拒绝不得触发热重载（也证明未走落盘通路）"
+        );
+    }
+
+    #[test]
+    fn apply_patch_empty_fragment_is_noop_success() {
+        let core = FakeCore::new();
+        let st = DispatchState::new(core.clone(), "dev").unwrap();
+        let resp = dispatch(&st, req("config.applyPatch", json!({ "text": "" })));
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["applied"], json!(0));
+        assert!(
+            !core.config_applied.load(Ordering::SeqCst),
+            "no-op 不落盘也不热重载"
+        );
     }
 
     #[test]

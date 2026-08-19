@@ -36,7 +36,7 @@ fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
 
 /// 在 TOML 表里按 `path` 导航（缺失则创建嵌套表），把叶子设为 `value`。
 /// 路径中途若遇非表值（类型冲突）则覆盖为表。供 [`Config::set_user_value`] 部分合并用。
-fn set_nested(table: &mut toml::Table, path: &[&str], value: toml::Value) {
+pub(crate) fn set_nested(table: &mut toml::Table, path: &[&str], value: toml::Value) {
     if path.len() == 1 {
         table.insert(path[0].to_string(), value);
         return;
@@ -56,7 +56,7 @@ fn set_nested(table: &mut toml::Table, path: &[&str], value: toml::Value) {
 
 /// 在 TOML 值里按 `path` 逐级取值（任一级缺失或非表则 `None`）。
 /// 供 [`Config::set_user_value`] 与出厂默认（L1⊕L2）比对用。
-fn get_nested<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+pub(crate) fn get_nested<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
     let mut cur = root;
     for k in path {
         cur = cur.as_table()?.get(*k)?;

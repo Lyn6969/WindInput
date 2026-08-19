@@ -9,6 +9,7 @@ pub mod config;
 pub mod config_schema;
 pub mod dir_var;
 pub mod hotkey;
+pub mod patch;
 pub mod runtime_state;
 pub mod schema;
 pub mod startup_trace;
