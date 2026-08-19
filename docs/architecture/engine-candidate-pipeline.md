@@ -2,7 +2,8 @@
 
 > **现状文档**（非设计差分）。基于 2026-07-06 对 `wind_input/crates/` Rust 实现的实际代码核查整理，
 > 覆盖码表 / 拼音（全拼）/ 双拼 / 混输 / 英文五类引擎从词库加载到候选呈现的完整链路，
-> 并对比各模式流程差异。行号为核查时快照，随代码演进可能漂移，以函数/结构名为准。
+> 并对比各模式流程差异；§9 补辅助码字形二次筛选（协调器 overlay 模式）。
+> 行号为核查时快照，随代码演进可能漂移，以函数/结构名为准。
 >
 > 历史设计差分见 [redesign/engine.md](../redesign/engine.md)（2026-06-15，其中记录的 Rust 现状已过时）。
 
@@ -651,7 +652,61 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 
 ---
 
-## 9. 各模式流程对比
+## 9. 辅助码模式（AuxCode）—— 拼音候选的字形二次筛选
+
+协调器 overlay 模式（`ModeKind::AuxCode`），**非引擎**：对已跑完 §8 管线的拼音候选做字形二次
+筛选。文件：`wind-coordinator/src/handle_aux_code.rs` + `wind-aux-code/`（纯逻辑：三段式紧凑表
++ 纯筛选，不碰文件系统，路径由调用方解析）。
+
+- **配置（三层，同 `[schema.codetable]` 那套 tri-state，见 schema-config-layering.md §4）**：
+  全局基线 `[schema.pinyin.aux_code]`（`enabled` **出厂 false** / `max_phrase_len`）；
+  方案段 `[engine.aux_code]` 放 `files`（方案属性：全拼配笔画、双拼配小鹤形码），并可用
+  同名 `enabled` / `max_phrase_len` 逐字段覆盖全局；`schema_overrides/{id}.toml` 用**相同段名**
+  经 `read_schema` 的 `merge_toml` 深合并（设置页写入点）。折叠在
+  `AuxCodeGlobal::resolved`，取值出口只有 `EngineManager::aux_code_settings` 一个。
+  ★ **`files` 非空 ≠ 功能开启**：方案配码表只是「这个方案推荐哪张表」。
+- **★ 为什么 `enabled` 必须能按方案覆盖**：全拼与双拼在这个功能上不是偏好不同，是**键位
+  预算不同**。双拼把韵母塞进字母键、符号键全空闲（`pinyin_separator_key` 对双拼恒早退）；
+  全拼的音节边界必须靠符号表达，出厂 `separator = "auto"` + `'` 作选词键 ⇒ **反引号即音节
+  分隔符**。且按键 match 里分隔符臂（`message_handler.rs` 的 `VK_QUOTE|VK_BACKTICK`）位于
+  `[key_actions]` 裁决（兜底臂里的 D0）**之前**，所以全拼下哪怕绑了 `backtick = "aux_code"`
+  也永远走不到辅助码。于是「双拼开、全拼关」是常态需求，一个全局开关表达不了。
+- **触发**：`[key_actions]` 绑 `"aux_code"`；双拼出厂绑反引号（绑定本身不激活功能，
+  `enabled = false` 时门卫拒绝、该键照常落普通标点），全拼出厂不绑（理由见上）。
+  门卫四道：未启用 / 触发键被音节分隔符占用（`warn_aux_code_key_taken` 每方案告警一次，
+  不再静默失效）/ 方案未配 `files` 或文件全缺 / 当前无候选 → 一律不吞键。
+  组码中进入，**只筛选不改排序**。
+- **加载**：`EngineManager::aux_code_settings` 一次 `read_schema` 出齐 `enabled` /
+  `max_phrase_len` / 已解析的 `files`（用户目录同名优先；**关闭时不解析路径**）；首进时
+  `ensure_aux_code_table` 懒加载 + `merge`（先出现 = 高优），**不参与预热**。缓存是全局一份，
+  各方案码表不同（拼音笔画表 vs 双拼小鹤全码表），**切方案必须失效重挂**
+  （`invalidate_aux_code_table`，随 `sync_chaizi_assets`/`sync_comment_dicts` 一起）。表格式：
+  UTF-8 `字=码` 一行一条（`=` 分隔，与 rime-lua-aux-code `aux_code` 目录一致），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），
+  version/source 当普通注释不解析。码表文件是 `wind-tools/gen_aux_code` 的构建产物、
+  **不入版本库**（rime-stroke 为 LGPL-3.0，见 NOTICE.md）。
+- **筛选**（`wind-aux-code/src/filter.rs`）：`aux_code_matches` 谓词判断单个候选是否匹配；
+  `filter_by_aux_code` 批量筛选，`kept` 是输入候选的**子序列**（不变量，绝不重排）；
+  单字任一码前缀匹配 `aux_input` 则留；词组**逐字首码匹配**（固定语义，无模式选项）——第 i 位
+  命中第 i 字任一码的首字符，恰好 N 位，**不足 N 位 = 前缀态保留（边打边缩）、超过或某位不中
+  都滤**；字符一律按表查询，不做纯汉字判断；
+  空输入 / 空表 = **不过滤**（防候选窗滤光）。
+- **会话**（`AuxCodeSession`）：内部持 `CandidateStore`（原始候选快照 + 筛选视图）+
+  辅助码缓冲；每次从快照**重筛**（通过 `CandidateStore::set_filter`，否则退格还原会乱序）；
+  **被滤候选直接丢弃**——辅助码是字形二次筛选，候选窗只显示命中者（如 `om` 配「时间」
+  「实践」时实践消失），还原不靠残留标记，退出/退格都从快照恢复（`CandidateStore::clear_filter`）。
+  **显示态**（组合区/光标）与筛选会话一起打包在协调器 `State.aux_code: Option<AuxCodeOverlay>`
+  （`preedit_base` 退出还原、`preedit_prefix` 进入时拼一次 = 拼音基线 + 4 空格），三件套
+  同生共死、整体销毁；刷新组合区与 overlay 光标共用同一前缀，分隔符只写一遍。组合区
+  = 显示前缀 + 辅助码。
+- **键语义**：字母累积（小写化）；Esc 退出还原拼音；Backspace 删空保持空码态、已空再退格退出；
+  Space/Enter/数字选词上屏后退出；翻页/高亮走统一 `handle_candidate_nav`；Ctrl/Alt 组合走公共
+  `overlay_ctrl_alt_guard`。退出 `exit_aux_code` 刻意不 `ClearComposition`（筛选非放弃组合）。
+- **表名**：`mode_indicator_names` 的 AuxCode 分支读表 `name`（如「笔画」）显示在指示位，
+  未命名/未加载则沿用主路径。
+
+---
+
+## 10. 各模式流程对比
 
 | 阶段 | 码表 | 拼音（全拼） | 双拼 | 混输 | 英文 |
 |---|---|---|---|---|---|
@@ -667,10 +722,11 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | preedit | 原始码 | 音节 `'` 分隔 | 原始按键按音节分隔 | `preedit_display`：≥2 音节用拼音拆分串，否则原始码。`preedit_pinyin`（高亮跟随用）判据更宽：**拆分串 ≠ 原串**即给出，覆盖单音节 + 残码（`nun'l`） | 原始输入 |
 
 后处理管线（短语/过滤/词频/shadow/复评，§8）对所有模式统一，由协调器执行。
+辅助码（§9）不在此表——它不是引擎，是协调器 overlay 模式，对已跑完管线的拼音候选做字形二次筛选。
 
 ---
 
-## 10. 配置速查（实际生效默认值）
+## 11. 配置速查（实际生效默认值）
 
 引擎相关配置三层合并：代码默认 → 系统 `data/config.toml` → 用户 `%APPDATA%\WindInput\config.toml`。
 下表「默认」为**系统配置层实际值**（与代码默认不同处已注明）：
@@ -697,7 +753,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 
 ---
 
-## 11. 关键源文件索引
+## 12. 关键源文件索引
 
 | 模块 | 文件 |
 |---|---|
@@ -712,4 +768,5 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | Candidate / 智能过滤 / shadow | `wind-candidate/src/{candidate,filter,shadow}.rs` |
 | 词库（格式/缓存/多层） | `wind-dict/src/{codetable,binformat,datformat,cached,composite,manager,layer,store_layer}.rs` |
 | 后处理管线 / 顶码守护 | `wind-coordinator/src/handle_candidate.rs`、`coordinator.rs`（VK_A..Z 顶码段） |
+| 辅助码（overlay 模式 / 纯筛选 / 三段式表 / 表格式） | `wind-coordinator/src/handle_aux_code.rs`、`wind-aux-code/src/{table,loader,filter}.rs`、`data/schemas/aux_code/*.txt` |
 | 配置结构与注册 | `wind-config/src/{config,schema,config_schema}.rs`、`data/config.toml` |
