@@ -75,6 +75,36 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
   完整条款见 https://www.unicode.org/license.txt。若将来启用该功能，其产物可
   直接入库——本许可证无 copyleft 传染性
 
+#### rime-stroke（笔画辅助码）
+
+- **用途**: 辅助码功能的笔画码表（拼音候选的字形二次筛选，出厂关闭）
+- **仓库**: https://github.com/rime/rime-stroke
+- **许可证**: **LGPL-3.0**
+- **使用的文件**: `stroke.dict.yaml`（`字<TAB>笔画码`，h/s/p/n/z 表横竖撇捺折）
+- **加工方式**: 由 `wind-tools/gen_aux_code` 剥去 YAML 头、`<TAB>` 转 `=`，并按常用
+  字集裁剪后写入构建产物 `data/schemas/aux_code/stroke.txt`。**码本身不作任何改动**
+  （同字多码保留上游行序 = 优先级）。裁剪字集见下方 hanzi-chars 条目
+
+#### rime-lua-aux-code（小鹤 / 自然码形码）
+
+- **用途**: 辅助码功能的字形码表（双拼用户的形码筛选，出厂关闭）
+- **仓库**: https://github.com/HowcanoeWang/rime-lua-aux-code
+- **许可证**: MIT
+- **使用的文件**: `aux_code/flypy_full.txt`（小鹤音形）、`aux_code/ZRM-wanxiang.txt`（自然码）
+- **加工方式**: 上游已是 `字=码` 行格式，**逐行原样透传**，仅在文件首部补
+  `# name/source/license` 元数据头（运行时据首行显示码表名）
+
+#### hanzi-chars（汉字字表）
+
+- **用途**: 裁剪笔画码表的字集依据。上游笔画表覆盖 11 万字（含扩展 B/C/…），
+  全量载入对一个默认关闭的功能过重
+- **仓库**: https://github.com/zispace/hanzi-chars
+- **使用的文件**: `data-charset/GB 18030-2000.txt`、
+  `data-charlist/《通用规范汉字表》（2013年）.txt`、`data-unicode/Unicode-CJK 〇.txt`
+  （取并集，共 27733 字；清单在 `gen_aux_code::CHARSET_FILES`）
+- **说明**: 这些是字表（事实数据汇编），本项目只用其中的汉字集合作过滤条件，
+  不分发字表文件本身
+
 #### 腾讯词向量
 
 - **用途**: 词频数据参考（经由 rime-frost 的 `tencent.dict.yaml`），
@@ -137,9 +167,9 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 本项目源代码采用 [MIT 许可证](LICENSE)。
 
 词库数据文件来源于上述第三方项目，其各自适用原项目的许可证条款。
-GPL-3.0 许可的词库数据（rime-frost）不包含在本仓库中，而是在构建过程中
-作为外部数据依赖从原始仓库下载；发行版中包含由其生成的词库数据文件，
-该部分数据适用 GPL-3.0 条款。
+GPL-3.0 许可的词库数据（rime-frost）与 LGPL-3.0 许可的笔画码表（rime-stroke）
+不包含在本仓库中，而是在构建过程中作为外部数据依赖从原始仓库下载；发行版中包含
+由其生成的数据文件，该部分数据分别适用 GPL-3.0 / LGPL-3.0 条款。
 
 Apache-2.0（极点五笔码表）与 Unicode-3.0（Unicode CLDR，当前仅研究用）
 均为宽松许可证，允许修改后再分发，其加工产物可直接包含在本仓库中，

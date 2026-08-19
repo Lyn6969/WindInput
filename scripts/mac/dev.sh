@@ -764,6 +764,25 @@ download_dicts() {
     for f in wubi86_jidian wubi86_jidian_extra wubi86_jidian_extra_district; do
         get_dict "$wubibase/$f.dict.yaml" "$wubi/$f.dict.yaml"
     done
+
+    # 辅助码表: 拼音候选的字形二次筛选 (默认关闭, 见 schema.pinyin.aux_code)。
+    # 小鹤/自然码零转换; 笔画表由 gen_aux_code 从 rime-stroke 的 .dict.yaml 转换 + 字集裁剪。
+    # ⚠️ rime-stroke 是 LGPL-3.0 —— 同 rime-frost 处理: 只下载不入库, 见 NOTICE.md。
+    local aux="$CACHE_DIR/aux-code"
+    mkdir -p "$aux/charset"
+    local auxbase="https://raw.githubusercontent.com/HowcanoeWang/rime-lua-aux-code/main/aux_code"
+    info "辅助码表:"
+    for f in flypy_full ZRM-wanxiang; do
+        get_dict "$auxbase/$f.txt" "$aux/$f.txt"
+    done
+    get_dict "https://raw.githubusercontent.com/rime/rime-stroke/master/stroke.dict.yaml" \
+        "$aux/stroke.dict.yaml"
+    # 字集 (文件名须与 gen_aux_code::CHARSET_FILES 一致; URL 段已百分号编码)
+    local hanzibase="https://raw.githubusercontent.com/zispace/hanzi-chars/main"
+    get_dict "$hanzibase/data-charset/GB%2018030-2000.txt" "$aux/charset/GB 18030-2000.txt"
+    get_dict "$hanzibase/data-charlist/%E3%80%8A%E9%80%9A%E7%94%A8%E8%A7%84%E8%8C%83%E6%B1%89%E5%AD%97%E8%A1%A8%E3%80%8B%EF%BC%882013%E5%B9%B4%EF%BC%89.txt" \
+        "$aux/charset/《通用规范汉字表》（2013年）.txt"
+    get_dict "$hanzibase/data-unicode/Unicode-CJK%20%E3%80%87.txt" "$aux/charset/Unicode-CJK 〇.txt"
     return 0
 }
 
@@ -840,6 +859,19 @@ assemble_data() {
             || warn "五笔词库生成失败 (五笔方案不可用)"
     else
         warn "缺 .cache/rime-wubi/, 五笔词库不可用 (先跑 gd 下载)"
+    fi
+
+    # 7. 辅助码表 (Rust 工具 gen_aux_code): 小鹤/自然码原样透传, 笔画表 YAML→`字=码` + 字集裁剪。
+    # 与五笔同理: 产物只进 build 目录、不入版本库 (rime-stroke 是 LGPL-3.0, 见 NOTICE.md)。
+    # 功能出厂关闭, 故缺表只是「辅助码用不了」, 不影响其它一切 —— 用 warn 不中断构建。
+    if [[ -f "$CACHE_DIR/aux-code/stroke.dict.yaml" ]]; then
+        info "生成辅助码表 (gen_aux_code) ..."
+        mkdir -p "$data/schemas/aux_code"
+        ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_aux_code -- \
+            --cache "$CACHE_DIR" --out "$data/schemas/aux_code" ) \
+            || warn "辅助码表生成失败 (辅助码功能不可用)"
+    else
+        warn "缺 .cache/aux-code/, 辅助码不可用 (先跑 gd 下载)"
     fi
 
     info "data/ 组装完成 ($(find "$data" -type f | wc -l | tr -d ' ') 文件)"
