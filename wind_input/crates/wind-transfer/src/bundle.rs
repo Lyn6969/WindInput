@@ -125,10 +125,17 @@ impl BundleWriter {
     }
 }
 
-/// 校验归档条目名并返回剥去前缀的相对路径：必须 `required_prefix` 前缀、非空，
-/// 且（`\`归一为`/`后）所有路径段均为普通段——components 白名单，
-/// 拦 `..`/绝对/盘符相对（`C:foo`）/UNC/`.`，段内禁 `:`（NTFS ADS 防御）。
-pub fn validate_entry_rel<'a>(name: &'a str, required_prefix: &str) -> anyhow::Result<&'a str> {
+/// 校验归档条目名并返回剥去前缀、**分隔符归一为 `/`** 的相对路径：必须
+/// `required_prefix` 前缀、非空，且（`\`归一为`/`后）所有路径段均为普通段——
+/// components 白名单，拦 `..`/绝对/盘符相对（`C:foo`）/UNC/`.`，段内禁 `:`
+/// （NTFS ADS 防御）。
+///
+/// ★ **返回归一化后的值，而不是原始切片**。校验按归一化形式做、返回值却保留反斜杠，
+/// 会让调用方拿到一个「校验时是这个意思、使用时是另一个意思」的路径：`.contains('/')`
+/// 判根在 `sub\evil.schema.toml` 上返回 false，于是子目录文件被当成根方案文件
+/// （破坏「根须含 `*.schema.toml`」契约，`schema_ids` 还会提出假 id）；类 Unix 平台上
+/// 落盘更会造出文件名里带字面 `\` 的文件。调用方的 join / 判根 / 取 id 一律用本返回值。
+pub fn validate_entry_rel(name: &str, required_prefix: &str) -> anyhow::Result<String> {
     let rel = name
         .strip_prefix(required_prefix)
         .ok_or_else(|| anyhow::anyhow!("非法条目(缺 {required_prefix} 前缀): {name}"))?;
@@ -142,7 +149,7 @@ pub fn validate_entry_rel<'a>(name: &'a str, required_prefix: &str) -> anyhow::R
     if !ok {
         anyhow::bail!("非法条目(路径穿越): {name}");
     }
-    Ok(rel)
+    Ok(normalized)
 }
 
 /// 免全解压读取并校验 manifest.toml。
@@ -225,6 +232,40 @@ mod tests {
         // 取单个条目
         let data = extract_entry(&zip_path, "userdata/user_words.wdict").unwrap();
         assert_eq!(data, b"hello-words");
+    }
+
+    /// 返回值必须是**归一化后**的路径:调用方拿它判根(`contains('/')`)、取 id、落盘。
+    /// 若原样返回带 `\` 的切片,`sub\evil.schema.toml` 会被判成根方案文件。
+    #[test]
+    fn validate_entry_rel_returns_normalized_separators() {
+        assert_eq!(
+            validate_entry_rel("sub\\x.schema.toml", "").unwrap(),
+            "sub/x.schema.toml"
+        );
+        assert_eq!(
+            validate_entry_rel("schemas/a\\b\\c.yaml", "schemas/").unwrap(),
+            "a/b/c.yaml"
+        );
+        // 归一化后不再是根条目
+        assert!(
+            validate_entry_rel("sub\\x.schema.toml", "")
+                .unwrap()
+                .contains('/'),
+            "反斜杠路径不得被判成根条目"
+        );
+        // 无分隔符的条目原样返回
+        assert_eq!(
+            validate_entry_rel("x.schema.toml", "").unwrap(),
+            "x.schema.toml"
+        );
+    }
+
+    /// 穿越守卫本身不受归一化影响:反斜杠形态的 `..` 一样拦。
+    #[test]
+    fn validate_entry_rel_still_rejects_traversal_in_backslash_form() {
+        assert!(validate_entry_rel("..\\evil.toml", "").is_err());
+        assert!(validate_entry_rel("a\\..\\..\\evil.toml", "").is_err());
+        assert!(validate_entry_rel("C:evil.toml", "").is_err());
     }
 
     #[test]

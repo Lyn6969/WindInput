@@ -216,6 +216,10 @@ pub trait WebDataRpc: WebDataHost {
             "scheme.exportPackage" => self.web_scheme_export_package(params),
             "scheme.importPackage" => self.web_scheme_import_package(params),
             "scheme.previewImport" => self.web_scheme_preview_import(params),
+            // 文本信封（kind = "schema_text"）：形状与上面两个 path 版完全一致，
+            // 设置端复用同一个确认对话框。
+            "scheme.previewImportText" => self.web_scheme_preview_import_text(params),
+            "scheme.importText" => self.web_scheme_import_text(params),
 
             // ── backup.*（整机备份，wind-transfer::backup）───────
             "backup.create" => self.web_backup_create(params),
@@ -1065,14 +1069,73 @@ pub trait WebDataRpc: WebDataHost {
         let path = str_param(params, "path")?;
         let user = Self::user_schemas_dir()?;
         let p = wind_transfer::scheme::preview_import(std::path::Path::new(path), &user)?;
+        Self::scheme_preview_json(&p)
+    }
+
+    /// `scheme.previewImportText { text }`：文本信封的只读预览。
+    /// 文本不是信封时错误以 `not_schema_text:` 开头，设置端据此回落配置片段管线。
+    fn web_scheme_preview_import_text(&self, params: &Value) -> anyhow::Result<Value> {
+        let text = str_param(params, "text")?;
+        let user = Self::user_schemas_dir()?;
+        let p = wind_transfer::envelope::preview_import_text(text, &user)?;
+        Self::scheme_preview_json(&p)
+    }
+
+    /// `scheme.importText { text, strategy? }`：文本信封落盘。响应形状与
+    /// `scheme.importPackage` 一致；同样**不**应用包内配置片段（设置端两步编排）。
+    fn web_scheme_import_text(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_transfer::merge::Strategy;
+        let text = str_param(params, "text")?;
+        let strategy = Strategy::from_param(
+            params
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+        let user = Self::user_schemas_dir()?;
+        let r = wind_transfer::envelope::import_text(text, &user, strategy)?;
+        // 覆盖已加载方案时失效缓存（新方案为安全 no-op），与 path 版同处置。
+        for id in &r.schema_ids {
+            self.engine_mgr().invalidate_schema(id);
+        }
         Ok(json!({
+            "imported": r.imported,
+            "conflicts": r.conflicts,
+            "schemaIds": r.schema_ids,
+        }))
+    }
+
+    /// 预览响应的公共形状(zip 与文本信封共用,两条路复用同一个确认对话框)。
+    fn scheme_preview_json(
+        p: &wind_transfer::scheme::SchemeImportPreview,
+    ) -> anyhow::Result<Value> {
+        let mut out = json!({
             // v2:包元信息来自可选 package.toml(缺失时各字段为空串,前端显示"未知")。
             "package": serde_json::to_value(&p.meta)?,
             "willAdd": p.will_add,
             "conflicts": p.conflicts,
             "systemRefs": p.system_refs,
             "missing": p.missing,
-        }))
+        });
+        if let Some(text) = &p.config_patch {
+            out["configPatch"] = Self::config_patch_diff(text)?;
+        }
+        Ok(out)
+    }
+
+    /// 包内配置片段的逐键 diff(`{ text, ok, entries }`),形状与 `config.previewPatch` 同源。
+    ///
+    /// 只预览、**不应用**:应用编排在设置端(导入方案文件 → `config.applyPatch`),那条路
+    /// 才有热重载与镜像回灌。在文件层复刻它们就是第二份真相源。
+    fn config_patch_diff(text: &str) -> anyhow::Result<Value> {
+        let fragment = wind_config::patch::parse_fragment(text)
+            .map_err(|e| anyhow::anyhow!("包内配置片段无法解析: {e}"))?;
+        let current = toml::Value::try_from(wind_config::Config::load(
+            wind_config::Config::data_dir().as_deref(),
+        )?)?;
+        let entries = wind_config::patch::preview(&fragment, &current);
+        let ok = entries.iter().all(|e| e.error.is_none());
+        Ok(json!({ "text": text, "ok": ok, "entries": entries }))
     }
 
     fn web_backup_create(&self, params: &Value) -> anyhow::Result<Value> {
@@ -4969,6 +5032,61 @@ moved = [{ id = 'date.lunar', position = 0 }]
                 &json!({ "path": std::env::temp_dir().join("zz_no_such_pkg.zip").to_string_lossy() }),
             )
             .is_err()
+        );
+    }
+
+    /// 文本信封 RPC 契约(只测只读与错误路径:importText 会真写用户 schemas 目录,
+    /// 落盘语义已在 wind-transfer::envelope 层覆盖——与 importPackage 同一取舍)。
+    #[test]
+    fn scheme_text_envelope_rpc_contract() {
+        let c = coord("schemetext");
+        let envelope = "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+                        [schema]\nid = \"kf\"\nversion = \"1.00.0\"\n\
+                        [[files]]\npath = \"zz_kf_probe.schema.toml\"\ncontent = \"[schema]\\nid = 'kf'\\n\"\n\
+                        [[files]]\npath = \"config_patch.toml\"\ncontent = \"ui.candidate.per_page = 9\\n\"\n";
+        let prev = c
+            .web_data_rpc("scheme.previewImportText", &json!({ "text": envelope }))
+            .unwrap();
+        // 形状与 path 版一致
+        assert_eq!(
+            prev.get("package")
+                .and_then(|p| p.get("schema"))
+                .and_then(|s| s.get("id"))
+                .and_then(|v| v.as_str()),
+            Some("kf")
+        );
+        assert!(prev.get("willAdd").and_then(|v| v.as_array()).is_some());
+        assert!(prev.get("conflicts").and_then(|v| v.as_array()).is_some());
+        // 配置片段随预览附带逐键 diff(不落盘、不应用)
+        let cp = prev.get("configPatch").expect("含 config_patch 应附 diff");
+        assert_eq!(cp["ok"], json!(true));
+        let entries = cp["entries"].as_array().expect("entries 应为数组");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["key"], json!("ui.candidate.per_page"));
+        assert_eq!(entries[0]["next"], json!(9));
+        assert!(
+            prev.get("willAdd")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().all(|v| v != "config_patch.toml"))
+                .unwrap_or(false),
+            "config_patch 不进文件清单"
+        );
+
+        // 非信封文本 → 错误带 not_schema_text: 前缀(设置端据此回落片段管线),两个方法一致。
+        for method in ["scheme.previewImportText", "scheme.importText"] {
+            let err = c
+                .web_data_rpc(method, &json!({ "text": "ui.candidate.per_page = 9\n" }))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(wind_transfer::envelope::NOT_SCHEMA_TEXT),
+                "{method} 对非信封文本须带回落前缀: {err}"
+            );
+        }
+        // 缺 text 参数 → 错误
+        assert!(
+            c.web_data_rpc("scheme.previewImportText", &json!({}))
+                .is_err()
         );
     }
 
