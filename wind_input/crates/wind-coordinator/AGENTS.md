@@ -69,7 +69,7 @@
 ## Dependencies
 
 ### Internal
-- `wind-ipc`（协议常量/键 hash）、`wind-bridge`（MessageHandler/KeyEventData/Push）、`wind-config`、`wind-store`（redb 持久化）、`wind-dict`、`wind-engine`、`wind-candidate`、`wind-transform`、`wind-theme`、`wind-ui-types`（UiCommand/UiEvent 等表现层协议）、`wind-ui`（**optional，desktop-ui feature**：UiManager/剪贴板/macOS forwarder）、`wind-cmdbar`、`wind-phrase`、`wind-keys`（keymap/VK/NavKeys）、`wind-quick-input`、`wind-reverse`、`wind-punct`
+- `wind-ipc`（协议常量/键 hash）、`wind-bridge`（MessageHandler/KeyEventData/Push）、`wind-config`、`wind-store`（redb 持久化）、`wind-dict`、`wind-engine`、`wind-candidate`、`wind-transform`、`wind-theme`、`wind-ui-types`（UiCommand/UiEvent 等表现层协议）、`wind-ui`（**optional，desktop-ui feature**：UiManager/剪贴板/macOS forwarder）、`wind-cmdbar`、`wind-phrase`、`wind-keys`（keymap/VK/NavKeys）、`wind-quick-input`、`wind-reverse`、`wind-aux-code`（辅助码表懒加载 `ensure_aux_code_table`/`ModeKind::AuxCode` 筛选态）、`wind-punct`
 
 ### External
 - `tracing`、`anyhow`、`serde`/`serde_json`、`toml`、`chrono`、`fontdb`；`windows`（仅 `cfg(windows)`）。无 tokio（2026-07 移除，全 workspace 同步线程模型）

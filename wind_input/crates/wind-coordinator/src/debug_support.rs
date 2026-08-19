@@ -64,6 +64,7 @@ impl Coordinator {
             Some(ModeKind::Url) => Some("url"),
             Some(ModeKind::Special(_)) => Some("special"),
             Some(ModeKind::Mix(_)) => Some("mix"),
+            Some(ModeKind::AuxCode) => Some("aux_code"),
             None => None,
         }
     }

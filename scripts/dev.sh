@@ -356,6 +356,28 @@ download_dicts() {
     download_file "$CLDR_BASE/annotations/zh.xml"        "$cldr/zh.xml"         "emoji 注解"
     download_file "$CLDR_BASE/annotationsDerived/zh.xml" "$cldr/zh_derived.xml" "派生注解(国旗)"
     download_file "https://unicode.org/Public/emoji/latest/emoji-test.txt" "$cldr/emoji-test.txt" "emoji 白名单"
+
+    # 辅助码表：拼音候选的字形二次筛选（默认关闭的功能，见 schema.pinyin.aux_code）。
+    # 小鹤/自然码两张已是 `字=码` 行格式，零转换；笔画表来自 rime-stroke 的 .dict.yaml，
+    # 由 gen_aux_code 剥 YAML 头 + 按字集裁剪（字表来自 zispace/hanzi-chars）。
+    # ⚠️ rime-stroke 是 LGPL-3.0，与本仓 MIT 不同 —— 同 rime-frost 处理：只下载不入库，
+    # 产物随发行版分发并适用原许可，见 NOTICE.md。
+    local aux_code="$CACHE_DIR/aux-code"
+    mkdir -p "$aux_code/charset"
+    local AUX_BASE="https://raw.githubusercontent.com/HowcanoeWang/rime-lua-aux-code/main/aux_code"
+    gray "辅助码表:"
+    download_file "$AUX_BASE/flypy_full.txt"   "$aux_code/flypy_full.txt"   "小鹤形码"
+    download_file "$AUX_BASE/ZRM-wanxiang.txt" "$aux_code/ZRM-wanxiang.txt" "自然码形码"
+    download_file "https://raw.githubusercontent.com/rime/rime-stroke/master/stroke.dict.yaml" \
+        "$aux_code/stroke.dict.yaml" "笔画(上游全表)"
+    # 笔画表裁剪用的字集（文件名须与 gen_aux_code::CHARSET_FILES 一致；URL 段已百分号编码）
+    local HANZI_BASE="https://raw.githubusercontent.com/zispace/hanzi-chars/main"
+    download_file "$HANZI_BASE/data-charset/GB%2018030-2000.txt" \
+        "$aux_code/charset/GB 18030-2000.txt" "字集: GB18030 基本集"
+    download_file "$HANZI_BASE/data-charlist/%E3%80%8A%E9%80%9A%E7%94%A8%E8%A7%84%E8%8C%83%E6%B1%89%E5%AD%97%E8%A1%A8%E3%80%8B%EF%BC%882013%E5%B9%B4%EF%BC%89.txt" \
+        "$aux_code/charset/《通用规范汉字表》（2013年）.txt" "字集: 通用规范汉字表"
+    download_file "$HANZI_BASE/data-unicode/Unicode-CJK%20%E3%80%87.txt" \
+        "$aux_code/charset/Unicode-CJK 〇.txt" "字集: 〇"
 }
 
 # 从 data/（源）+ .cache/（下载/生成）组装完整运行时数据到 $outdir/data/
@@ -439,6 +461,19 @@ assemble_data() {
             || warn "五笔词库生成失败（五笔方案不可用）"
     else
         warn "缺 .cache/rime-wubi/，五笔词库不可用（运行 gen-data 下载）"
+    fi
+
+    # 7. 辅助码表（Rust 工具 gen_aux_code）：小鹤/自然码原样透传，笔画表 YAML→`字=码` + 字集裁剪。
+    # 与五笔同理：产物只进 build 目录、不入版本库（rime-stroke 是 LGPL-3.0，见 NOTICE.md）。
+    # 功能出厂关闭，故缺表只是「辅助码用不了」，不影响其它一切 —— 用 warn 不中断构建。
+    if [ -f "$CACHE_DIR/aux-code/stroke.dict.yaml" ]; then
+        gray "生成辅助码表 (gen_aux_code) ..."
+        mkdir -p "$schemas/aux_code"
+        ( cd "$RUST_WORKSPACE" && cargo run -q -p wind-tools --bin gen_aux_code -- \
+            --cache "$CACHE_DIR" --out "$schemas/aux_code" ) \
+            || warn "辅助码表生成失败（辅助码功能不可用）"
+    else
+        warn "缺 .cache/aux-code/，辅助码不可用（运行 gen-data 下载）"
     fi
 
     gray "data/ 组装完成 ($(find "$data" -type f | wc -l) 文件)"

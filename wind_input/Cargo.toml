@@ -20,6 +20,7 @@ members = [
     "crates/wind-keys",
     "crates/wind-quick-input",
     "crates/wind-reverse",
+    "crates/wind-aux-code",
     "crates/wind-punct",
     "crates/wind-assoc",
     "crates/wind-coordinator",

@@ -560,6 +560,10 @@ pub(crate) struct State {
     /// 该候选没有对应编码，只能整体上屏：选词记录、造词、标点顶屏三条路径据此绕开它。
     /// 由 `update_mix_candidates` 每次装配时重置，故任何一次输入都会自动清掉。
     pub(crate) mix_repeat: bool,
+    /// 辅助码 overlay（筛选会话 + 显示基线 + 显示前缀三件套）。仅 active==AuxCode 时
+    /// 有效，退出/上屏/复位一律整体 `take`/`None`（同生共死，见 `AuxCodeOverlay`）。
+    /// 筛选会话状态在 `wind_aux_code::AuxCodeSession`，按键路由在 `handle_aux_code` 模块。
+    pub(crate) aux_code: Option<crate::handle_aux_code::AuxCodeOverlay>,
     pub(crate) caret_x: i32,
     pub(crate) caret_y: i32,
     pub(crate) caret_height: i32,
@@ -844,6 +848,12 @@ pub struct Coordinator {
     /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段随主码表方案
     /// 热重载（见 `sync_chaizi_assets`），拼音段启动加载后不变。
     pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
+    /// 辅助码表（懒加载，首次辅助码输入时经 `ensure_aux_code_table` 读取并 merge；路径由
+    /// 调用方经覆盖解析函数定位，本处不做 `data_dir.join`）。`None` = 尚未加载。
+    pub(crate) aux_code_table: std::sync::RwLock<Option<wind_aux_code::AuxCodeTable>>,
+    /// 「辅助码触发键被音节分隔符占用」的告警是否已发过（每方案一次，随
+    /// `invalidate_aux_code_table` 复位）。见 `handle_aux_code::warn_aux_code_key_taken`。
+    pub(crate) aux_code_key_warned: std::sync::atomic::AtomicBool,
     /// 快捷输入格式表（`system.quick.toml`，支持用户目录整份覆盖）。
     ///
     /// 启动加载后不变，故无锁：与 `system.phrases.toml` 同语义——**改完必须重启服务**，
@@ -1584,6 +1594,7 @@ impl Coordinator {
                 mix_id: 0,
                 mix_prefix: String::new(),
                 mix_repeat: false,
+                aux_code: None,
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -1618,6 +1629,8 @@ impl Coordinator {
             toolbar_positions: Mutex::new(toolbar_positions_init),
             current_toolbar_monitor: Mutex::new(None),
             reverse: std::sync::RwLock::new(reverse),
+            aux_code_table: std::sync::RwLock::new(None),
+            aux_code_key_warned: std::sync::atomic::AtomicBool::new(false),
             quick_formats,
             // 空初值：真正的装载在 new() 里经 `reload_quick_adjust` 完成（需要 store，
             // 而 store 在本结构体构造之后才可用）。headless 无 store 时保持空 = 出厂顺序。
@@ -2590,6 +2603,22 @@ impl Coordinator {
         *cur = paths;
     }
 
+    /// 辅助码表缓存失效：方案切换后置 `None`，下次进入辅助码时按新方案的
+    /// `[engine.aux_code]` 重新懒加载（`ensure_aux_code_table` 只在 `None` 时加载）。
+    ///
+    /// 缓存是**全局共享一份**、不区分方案，而各方案码表不同（拼音用笔画表、双拼用
+    /// 小鹤全码表）——切方案不清缓存会让双拼仍在用拼音那份表。与 `sync_chaizi_assets`
+    /// / `sync_comment_dicts` 同源：方案附属资源随活跃方案切换重挂载。
+    pub(crate) fn invalidate_aux_code_table(&self) {
+        *self
+            .aux_code_table
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        // 键位环境随方案而变（全拼反引号是分隔符、双拼是自由键），故告警配额一并重置。
+        self.aux_code_key_warned
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 就地改写内存配置并重建 ConfigBundle，**不触发** reload_user_config 的那一整套副作用
     /// （toast、引擎热重建、热键重注册、主题下发、向 TSF 推 IPC 配置）。
     ///
@@ -3047,6 +3076,7 @@ impl Coordinator {
             Some(ModeKind::Url) => self.exit_url_mode(state),
             Some(ModeKind::Special(_)) => self.exit_special_mode(state),
             Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
+            Some(ModeKind::AuxCode) => self.exit_aux_code(state),
             // 普通输入：取消整个组合，含已转换前缀（拼音分步上屏的那部分）一并丢弃。
             None => self.reset_pinyin_composition(state),
         }
@@ -4895,7 +4925,7 @@ impl Coordinator {
 
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
     /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
-    fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
+    pub(crate) fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
         // 切中英 / CapsLock / 系统切换三条路径全部经此。语境变了，上一句中文后面的联想
         // 已无意义。三个调用方随后都会 `notify_ui_hide`，故此处只清状态不动 UI。
         self.exit_assoc(state, crate::handle_assoc::AssocExit::ModeSwitch);
@@ -4923,6 +4953,15 @@ impl Coordinator {
                 Some(ModeKind::Mix(_)) => {
                     Some((state.mix_buffer.clone(), state.mix_prefix.clone()))
                 }
+                // 辅助码是唯一**不清空 `input_buffer`** 的独占模式（它只筛候选，拼音码
+                // 原封不动留在主缓冲里），故上面那句「独占模式下 input_buffer 必为空」
+                // 对它不成立。取主缓冲、无引导前缀——语义与普通拼音态切英文完全一致，
+                // 否则辅助码态下切英文会把待上屏的拼音原码静默丢掉。
+                Some(ModeKind::AuxCode) => Some((
+                    preedit_cursor::cased_or_buffer(&state.input_buffer, &state.input_buffer_cased)
+                        .to_string(),
+                    String::new(),
+                )),
                 _ => None,
             } {
                 // 临拼 / mix：镜像普通组合的 commit_on_switch，且对齐各自的回车上屏语义。

@@ -106,9 +106,18 @@ schema_overrides/{id}.toml ── 方案覆盖（仅码表；带开关；设置�
 
 **引擎固定**（留 `.schema.toml`）：`scheme`(full/shuangpin)、`weight_spec`、`unigram_path`（置于 `[engine.pinyin]`，属解码/语言模型，非学习）、dicts。
 
-**方案 override（仅这两项，始终生效、无行为开关）**：
+**方案 override（这三项，始终生效、无行为开关）**：
 - `shuangpin.layout`（决策 P1-a：单个双拼方案 + 可配布局）
 - 词库启停 `[[dictionaries]] enabled`
+- `[engine.aux_code]`（辅助码，2026-08-19 补）：`files` 是方案属性（全拼配笔画、双拼配
+  小鹤形码），`enabled` / `max_phrase_len` 是 tri-state，折叠全局 `[schema.pinyin.aux_code]`
+  （`AuxCodeGlobal::resolved`，与 `CodetableGlobal::resolved` 同构）。
+  > **为什么拼音破了「无方案 override」这条**：全拼与双拼在辅助码上不是偏好不同，
+  > 而是**键位预算不同**——全拼的反引号出厂已被音节分隔符占用
+  > （`separator = "auto"` + `'` 作选词键），且分隔符臂在按键分派里位于 `[key_actions]`
+  > 裁决之前，绑了也进不去；双拼则 `pinyin_separator_key` 恒早退、反引号是自由键。
+  > 「双拼开、全拼关」由此成为常态需求，全局唯一的开关表达不了。
+  > 这与 `shuangpin.layout` 破例的性质相同：**方案的编码规则决定了它，不是用户的偏好**。
 
 ### 3.3 混输（mix）
 

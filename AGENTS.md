@@ -39,6 +39,7 @@
 | `wind-transfer` | 导入导出/备份还原底座：Bundle（manifest + zip）聚合打包与 Merge 合并策略（编解码在 wind-store） | — |
 | `wind-quick-input` | 快捷输入的内置候选来源（纯逻辑）：`quick_input.calc` 算式（含幂 `^`）/ `.date` 日期年月 / `.number` 数字金额；另定义 `.repeat`（重复上屏，由协调器实现）的成员 id。开关与优先级 = `mix_modes.members` 的有无与顺序 | — |
 | `wind-reverse` | 候选反查：五笔编码/拆字/拼音读音（悬停 tooltip） | — |
+| `wind-aux-code` | 辅助码过滤：拼音后追加字形辅助码，按字形裁减候选字词（**出厂关闭**，`schema.pinyin.aux_code.enabled`） | [AGENTS.md](wind_input/crates/wind-aux-code/AGENTS.md) |
 | `wind-punct` | 标点转换纯逻辑（中英标点/全半角/数字后智能） | — |
 | `wind-transform` | 文本变换：标点、全角、自动配对、简繁 | — |
 

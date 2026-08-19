@@ -429,6 +429,8 @@ impl Coordinator {
                 }
                 Some(self.commit_and_enter_mix_mode(state, idx, key_code))
             }
+            // 辅助码刻意**不顶字**：候选列表保持原状仅筛选，进入后原地过滤。见 `enter_aux_code`。
+            BoundAction::AuxCode => self.enter_aux_code(state, key_code),
             BoundAction::Special(id) => {
                 let idx = self.special_mode_idx(id)?;
                 let schema = self.special_schema(idx)?;
@@ -589,6 +591,7 @@ impl Coordinator {
         self.engine_mgr.switch_schema(&id);
         self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
         self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
+        self.invalidate_aux_code_table(); // 辅助码表各方案不同，切方案必须重挂（见函数注释）
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.chinese_mode = true;
@@ -985,6 +988,20 @@ impl Coordinator {
                 };
                 Some((e.name, short))
             }
+            // 辅助码：显示码表名（如「笔画」）；表未加载或未命名 → 无指示（沿用主路径）。
+            ModeKind::AuxCode => {
+                let table = self
+                    .aux_code_table
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                let name = table.as_ref()?.name.clone();
+                if name.is_empty() {
+                    None
+                } else {
+                    let short = Self::short_or_first("", &name);
+                    Some((name, short))
+                }
+            }
         }
     }
 
@@ -1166,6 +1183,7 @@ impl Coordinator {
         // 见 `Coordinator::schema_toggle_origin` 的字段说明。
         self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
         self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
+        self.invalidate_aux_code_table(); // 辅助码表各方案不同，切方案必须重挂（见函数注释）
         // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，
         // 配置开启时取消 CapsLock，且若当前为英文模式一并归位中文。
         let caps_cancelled = self.cancel_caps_on_switch();

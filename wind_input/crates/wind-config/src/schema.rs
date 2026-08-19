@@ -149,6 +149,9 @@ pub struct EngineSpec {
     /// 拆字（字根分解）反查与字根字体（码表方案的悬停提示用）。
     #[serde(default)]
     pub chaizi: ChaiziSpec,
+    /// 辅助码码表（拼音/双拼候选的字形二次筛选用）。
+    #[serde(default)]
+    pub aux_code: AuxCodeSpec,
 }
 
 /// 拆字配置（[engine.chaizi]）。供悬停提示的"如何输入"反查与 PUA 字根字符渲染。
@@ -170,6 +173,47 @@ impl ChaiziSpec {
     /// 是否配置了拆字（至少有库或字体路径）。
     pub fn is_configured(&self) -> bool {
         !self.db_path.is_empty() || !self.font_path.is_empty()
+    }
+}
+
+/// 辅助码方案段（`[engine.aux_code]`）：**方案作者的码表基线 + 行为 tri-state 覆盖**。
+///
+/// 与 [`CodeTableSpec`] 同构（见 schema-config-layering.md §4）：
+/// - `files` 是方案属性（全拼配笔画、双拼配小鹤形码——换表不换方案），留在方案文件；
+/// - `enabled` / `max_phrase_len` 是用户可配行为，tri-state `Option`：
+///   `Some` 覆盖、`None` 回落全局 `[schema.pinyin.aux_code]`。
+///
+/// ⚠️ **`files` 非空不等于功能开启**。总闸是 `enabled`（出厂 `false`），
+/// 判据见 [`crate::config::AuxCodeGlobal::resolved`]——方案文件里配了推荐码表，
+/// 只是「这个方案该用哪张表」，不代表用户要用它。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuxCodeSpec {
+    /// 辅助码文件列表（`字=码` 文本，每行一条），相对 schemas 目录。
+    /// 多份按**顺序** merge 成一张表（先出现 = 高优，见 wind-aux-code 的 merge 语义）。
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// 本方案是否启用辅助码。`None` = 回落全局 `[schema.pinyin.aux_code].enabled`。
+    ///
+    /// ★ **为什么需要方案级覆盖**：全拼与双拼在这个功能上不是「偏好不同」而是
+    /// **键位预算不同**——双拼把韵母塞进字母键、符号键全空闲；全拼的音节边界要靠
+    /// 符号表达，反引号出厂即被 `pinyin_separator_key` 占用。故「双拼开、全拼关」
+    /// 是常态需求，一个全局开关表达不了。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// 词组长度上限：字数 > 此值的**词组**一律排除、不参与辅助码筛选（0 = 不限）。
+    /// `None` = 回落全局 `[schema.pinyin.aux_code].max_phrase_len`。
+    ///
+    /// 长词组（整词补全/组合词，如 `meishijian` 下的「没时间看/没时间做」）首字辅助码
+    /// 前缀匹配会让它们大量残留、污染逐字词筛选，而辅助码字形筛选的目标是短字词；
+    /// 单字恒参与匹配，不受此限。见 wind-aux-code 的 `AuxCodeFilterOptions::max_phrase_len`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_phrase_len: Option<usize>,
+}
+
+impl AuxCodeSpec {
+    /// 本方案是否配了码表（至少一个文件）。**不是**功能开关，见结构体文档。
+    pub fn has_files(&self) -> bool {
+        !self.files.is_empty()
     }
 }
 

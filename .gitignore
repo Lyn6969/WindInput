@@ -27,6 +27,11 @@ build_debug/
 # (源在 .cache/rime-wubi/, 由 scripts/dev.* 的 gen-data 下载并生成)
 data/schemas/wubi86/*.dict.yaml
 
+# 辅助码表为 gen_aux_code 生成物, 同上不入库
+# (源在 .cache/aux-code/, 由 scripts/dev.* 的 gen-data 下载并生成)
+# ⚠️ 笔画表上游 rime-stroke 是 LGPL-3.0, 按 NOTICE.md 的政策不得入库
+data/schemas/aux_code/
+
 # scripts/lm/ 的分析脚本跑一次就会留字节码缓存
 __pycache__/
 *.pyc

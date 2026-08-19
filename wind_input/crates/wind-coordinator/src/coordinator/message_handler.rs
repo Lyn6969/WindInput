@@ -800,6 +800,7 @@ impl MessageHandler for Coordinator {
             Some(ModeKind::Url) => return self.handle_url_key(&mut state, data),
             Some(ModeKind::Special(_)) => return self.handle_special_key(&mut state, data),
             Some(ModeKind::Mix(_)) => return self.handle_mix_key(&mut state, data),
+            Some(ModeKind::AuxCode) => return self.handle_aux_code_key(&mut state, data),
             None => {}
         }
 

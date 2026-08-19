@@ -341,7 +341,8 @@ function Download-Dicts {
     $pinyinData  = "$CacheDir\pinyin-data"
     $rimeWubi    = "$CacheDir\rime-wubi"
     $cldr        = "$CacheDir\cldr"
-    foreach ($d in @($rimeFrostCn, $rimeFrostEn, $opencc, $pinyinData, $rimeWubi, $cldr)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    $auxCode     = "$CacheDir\aux-code"
+    foreach ($d in @($rimeFrostCn, $rimeFrostEn, $opencc, $pinyinData, $rimeWubi, $cldr, $auxCode)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 
     $frostBase = "https://raw.githubusercontent.com/gaboolic/rime-frost/master"
     Gray "rime-frost (拼音):"
@@ -385,6 +386,32 @@ function Download-Dicts {
     Get-Dict "$cldrBase/annotations/zh.xml"        "$cldr\zh.xml"         "emoji 注解"     | Out-Null
     Get-Dict "$cldrBase/annotationsDerived/zh.xml" "$cldr\zh_derived.xml" "派生注解(国旗)" | Out-Null
     Get-Dict "https://unicode.org/Public/emoji/latest/emoji-test.txt" "$cldr\emoji-test.txt" "emoji 白名单" | Out-Null
+
+    # 辅助码表: 拼音候选的字形二次筛选 (默认关闭的功能, 见 schema.pinyin.aux_code)。
+    # 小鹤/自然码两张已是 `字=码` 行格式, 零转换; 笔画表来自 rime-stroke 的 .dict.yaml,
+    # 由 gen_aux_code 剥 YAML 头 + 按字集裁剪 (字表来自 zispace/hanzi-chars)。
+    # ⚠️ rime-stroke 是 LGPL-3.0, 与本仓 MIT 不同 —— 同 rime-frost 处理: 只下载不入库,
+    # 产物随发行版分发并适用原许可, 见 NOTICE.md。
+    $auxBase = "https://raw.githubusercontent.com/HowcanoeWang/rime-lua-aux-code/main/aux_code"
+    Gray "辅助码表:"
+    Get-Dict "$auxBase/flypy_full.txt"   "$auxCode\flypy_full.txt"   "小鹤形码"   | Out-Null
+    Get-Dict "$auxBase/ZRM-wanxiang.txt" "$auxCode\ZRM-wanxiang.txt" "自然码形码" | Out-Null
+    Get-Dict "https://raw.githubusercontent.com/rime/rime-stroke/master/stroke.dict.yaml" `
+             "$auxCode\stroke.dict.yaml" "笔画(上游全表)" | Out-Null
+    # 笔画表裁剪用的字集 (文件名须与 gen_aux_code::CHARSET_FILES 一致)
+    $charsetDir = "$auxCode\charset"
+    New-Item -ItemType Directory -Path $charsetDir -Force | Out-Null
+    $hanziBase = "https://raw.githubusercontent.com/zispace/hanzi-chars/main"
+    foreach ($cs in @(
+        @{ Path = "data-charset/GB 18030-2000.txt";                 Label = "GB18030 基本集" },
+        @{ Path = "data-charlist/《通用规范汉字表》（2013年）.txt";  Label = "通用规范汉字表" },
+        @{ Path = "data-unicode/Unicode-CJK 〇.txt";                 Label = "〇" }
+    )) {
+        $leaf = Split-Path $cs.Path -Leaf
+        # 路径含中文/空格, 需 URL 编码后再拼接
+        $encoded = ($cs.Path -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+        Get-Dict "$hanziBase/$encoded" "$charsetDir\$leaf" "字集: $($cs.Label)" | Out-Null
+    }
 
     $openccBase = "https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
     Gray "OpenCC 简繁词典:"
@@ -470,6 +497,20 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
         } finally { Pop-Location }
     } else { Warn "缺 .cache\rime-wubi\, 五笔词库不可用 (运行 gen-data 下载)" }
 
+    # 7. 辅助码表 (Rust 工具 gen_aux_code): 小鹤/自然码原样透传, 笔画表 YAML→`字=码` + 字集裁剪。
+    #    与五笔同理: 产物只进 build 目录, 不入版本库 (rime-stroke 是 LGPL-3.0, 见 NOTICE.md)。
+    #    功能出厂关闭, 故缺表只是「辅助码用不了」, 不影响其它一切 —— 用 Warn 不中断构建。
+    $auxCache = "$CacheDir\aux-code"
+    if (Test-Path "$auxCache\stroke.dict.yaml") {
+        Gray "生成辅助码表 (gen_aux_code) ..."
+        New-Item -ItemType Directory -Path "$schemas\aux_code" -Force | Out-Null
+        Push-Location $ProjectRoot
+        try {
+            cargo run -q -p wind-tools --bin gen_aux_code -- --cache $CacheDir --out "$schemas\aux_code"
+            if ($LASTEXITCODE -ne 0) { Warn "辅助码表生成失败 (辅助码功能不可用)" }
+        } finally { Pop-Location }
+    } else { Warn "缺 .cache\aux-code\, 辅助码不可用 (运行 gen-data 下载)" }
+
     $cnt = (Get-ChildItem $data -Recurse -File).Count
     Gray "data/ 组装完成 ($cnt 文件)"
     return $true
@@ -522,7 +563,11 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
         @{ Path = "schemas\wubi86\wubi86_jidian.dict.yaml";       Min = 1000000 },
         @{ Path = "schemas\wubi86\wubi86_jidian_extra.dict.yaml"; Min = 10000 },
         @{ Path = "schemas\wubi86\wubi86_jidian_emoji.dict.yaml"; Min = 1000 },
-        @{ Path = "schemas\wubi86\wubi86_jidian_extra_district.dict.yaml"; Min = 10000 }
+        @{ Path = "schemas\wubi86\wubi86_jidian_extra_district.dict.yaml"; Min = 10000 },
+        # 辅助码表同为生成物、同样不入库。功能虽出厂关闭, 缺表的后果仍是「用户在设置里
+        # 打开了却毫无反应」—— 门卫只 warn 一行日志, 用户看不到。故照样在此硬拦。
+        @{ Path = "schemas\aux_code\stroke.txt";     Min = 500000 },
+        @{ Path = "schemas\aux_code\flypy_full.txt"; Min = 50000 }
     )
     Say "`n校验发布数据完整性 → $data"
     foreach ($c in $checks) {

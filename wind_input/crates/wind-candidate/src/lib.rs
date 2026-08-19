@@ -6,8 +6,10 @@ pub mod candidate;
 pub mod common;
 pub mod filter;
 pub mod shadow;
+pub mod store;
 
 pub use candidate::*;
 pub use common::*;
 pub use filter::*;
 pub use shadow::*;
+pub use store::*;
