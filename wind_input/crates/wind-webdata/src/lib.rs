@@ -1065,14 +1065,40 @@ pub trait WebDataRpc: WebDataHost {
         let path = str_param(params, "path")?;
         let user = Self::user_schemas_dir()?;
         let p = wind_transfer::scheme::preview_import(std::path::Path::new(path), &user)?;
-        Ok(json!({
+        Self::scheme_preview_json(&p)
+    }
+
+    /// 预览响应的公共形状(zip 与文本信封共用,两条路复用同一个确认对话框)。
+    fn scheme_preview_json(
+        p: &wind_transfer::scheme::SchemeImportPreview,
+    ) -> anyhow::Result<Value> {
+        let mut out = json!({
             // v2:包元信息来自可选 package.toml(缺失时各字段为空串,前端显示"未知")。
             "package": serde_json::to_value(&p.meta)?,
             "willAdd": p.will_add,
             "conflicts": p.conflicts,
             "systemRefs": p.system_refs,
             "missing": p.missing,
-        }))
+        });
+        if let Some(text) = &p.config_patch {
+            out["configPatch"] = Self::config_patch_diff(text)?;
+        }
+        Ok(out)
+    }
+
+    /// 包内配置片段的逐键 diff(`{ text, ok, entries }`),形状与 `config.previewPatch` 同源。
+    ///
+    /// 只预览、**不应用**:应用编排在设置端(导入方案文件 → `config.applyPatch`),那条路
+    /// 才有热重载与镜像回灌。在文件层复刻它们就是第二份真相源。
+    fn config_patch_diff(text: &str) -> anyhow::Result<Value> {
+        let fragment = wind_config::patch::parse_fragment(text)
+            .map_err(|e| anyhow::anyhow!("包内配置片段无法解析: {e}"))?;
+        let current = toml::Value::try_from(wind_config::Config::load(
+            wind_config::Config::data_dir().as_deref(),
+        )?)?;
+        let entries = wind_config::patch::preview(&fragment, &current);
+        let ok = entries.iter().all(|e| e.error.is_none());
+        Ok(json!({ "text": text, "ok": ok, "entries": entries }))
     }
 
     fn web_backup_create(&self, params: &Value) -> anyhow::Result<Value> {

@@ -20,6 +20,11 @@ pub const PACKAGE_META_NAME: &str = "package.toml";
 /// 当前实现支持的分发包格式版本(写进导出的 package.toml,导入按此门禁)。
 pub const PACKAGE_FORMAT_VERSION: u32 = 2;
 
+/// 包内配置片段条目名(根条目)。**按名识别、不落盘**:它不是方案资源,写进 schemas
+/// 目录只会多一个死文件。文本随 [`SchemeImportPreview::config_patch`] 上浮,应用编排
+/// 在设置端(导入方案文件 → `config.applyPatch`),文件层不复刻片段管线的热重载与镜像回灌。
+pub const CONFIG_PATCH_NAME: &str = "config_patch.toml";
+
 /// 缺 format_version 字段的包一律视为 legacy v1(该字段出现之前的产物)。
 fn legacy_format_version() -> u32 {
     1
@@ -412,6 +417,18 @@ pub fn export_package(
 /// 路径的共用点。门禁先于布局校验——更高版本的包布局可能已变,先报"版本过高"
 /// 比报"不是有效的方案包"对得上真实原因。
 fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(scan_package(package)?.0)
+}
+
+/// 枚举包内条目,返回(落盘载荷条目, 是否含根 `config_patch.toml`)。
+///
+/// config_patch 按名识别后**从载荷里摘出去**:它既不进 will_add/conflicts,也不参与
+/// 「根下有没有 *.schema.toml」的判定(纯配置包由设置端的侦测规则 3 分派,不走这里),
+/// 更不会被 `import_package` 写进 schemas 目录。
+///
+/// 它还要求 `format_version ≥ 2`:legacy 语义下旧客户端会把它当死文件落盘,生成端
+/// 必须显式声明版本——硬拒绝比「装了但配置没生效」更早暴露问题。
+fn scan_package(package: &Path) -> anyhow::Result<(Vec<String>, bool)> {
     let meta = read_package_meta(package)?;
     if meta.package.format_version > PACKAGE_FORMAT_VERSION {
         anyhow::bail!(
@@ -424,6 +441,7 @@ fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
     let archive = zip::ZipArchive::new(file)?;
     let mut rels = Vec::new();
     let mut has_root_schema = false;
+    let mut has_config_patch = false;
     for name in archive.file_names() {
         if name == PACKAGE_META_NAME || name.ends_with('/') {
             continue;
@@ -432,16 +450,26 @@ fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
             anyhow::bail!("该文件是整机备份包或旧格式归档,不是方案包");
         }
         let rel = crate::bundle::validate_entry_rel(name, "")?;
+        if rel == CONFIG_PATCH_NAME {
+            has_config_patch = true;
+            continue;
+        }
         if !rel.contains('/') && rel.ends_with(".schema.toml") {
             has_root_schema = true;
         }
         rels.push(rel.to_string());
     }
+    if has_config_patch && meta.package.format_version < 2 {
+        anyhow::bail!(
+            "包内含 {CONFIG_PATCH_NAME} 却声明 format_version={},配置片段需 format_version = 2,请按新格式重新打包",
+            meta.package.format_version
+        );
+    }
     if !has_root_schema {
         anyhow::bail!("不是有效的方案包(根目录缺少 *.schema.toml)");
     }
     rels.sort();
-    Ok(rels)
+    Ok((rels, has_config_patch))
 }
 
 /// 读取包内可选元信息。宽容只给过去,不给未来:
@@ -486,14 +514,37 @@ pub struct SchemeImportPreview {
     pub conflicts: Vec<String>,
     pub system_refs: Vec<String>,
     pub missing: Vec<String>,
+    /// 包内 `config_patch.toml` 原文(不落盘)。上层据此生成逐键 diff 并在
+    /// 导入成功后另调 `config.applyPatch`——见 [`CONFIG_PATCH_NAME`]。
+    pub config_patch: Option<String>,
 }
 
 pub fn preview_import(package: &Path, user_dir: &Path) -> anyhow::Result<SchemeImportPreview> {
-    let rels = list_payload_entries(package)?;
+    let (rels, has_config_patch) = scan_package(package)?;
     let meta = read_package_meta(package)?;
+    let config_patch = if has_config_patch {
+        let bytes = crate::bundle::extract_entry(package, CONFIG_PATCH_NAME)?;
+        Some(
+            String::from_utf8(bytes)
+                .map_err(|_| anyhow::anyhow!("{CONFIG_PATCH_NAME} 不是 UTF-8 文本"))?,
+        )
+    } else {
+        None
+    };
+    Ok(build_preview(meta, &rels, user_dir, config_patch))
+}
+
+/// 由条目清单对目标目录算出 will_add/conflicts,组装预览。zip 与文本信封共用,
+/// 保证两条导入路径的预览语义逐字段一致。
+pub(crate) fn build_preview(
+    meta: PackageMeta,
+    rels: &[String],
+    user_dir: &Path,
+    config_patch: Option<String>,
+) -> SchemeImportPreview {
     let mut will_add = Vec::new();
     let mut conflicts = Vec::new();
-    for rel in &rels {
+    for rel in rels {
         if user_dir.join(rel).exists() {
             conflicts.push(rel.clone());
         } else {
@@ -502,13 +553,14 @@ pub fn preview_import(package: &Path, user_dir: &Path) -> anyhow::Result<SchemeI
     }
     let system_refs = meta.refs.system.clone();
     let missing = meta.refs.missing.clone();
-    Ok(SchemeImportPreview {
+    SchemeImportPreview {
         meta,
         will_add,
         conflicts,
         system_refs,
         missing,
-    })
+        config_patch,
+    }
 }
 
 /// 导入结果。
@@ -533,9 +585,27 @@ pub fn import_package(
         staged.push((rel.clone(), bytes));
     }
     // 写入阶段:tmp+rename,Merge 跳过已存在。
+    let (imported, conflicts) = write_staged(&staged, user_dir, strategy)?;
+    Ok(SchemeImportResult {
+        imported,
+        conflicts,
+        schema_ids: schema_ids_of(&rels),
+    })
+}
+
+/// 把已读入内存的载荷落进用户 schemas 目录:逐文件 tmp+rename,Merge 跳过已存在
+/// (计 conflicts),Replace 覆盖。返回 (imported, conflicts)。
+///
+/// zip 导入与文本信封导入共用——第二份写盘逻辑就是第二份真相源,原子性/冲突语义
+/// 会各自漂移。
+pub(crate) fn write_staged(
+    staged: &[(String, Vec<u8>)],
+    user_dir: &Path,
+    strategy: crate::merge::Strategy,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mut imported = Vec::new();
     let mut conflicts = Vec::new();
-    for (rel, bytes) in &staged {
+    for (rel, bytes) in staged {
         let target = user_dir.join(rel);
         if target.exists() && strategy == crate::merge::Strategy::Merge {
             conflicts.push(rel.clone());
@@ -553,11 +623,7 @@ pub fn import_package(
         std::fs::rename(&tmp, &target)?;
         imported.push(rel.clone());
     }
-    Ok(SchemeImportResult {
-        imported,
-        conflicts,
-        schema_ids: schema_ids_of(&rels),
-    })
+    Ok((imported, conflicts))
 }
 
 /// 删除结果。rel 均为 schemas 根相对路径。
@@ -1309,6 +1375,107 @@ layout = "old"
         assert_eq!(prev.meta.package.format_version, 1, "无声明回落 legacy");
         let r = import_package(&pkg2, &dest, crate::merge::Strategy::Merge).unwrap();
         assert_eq!(r.schema_ids, vec!["g"]);
+    }
+
+    // ── config_patch.toml(配置包)──
+
+    /// v2 包里的 config_patch.toml:不进 will_add/conflicts、不落盘,原文随预览返回。
+    #[test]
+    fn config_patch_is_returned_not_written() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("cfg.zip");
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    b"[package]\nformat_version = 2\n".as_slice(),
+                ),
+                ("cfg.schema.toml", b"[schema]\nid=\"cfg\"\n".as_slice()),
+                (
+                    CONFIG_PATCH_NAME,
+                    "[ui.candidate]\nper_page = 9\n".as_bytes(),
+                ),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let prev = preview_import(&pkg, &dest).unwrap();
+        assert_eq!(
+            prev.will_add,
+            vec!["cfg.schema.toml"],
+            "config_patch 不进文件清单,实际: {:?}",
+            prev.will_add
+        );
+        assert!(prev.conflicts.is_empty());
+        assert_eq!(
+            prev.config_patch.as_deref(),
+            Some("[ui.candidate]\nper_page = 9\n"),
+            "片段原文须随预览返回"
+        );
+
+        let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.imported, vec!["cfg.schema.toml"]);
+        assert!(
+            !dest.join(CONFIG_PATCH_NAME).exists(),
+            "config_patch 不是方案资源,不得落进 schemas 目录"
+        );
+    }
+
+    /// 不含 config_patch 的普通包:字段为 None(不是空串),消费端据此区分「没有片段」。
+    #[test]
+    fn plain_package_has_no_config_patch() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("plain.zip");
+        write_zip(
+            &pkg,
+            &[("p.schema.toml", b"[schema]\nid=\"p\"\n".as_slice())],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(preview_import(&pkg, &dest).unwrap().config_patch.is_none());
+    }
+
+    /// legacy(v1 / 无 package.toml)包里出现 config_patch → 硬拒绝并提示重新打包。
+    /// v1 语义下旧客户端会把它当死文件落盘,生成端必须显式声明版本。
+    #[test]
+    fn config_patch_in_legacy_package_is_rejected() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // 无 package.toml
+        let pkg = t.path().join("v1-nometa.zip");
+        write_zip(
+            &pkg,
+            &[
+                ("v1.schema.toml", b"[schema]\nid=\"v1\"\n".as_slice()),
+                (CONFIG_PATCH_NAME, b"ui.candidate.per_page = 9\n".as_slice()),
+            ],
+        );
+        let err = preview_import(&pkg, &dest).unwrap_err().to_string();
+        assert!(err.contains("重新打包"), "须提示按新格式重新打包: {err}");
+        assert!(import_package(&pkg, &dest, crate::merge::Strategy::Merge).is_err());
+        assert!(
+            !dest.join("v1.schema.toml").exists(),
+            "拒绝的包不得落盘任何文件"
+        );
+
+        // package.toml 在场但声明 format_version = 1
+        let pkg2 = t.path().join("v1-meta.zip");
+        write_zip(
+            &pkg2,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    b"[package]\nformat_version = 1\n".as_slice(),
+                ),
+                ("v1b.schema.toml", b"[schema]\nid=\"v1b\"\n".as_slice()),
+                (CONFIG_PATCH_NAME, b"ui.candidate.per_page = 9\n".as_slice()),
+            ],
+        );
+        assert!(preview_import(&pkg2, &dest).is_err());
     }
 
     #[test]
