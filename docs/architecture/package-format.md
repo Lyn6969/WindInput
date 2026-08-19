@@ -135,6 +135,9 @@ content = '''…词库原文…'''
 1. zip 且含 `manifest.toml` / `manifest.json` → 备份包 → 转备份还原流程（或提示去备份页）。
 2. zip 且根含 `*.schema.toml` → 分发包（方案包/配置包）→ `scheme.previewImport` 流程；若同时含 `config_patch.toml`，预览必须附带 §2.3 的逐键 diff。
 3. zip 且仅含 `config_patch.toml`（无方案文件）→ 纯配置包 → 片段流程。
+   **实现状态（2026-08-19）**：core 侧暂未承接此形——`scheme.previewImport` 对无根方案的包报
+   「不是有效的方案包」，官方生成端也不产出纯配置 zip；纯配置分发请用片段文本或文本信封（§3.4）。
+   本条规则保留为格式家族的完备性定义，待有真实需求再接。
 4. 非 zip 的合法 TOML 文本，且 `package.kind = "schema_text"` → 文本信封（§3.4）→ `scheme.previewImportText` 流程。
 5. 其余合法 TOML 文本（文件或剪贴板）→ 配置片段流程。
 6. 均不匹配 → 明确报错，不猜。
