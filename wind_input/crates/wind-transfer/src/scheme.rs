@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 /// 包内元信息文件名(可选条目)。
 pub const PACKAGE_META_NAME: &str = "package.toml";
 
+/// 当前实现支持的分发包格式版本(写进导出的 package.toml,导入按此门禁)。
+pub const PACKAGE_FORMAT_VERSION: u32 = 2;
+
+/// 缺 format_version 字段的包一律视为 legacy v1(该字段出现之前的产物)。
+fn legacy_format_version() -> u32 {
+    1
+}
+
 /// 方案包元信息(package.toml)。全部字段可缺省——导入端拿不到就显示"未知"。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackageMeta {
@@ -29,14 +37,28 @@ pub struct PackageMeta {
 }
 
 /// 导出环境信息。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageInfo {
+    /// 包格式版本。缺省 = 1(legacy),导出恒写 PACKAGE_FORMAT_VERSION。
+    #[serde(default = "legacy_format_version")]
+    pub format_version: u32,
     #[serde(default)]
     pub app_version: String,
     #[serde(default)]
     pub platform: String,
     #[serde(default)]
     pub created_at: String,
+}
+
+impl Default for PackageInfo {
+    fn default() -> Self {
+        Self {
+            format_version: legacy_format_version(),
+            app_version: String::new(),
+            platform: String::new(),
+            created_at: String::new(),
+        }
+    }
 }
 
 /// 根方案标识(与 zip 内 .schema.toml 冗余,便于免解压显示)。
@@ -281,6 +303,7 @@ pub fn export_package(
     let plan = collect_package_files(id, user_dir, system_dir, true)?;
     let meta = PackageMeta {
         package: PackageInfo {
+            format_version: PACKAGE_FORMAT_VERSION,
             app_version: app_version.to_string(),
             platform: platform.to_string(),
             created_at: created_at.to_string(),
@@ -320,7 +343,19 @@ pub fn export_package(
 
 /// 枚举包内载荷条目(排除 package.toml、目录项),逐条过穿越守卫。
 /// 校验根下至少一个 `*.schema.toml`;对备份包/旧格式给出针对性错误。
+///
+/// 版本门禁也在这里:preview_import 与 import_package 都必经此函数,是两条导入
+/// 路径的共用点。门禁先于布局校验——更高版本的包布局可能已变,先报"版本过高"
+/// 比报"不是有效的方案包"对得上真实原因。
 fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
+    let meta = read_package_meta(package)?;
+    if meta.package.format_version > PACKAGE_FORMAT_VERSION {
+        anyhow::bail!(
+            "方案包版本过高(format_version={},当前支持 {}),请升级 WindInput",
+            meta.package.format_version,
+            PACKAGE_FORMAT_VERSION
+        );
+    }
     let file = std::fs::File::open(package)?;
     let archive = zip::ZipArchive::new(file)?;
     let mut rels = Vec::new();
@@ -345,12 +380,29 @@ fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
     Ok(rels)
 }
 
-/// 读取包内可选元信息(缺失/解析失败均回落默认值——导入不强制 package.toml)。
-pub fn read_package_meta(package: &Path) -> PackageMeta {
-    crate::bundle::extract_entry(package, PACKAGE_META_NAME)
-        .ok()
-        .and_then(|bytes| toml::from_str(&String::from_utf8_lossy(&bytes)).ok())
-        .unwrap_or_default()
+/// 读取包内可选元信息。宽容只给过去,不给未来:
+/// - `package.toml` 不存在 → 回落默认值(导入不强制元信息,兼容手工打包);
+/// - 解析失败但原文声明了 `package.format_version` → 硬报错——声明新格式却写坏,
+///   静默回落会把 format_version 当 legacy 处理,等于绕过版本门禁;
+/// - 解析失败且无该字段(或根本不是 TOML)→ 回落默认值(legacy 宽容,现状不变)。
+pub fn read_package_meta(package: &Path) -> anyhow::Result<PackageMeta> {
+    let Ok(bytes) = crate::bundle::extract_entry(package, PACKAGE_META_NAME) else {
+        return Ok(PackageMeta::default());
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    match toml::from_str(&text) {
+        Ok(meta) => Ok(meta),
+        Err(e) => {
+            let declares_format_version = toml::from_str::<toml::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("package")?.get("format_version").cloned())
+                .is_some();
+            if declares_format_version {
+                anyhow::bail!("package.toml 无法解析: {e}");
+            }
+            Ok(PackageMeta::default())
+        }
+    }
 }
 
 /// 从条目清单提取方案 id(根下 `*.schema.toml` 的文件名主干)。
@@ -374,7 +426,7 @@ pub struct SchemeImportPreview {
 
 pub fn preview_import(package: &Path, user_dir: &Path) -> anyhow::Result<SchemeImportPreview> {
     let rels = list_payload_entries(package)?;
-    let meta = read_package_meta(package);
+    let meta = read_package_meta(package)?;
     let mut will_add = Vec::new();
     let mut conflicts = Vec::new();
     for rel in &rels {
@@ -774,7 +826,8 @@ secondary_schema = "pinyin"
             b"s"
         );
         // package.toml 元信息完备
-        let meta = read_package_meta(&out);
+        let meta = read_package_meta(&out).unwrap();
+        assert_eq!(meta.package.format_version, PACKAGE_FORMAT_VERSION);
         assert_eq!(meta.package.app_version, "1.0.0");
         assert_eq!(meta.schema.id, "my");
         assert_eq!(meta.schema.version, "1.2");
@@ -862,9 +915,131 @@ secondary_schema = "pinyin"
         let prev = preview_import(&pkg, &dest).unwrap();
         assert_eq!(prev.will_add.len(), 2);
         assert!(prev.meta.package.created_at.is_empty(), "无元信息回落默认");
+        assert_eq!(
+            prev.meta.package.format_version, 1,
+            "无元信息视为 legacy v1"
+        );
         let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
         assert_eq!(r.schema_ids, vec!["hand"]);
         assert!(dest.join("hand.schema.toml").is_file());
+    }
+
+    /// package.toml 在场但无 format_version 字段 → legacy v1,照常导入。
+    #[test]
+    fn import_meta_without_format_version_is_legacy() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("legacy.zip");
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    b"[package]\napp_version = \"0.9.0\"\n".as_slice(),
+                ),
+                (
+                    "legacy.schema.toml",
+                    b"[schema]\nid=\"legacy\"\n".as_slice(),
+                ),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let prev = preview_import(&pkg, &dest).unwrap();
+        assert_eq!(prev.meta.package.format_version, 1, "缺字段即 legacy v1");
+        assert_eq!(prev.meta.package.app_version, "0.9.0");
+        let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.schema_ids, vec!["legacy"]);
+    }
+
+    /// 当前规格版本(=2)的包正常通过门禁。
+    #[test]
+    fn import_accepts_current_format_version() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("v2.zip");
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    b"[package]\nformat_version = 2\n".as_slice(),
+                ),
+                ("v2.schema.toml", b"[schema]\nid=\"v2\"\n".as_slice()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let prev = preview_import(&pkg, &dest).unwrap();
+        assert_eq!(prev.meta.package.format_version, 2);
+        let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.schema_ids, vec!["v2"]);
+    }
+
+    /// 更高 format_version → preview 与 import 都硬拒绝,并提示升级应用。
+    /// 宽容只给过去,不给未来。
+    #[test]
+    fn import_rejects_future_format_version() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("v3.zip");
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    b"[package]\nformat_version = 3\n".as_slice(),
+                ),
+                ("v3.schema.toml", b"[schema]\nid=\"v3\"\n".as_slice()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = preview_import(&pkg, &dest).unwrap_err().to_string();
+        assert!(err.contains("升级"), "拒绝信息须提示升级应用: {err}");
+        let err2 = import_package(&pkg, &dest, crate::merge::Strategy::Merge)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err2.contains("升级"), "import 同样拒绝: {err2}");
+        assert!(
+            !dest.join("v3.schema.toml").exists(),
+            "拒绝的包不得落盘任何文件"
+        );
+    }
+
+    /// package.toml 声明了 format_version 却解析损坏(类型错)→ 硬报错,不得静默
+    /// 回落 legacy 绕过门禁。
+    #[test]
+    fn import_rejects_corrupt_meta_declaring_format_version() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("corrupt.zip");
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    b"[package]\nformat_version = \"not-a-number\"\n".as_slice(),
+                ),
+                ("c.schema.toml", b"[schema]\nid=\"c\"\n".as_slice()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = preview_import(&pkg, &dest).unwrap_err().to_string();
+        assert!(err.contains("无法解析"), "损坏元信息须报解析错误: {err}");
+        assert!(import_package(&pkg, &dest, crate::merge::Strategy::Merge).is_err());
+
+        // 对照:同样解析失败但未声明 format_version → 维持 legacy 宽容,照常导入。
+        let pkg2 = t.path().join("garbage-meta.zip");
+        write_zip(
+            &pkg2,
+            &[
+                (PACKAGE_META_NAME, b"not toml at all {{{".as_slice()),
+                ("g.schema.toml", b"[schema]\nid=\"g\"\n".as_slice()),
+            ],
+        );
+        let prev = preview_import(&pkg2, &dest).unwrap();
+        assert_eq!(prev.meta.package.format_version, 1, "无声明回落 legacy");
+        let r = import_package(&pkg2, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.schema_ids, vec!["g"]);
     }
 
     #[test]
