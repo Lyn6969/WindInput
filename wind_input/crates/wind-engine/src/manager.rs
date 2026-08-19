@@ -195,6 +195,20 @@ pub struct OverlayEntry {
     pub spec: wind_config::OverlaySpec,
 }
 
+/// 活跃方案的辅助码生效设置（全局基线折叠方案覆盖后的结果）。
+///
+/// 由 [`EngineManager::aux_code_settings`] 一次读出，供协调器的进入门卫与筛选选项共用
+/// ——三个值同源同一次 `read_schema`，不存在「开关读到 A、码表读到 B」的漂移。
+#[derive(Debug, Clone, Default)]
+pub struct AuxCodeSettings {
+    /// 本方案最终是否启用辅助码（`[schema.pinyin.aux_code].enabled` 经方案 tri-state 折叠）。
+    pub enabled: bool,
+    /// 词组长度上限（0 = 不限）。
+    pub max_phrase_len: usize,
+    /// 已解析的码表文件绝对路径。**`enabled == false` 时恒空**（关闭即不解析）。
+    pub files: Vec<std::path::PathBuf>,
+}
+
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 pub struct EngineManager {
     /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
@@ -2227,6 +2241,61 @@ impl EngineManager {
             Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
         let c = schema.engine.chaizi;
         c.is_configured().then_some(c)
+    }
+
+    /// 活跃方案的辅助码生效设置：全局基线 `[schema.pinyin.aux_code]` 折叠方案段
+    /// `[engine.aux_code]`（含 `schema_overrides` 深合并后的结果）。
+    ///
+    /// **一次 `read_schema` 出全部三个值**。此前 `files` 与 `max_phrase_len` 是两个各自
+    /// `read_schema` 的函数，进入辅助码时一次按键要读盘 + 解析 TOML 四遍（base + override
+    /// 各两轮），而这发生在按键线程上。
+    ///
+    /// 与拆字不同：辅助码过滤的对象是**拼音候选**，触发时活跃方案即拼音方案本身，
+    /// 故取 `active_schema_id()`（而非 `code_source_schema()`——那是码表字形反查的归属）。
+    ///
+    /// `files` 逐条解析，`schemas/` 基准、用户目录优先——与 `read_schema` 同源
+    /// `self.data_dir`，故方案从哪读、码表也从哪解析；缺失逐条 warn，不中断其余文件。
+    pub fn aux_code_settings(&self) -> AuxCodeSettings {
+        let global = self
+            .pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aux_code
+            .clone();
+        let id = self.active_schema_id();
+        let spec = (!id.is_empty())
+            .then(|| Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref()))
+            .flatten()
+            .map(|s| s.engine.aux_code);
+        let resolved = global.resolved(spec.as_ref());
+        // 关闭时不解析路径：省掉 N 次目录探测，也避免为一个用不上的功能刷 warn。
+        let files = if resolved.enabled {
+            spec.map(|c| {
+                c.files
+                    .iter()
+                    .filter_map(|rel| {
+                        let p = wind_config::Config::resolve_schema_resource(
+                            self.data_dir.as_deref(),
+                            rel,
+                        );
+                        if p.is_none() {
+                            tracing::warn!(
+                                "辅助码文件不存在（用户/系统 schemas 目录均未找到）: {rel}"
+                            );
+                        }
+                        p
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        AuxCodeSettings {
+            enabled: resolved.enabled,
+            max_phrase_len: resolved.max_phrase_len,
+            files,
+        }
     }
 
     /// 活跃方案的词频排序设置。等价于 `freq_settings_for(active_schema_id())`。

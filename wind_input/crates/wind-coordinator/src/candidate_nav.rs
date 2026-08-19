@@ -12,7 +12,13 @@ impl Coordinator {
         let bundle = self.rt();
         let cand = &bundle.config.ui.candidate;
         // overlay 模式(临拼/快捷/短语/临英等,state.active 非空)用扩展档(配置>0 时)。
-        if active.is_some() && cand.per_page_extended > 0 {
+        //
+        // **辅助码除外**：它的候选就是主路径候选被筛过一轮，呈现形态应与主路径一致
+        // （`layout::intent_for` 的 AuxCode 臂返回 `None` 表达的正是这个意图）。
+        // 走扩展档会让候选窗在按下触发键的瞬间从 per_page 跳到 per_page_extended，
+        // 「只是筛选」的视觉承诺当场破功。出厂 `per_page_extended = 0` 时不可见，
+        // 配了扩展档的用户才会撞上——同一意图两处判据不一致，迟早漂移。
+        if active.is_some_and(|m| m != ModeKind::AuxCode) && cand.per_page_extended > 0 {
             cand.per_page_extended.max(1)
         } else {
             cand.per_page.max(1)
@@ -168,6 +174,11 @@ impl Coordinator {
         // 抹平了——用户选「常用字」要的正是一个稳定只出常用字的列表；`Gb18030` 本就不过滤，
         // 更无可放宽。
         if state.scope_relaxed || state.filter_mode != wind_candidate::FilterMode::Smart {
+            return false;
+        }
+        // 辅助码模式：放宽是智能档「常用字」的补偿，辅助码按字形筛、不适用——且放宽会重建
+        // 整池候选、绕过辅助码筛选（过滤结果丢失），跳过。
+        if matches!(state.active, Some(ModeKind::AuxCode)) {
             return false;
         }
         // ⚠️ 临拼的码在 `temp_pinyin_buffer`，主路径的在 `input_buffer`——须按当前模式取。

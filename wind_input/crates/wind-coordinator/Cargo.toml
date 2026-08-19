@@ -27,6 +27,7 @@ wind-phrase = { path = "../wind-phrase" }
 wind-keys = { path = "../wind-keys" }
 wind-quick-input = { path = "../wind-quick-input" }
 wind-reverse = { path = "../wind-reverse" }
+wind-aux-code = { path = "../wind-aux-code" }
 wind-punct = { path = "../wind-punct" }
 tracing = { workspace = true }
 anyhow = { workspace = true }

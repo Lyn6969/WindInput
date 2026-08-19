@@ -1427,6 +1427,12 @@ impl Coordinator {
         if !state.has_more || state.candidate_input != state.input_buffer {
             return;
         }
+        // 辅助码模式：候选列表是「会话快照 + 辅助码筛选」的结果，翻页放宽重建整池会绕过
+        // 辅助码筛选、把未过滤候选塞回来（过滤结果丢失）。辅助码按字形筛、结果通常已很小，
+        // 不需要放宽，直接不扩展（保持过滤结果）。
+        if matches!(state.active, Some(ModeKind::AuxCode)) {
+            return;
+        }
         let new_limit = (state.candidate_limit.saturating_mul(2)).min(5000);
         if new_limit <= state.candidate_limit {
             state.has_more = false;
@@ -1500,6 +1506,12 @@ impl Coordinator {
             Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
             // 网址模式无候选列表（不出候选窗），没有可选中的东西。
             Some(ModeKind::Url) => return None,
+            Some(ModeKind::AuxCode) => {
+                let cand = state.candidates[gi].clone();
+                let act = self.commit_selected(state, &cand, offset as i32);
+                self.finish_aux_code_after_commit(state);
+                act
+            }
             None => {
                 let cand = state.candidates[gi].clone();
                 self.commit_selected(state, &cand, offset as i32)
@@ -1670,6 +1682,8 @@ impl Coordinator {
             ModeKind::Mix(_) => {
                 preedit_cursor::BufEdit::new(&mut st.mix_buffer, &mut st.mix_cursor)
             }
+            // 辅助码缓冲纯追加（尾增尾删，无光标编辑），不走 BufEdit。
+            ModeKind::AuxCode => return None,
         })
     }
 
@@ -1710,6 +1724,13 @@ impl Coordinator {
                 &state.url_buffer,
                 state.url_cursor,
             ),
+            // 辅助码：主体 = 辅助码缓冲，前缀 = overlay 里进入时拼好的显示前缀（基线 + 分隔符，
+            // 只写一遍）。光标恒在串尾。
+            ModeKind::AuxCode => {
+                let overlay = state.aux_code.as_ref().expect("aux 模式必持 overlay");
+                let buf = overlay.session.buffer();
+                (overlay.preedit_prefix.clone(), buf, buf, buf.len())
+            }
         })
     }
 
@@ -3109,11 +3130,26 @@ impl Coordinator {
             return None;
         }
         // 主输入路：与数字键同一条提交路径（is_group 的二级选择亦由其内部处理）。
-        if state.active.is_none() {
+        //
+        // **辅助码并入本条**：它的候选就是主路径候选（只是被字形筛过一轮），选中要走
+        // `commit_selected` 才有分步转换——走下面的 overlay 分支会 `commit_candidate`
+        // 直接清空 `input_buffer`，于是「没时间」这类分步组句在鼠标点「没」时把剩余
+        // 拼音一并丢掉，而键盘选同一个候选却能继续组句。同一候选两种入口两种结果。
+        if state.active.is_none() || state.active == Some(ModeKind::AuxCode) {
             let cand = state.candidates[idx].clone();
             let chinese_mode = state.chinese_mode;
             // 鼠标页内位置 = page_local（候选首选率统计，与数字键的 num-1 同义）。
             let act = self.commit_selected(&mut state, &cand, page_local as i32);
+            // 辅助码收尾：与键盘 `aux_code_committed` 同源——部分消费（缓冲还有剩余）
+            // 留在模式内重建会话继续筛，完整消费才退出。少了这一步 `state.aux_code`
+            // 会连同候选快照残留（overlay 三件套「同生共死」的约定在此被打破）。
+            if state.active == Some(ModeKind::AuxCode) {
+                if state.input_buffer.is_empty() {
+                    self.finish_aux_code_after_commit(&mut state);
+                } else {
+                    self.rearm_aux_code_session(&mut state);
+                }
+            }
             drop(state);
             // commit_selected 已按分支自行 notify_ui_update / notify_ui_hide，此处不再重复。
             self.push_mouse_action(&act, chinese_mode);

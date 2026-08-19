@@ -403,9 +403,60 @@ pub struct PinyinGlobalConfig {
     /// 双拼相关的全局行为（`[schema.pinyin.shuangpin]`）。
     #[serde(default)]
     pub shuangpin: PinyinShuangpin,
+    /// 辅助码字形二次筛选（`[schema.pinyin.aux_code]`）。**出厂关闭**。
+    #[serde(default)]
+    pub aux_code: AuxCodeGlobal,
     /// 上下文语言模型（n-gram 语法模型）。
     #[serde(default)]
     pub grammar: PinyinGrammar,
+}
+
+/// 辅助码的**全局基线**（`[schema.pinyin.aux_code]`）：拼音候选的字形二次筛选。
+///
+/// 与方案段 `[engine.aux_code]`（[`crate::schema::AuxCodeSpec`]）的分工同码表那套
+/// （schema-config-layering.md §4）：那里放 `files`（这个方案配哪张码表，属方案属性），
+/// 本段放「这台机器怎么用辅助码」的行为基线，方案可用 tri-state `Option` 逐字段覆盖。
+///
+/// 两个字段的出厂值恰好都是类型默认值（`false` / `0`），故用 `derive(Default)`
+/// 而非手写 `impl`——**这不是巧合而是设计**：出厂值必须是「什么都不发生」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AuxCodeGlobal {
+    /// 总开关。**出厂 `false`**。
+    ///
+    /// ## ★ 为什么默认必须是关
+    ///
+    /// 同 [`PinyinGrammar::model`] 那条：默认值必须是「什么都不发生」。辅助码会
+    /// **改变一个已有按键的语义**（双拼下反引号从标点变成进入筛选模式），并把
+    /// 数十万条码表读进内存。这两件事都不该在用户没表态时发生。
+    ///
+    /// 方案文件里配了 `files` 只表示「这个方案推荐这张表」，不构成开启意图——
+    /// 判据分离在 [`Self::resolved`]。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 词组长度上限：字数 > 此值的**词组**一律排除、不参与筛选（0 = 不限）。
+    /// 单字恒参与匹配，不受此限。
+    #[serde(default)]
+    pub max_phrase_len: usize,
+}
+
+impl AuxCodeGlobal {
+    /// 折叠方案 `[engine.aux_code]` 的内联/override 到全局基线：`Some` 覆盖、`None` 回落。
+    ///
+    /// 与 [`CodetableGlobal::resolved`] 同构——方案内联与 `schema_overrides` 已在
+    /// `read_schema` 经 `merge_toml` 合并成单个 `AuxCodeSpec`，此处只做一次折叠。
+    pub fn resolved(&self, ov: Option<&crate::schema::AuxCodeSpec>) -> AuxCodeGlobal {
+        let mut out = self.clone();
+        let Some(o) = ov else {
+            return out;
+        };
+        if let Some(v) = o.enabled {
+            out.enabled = v;
+        }
+        if let Some(v) = o.max_phrase_len {
+            out.max_phrase_len = v;
+        }
+        out
+    }
 }
 
 /// 上下文语言模型（`[schema.pinyin.grammar]`）。
@@ -556,6 +607,7 @@ impl Default for PinyinGlobalConfig {
             auto_learn: AutoLearnConfig::default(),
             completion: PinyinCompletion::default(),
             shuangpin: PinyinShuangpin::default(),
+            aux_code: AuxCodeGlobal::default(),
             grammar: PinyinGrammar::default(),
         }
     }
@@ -596,6 +648,8 @@ pub enum BoundAction {
     TempPinyin,
     /// 进临时英文。
     TempEnglish,
+    /// 进辅助码模式（拼音候选字形二次筛选；仅组码中有效）。
+    AuxCode,
     /// 进指定融合模式（携带实例 id）。
     Mix(String),
     /// 进指定特殊模式（携带实例 id）。
@@ -686,6 +740,7 @@ impl BoundAction {
         match lower.as_str() {
             "temp_pinyin" => Self::TempPinyin,
             "temp_english" => Self::TempEnglish,
+            "aux_code" => Self::AuxCode,
             a if Self::DISPATCH_ACTIONS.contains(&a) => Self::Action(a.to_string()),
             _ => Self::None,
         }
@@ -4579,6 +4634,7 @@ mod tests {
         assert_eq!(BoundAction::parse("none"), BoundAction::None);
         assert_eq!(BoundAction::parse(" TEMP_PINYIN "), BoundAction::TempPinyin);
         assert_eq!(BoundAction::parse("temp_english"), BoundAction::TempEnglish);
+        assert_eq!(BoundAction::parse("AUX_CODE"), BoundAction::AuxCode);
         assert_eq!(
             BoundAction::parse("mix:quick_mix"),
             BoundAction::Mix("quick_mix".into())

@@ -457,6 +457,8 @@ impl Coordinator {
                 debug!("key_action: entering mix idx={}", idx);
                 Some(self.enter_mix_mode(state, idx, key_code))
             }
+            // 辅助码：空缓冲无候选可筛 → 门卫返回 None，触发键落普通标点流程。
+            BoundAction::AuxCode => self.enter_aux_code(state, key_code),
             BoundAction::Special(id) => {
                 let idx = self.special_mode_idx(id)?;
                 let schema = self.special_schema(idx)?;
@@ -639,6 +641,7 @@ impl Coordinator {
         state.overlay_spec = None;
         state.mix_buffer.clear();
         state.mix_cursor = 0;
+        state.aux_code = None;
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.input_buffer_cased.clear();

@@ -51,6 +51,8 @@ pub(crate) fn intent_for(
         Some(ModeKind::TempPinyin) => Some(cfg.input.temp_pinyin.candidate_layout),
         Some(ModeKind::TempEnglish) => Some(cfg.input.temp_english.candidate_layout),
         Some(ModeKind::Url) => Some(cfg.input.url.candidate_layout),
+        // 辅助码：候选布局沿用主路径（筛选不改呈现形态）。
+        Some(ModeKind::AuxCode) => None,
         None => None,
     }
     // 下标越界（热重载删掉了该实例）回落 Follow——跟随全局是安全的默认，不猜方向。

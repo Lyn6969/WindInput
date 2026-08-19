@@ -1,0 +1,11 @@
+[package]
+name = "wind-aux-code"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-candidate = { path = "../wind-candidate" }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

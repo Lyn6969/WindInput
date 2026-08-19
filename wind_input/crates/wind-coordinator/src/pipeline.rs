@@ -40,6 +40,10 @@ pub enum ModeKind {
     Special(u8),
     /// 临时 mix：引导键触发，合并多个成员方案候选。载荷为 `features.mix_modes` 下标。
     Mix(u8),
+    /// 辅助码：拼音候选的字形二次筛选。独占输入流（组码中无法同时打拼音），但候选
+    /// 列表**只保留命中者**——被滤候选直接丢弃，候选窗只显示匹配词（还原不靠残留
+    /// 标记，退出/退格都从会话快照恢复）。
+    AuxCode,
 }
 
 /// 统一夺取回退登记（对齐 Go decider 的 armRewind/canRewind/rewindHijack）。

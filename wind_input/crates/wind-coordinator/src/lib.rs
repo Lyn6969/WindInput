@@ -17,6 +17,7 @@ pub mod edit_ops;
 mod freq_learn_tests;
 pub mod handle_addword;
 pub mod handle_assoc;
+pub mod handle_aux_code;
 pub mod handle_candidate;
 pub mod handle_cmdbar;
 #[cfg(target_os = "macos")]

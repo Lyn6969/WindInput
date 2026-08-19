@@ -2328,6 +2328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wind-aux-code"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "wind-candidate",
+]
+
+[[package]]
 name = "wind-bridge"
 version = "0.1.0"
 dependencies = [
@@ -2388,6 +2396,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "wind-assoc",
+ "wind-aux-code",
  "wind-bridge",
  "wind-candidate",
  "wind-cmdbar",
