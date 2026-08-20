@@ -3208,31 +3208,46 @@ pub struct UiCandidateConfig {
     /// 候选文本最大显示字数，超出截断（0=不限）。
     #[serde(default)]
     pub max_chars: usize,
-    /// **横排**候选格内容的最小宽度，按全角字符数计（0=关闭，跟随内容）。
+    /// **横排**候选窗的最小宽度，单位 dp（逻辑像素；0=关闭，跟随内容）。
     ///
-    /// 横竖两种排布的实用值往往不同，故拆成两项独立配置（真机实测反馈）：横排各候选格
-    /// 并列于一行，格间距通常更紧凑，每格多留的宽度会成倍放大到整行；竖排每个候选独占
-    /// 一行，横向空间更宽裕，注释也常配得更长，实用值一般大于横排。见
-    /// [`Self::min_width_chars_vertical`]。
+    /// 下限量的是**整个窗口**，不是单个候选：候选照常按内容紧凑排列并左对齐，凑不满的
+    /// 宽度留在窗口右侧空着。翻页栏、内边距、序号列这些窗口内的其它部件一并计入，故
+    /// 「窗口宽度不变」是可以直接达成的——这正是本项取代旧 `min_width_chars_*` 的理由：
+    /// 旧项把下限打在每个候选格上，横排时每格都被撑宽、格间距成倍放大，量的对象错了。
     ///
-    /// 设 3 即为每个候选格至少预留 3 个汉字宽，不足也占着——单字候选与三字词占位相同，
-    /// 横排行宽不再随每次按键伸缩。与 [`Self::max_chars`] 成对：一个封下限、一个封上限，
-    /// 两个都配上宽度就完全钉死了。
+    /// 横竖两种排布各配一项（见 [`Self::min_window_width_vertical`]）：可用横向空间差一个
+    /// 数量级（竖排每行独占，横排全部候选共享一行），合理值不是同一个答案。
     ///
-    /// **衡量的是整格内容**（序号 + 候选文字 + 注释，不含格内边距），不是只有文字段：
-    /// 注释模板往往比候选文字本身更长且长度多变（拆字、编码、注音），只锁文字段的话
-    /// 注释会在右边继续伸缩，宽度照样抖。格内容超出下限后照常跟随内容，下限不封顶。
-    ///
-    /// **单位是字符不是像素**，因为像素值无法跨主题成立：主题各自的字号不同，一个按
-    /// 18px 配好的最小宽度换到 14px 的主题上就过宽了。字符数则随字号与 DPI 自动缩放。
+    /// **单位是 dp 不是字符**：本项量的是窗口而非文字，窗口宽度里还有序号列、各级内边距、
+    /// 翻页栏等与字号无关的部分，用字符数换算不出来。dp 随 DPI 缩放（×scale），在高分屏上
+    /// 自动等比放大。与 [`Self::max_chars`] 不冲突：后者仍封候选文字的上限。
     #[serde(default)]
-    pub min_width_chars_horizontal: usize,
-    /// **竖排**候选行内容的最小宽度，按全角字符数计（0=关闭，跟随内容）。
+    pub min_window_width_horizontal: u32,
+    /// **竖排**候选窗的最小宽度，单位 dp（0=关闭，跟随内容）。
     ///
-    /// 语义、单位、衡量对象与 [`Self::min_width_chars_horizontal`] 完全一致，仅作用
-    /// 排布不同——为什么分开配置见该字段文档。
+    /// 语义、单位、衡量对象与 [`Self::min_window_width_horizontal`] 完全一致，仅作用排布
+    /// 不同——为什么分开配置见该字段文档。
+    ///
+    /// 与主题 `behavior.vertical_max_width`（竖排宽度上限）冲突时**下限优先**：用户显式配的
+    /// 抗抖动宽度不该被主题的裁切上限压回去。
     #[serde(default)]
-    pub min_width_chars_vertical: usize,
+    pub min_window_width_vertical: u32,
+    /// **横排**候选窗的最小高度，单位 dp（0=关闭，跟随内容）。
+    ///
+    /// 与宽度同为窗口级下限，凑不满的高度留空。横排候选虽只有一行，窗口高度仍会随编码栏
+    /// 出现/消失而变，故本项对横排同样有意义。
+    ///
+    /// 窗口被翻到光标**上方**时，多出的高度补在**顶部**：窗口上方显示时底边贴光标，空白
+    /// 压在下面会把候选整体顶离光标，位置反而随内容抖动——正是本项要消除的东西。
+    #[serde(default)]
+    pub min_window_height_horizontal: u32,
+    /// **竖排**候选窗的最小高度，单位 dp（0=关闭，跟随内容）。
+    ///
+    /// 与 [`Self::min_rows`] 是两种量法，可同时配、取两者较大者：`min_rows` 只数候选行，
+    /// 翻页栏、编码栏的出现/消失它管不着（真机反馈的正是翻页栏这一处）；本项量的是窗口
+    /// 总高，把这些一并罩住。只想稳住候选区、让翻页栏照常伸缩时仍该用 `min_rows`。
+    #[serde(default)]
+    pub min_window_height_vertical: u32,
     /// **竖排**候选窗的最小行数（0=关闭，跟随候选数量）。
     ///
     /// 不足此数时补足等高的透明占位行，使窗口高度在候选数变化时保持不变。上限自动
@@ -3241,6 +3256,9 @@ pub struct UiCandidateConfig {
     ///
     /// 横排不适用（候选并列于一行，高度本就恒定）；候选为空的提示态（临拼/临英/网址
     /// 刚进入）也不补足，那时窗口本就只有一行提示，撑成满高更突兀。
+    ///
+    /// 只稳住**候选区**：翻页栏、编码栏的出现/消失不在其量程内，窗口总高仍会跟着跳。
+    /// 要连这些一并罩住用 [`Self::min_window_height_vertical`]（两项可同时配，取较大者）。
     #[serde(default)]
     pub min_rows: usize,
     /// **竖排**候选的注释段（候选右侧灰字）模板。语法见 `wind_coordinator::comment`。
@@ -3387,9 +3405,11 @@ impl Default for UiCandidateConfig {
             pager_bar_display: String::new(),
             page_number_display: String::new(),
             max_chars: 16,
-            // 三项下限均出厂关闭：任何非零默认都会让存量用户升级后候选窗突然变宽/变高。
-            min_width_chars_horizontal: 0,
-            min_width_chars_vertical: 0,
+            // 五项下限均出厂关闭：任何非零默认都会让存量用户升级后候选窗突然变宽/变高。
+            min_window_width_horizontal: 0,
+            min_window_width_vertical: 0,
+            min_window_height_horizontal: 0,
+            min_window_height_vertical: 0,
             min_rows: 0,
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),

@@ -105,16 +105,21 @@ pub enum UiCommand {
     SetCandidateFontSize(f32),
     /// 候选字体族（空=默认）。来自 ui.font.family。
     SetCandidateFontFamily(String),
-    /// 候选窗尺寸下限（抗抖动）。来自 ui.candidate.min_width_chars_horizontal /
-    /// min_width_chars_vertical / min_rows。
+    /// 候选窗尺寸下限（抗抖动）。来自 ui.candidate.min_window_width_horizontal /
+    /// min_window_width_vertical / min_window_height_horizontal /
+    /// min_window_height_vertical / min_rows。
     ///
-    /// 三值合成一条命令而非各发各的：每条命令都要在两个平台的 manager 各接一条分发臂、
+    /// 五值合成一条命令而非各发各的：每条命令都要在两个平台的 manager 各接一条分发臂、
     /// 在启动与热重载两处各发一次，合并后这四个接线点只需记住一次。
     SetCandidateMinSize {
-        /// 横排候选格最小宽度，按全角字符数（0=不限）。
-        width_chars_horizontal: u32,
-        /// 竖排候选行最小宽度，按全角字符数（0=不限）。
-        width_chars_vertical: u32,
+        /// 横排时窗口最小宽度，单位 dp（0=不限）。
+        width_horizontal: u32,
+        /// 竖排时窗口最小宽度，单位 dp（0=不限）。
+        width_vertical: u32,
+        /// 横排时窗口最小高度，单位 dp（0=不限）。
+        height_horizontal: u32,
+        /// 竖排时窗口最小高度，单位 dp（0=不限）。
+        height_vertical: u32,
         /// 竖排最小行数，不足补透明占位行（0=不补）。
         rows: u32,
     },

@@ -350,12 +350,18 @@ impl Forwarder {
             UiCommand::SetCandidateFontSize(s) => self.win.set_font_size_override(s),
             UiCommand::SetCandidateFontFamily(f) => self.win.set_font_family(&f),
             UiCommand::SetCandidateMinSize {
-                width_chars_horizontal,
-                width_chars_vertical,
+                width_horizontal,
+                width_vertical,
+                height_horizontal,
+                height_vertical,
                 rows,
-            } => self
-                .win
-                .set_min_size(width_chars_horizontal, width_chars_vertical, rows),
+            } => self.win.set_min_size(
+                width_horizontal,
+                width_vertical,
+                height_horizontal,
+                height_vertical,
+                rows,
+            ),
             UiCommand::SetTooltipDelay(d) => self.win.set_tooltip_delay(d),
             UiCommand::SetCandidateFlipWhenAbove(v) => self.win.set_flip_when_above(v),
             UiCommand::SetCandidateSwapWhenAbove(v) => self.win.set_swap_preedit_when_above(v),

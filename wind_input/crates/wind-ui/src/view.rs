@@ -277,17 +277,33 @@ pub struct View {
     pub padding: Edges,
     pub gap: f32,
     pub cross_align: Align,
+    /// 主轴对齐：内容总长小于容器主轴长度时，富余空间落在哪一端（默认 `Start`＝末端留空）。
+    ///
+    /// 只有存在富余时才有意义，而容器的主轴长度本就由内容决定——富余只可能来自
+    /// `fixed_h`/`min_h`（Column）或 `fixed_w`/`min_w`（Row）。候选窗根容器上翻显示时
+    /// 用 `End`：窗口最小高度撑出的空白必须落在**顶部**，否则贴光标的底边被空白顶开。
+    ///
+    /// 与 `grow` 互斥：有 `grow` 子节点时富余已被它们吸收，本项自然失效。
+    pub main_align: Align,
     pub fixed_w: Option<f32>,
     pub fixed_h: Option<f32>,
     /// 宽度下限（设备像素）：测得宽度不足时抬到此值，超出则按内容。
     ///
-    /// 与 `fixed_w` 的区别是「不得窄于」而非「就是这么宽」——候选文本节点用它预留
-    /// 最小字符宽度（`ui.candidate.min_width_chars_horizontal` / `_vertical`），宽度从
-    /// 叶子逐层冒到窗口，序号列宽/内边距由布局引擎自行累加，无需调用方换算。
+    /// 与 `fixed_w` 的区别是「不得窄于」而非「就是这么宽」——候选窗的根容器用它施加
+    /// 窗口最小宽度（`ui.candidate.min_window_width_horizontal` / `_vertical`，dp×scale）。
     ///
-    /// 只有宽度没有高度：候选窗的高度下限靠补足透明占位行实现（见 `candidate_window`），
-    /// 那样补出的空间参与 `fill_cross` 与命中收集，与钳高不等价。
+    /// ★ 撑出的富余空间**在 `arrange` 阶段**才分配：`fill_cross` 子节点会跟着撑到新的
+    /// 内容宽（竖排候选高亮因此自动铺满窗口），非 `fill_cross` 的子节点按 `cross_align`
+    /// 落位（默认 `Start`＝左对齐，右侧留空）。故调用方给根容器加下限即可，无需逐层接线。
     pub min_w: Option<f32>,
+    /// 高度下限（设备像素）：测得高度不足时抬到此值，超出则按内容。与 `min_w` 对称。
+    ///
+    /// 候选窗根容器用它施加窗口最小高度（`ui.candidate.min_window_height_*`，dp×scale）。
+    ///
+    /// ★ 富余高度**默认落在主轴末端**（Column 的底部）：子节点从 `cy0` 依次排下，排完
+    /// 即止。要把富余顶到另一端，在首个子节点位置插一个 `grow` 节点（`View::spacer()`）
+    /// 吸收——候选窗上翻时正是这么做的，否则贴光标的底边会被空白顶开。
+    pub min_h: Option<f32>,
     pub bg: Option<[u8; 4]>,
     pub corner_radius: f32,
     /// 边框 (颜色, 宽度)
@@ -342,9 +358,11 @@ impl Default for View {
             padding: Edges::default(),
             gap: 0.0,
             cross_align: Align::Start,
+            main_align: Align::Start,
             fixed_w: None,
             fixed_h: None,
             min_w: None,
+            min_h: None,
             bg: None,
             caret_at: None,
             caret_w: 1.0,
@@ -427,6 +445,11 @@ impl View {
         self.cross_align = a;
         self
     }
+    /// 设置主轴对齐（富余空间落在哪一端）。见 [`View::main_align`]。
+    pub fn main(mut self, a: Align) -> Self {
+        self.main_align = a;
+        self
+    }
     pub fn bg(mut self, c: [u8; 4]) -> Self {
         self.bg = Some(c);
         self
@@ -507,6 +530,11 @@ impl View {
         self.min_w = (w > 0.0).then_some(w);
         self
     }
+    /// 设置高度下限（设备像素）。<=0 视为不限制。
+    pub fn min_h(mut self, h: f32) -> Self {
+        self.min_h = (h > 0.0).then_some(h);
+        self
+    }
     pub fn fixed_w(mut self, w: f32) -> Self {
         self.fixed_w = Some(w);
         self
@@ -578,9 +606,12 @@ impl View {
         if let Some(fh) = self.fixed_h {
             h = fh;
         }
-        // 下限在 fixed_w 之后施加：二者同时给时 min 仍然是下限（fixed 更窄会被抬起来）。
+        // 下限在 fixed_* 之后施加：二者同时给时 min 仍然是下限（fixed 更窄会被抬起来）。
         if let Some(minw) = self.min_w {
             w = w.max(minw);
+        }
+        if let Some(minh) = self.min_h {
+            h = h.max(minh);
         }
         self.mw = w;
         self.mh = h;
@@ -609,18 +640,41 @@ impl View {
         };
         let growers = self.children.iter().filter(|c| c.grow).count();
 
+        // 主轴富余（内容总长 < 容器主轴长，仅 fixed/min 撑出容器时非零）。grow 子节点会
+        // 把它吃干净，故那时对齐偏移恒为 0。
+        let main_used = |v: &Self, horizontal: bool| -> f32 {
+            v.children
+                .iter()
+                .map(|c| {
+                    let (mw, mh) = c.margin_box();
+                    if horizontal { mw } else { mh }
+                })
+                .sum::<f32>()
+                + gap_total
+        };
+        let main_offset = |slack: f32, align: Align| -> f32 {
+            match align {
+                Align::Start => 0.0,
+                Align::Center => (slack * 0.5).max(0.0),
+                Align::End => slack.max(0.0),
+            }
+        };
         match self.layout {
             Layout::Row => {
+                let used = main_used(self, true);
                 // 弹性分配：主轴剩余空间均摊给 grow 子节点（撑大其 mw）。
                 if growers > 0 {
-                    let used: f32 =
-                        self.children.iter().map(|c| c.margin_box().0).sum::<f32>() + gap_total;
                     let extra = (content_w - used).max(0.0) / growers as f32;
                     for c in self.children.iter_mut().filter(|c| c.grow) {
                         c.mw += extra;
                     }
                 }
-                let mut cx = cx0;
+                let mut cx = cx0
+                    + if growers > 0 {
+                        0.0
+                    } else {
+                        main_offset(content_w - used, self.main_align)
+                    };
                 for c in &mut self.children {
                     let (cmw, cmh) = c.margin_box();
                     let cy = match self.cross_align {
@@ -633,9 +687,8 @@ impl View {
                 }
             }
             Layout::Column => {
+                let used = main_used(self, false);
                 if growers > 0 {
-                    let used: f32 =
-                        self.children.iter().map(|c| c.margin_box().1).sum::<f32>() + gap_total;
                     let extra = (content_h - used).max(0.0) / growers as f32;
                     for c in self.children.iter_mut().filter(|c| c.grow) {
                         c.mh += extra;
@@ -645,7 +698,12 @@ impl View {
                 for c in self.children.iter_mut().filter(|c| c.fill_cross) {
                     c.mw = (content_w - c.margin.w()).max(c.mw);
                 }
-                let mut cy = cy0;
+                let mut cy = cy0
+                    + if growers > 0 {
+                        0.0
+                    } else {
+                        main_offset(content_h - used, self.main_align)
+                    };
                 for c in &mut self.children {
                     let (cmw, cmh) = c.margin_box();
                     let cx = match self.cross_align {

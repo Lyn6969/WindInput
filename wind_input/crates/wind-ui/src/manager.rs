@@ -917,13 +917,17 @@ impl UiManager {
                         candidate_window.set_font_family(&family);
                     }
                     UiCommand::SetCandidateMinSize {
-                        width_chars_horizontal,
-                        width_chars_vertical,
+                        width_horizontal,
+                        width_vertical,
+                        height_horizontal,
+                        height_vertical,
                         rows,
                     } => {
                         candidate_window.set_min_size(
-                            width_chars_horizontal,
-                            width_chars_vertical,
+                            width_horizontal,
+                            width_vertical,
+                            height_horizontal,
+                            height_vertical,
                             rows,
                         );
                     }
