@@ -41,7 +41,7 @@ pub struct PackageMeta {
     pub refs: PackageRefs,
 }
 
-/// 导出环境信息。
+/// 导出环境信息 + 说明元信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageInfo {
     /// 包格式版本。缺省 = 1(legacy),导出恒写 PACKAGE_FORMAT_VERSION。
@@ -53,6 +53,17 @@ pub struct PackageInfo {
     pub platform: String,
     #[serde(default)]
     pub created_at: String,
+    /// 包级说明标题(单行)。缺省即空串,导入端显示"未知"。
+    ///
+    /// ⚠️ 这与包内 `config_patch.toml` 自带的 `[package]` 说明**不合并**:包级说的是
+    /// "这个分发包是什么",片段级说的是"这段配置改了什么",两级不是同一件事。
+    /// 导入确认对话框各显各的(包级在顶部,片段级在"将修改的配置"区块),
+    /// 不做合并也不做优先级判定。
+    #[serde(default)]
+    pub title: String,
+    /// 包级说明正文(可多行)。与 [`Self::title`] 同源同校验,同样不与片段级说明合并。
+    #[serde(default)]
+    pub description: String,
 }
 
 impl Default for PackageInfo {
@@ -62,8 +73,23 @@ impl Default for PackageInfo {
             app_version: String::new(),
             platform: String::new(),
             created_at: String::new(),
+            title: String::new(),
+            description: String::new(),
         }
     }
+}
+
+/// 校验并归一 `[package]` 的说明元信息(title/description)。
+///
+/// **复用 wind-config 的同一份实现**——三种载体(片段 / 分发包 `package.toml` /
+/// 文本信封)同名同义,各写一份净化迟早分叉。失败是与 `format_version` 门禁同层的
+/// 硬错误:说明会直接渲染进 UI,写坏了该在分发前暴露,不静默截断也不静默丢弃。
+pub(crate) fn sanitize_package_info(info: &mut PackageInfo) -> anyhow::Result<()> {
+    info.title =
+        wind_config::patch::sanitize_title(&info.title).map_err(|e| anyhow::anyhow!("{e}"))?;
+    info.description = wind_config::patch::sanitize_description(&info.description)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 /// 根方案标识(与 zip 内 .schema.toml 冗余,便于免解压显示)。
@@ -367,6 +393,10 @@ pub fn export_package(
             app_version: app_version.to_string(),
             platform: platform.to_string(),
             created_at: created_at.to_string(),
+            // 导出留空:导出的是用户自己的方案,没有"说明"这个来源(它是分发者写给
+            // 收方看的话)。手工打包/web 工具写进来的值照样能原样读回。
+            title: String::new(),
+            description: String::new(),
         },
         schema: PackageSchemaInfo {
             id: id.to_string(),
@@ -413,9 +443,9 @@ pub fn export_package(
 /// 枚举包内载荷条目(排除 package.toml、目录项),逐条过穿越守卫。
 /// 校验根下至少一个 `*.schema.toml`;对备份包/旧格式给出针对性错误。
 ///
-/// 版本门禁也在这里:preview_import 与 import_package 都必经此函数,是两条导入
-/// 路径的共用点。门禁先于布局校验——更高版本的包布局可能已变,先报"版本过高"
-/// 比报"不是有效的方案包"对得上真实原因。
+/// 版本门禁在它调用的 [`read_package_meta`] 里,恒先于本函数的布局校验——更高版本的包
+/// 布局可能已变,先报"版本过高"比报"不是有效的方案包"对得上真实原因。同理它也先于
+/// 说明校验(说明字段的规则同样可能已变)。
 /// 包内一个载荷条目。
 ///
 /// `name` = zip 条目原名(取字节只能用它);`rel` = 归一化后的 schemas 相对路径
@@ -436,14 +466,8 @@ pub(crate) struct PayloadEntry {
 /// 它还要求 `format_version ≥ 2`:legacy 语义下旧客户端会把它当死文件落盘,生成端
 /// 必须显式声明版本——硬拒绝比「装了但配置没生效」更早暴露问题。
 fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<String>)> {
+    // 版本门禁在 read_package_meta 内(先于说明校验),此处不再重复。
     let meta = read_package_meta(package)?;
-    if meta.package.format_version > PACKAGE_FORMAT_VERSION {
-        anyhow::bail!(
-            "方案包版本过高(format_version={},当前支持 {}),请升级 WindInput",
-            meta.package.format_version,
-            PACKAGE_FORMAT_VERSION
-        );
-    }
     let file = std::fs::File::open(package)?;
     let archive = zip::ZipArchive::new(file)?;
     let mut entries: Vec<PayloadEntry> = Vec::new();
@@ -484,18 +508,36 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<Str
     Ok((entries, config_patch_name))
 }
 
-/// 读取包内可选元信息。宽容只给过去,不给未来:
+/// 读取包内可选元信息,并按序做**版本门禁 → 说明校验**两道检查。
+///
+/// 解析的宽容度(宽容只给过去,不给未来):
 /// - `package.toml` 不存在 → 回落默认值(导入不强制元信息,兼容手工打包);
 /// - 解析失败但原文声明了 `package.format_version` → 硬报错——声明新格式却写坏,
 ///   静默回落会把 format_version 当 legacy 处理,等于绕过版本门禁;
 /// - 解析失败且无该字段(或根本不是 TOML)→ 回落默认值(legacy 宽容,现状不变)。
+///
+/// **两道检查的先后不可换**:更高版本的包,说明字段的规则也可能已放宽,拿当前规则去判
+/// 它本身就是错的;且「版本过高,请升级」对得上真实原因,「title 过长」只会把人带偏。
+/// 这与 [`scan_package`] 文档里「门禁先于布局校验」是同一条原则,信封路径
+/// (`envelope::parse`)也是同一顺序——两条路必须同判据。
 pub fn read_package_meta(package: &Path) -> anyhow::Result<PackageMeta> {
     let Ok(bytes) = crate::bundle::extract_entry(package, PACKAGE_META_NAME) else {
         return Ok(PackageMeta::default());
     };
     let text = String::from_utf8_lossy(&bytes);
-    match toml::from_str(&text) {
-        Ok(meta) => Ok(meta),
+    match toml::from_str::<PackageMeta>(&text) {
+        Ok(mut meta) => {
+            if meta.package.format_version > PACKAGE_FORMAT_VERSION {
+                anyhow::bail!(
+                    "方案包版本过高(format_version={},当前支持 {}),请升级 WindInput",
+                    meta.package.format_version,
+                    PACKAGE_FORMAT_VERSION
+                );
+            }
+            // 说明校验在版本门禁之后:preview 与 import 都必经本函数,是两条路径的共用点。
+            sanitize_package_info(&mut meta.package)?;
+            Ok(meta)
+        }
         Err(e) => {
             let declares_format_version = toml::from_str::<toml::Value>(&text)
                 .ok()
@@ -1393,6 +1435,155 @@ layout = "old"
         assert_eq!(prev.meta.package.format_version, 1, "无声明回落 legacy");
         let r = import_package(&pkg2, &dest, crate::merge::Strategy::Merge).unwrap();
         assert_eq!(r.schema_ids, vec!["g"]);
+    }
+
+    // ── 说明元信息(title / description)──
+
+    /// 包级说明正常读出:title 单行、description 可多行,首尾空白 trim。
+    #[test]
+    fn import_reads_package_title_and_description() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("info.zip");
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    "[package]\nformat_version = 2\ntitle = \"快符方案\"\n\
+                     description = \"\"\"\n分号引导的符号表。\n含常用标点。\n\"\"\"\n"
+                        .as_bytes(),
+                ),
+                ("info.schema.toml", b"[schema]\nid=\"info\"\n".as_slice()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let prev = preview_import(&pkg, &dest).unwrap();
+        assert_eq!(prev.meta.package.title, "快符方案");
+        assert_eq!(
+            prev.meta.package.description,
+            "分号引导的符号表。\n含常用标点。"
+        );
+        // 缺省即空串(既有风格),不报错。
+        let prev2 = {
+            let pkg2 = t.path().join("noinfo.zip");
+            write_zip(
+                &pkg2,
+                &[
+                    (
+                        PACKAGE_META_NAME,
+                        b"[package]\nformat_version = 2\n".as_slice(),
+                    ),
+                    (
+                        "noinfo.schema.toml",
+                        b"[schema]\nid=\"noinfo\"\n".as_slice(),
+                    ),
+                ],
+            );
+            preview_import(&pkg2, &dest).unwrap()
+        };
+        assert!(prev2.meta.package.title.is_empty());
+        assert!(prev2.meta.package.description.is_empty());
+    }
+
+    /// 说明非法(换行 / 超长 / 控制字符 / 类型不对)→ 与 format_version 门禁同层的硬错误,
+    /// preview 与 import 都拒绝,且零落盘。校验复用 wind-config 的同一份实现。
+    #[test]
+    fn import_rejects_invalid_package_info() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let long_title = "字".repeat(wind_config::patch::INFO_TITLE_MAX_CHARS + 1);
+        let long_desc = "说".repeat(wind_config::patch::INFO_DESCRIPTION_MAX_CHARS + 1);
+        let cases: Vec<String> = vec![
+            "[package]\nformat_version = 2\ntitle = \"第一行\\n第二行\"\n".to_string(),
+            format!("[package]\nformat_version = 2\ntitle = \"{long_title}\"\n"),
+            format!("[package]\nformat_version = 2\ndescription = \"{long_desc}\"\n"),
+            "[package]\nformat_version = 2\ndescription = \"说明\\u0007\"\n".to_string(),
+            "[package]\nformat_version = 2\ntitle = 5\n".to_string(),
+        ];
+        for (i, meta) in cases.iter().enumerate() {
+            let pkg = t.path().join(format!("bad{i}.zip"));
+            write_zip(
+                &pkg,
+                &[
+                    (PACKAGE_META_NAME, meta.as_bytes()),
+                    ("bad.schema.toml", b"[schema]\nid=\"bad\"\n".as_slice()),
+                ],
+            );
+            assert!(preview_import(&pkg, &dest).is_err(), "应拒绝: {meta}");
+            assert!(
+                import_package(&pkg, &dest, crate::merge::Strategy::Merge).is_err(),
+                "import 同样拒绝: {meta}"
+            );
+        }
+        assert!(
+            !dest.join("bad.schema.toml").exists(),
+            "拒绝的包不得落盘任何文件"
+        );
+    }
+
+    /// 版本门禁**先于**说明校验:未来版本很可能放宽说明限额,拿当前规则去判更高版本的包
+    /// 本身就是错的,且"请升级"才对得上真实原因。同一个包若两处都不合法,必须报版本过高。
+    #[test]
+    fn future_format_version_reported_before_invalid_info() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("v3-badinfo.zip");
+        let long_title = "字".repeat(wind_config::patch::INFO_TITLE_MAX_CHARS + 1);
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    format!("[package]\nformat_version = 3\ntitle = \"{long_title}\"\n").as_bytes(),
+                ),
+                ("v3.schema.toml", b"[schema]\nid=\"v3\"\n".as_slice()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        for err in [
+            preview_import(&pkg, &dest).unwrap_err().to_string(),
+            import_package(&pkg, &dest, crate::merge::Strategy::Merge)
+                .err()
+                .expect("import 同样应拒绝")
+                .to_string(),
+        ] {
+            assert!(err.contains("升级"), "应先报版本过高: {err}");
+            assert!(
+                !err.contains("过长"),
+                "不该拿当前规则去判更高版本的说明: {err}"
+            );
+        }
+    }
+
+    /// 包级说明与包内 config_patch 自带的说明**互不干扰**:两级说的不是同一件事,
+    /// 不合并、不做优先级判定。片段原文原样上浮(含它自己的 `[package]` 段)。
+    #[test]
+    fn package_info_and_config_patch_info_stay_separate() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("twolevel.zip");
+        let patch = "[package]\ntitle = \"片段级说明\"\n[ui.candidate]\nper_page = 9\n";
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    "[package]\nformat_version = 2\ntitle = \"包级说明\"\n".as_bytes(),
+                ),
+                ("two.schema.toml", b"[schema]\nid=\"two\"\n".as_slice()),
+                (CONFIG_PATCH_NAME, patch.as_bytes()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let prev = preview_import(&pkg, &dest).unwrap();
+        assert_eq!(prev.meta.package.title, "包级说明");
+        assert_eq!(
+            prev.config_patch.as_deref(),
+            Some(patch),
+            "片段原文原样上浮,包级说明不并入也不覆盖"
+        );
     }
 
     // ── config_patch.toml(配置包)──

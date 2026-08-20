@@ -8,6 +8,10 @@
 //! [package]
 //! format_version = 2          # 必填。信封无 legacy——缺失即错
 //! kind = "schema_text"        # 必填。显式声明,侦测不做猜测
+//! title = "快符方案"           # 可选,说明元信息(语法与片段/zip 包同名同义)
+//! description = """
+//! 分号引导的符号表。
+//! """
 //!
 //! [schema]                    # 可选冗余,免解析 files 即可显示 id/版本
 //! id = "kf"
@@ -66,6 +70,14 @@ struct EnvelopePackage {
     platform: String,
     #[serde(default)]
     created_at: String,
+    /// 说明元信息,语法与限额同片段与 zip 包(同名同义,一套语法学一次)。
+    ///
+    /// ⚠️ 与信封内 `config_patch.toml` 自带的 `[package]` 说明**不合并**:这里说的是
+    /// "这个信封是什么",片段级说的是"这段配置改了什么"。导入确认对话框各显各的。
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +134,17 @@ fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
             "方案文本信封版本过高(format_version={format_version},当前支持 {PACKAGE_FORMAT_VERSION}),请升级 WindInput"
         );
     }
+    // 说明元信息与版本同层(都是 `[package]` 段的声明)：走 wind-config 的同一份净化，
+    // 不另写一份。非法即硬错误——说明会直接渲染进 UI。
+    let mut package = PackageInfo {
+        format_version,
+        app_version: env.package.app_version,
+        platform: env.package.platform,
+        created_at: env.package.created_at,
+        title: env.package.title,
+        description: env.package.description,
+    };
+    crate::scheme::sanitize_package_info(&mut package)?;
     if env.files.len() > MAX_FILES {
         anyhow::bail!(
             "方案文本信封文件过多({} 个,上限 {MAX_FILES}),请改用 .wpkg 分发",
@@ -157,12 +180,7 @@ fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
 
     Ok(ParsedEnvelope {
         meta: PackageMeta {
-            package: PackageInfo {
-                format_version,
-                app_version: env.package.app_version,
-                platform: env.package.platform,
-                created_at: env.package.created_at,
-            },
+            package,
             schema: env.schema,
             refs: Default::default(),
         },
@@ -432,6 +450,71 @@ content = "a\t啊\n"
         }
         let err = preview_import_text(&text, &d).unwrap_err().to_string();
         assert!(err.contains("文件过多"), "{err}");
+    }
+
+    /// 信封的说明元信息:与 zip 包同名同义、同一份校验。缺省即空串(不报错)。
+    #[test]
+    fn envelope_carries_package_info() {
+        let (_t, d) = dest();
+        let text = "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+                    title = \"快符方案\"\n\
+                    description = \"\"\"\n分号引导的符号表。\n含常用标点。\n\"\"\"\n\
+                    [[files]]\npath = \"kf.schema.toml\"\ncontent = \"x\"\n";
+        let prev = preview_import_text(text, &d).unwrap();
+        assert_eq!(prev.meta.package.title, "快符方案");
+        assert_eq!(
+            prev.meta.package.description,
+            "分号引导的符号表。\n含常用标点。"
+        );
+
+        // 缺省 → 空串,不报错(HAPPY 没写这两个字段)。
+        let prev2 = preview_import_text(HAPPY, &d).unwrap();
+        assert!(prev2.meta.package.title.is_empty());
+        assert!(prev2.meta.package.description.is_empty());
+    }
+
+    /// 说明非法 → 硬错误(与 format_version 门禁同层),且**不带**回落前缀:
+    /// 它确实是信封,只是说明写坏了。零落盘。
+    #[test]
+    fn invalid_envelope_info_is_rejected() {
+        let (_t, d) = dest();
+        let long_title = "字".repeat(wind_config::patch::INFO_TITLE_MAX_CHARS + 1);
+        for info in [
+            "title = \"第一行\\n第二行\"".to_string(),
+            format!("title = \"{long_title}\""),
+            "description = \"说明\\u0007\"".to_string(),
+        ] {
+            let text = format!(
+                "[package]\nformat_version = 2\nkind = \"schema_text\"\n{info}\n\
+                 [[files]]\npath = \"bad.schema.toml\"\ncontent = \"x\"\n"
+            );
+            let err = preview_import_text(&text, &d).unwrap_err().to_string();
+            assert!(err.contains("package."), "错误须点名字段: {err}");
+            assert!(
+                !err.starts_with(NOT_SCHEMA_TEXT),
+                "已声明 kind 就不回落: {err}"
+            );
+            assert!(import_text(&text, &d, crate::merge::Strategy::Merge).is_err());
+        }
+        assert!(!d.join("bad.schema.toml").exists(), "拒绝的信封不得落盘");
+    }
+
+    /// 版本门禁**先于**说明校验(与 zip 路径同判据同顺序):两处都不合法时报版本过高。
+    #[test]
+    fn future_format_version_reported_before_invalid_info() {
+        let (_t, d) = dest();
+        let long_title = "字".repeat(wind_config::patch::INFO_TITLE_MAX_CHARS + 1);
+        let text = format!(
+            "[package]\nformat_version = 3\nkind = \"schema_text\"\ntitle = \"{long_title}\"\n\
+             [[files]]\npath = \"v3.schema.toml\"\ncontent = \"x\"\n"
+        );
+        let err = preview_import_text(&text, &d).unwrap_err().to_string();
+        assert!(err.contains("升级"), "应先报版本过高: {err}");
+        assert!(
+            !err.contains("过长"),
+            "不该拿当前规则去判更高版本的说明: {err}"
+        );
+        assert!(import_text(&text, &d, crate::merge::Strategy::Merge).is_err());
     }
 
     /// config_patch.toml 作 files 条目:不落盘,原文随预览返回(语义同 zip 包)。

@@ -19,6 +19,14 @@
 //!
 //! 错误只有三类：整体 TOML 解析失败（[`parse_fragment`] 返回 `Err`，不产出任何条目）、
 //! 未知配置键、类型或取值不合法（后两类落在条目的 `error` 字段，逐键/逐条目报告）。
+//!
+//! **保留顶层段 [`RESERVED_TOP_SECTION`]（`[package]`）**：片段可自带一段说明元信息
+//! （`title` / `description`），供导入界面回答「这个包是干什么的」。它是片段里**唯一**的
+//! 保留顶层段——展平时整段跳过，既不产出配置条目、也不报「未知配置键」；config.toml
+//! 没有 `package` 域，不存在与真实配置键撞名的可能。段内未知子键一律忽略（向前兼容：
+//! 分发包与文本信封把 `kind` / `format_version` 写在同一段里，旧客户端遇到新字段不能炸）。
+//! 提取走 [`extract_info`]，净化与限额走 [`sanitize_info_text`]——三种载体
+//! （片段 / 分发包 `package.toml` / 文本信封）共用这一份实现，wind-transfer 直接复用。
 
 use std::collections::HashMap;
 
@@ -72,9 +80,149 @@ pub struct PatchEntry {
     pub error: Option<String>,
 }
 
+/// 片段里唯一的保留顶层段名（见模块文档）。展平时整段跳过，说明元信息由
+/// [`extract_info`] 单独提取。
+pub const RESERVED_TOP_SECTION: &str = "package";
+
+/// `title` 的字符数上限（不是字节数——CJK 说明按字符算才是用户看到的长度）。
+pub const INFO_TITLE_MAX_CHARS: usize = 200;
+
+/// `description` 的字符数上限。
+pub const INFO_DESCRIPTION_MAX_CHARS: usize = 4000;
+
+/// 分发内容的说明元信息，来自保留段 `[package]`。
+///
+/// 两字段都缺省（或全空白）时整个结构不产生——[`extract_info`] 返回 `None`，
+/// RPC 响应里就没有 `info` 字段。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PatchInfo {
+    /// 单行标题。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 多行说明。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// 解析片段文本。失败即整体错误，调用方不应再走展平/校验。
 pub fn parse_fragment(text: &str) -> Result<toml::Value, String> {
     toml::from_str::<toml::Value>(text).map_err(|e| format!("TOML 解析失败: {e}"))
+}
+
+/// 从片段的 `[package]` 段提取说明元信息。
+///
+/// - 段不存在、或 `title`/`description` 都缺省（含全空白）→ `Ok(None)`；
+/// - 段内**未知子键一律忽略**（向前兼容，`kind` / `format_version` 也在此被忽略）；
+/// - 段不是表、字段不是字符串、内容违反 [`sanitize_info_text`] 的限额与净化规则 → `Err`。
+///
+/// 错误是**整片段错误**（与 TOML 解析失败同级），不是逐条目的 `error`：说明本身写坏了，
+/// 逐键 diff 再漂亮也没有意义，且预览与应用必须同判据（分发前该自测，不静默截断）。
+pub fn extract_info(fragment: &toml::Value) -> Result<Option<PatchInfo>, String> {
+    let Some(section) = fragment.get(RESERVED_TOP_SECTION) else {
+        return Ok(None);
+    };
+    let Some(table) = section.as_table() else {
+        return Err(format!("[{RESERVED_TOP_SECTION}] 应为表"));
+    };
+    let title = info_field(table, "title", sanitize_title)?;
+    let description = info_field(table, "description", sanitize_description)?;
+    if title.is_none() && description.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PatchInfo { title, description }))
+}
+
+/// 取 `[package]` 段内一个说明字段：缺省 → `None`；非字符串 → 报错（不静默忽略——
+/// 忽略就成了「写了没生效」）；净化后全空白 → `None`（视同没写）。
+fn info_field(
+    table: &toml::map::Map<String, toml::Value>,
+    name: &str,
+    sanitize: fn(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(v) = table.get(name) else {
+        return Ok(None);
+    };
+    let Some(raw) = v.as_str() else {
+        return Err(format!(
+            "{RESERVED_TOP_SECTION}.{name} 应为字符串（实际为 {}）",
+            v.type_str()
+        ));
+    };
+    let text = sanitize(raw)?;
+    Ok((!text.is_empty()).then_some(text))
+}
+
+/// `title` 的净化入口：单行、上限 [`INFO_TITLE_MAX_CHARS`]。
+///
+/// 「哪个字段配哪套限额」只在这里定一次——三种载体各自调 [`sanitize_info_text`] 传参，
+/// 迟早有一处把 `allow_newline` 传反。
+pub fn sanitize_title(raw: &str) -> Result<String, String> {
+    sanitize_info_text(
+        &format!("{RESERVED_TOP_SECTION}.title"),
+        raw,
+        INFO_TITLE_MAX_CHARS,
+        false,
+    )
+}
+
+/// `description` 的净化入口：允许换行、上限 [`INFO_DESCRIPTION_MAX_CHARS`]。
+pub fn sanitize_description(raw: &str) -> Result<String, String> {
+    sanitize_info_text(
+        &format!("{RESERVED_TOP_SECTION}.description"),
+        raw,
+        INFO_DESCRIPTION_MAX_CHARS,
+        true,
+    )
+}
+
+/// 说明文本的净化与限额校验——**三种载体唯一的一份实现**（片段 / 分发包 `package.toml` /
+/// 文本信封都走这里，wind-transfer 复用，不得另写）。说明是分发者提供的任意文本、会直接
+/// 渲染进 UI，故：
+///
+/// - `\r\n` 与孤立 `\r` 归一为 `\n`（分发者的平台行尾差异不该算「非法字符」）；
+/// - 除 `\t` 与 `\n` 外的 C0 控制字符（U+0000–U+001F）与 U+007F 一律拒绝，错误点名字段；
+/// - `allow_newline = false` 时，**trim 之后**仍含 `\n` 即拒绝；
+/// - 超过 `max_chars` **字符**（不是字节）即拒绝，错误写明上限与实际长度——分发前该自测，
+///   静默截断只会让分发者以为写全了；
+/// - 返回 `trim()` 后的文本，调用方按「空串 = 没写」处理。
+///
+/// **换行判定在 trim 之后**（长度同）：TOML 多行字符串是写 title 的合法语法，尾随换行是
+/// 该语法的固有产物而非分发者的错误——
+/// ```toml
+/// title = """
+/// 快符方案
+/// """
+/// ```
+/// 的值是 `"快符方案\n"`，拒掉它只会让人困惑「我明明只写了一行」。「不含换行」要挡的是
+/// **title 得是单行**，即 `"第一行\n第二行"`，那种仍然拒绝。
+///
+/// **控制字符判定则在 trim 之前**：那类字符 trim 不掉（U+0007 之流不是空白），
+/// 而 VT/FF 这些既是控制字符又算空白的，先 trim 就会被悄悄放行——不该宽容。
+pub fn sanitize_info_text(
+    field: &str,
+    raw: &str,
+    max_chars: usize,
+    allow_newline: bool,
+) -> Result<String, String> {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    for ch in normalized.chars() {
+        if ch == '\t' || ch == '\n' {
+            continue;
+        }
+        let cp = ch as u32;
+        if cp < 0x20 || cp == 0x7f {
+            return Err(format!("{field} 含控制字符 U+{cp:04X}"));
+        }
+    }
+    let trimmed = normalized.trim();
+    if !allow_newline && trimmed.contains('\n') {
+        return Err(format!("{field} 不能包含换行"));
+    }
+    let chars = trimmed.chars().count();
+    if chars > max_chars {
+        return Err(format!("{field} 过长（{chars} 字符，上限 {max_chars}）"));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// 展平片段并逐条校验、取当前值。`current` 为当前生效配置的 TOML 值树
@@ -127,6 +275,9 @@ fn is_map_key(key: &str) -> bool {
 /// （Map 键除外：再下钻一层，逐条目产出）；否则表继续下钻；叶子而不是任何已知键 →
 /// 记「未知配置键」。未知路径上的空表（如孤零零一行 `[input.foo]`）没有叶子可报，
 /// 静默不产出条目；Map 键下的空表同理不产出条目（空表 = no-op，不是「清空」）。
+///
+/// 顶层保留段 [`RESERVED_TOP_SECTION`] 整段跳过：它是说明元信息，不是配置
+/// （由 [`extract_info`] 单独提取），报「未知配置键」就成了误报。
 fn flatten(prefix: &str, value: &toml::Value, out: &mut Vec<PatchEntry>) {
     let is_patch_key = !prefix.is_empty()
         && (config_schema::is_known_key(prefix) || ALLOWED_UNREGISTERED_KEYS.contains(&prefix));
@@ -160,6 +311,11 @@ fn flatten(prefix: &str, value: &toml::Value, out: &mut Vec<PatchEntry>) {
         toml::Value::Table(t) => {
             for (k, v) in t {
                 let child = if prefix.is_empty() {
+                    // 保留段整段跳过（含 `package = 5` 这种写坏的形态：类型问题由
+                    // extract_info 报，展平层不该把它当配置键）。
+                    if k == RESERVED_TOP_SECTION {
+                        continue;
+                    }
                     k.clone()
                 } else {
                     format!("{prefix}.{k}")
@@ -564,6 +720,205 @@ mod tests {
     fn empty_fragment_and_empty_unknown_table_yield_no_entries() {
         assert!(preview_text("").is_empty());
         assert!(preview_text("[input.foo]\n").is_empty());
+    }
+
+    // ── `[package]` 保留段与说明元信息 ──
+
+    fn info_of(text: &str) -> Option<PatchInfo> {
+        let fragment = parse_fragment(text).expect("片段应能解析");
+        extract_info(&fragment).expect("说明元信息应合法")
+    }
+
+    fn info_err(text: &str) -> String {
+        let fragment = parse_fragment(text).expect("片段应能解析");
+        extract_info(&fragment).expect_err("说明元信息应被拒绝")
+    }
+
+    /// 保留段整段跳过：不产出配置条目,也不报「未知配置键」。同片段里的真配置键照常展平。
+    #[test]
+    fn reserved_section_is_skipped_by_flatten() {
+        let entries = preview_text(
+            "[package]\ntitle = \"演示\"\ndescription = \"说明\"\n\
+             [ui.candidate]\nper_page = 9\n",
+        );
+        assert_eq!(entries.len(), 1, "只应剩真配置键,实际: {entries:?}");
+        assert_eq!(entries[0].key, "ui.candidate.per_page");
+        assert!(entries[0].error.is_none(), "{:?}", entries[0].error);
+    }
+
+    /// 只有 `[package]` 段的片段 → entries 为空,「片段为空」的既有语义不变
+    /// （applyPatch 视作成功 no-op）。
+    #[test]
+    fn fragment_with_only_reserved_section_has_no_entries() {
+        assert!(preview_text("[package]\ntitle = \"只有说明\"\n").is_empty());
+        // 段内子键叫得跟配置域一模一样也照样跳过（`package.ui` 不是 `ui`）。
+        assert!(preview_text("[package.ui]\ncandidate = 9\n").is_empty());
+    }
+
+    /// title / description 正常提取,description 可多行。
+    #[test]
+    fn extract_info_reads_title_and_multiline_description() {
+        let info = info_of(
+            "[package]\ntitle = \"快符方案\"\ndescription = \"\"\"\n第一行\n第二行\n\"\"\"\n",
+        )
+        .expect("两字段都写了应返回 Some");
+        assert_eq!(info.title.as_deref(), Some("快符方案"));
+        assert_eq!(
+            info.description.as_deref(),
+            Some("第一行\n第二行"),
+            "多行说明保留内部换行,首尾空白 trim"
+        );
+    }
+
+    /// 段不存在 / 两字段都缺省 → None（RPC 响应里就没有 info 字段）。
+    #[test]
+    fn extract_info_absent_yields_none() {
+        assert!(info_of("ui.candidate.per_page = 9\n").is_none());
+        assert!(info_of("[package]\n").is_none());
+        assert!(
+            info_of("[package]\nkind = \"schema_text\"\n").is_none(),
+            "只有未知子键 = 没写说明"
+        );
+    }
+
+    /// 段内未知子键一律忽略（向前兼容）：`kind` / `format_version` 是信封与包的字段,
+    /// 出现在同一段里不该报错,也不该影响 title/description 的提取。
+    #[test]
+    fn extract_info_ignores_unknown_subkeys() {
+        let info = info_of(
+            "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+             future_field = { nested = true }\ntitle = \"带未知子键\"\n",
+        )
+        .expect("有 title 就该返回 Some");
+        assert_eq!(info.title.as_deref(), Some("带未知子键"));
+        assert!(info.description.is_none());
+    }
+
+    /// title 必须是单行:内部含换行即拒。归一后的 `\r\n` 同样算换行——归一是为了统一判据,
+    /// 不是为了放行。
+    #[test]
+    fn title_with_inner_newline_is_rejected() {
+        for text in [
+            "[package]\ntitle = \"第一行\\n第二行\"\n",
+            "[package]\ntitle = \"第一行\\r\\n第二行\"\n",
+        ] {
+            let err = info_err(text);
+            assert!(err.contains("package.title"), "错误须点名字段: {err}");
+            assert!(err.contains("换行"), "{err}");
+        }
+    }
+
+    /// 首尾换行**放行**:TOML 多行字符串是写 title 的合法语法,尾随换行是该语法的固有产物,
+    /// 不是分发者的错误。「不含换行」挡的是「title 得是单行」,不是「字节里不许出现 \n」。
+    #[test]
+    fn title_with_surrounding_newline_is_accepted() {
+        let info = info_of("[package]\ntitle = \"\"\"\n快符方案\n\"\"\"\n")
+            .expect("TOML 多行字符串写的单行标题应放行");
+        assert_eq!(info.title.as_deref(), Some("快符方案"));
+        let info = info_of("[package]\ntitle = \"尾随换行\\r\\n\"\n").unwrap();
+        assert_eq!(info.title.as_deref(), Some("尾随换行"));
+    }
+
+    /// 限额按**字符**不是字节：200 个 CJK 字符（600 字节）的 title 合法,201 个即拒。
+    /// description 同理 4000/4001。
+    #[test]
+    fn length_limit_counts_chars_not_bytes() {
+        let ok_title = "字".repeat(INFO_TITLE_MAX_CHARS);
+        assert_eq!(ok_title.len(), INFO_TITLE_MAX_CHARS * 3, "CJK 每字 3 字节");
+        let info = info_of(&format!("[package]\ntitle = \"{ok_title}\"\n")).unwrap();
+        assert_eq!(info.title.as_deref(), Some(ok_title.as_str()));
+
+        let long_title = "字".repeat(INFO_TITLE_MAX_CHARS + 1);
+        let err = info_err(&format!("[package]\ntitle = \"{long_title}\"\n"));
+        assert!(err.contains("package.title"), "{err}");
+        assert!(
+            err.contains(&(INFO_TITLE_MAX_CHARS + 1).to_string())
+                && err.contains(&INFO_TITLE_MAX_CHARS.to_string()),
+            "错误须写明实际长度与上限: {err}"
+        );
+
+        let ok_desc = "说".repeat(INFO_DESCRIPTION_MAX_CHARS);
+        assert!(info_of(&format!("[package]\ndescription = \"{ok_desc}\"\n")).is_some());
+        let long_desc = "说".repeat(INFO_DESCRIPTION_MAX_CHARS + 1);
+        let err = info_err(&format!("[package]\ndescription = \"{long_desc}\"\n"));
+        assert!(err.contains("package.description"), "{err}");
+    }
+
+    /// C0 控制字符与 DEL 拒绝;`\t` 放行;`\r\n` 与孤立 `\r` 归一为 `\n`。
+    #[test]
+    fn control_chars_rejected_tab_allowed_crlf_normalized() {
+        for bad in ["\\u0000", "\\u0007", "\\u001B", "\\u007F"] {
+            let err = info_err(&format!("[package]\ndescription = \"说明{bad}\"\n"));
+            assert!(err.contains("package.description"), "{err}");
+            assert!(err.contains("控制字符"), "{err}");
+        }
+        let info = info_of("[package]\ntitle = \"制表\\t符\"\n").expect("\\t 应放行");
+        assert_eq!(info.title.as_deref(), Some("制表\t符"));
+
+        let info = info_of("[package]\ndescription = \"甲\\r\\n乙\\r丙\"\n").unwrap();
+        assert_eq!(
+            info.description.as_deref(),
+            Some("甲\n乙\n丙"),
+            "\\r\\n 与孤立 \\r 都归一为 \\n"
+        );
+    }
+
+    /// 类型不对 → 报错,不静默忽略（忽略就成了「写了没生效」）。段本身不是表同理。
+    #[test]
+    fn wrong_type_is_rejected() {
+        let err = info_err("[package]\ntitle = 5\n");
+        assert!(err.contains("package.title"), "{err}");
+        assert!(err.contains("字符串"), "{err}");
+        let err = info_err("[package]\ndescription = [\"a\"]\n");
+        assert!(err.contains("package.description"), "{err}");
+        let err = info_err("package = 5\n");
+        assert!(err.contains("package"), "{err}");
+        assert!(
+            preview_text("package = 5\n").is_empty(),
+            "写坏的保留段也不该冒充配置键"
+        );
+    }
+
+    /// 全空白视同没写（trim 后为空 → None）,不是「一个空标题」。
+    /// 全角空格 U+3000 同样算空白（Rust `trim()` 认它）——中文分发者最容易误打的正是它。
+    #[test]
+    fn all_whitespace_is_treated_as_absent() {
+        assert!(info_of("[package]\ntitle = \"   \"\n").is_none());
+        assert!(
+            info_of("[package]\ntitle = \"\u{3000}\u{3000}\"\n").is_none(),
+            "全角空格也是空白,视同没写"
+        );
+        assert_eq!(
+            info_of("[package]\ntitle = \"\u{3000}有标题\u{3000}\"\n")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("有标题"),
+            "全角空格同样被 trim 掉"
+        );
+        assert!(info_of("[package]\ndescription = \"\\n\\n  \"\n").is_none());
+        let info = info_of("[package]\ntitle = \"  有标题  \"\ndescription = \"  \"\n").unwrap();
+        assert_eq!(info.title.as_deref(), Some("有标题"), "首尾空白 trim");
+        assert!(info.description.is_none(), "全空白的说明视同没写");
+    }
+
+    /// [`sanitize_info_text`] 是三种载体共用的入口,直接调用时的语义与经 extract_info
+    /// 走一遍一致（wind-transfer 复用的正是这条路）。
+    #[test]
+    fn sanitize_info_text_is_reusable_directly() {
+        assert_eq!(
+            sanitize_title("  标题\r\n\r\n").unwrap(),
+            "标题",
+            "首尾换行 trim 掉即可,只有内部换行才算多行"
+        );
+        assert!(sanitize_title("甲\r\n乙").unwrap_err().contains("换行"));
+        assert_eq!(sanitize_description("甲\r\n乙").unwrap(), "甲\n乙");
+        assert_eq!(sanitize_description("   ").unwrap(), "", "空串 = 没写");
+        let err = sanitize_info_text("自定字段", "a\u{1}b", 10, true).unwrap_err();
+        assert!(
+            err.starts_with("自定字段"),
+            "错误须点名调用方给的字段名: {err}"
+        );
     }
 
     // ── ALLOWED_UNREGISTERED_KEYS 守门：名单不许腐烂 ──
