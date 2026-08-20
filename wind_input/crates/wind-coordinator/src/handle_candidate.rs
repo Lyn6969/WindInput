@@ -1089,6 +1089,39 @@ impl Coordinator {
         Some(InputOutcome::AutoCommit(c.text.clone()))
     }
 
+    /// 短语侧对**顶码上屏**的否决：整串已是精确码短语，或还能续打成更长短语 → 不许顶码。
+    ///
+    /// 与 [`Self::phrase_auto_commit`] 的两道闸同源，补的是引擎侧够不到的那一半：
+    /// `CodeTableEngine::handle_top_code` 的 `has_full_input_match` / `has_longer_code`
+    /// 都只问 `DictManager`（码表），而短语层归协调器持有。于是**码长超过方案满码长**的
+    /// 短语（5 码短语落在 4 码方案里）在码表侧「既无精确匹配也无更长后继」，被判成
+    /// 「溢出该顶字」→ 顶掉前 N 码的显示首选、余码续打，那条短语**永远打不出来**。
+    ///
+    /// ⚠️ 顶码在 [`Coordinator::accumulate_code_char`] 里**排在 `update_candidates` 之前**
+    /// 且命中即 `return`，故 `phrase_auto_commit` 补得再全也救不回来——判据必须补在先手
+    /// 这条路径上。出厂 `schema.codetable.top_code_commit = true`，真机默认走的就是这条。
+    ///
+    /// 调用点刻意放在 `handle_top_code` **返回 Some 之后**：本判据要全量扫短语码表，而
+    /// 引擎侧首道闸（开关 + 码长 ≤ 满码长）极廉价且绝大多数按键都在那里返回 None。
+    pub(crate) fn phrase_vetoes_top_code(&self, input: &str) -> bool {
+        let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
+        phrases.has_exact_code(input) || phrases.has_longer_code(input)
+    }
+
+    /// 这串码是否**恰好**是一条短语的编码（[`wind_phrase::PhraseLayer::has_exact_code`] 直通）。
+    ///
+    /// ⚠️ **短语候选的 `code` 字段恒为空串**（协调器在引擎 convert 之后追加，不填码），
+    /// 故「这条短语候选是不是当前这串码的精确命中」**无法从候选本身看出来**——必须回头问
+    /// 短语层。真机现场：5 码短语 `zzsfz` 在敲到 `zzsf` 时就以 `is_prefix=false` 的形态出现在
+    /// 候选首位（前缀命中不打标记），顶码把它当成「`zzsf` 的首选」兑现，于是打 `zzsfa`
+    /// （短语里根本没有这条码）反而上屏了 `zzsfz` 的内容。
+    pub(crate) fn phrase_has_exact_code(&self, code: &str) -> bool {
+        self.phrases
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_exact_code(code)
+    }
+
     /// 短语自动上屏的最短码长门槛。
     ///
     /// **当前跟随主码表**的 `schema.codetable.auto_commit_min_len`：短语虽是独立体系，但

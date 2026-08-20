@@ -343,6 +343,19 @@ impl PhraseLayer {
             .any(|k| k.len() > code.len() && k.starts_with(code))
     }
 
+    /// 是否存在**码恰为** `code` 的短语（不含更长后继，那是 [`Self::has_longer_code`]）。
+    ///
+    /// 供顶码上屏的「整串仍是精确匹配」判据补齐短语侧：引擎 `handle_top_code` 的
+    /// `has_full_input_match` 只问码表（`DictManager`），短语层归协调器持有、引擎够不着，
+    /// 于是码长超过满码长的短语（如 5 码短语在 4 码方案里）会被判成「溢出该顶字」，
+    /// 顶掉前 N 码首选、余码续打——那条短语永远打不出来。
+    pub fn has_exact_code(&self, code: &str) -> bool {
+        if code.is_empty() {
+            return false;
+        }
+        self.map.get(code).is_some_and(|v| !v.is_empty())
+    }
+
     /// 前缀导航：敲 `code`（长度 ≥ `min_len`）时，列出所有**码以 `code` 开头但更长**的
     /// marker 短语（`$CC`/`$SS`/`$AA`，未显式 `{prefix: false}`），每条出一个导航候选——
     /// `text` 为组名/命令显示名，`comment` 为码后缀。选中后由 coordinator 补全到完整码再展开。

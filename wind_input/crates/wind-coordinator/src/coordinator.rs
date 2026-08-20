@@ -3161,11 +3161,15 @@ impl Coordinator {
         // 候选（拼音本就排首，或智能过滤掉生僻码表字后仅剩拼音，如「wang」只有生僻字
         // 「佢」被过滤、显示全是拼音）仍被排除 → 下方放弃顶码继续组合
         // （对齐「上屏须与显示一致 + 非码表/短语类不上屏」）。
-        let pre_display_first = state
-            .candidates
-            .first()
-            .cloned()
-            .filter(|c| c.source == CandidateSource::CodeTable || c.is_phrase || c.is_command);
+        //
+        // ⚠️ 短语候选**必须再问一次短语层**：它们的 `code` 恒为空串，前缀命中与精确命中
+        // 在候选上长得一模一样（`is_prefix` 只标 marker 导航，普通字面短语的前缀命中不打
+        // 标记）。5 码短语 `zzsfz` 敲到 `zzsf` 时就已排在候选首位——不加这道判据，打
+        // `zzsfa`（短语里没有这条码）会顶出 `zzsfz` 的内容，而正确行为是落进空码。
+        let pre_display_first = state.candidates.first().cloned().filter(|c| {
+            c.source == CandidateSource::CodeTable
+                || ((c.is_phrase || c.is_command) && self.phrase_has_exact_code(&pre_buf))
+        });
         // 在光标处插入（光标在末尾时等价于旧的 push）。后续顶码/候选刷新一律按整串
         // 缓冲判定，与光标位置无关——光标只是编辑位置，不参与引擎查询。
         preedit_cursor::BufEdit::new_cased(
@@ -3177,8 +3181,30 @@ impl Coordinator {
 
         // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
         // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
-        if let Some((engine_top, remainder)) = self.engine_mgr.handle_top_code(&state.input_buffer)
-        {
+        // 短语侧否决：整串已是精确码短语 / 还能续打成更长短语 → 不是「溢出」，放弃顶码
+        // 继续组合（见 `phrase_vetoes_top_code`：引擎的两道闸只问码表，够不着短语层）。
+        let top_code = self
+            .engine_mgr
+            .handle_top_code(&state.input_buffer)
+            .filter(|_| !self.phrase_vetoes_top_code(&state.input_buffer))
+            // 切点修正：引擎把 prefix 固定切在 `max_code_length`，而**短语码长不受方案满码长
+            // 约束**（5 码短语 `zzsfz` 落在 4 码五笔里）。顶码前的缓冲若恰是一条精确码短语，
+            // 就以短语码为切点。不修则 `zzsfza` 被切成 `zzsf` + `za`，与 `pre_buf` 对不上而
+            // 落进「多级溢出」分支，又因 `zzsf` 在码表无字放弃顶码——表现为「进空码不顶码」。
+            // pre_buf 长度恰为满码长时两种切法本就重合（`zzbd` 一类），行为不变。
+            .map(|(engine_top, remainder)| {
+                if self.phrase_has_exact_code(&pre_buf) {
+                    let rem: String = state
+                        .input_buffer
+                        .chars()
+                        .skip(pre_buf.chars().count())
+                        .collect();
+                    (engine_top, rem)
+                } else {
+                    (engine_top, remainder)
+                }
+            });
+        if let Some((engine_top, remainder)) = top_code {
             let buf = state.input_buffer.clone();
             let prefix: String = buf[..buf.len().saturating_sub(remainder.len())].to_string();
             // 顶码候选决策：

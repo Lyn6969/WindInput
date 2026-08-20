@@ -5628,6 +5628,73 @@ fn phrase_auto_commit_unique_exact_no_longer() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// **码长超过方案满码长的短语不得被顶码劫走**（回归：5 码短语落在 4 码五笔方案里）。
+///
+/// 上一个测试用 `Config::default()`，其 `top_code_commit` 结构体零值是 `false`——而出厂
+/// toml 里是 `true`（`config.rs` 的 `[schema.codetable] top_code_commit = true`）。于是它
+/// 验证的自动上屏路径**在真机默认配置下压根走不到**：顶码排在 `update_candidates` 之前
+/// 且命中即 return。本测试把开关拨到出厂值，堵上那个盲区。
+///
+/// 修复前实测：`CommitThenDeferComposition { commit_text: "串口", deferred_composition: "x" }`
+/// ——`kkkk` 的码表首选被顶上屏、余码 `x` 落回缓冲，`kkkkx` 这条短语永远打不出来。
+/// 真机现场是 5 码短语 `zzsfz`：`zzsf` 在码表无字，顶上屏的正是该短语自身的前缀候选，
+/// 于是「词条上屏了，但多出一个 z」。
+#[test]
+fn top_code_yields_to_overlong_phrase() {
+    if !has_schemas() {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_phrase_overlong_topcode.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("kkkkx", "唯一测试短语", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    cfg.schema.codetable.top_code_commit = true; // 出厂即开，正是真机默认
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    // 第 5 键 'x'：短语侧有精确码 kkkkx → 否决顶码 → 落到自动上屏，且**不得留余码**。
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "唯一测试短语", "应整体上屏短语，而非顶码劫持");
+        }
+        other => panic!("超长短语应整体上屏，实际: {:?}(顶码劫持? 余码残留?)", other),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
+/// 对照组：同码长的**码表用户词**本就不受影响（引擎 `has_full_input_match` 查得到它）。
+/// 配它是为了钉死「差异来自存放位置（短语库 vs 码表词库），不是码长本身」——
+/// 真机反馈正是「`zzsfz` 不行、`abcde` 没问题」，两者恰好分居两处。
+#[test]
+fn top_code_never_hijacked_overlong_user_word() {
+    if !has_schemas() {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_userword_overlong_topcode.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store
+        .add_user_word("wubi86", "kkkkx", "用户词条", 0, 0)
+        .unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    cfg.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "用户词条", "码表用户词应整体上屏");
+        }
+        other => panic!("码表用户词应整体上屏，实际: {:?}", other),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
 /// **短语的上屏文本必须保留真换行**——`Candidate::text` 就是上屏内容，不得在装配期改写。
 ///
 /// 回归背景：短语候选装配曾调 `clamp_candidate_display` 做「一行化」（换行/制表→空格），
@@ -8705,4 +8772,127 @@ fn test_s2t_converts_commit_and_enter_mode() {
         }
         other => panic!("有候选按反引号应顶屏 + 进临时拼音，实际: {:?}", other),
     }
+}
+
+/// 真机回归其二：**顶码切点必须按短语码长走**，而非固定的方案满码长。
+///
+/// `zzsfz` 是 5 码短语，方案满码长 4。敲到 `zzsfza` 时引擎把 prefix 切在 `zzsf`，与顶码前
+/// 的缓冲 `zzsfz` 对不上 → 落进「多级溢出」分支 → `zzsf` 在 wubi86 码表无字 → 放弃顶码。
+/// 用户看到的是「进了空码状态，而不是顶码」。4 码短语正常，正因为两种切法恰好重合。
+#[test]
+fn top_code_splits_at_phrase_code_length() {
+    if !has_schemas() {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_phrase_topcode_split.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("zzsfz", "词条内容", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['z', 'z', 's', 'f', 'z'] {
+        press_letter(&coord, ch);
+    }
+    // 第 6 键 'a'：`zzsfz` 已溢出（短语侧既非精确码也无更长后继）→ 顶该短语 + 余码 a。
+    match press_letter(&coord, 'a') {
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
+            ..
+        } => {
+            assert_eq!(commit_text, "词条内容", "应顶出 5 码短语本身");
+            assert_eq!(deferred_composition, "a", "余码应是溢出的那一个字符");
+        }
+        other => panic!("超长短语溢出应顶码，实际: {:?}(切点切错→进空码?)", other),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
+/// 真机回归其三：**短语候选的 `code` 恒为空串**，前缀命中与精确命中在候选上无从分辨——
+/// 顶码必须回头问短语层，否则会把「还没打完的短语」提前兑现。
+///
+/// `zzsfz` 敲到 `zzsf` 时就以 `is_phrase=true, is_prefix=false` 排在候选首位（普通字面短语的
+/// 前缀命中**不打 `is_prefix` 标记**，那个标记只给 `$SS`/`$AA` 组导航用）。于是再敲一个 `a`
+/// ——`zzsfa` 这条码短语里根本没有——旧行为顶出了 `zzsfz` 的内容。正确行为是落进空码。
+///
+/// 构造关键：`zzsf` 在 wubi86 码表**无字**，否则码表候选会占住首位、由正常码表顶码兜底，
+/// 这条缺陷就被掩盖（`kkkk` 一类有字的前缀就测不出来）。
+#[test]
+fn top_code_rejects_prefix_only_phrase_hit() {
+    if !has_schemas() {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_phrase_topcode_prefixhit.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("zzsfz", "词条内容", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['z', 'z', 's', 'f'] {
+        press_letter(&coord, ch);
+    }
+    assert_eq!(
+        coord.debug_all_candidate_texts(),
+        vec!["词条内容".to_string()],
+        "构造前提：zzsf 处唯一候选是 zzsfz 的前缀命中"
+    );
+    // 第 5 键 'a'：`zzsf` 不是精确短语码 → 那条候选只是前缀命中，不得顶码上屏。
+    match press_letter(&coord, 'a') {
+        KeyAction::UpdateComposition { text, .. } => {
+            assert_eq!(text, "zzsfa", "码应原样留在编码栏");
+        }
+        other => panic!("不匹配的码应进空码状态，实际: {:?}(误顶前缀命中?)", other),
+    }
+    assert!(
+        coord.debug_all_candidate_texts().is_empty(),
+        "zzsfa 无任何匹配，应是空码状态，实际: {:?}",
+        coord.debug_all_candidate_texts()
+    );
+    let _ = std::fs::remove_file(&store_path);
+}
+
+/// 混输（`wubi86_pinyin`）下的超长短语顶码 —— 与纯码表同结论。
+///
+/// 补这条是因为真机方案是混输，而上面三条回归全用纯 `wubi86`：混输的 `handle_top_code`
+/// 在委托 primary 之前另有一整条拼音/英文否决链（`pinyin_only_overflow` 等），走的不是
+/// 同一段代码。**调查这个 bug 时我一度以为混输下没修好**，实际是当时的探针漏了
+/// `top_code_commit`——`Config::default()` 里它是 `false`，而出厂 toml 是 `true`。
+///
+/// ⚠️ 任何顶码测试都必须显式打开 `top_code_commit`，否则测的是一个关着的功能，
+/// 无论代码对错都「不顶码」。
+#[test]
+fn top_code_overlong_phrase_in_mixed_schema() {
+    if !has_schemas() {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_phrase_topcode_mixed.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("zzsfz", "TEST", 1800, 0).unwrap();
+    let mut cfg = config_mixed();
+    cfg.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['z', 'z', 's', 'f'] {
+        press_letter(&coord, ch);
+    }
+    // 打满 5 码：短语精确命中，停在候选态（不得被顶码劫走）。
+    match press_letter(&coord, 'z') {
+        KeyAction::UpdateComposition { text, .. } => assert_eq!(text, "zzsfz"),
+        other => panic!("混输下 5 码短语不该被顶码劫走，实际: {:?}", other),
+    }
+    // 第 6 键溢出：以短语码为切点顶码 + 余码。
+    match press_letter(&coord, 'a') {
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
+            ..
+        } => {
+            assert_eq!(commit_text, "TEST");
+            assert_eq!(deferred_composition, "a");
+        }
+        other => panic!("混输下超长短语溢出应顶码，实际: {:?}", other),
+    }
+    let _ = std::fs::remove_file(&store_path);
 }
