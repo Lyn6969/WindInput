@@ -207,25 +207,42 @@ fn apply_writes(
 ///
 /// 一并返回当前配置树：applyPatch 折算 Map 键的落盘整表要用它作合并种子，
 /// 重新加载一次会引入「预览用 A 树、落盘用 B 树」的窗口。
+///
+/// 说明元信息（保留段 `[package]`）在此一并提取：**非法即整体 Err**，与 TOML 解析失败
+/// 同级，不是逐条 error。预览与应用共走本函数，判据只有一套——预览放行、应用才拒绝
+/// （或反之）是分发者最难自查的一类不一致。
 fn patch_entries(
     params: &Value,
-) -> anyhow::Result<(Vec<wind_config::patch::PatchEntry>, toml::Value)> {
+) -> anyhow::Result<(
+    Vec<wind_config::patch::PatchEntry>,
+    toml::Value,
+    Option<wind_config::patch::PatchInfo>,
+)> {
     let text = params
         .get("text")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("invalid_params: text missing"))?;
     let fragment = wind_config::patch::parse_fragment(text)
         .map_err(|e| anyhow::anyhow!("invalid_patch: {e}"))?;
+    let info = wind_config::patch::extract_info(&fragment)
+        .map_err(|e| anyhow::anyhow!("invalid_patch: {e}"))?;
     let current = toml::Value::try_from(Config::load(Config::data_dir().as_deref())?)?;
     let entries = wind_config::patch::preview(&fragment, &current);
-    Ok((entries, current))
+    Ok((entries, current, info))
 }
 
-/// `config.previewPatch { text }` → `{ ok, entries: [{ key, mapEntry?, current?, next, error? }] }`，只读。
+/// `config.previewPatch { text }` → `{ ok, entries: [{ key, mapEntry?, current?, next, error? }], info? }`，只读。
+///
+/// `info` = 片段 `[package]` 段的说明元信息，供导入对话框在预览列表上方显示；
+/// 两字段都缺省时整个 `info` 不出现（前端不必区分「没写」与「写了空串」）。
 fn preview_patch(params: &Value) -> anyhow::Result<Value> {
-    let (entries, _) = patch_entries(params)?;
+    let (entries, _, info) = patch_entries(params)?;
     let ok = entries.iter().all(|e| e.error.is_none());
-    Ok(json!({ "ok": ok, "entries": entries }))
+    let mut out = json!({ "ok": ok, "entries": entries });
+    if let Some(info) = info {
+        out["info"] = serde_json::to_value(info)?;
+    }
+    Ok(out)
 }
 
 /// `config.applyPatch { text }`：先跑与 preview 相同的校验，任何一条有错 → 整体 Err、
@@ -236,8 +253,11 @@ fn preview_patch(params: &Value) -> anyhow::Result<Value> {
 /// Map 合并后客户端无法从 entries 自行拼出整表（它手里没有 core 的当前表），必须由此回传。
 /// `applied` 计的是**片段条目数**（Map 逐条目各计一条），与 preview 的 entries 条数对得上；
 /// 落盘键数（`written.len()`）因 Map 合并而更少，两者刻意分开报。
+///
+/// 说明元信息（`[package]`）在 [`patch_entries`] 里与预览同判据地校验，非法即整体拒绝；
+/// 响应本身**不**回带 `info`——它是给导入界面看的，落盘阶段没有消费者。
 fn apply_patch(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
-    let (entries, current) = patch_entries(params)?;
+    let (entries, current, _) = patch_entries(params)?;
     let bad: Vec<String> = entries
         .iter()
         .filter_map(|e| e.error.as_ref().map(|err| format!("{}: {}", e.key, err)))
@@ -623,6 +643,79 @@ mod tests {
             !core.config_applied.load(Ordering::SeqCst),
             "整体拒绝不得触发热重载（也证明未走落盘通路）"
         );
+    }
+
+    /// 片段自带的说明元信息随预览上浮：`info` 与 `entries` 各说各的——保留段既不产出
+    /// 配置条目，也不影响真配置键的展平。
+    #[test]
+    fn preview_patch_carries_package_info() {
+        let core = FakeCore::new();
+        let st = DispatchState::new(core.clone(), "dev").unwrap();
+        let resp = dispatch(
+            &st,
+            req(
+                "config.previewPatch",
+                json!({ "text": "[package]\ntitle = \"九列候选\"\ndescription = \"把候选窗改成每页 9 个。\"\n[ui.candidate]\nper_page = 9\n" }),
+            ),
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert_eq!(r["ok"], json!(true));
+        let entries = r["entries"].as_array().expect("entries 应为数组");
+        assert_eq!(entries.len(), 1, "保留段不产出配置条目: {entries:?}");
+        assert_eq!(entries[0]["key"], json!("ui.candidate.per_page"));
+        assert_eq!(r["info"]["title"], json!("九列候选"));
+        assert_eq!(r["info"]["description"], json!("把候选窗改成每页 9 个。"));
+        assert!(!core.config_applied.load(Ordering::SeqCst), "预览只读");
+    }
+
+    /// 无 `[package]` 段（或段内两字段都缺省）→ 响应里**没有** info 字段，
+    /// 前端不必区分「没写」与「写了空串」。
+    #[test]
+    fn preview_patch_omits_info_when_absent() {
+        for text in [
+            "[ui.candidate]\nper_page = 9\n",
+            "[package]\nkind = \"schema_text\"\n[ui.candidate]\nper_page = 9\n",
+            "[package]\ntitle = \"   \"\n[ui.candidate]\nper_page = 9\n",
+        ] {
+            let resp = dispatch(
+                &state(),
+                req("config.previewPatch", json!({ "text": text })),
+            );
+            let r = resp.result.expect("应成功");
+            assert!(
+                r.get("info").is_none(),
+                "不该出现 info 字段: {r} ({text:?})"
+            );
+        }
+    }
+
+    /// 说明非法 → preview 与 apply **都**整体拒绝（同一套判据）。
+    /// 只在其中一处拒绝，分发者就会遇到「预览好好的、装的时候炸了」。
+    #[test]
+    fn invalid_package_info_rejects_preview_and_apply() {
+        let bad = [
+            // title 不许换行
+            "[package]\ntitle = \"第一行\\n第二行\"\n[ui.candidate]\nper_page = 9\n",
+            // 类型不对
+            "[package]\ntitle = 5\n[ui.candidate]\nper_page = 9\n",
+            // C0 控制字符
+            "[package]\ndescription = \"说明\\u0007\"\n[ui.candidate]\nper_page = 9\n",
+        ];
+        for text in bad {
+            let core = FakeCore::new();
+            let st = DispatchState::new(core.clone(), "dev").unwrap();
+            for method in ["config.previewPatch", "config.applyPatch"] {
+                let resp = dispatch(&st, req(method, json!({ "text": text })));
+                assert!(resp.result.is_none(), "{method} 应整体拒绝: {text:?}");
+                let err = resp.error.expect("应有错误");
+                assert!(err.contains("package."), "错误须点名字段: {err}");
+            }
+            assert!(
+                !core.config_applied.load(Ordering::SeqCst),
+                "整体拒绝不得触发热重载（也证明未走落盘通路）"
+            );
+        }
     }
 
     #[test]
