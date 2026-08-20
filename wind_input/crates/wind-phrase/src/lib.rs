@@ -69,6 +69,17 @@ impl PhraseHit {
         self
     }
 
+    /// 附上注释（前缀命中时＝**剩余编码**）。
+    ///
+    /// 只在 [`PhraseLayer::lookup_prefix_at`] 用：精确路径（`lookup_at`）没有剩余编码，
+    /// 填了就是假提示。marker 短语（`$SS`/`$AA`/`$CC`）经 `nav`/`command_nav` 早就带上了
+    /// 同一个 `suffix`，静态短语（Literal/Template）此前漏填——同一串码下，系统 `zz*` 分组
+    /// 看得见还差几个字母、用户自己加的静态短语却看不见。
+    fn with_comment(mut self, comment: String) -> Self {
+        self.comment = comment;
+        self
+    }
+
     /// 前缀导航——**组**候选（`$SS`/`$AA`）：`code` 为补全目标完整码，选中后补全展开。
     fn nav(text: String, weight: i32, code: String, comment: String) -> Self {
         Self {
@@ -420,7 +431,11 @@ impl PhraseLayer {
                         if display.is_empty() {
                             continue;
                         }
-                        out.push(PhraseHit::plain(display, e.weight).with_source(&e.text));
+                        out.push(
+                            PhraseHit::plain(display, e.weight)
+                                .with_comment(suffix.clone())
+                                .with_source(&e.text),
+                        );
                     }
                     Phrase::Template(_) => {
                         // cmdbar 模板（含 {expr} 插值）：经 evaluate 求值。
@@ -435,7 +450,11 @@ impl PhraseLayer {
                         if display.is_empty() {
                             continue;
                         }
-                        out.push(PhraseHit::plain(display, e.weight).with_source(&e.text));
+                        out.push(
+                            PhraseHit::plain(display, e.weight)
+                                .with_comment(suffix.clone())
+                                .with_source(&e.text),
+                        );
                     }
                     Phrase::Array(ap) => {
                         if ap.modifiers.get_bool("prefix") == Some(false) {
@@ -1174,6 +1193,52 @@ mod tests {
             expand_dict_value("价格$5", "jg", now, &[], &clip),
             DictExpansion::None
         );
+    }
+
+    /// 静态短语的前缀命中要带**剩余编码**注释，与 marker 短语一致。
+    ///
+    /// 真机现场：5 码短语 `zzsfz` 敲到 `zzsf` 时候选已出现，但看不出「还差一个 z」——
+    /// 而同一串码下系统 `zz*` 的 `$SS` 分组是带提示的。`suffix` 早就算出来了，
+    /// 只有 Literal/Template 两个分支没往 `PhraseHit` 上放。
+    #[test]
+    fn prefix_hit_carries_remaining_code_comment() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "zzsfz".into(),
+            vec![PhraseEntry {
+                text: "TEST".into(),
+                weight: 1800,
+                position: 0,
+                is_system: false,
+            }],
+        );
+        map.insert(
+            "zzsfzab".into(),
+            vec![PhraseEntry {
+                text: r#"$SS("组", "甲")"#.into(),
+                weight: 100,
+                position: 0,
+                is_system: false,
+            }],
+        );
+        let layer = PhraseLayer { map };
+
+        let hits = layer.lookup_prefix_at("zzsf", fixed(), &[], 2);
+        let stat = hits
+            .iter()
+            .find(|h| h.text == "TEST")
+            .expect("静态短语应出现在前缀命中里");
+        assert_eq!(stat.comment, "z", "静态短语须带剩余编码");
+        let marker = hits
+            .iter()
+            .find(|h| h.text == "组")
+            .expect("marker 短语应出现在前缀命中里");
+        assert_eq!(marker.comment, "zab", "marker 短语的既有行为不得变");
+
+        // 精确命中（lookup）无剩余编码，不得凭空冒出注释。
+        let exact = layer.lookup_at("zzsfz", fixed(), &[], &no_clip());
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].comment, "", "精确路径不得带剩余编码注释");
     }
 
     #[test]
