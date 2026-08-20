@@ -180,14 +180,24 @@ pub fn sanitize_description(raw: &str) -> Result<String, String> {
 /// 渲染进 UI，故：
 ///
 /// - `\r\n` 与孤立 `\r` 归一为 `\n`（分发者的平台行尾差异不该算「非法字符」）；
-/// - 除 `\t` 与 `\n`（仅 `allow_newline` 时）外的 C0 控制字符（U+0000–U+001F）与 U+007F
-///   一律拒绝，错误点名字段；
+/// - 除 `\t` 与 `\n` 外的 C0 控制字符（U+0000–U+001F）与 U+007F 一律拒绝，错误点名字段；
+/// - `allow_newline = false` 时，**trim 之后**仍含 `\n` 即拒绝；
 /// - 超过 `max_chars` **字符**（不是字节）即拒绝，错误写明上限与实际长度——分发前该自测，
 ///   静默截断只会让分发者以为写全了；
 /// - 返回 `trim()` 后的文本，调用方按「空串 = 没写」处理。
 ///
-/// 控制字符与换行的判定在 trim **之前**：`title = "标题\n"` 是写法错误，先 trim 再判就成了
-/// 静默修复，与「不静默截断」同一取舍。长度按 trim **之后**计——首尾空白不占限额。
+/// **换行判定在 trim 之后**（长度同）：TOML 多行字符串是写 title 的合法语法，尾随换行是
+/// 该语法的固有产物而非分发者的错误——
+/// ```toml
+/// title = """
+/// 快符方案
+/// """
+/// ```
+/// 的值是 `"快符方案\n"`，拒掉它只会让人困惑「我明明只写了一行」。「不含换行」要挡的是
+/// **title 得是单行**，即 `"第一行\n第二行"`，那种仍然拒绝。
+///
+/// **控制字符判定则在 trim 之前**：那类字符 trim 不掉（U+0007 之流不是空白），
+/// 而 VT/FF 这些既是控制字符又算空白的，先 trim 就会被悄悄放行——不该宽容。
 pub fn sanitize_info_text(
     field: &str,
     raw: &str,
@@ -196,14 +206,8 @@ pub fn sanitize_info_text(
 ) -> Result<String, String> {
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     for ch in normalized.chars() {
-        if ch == '\t' {
+        if ch == '\t' || ch == '\n' {
             continue;
-        }
-        if ch == '\n' {
-            if allow_newline {
-                continue;
-            }
-            return Err(format!("{field} 不能包含换行"));
         }
         let cp = ch as u32;
         if cp < 0x20 || cp == 0x7f {
@@ -211,6 +215,9 @@ pub fn sanitize_info_text(
         }
     }
     let trimmed = normalized.trim();
+    if !allow_newline && trimmed.contains('\n') {
+        return Err(format!("{field} 不能包含换行"));
+    }
     let chars = trimmed.chars().count();
     if chars > max_chars {
         return Err(format!("{field} 过长（{chars} 字符，上限 {max_chars}）"));
@@ -787,19 +794,29 @@ mod tests {
         assert!(info.description.is_none());
     }
 
-    /// title 不许换行（单行标题）。归一后的 `\r\n` 同样算换行——归一是为了统一判据,
+    /// title 必须是单行:内部含换行即拒。归一后的 `\r\n` 同样算换行——归一是为了统一判据,
     /// 不是为了放行。
     #[test]
-    fn title_with_newline_is_rejected() {
+    fn title_with_inner_newline_is_rejected() {
         for text in [
             "[package]\ntitle = \"第一行\\n第二行\"\n",
             "[package]\ntitle = \"第一行\\r\\n第二行\"\n",
-            "[package]\ntitle = \"尾随换行\\n\"\n",
         ] {
             let err = info_err(text);
             assert!(err.contains("package.title"), "错误须点名字段: {err}");
             assert!(err.contains("换行"), "{err}");
         }
+    }
+
+    /// 首尾换行**放行**:TOML 多行字符串是写 title 的合法语法,尾随换行是该语法的固有产物,
+    /// 不是分发者的错误。「不含换行」挡的是「title 得是单行」,不是「字节里不许出现 \n」。
+    #[test]
+    fn title_with_surrounding_newline_is_accepted() {
+        let info = info_of("[package]\ntitle = \"\"\"\n快符方案\n\"\"\"\n")
+            .expect("TOML 多行字符串写的单行标题应放行");
+        assert_eq!(info.title.as_deref(), Some("快符方案"));
+        let info = info_of("[package]\ntitle = \"尾随换行\\r\\n\"\n").unwrap();
+        assert_eq!(info.title.as_deref(), Some("尾随换行"));
     }
 
     /// 限额按**字符**不是字节：200 个 CJK 字符（600 字节）的 title 合法,201 个即拒。
@@ -876,11 +893,12 @@ mod tests {
     /// 走一遍一致（wind-transfer 复用的正是这条路）。
     #[test]
     fn sanitize_info_text_is_reusable_directly() {
-        assert!(
-            sanitize_title("  标题\r\n\r\n")
-                .unwrap_err()
-                .contains("换行")
+        assert_eq!(
+            sanitize_title("  标题\r\n\r\n").unwrap(),
+            "标题",
+            "首尾换行 trim 掉即可,只有内部换行才算多行"
         );
+        assert!(sanitize_title("甲\r\n乙").unwrap_err().contains("换行"));
         assert_eq!(sanitize_description("甲\r\n乙").unwrap(), "甲\n乙");
         assert_eq!(sanitize_description("   ").unwrap(), "", "空串 = 没写");
         let err = sanitize_info_text("自定字段", "a\u{1}b", 10, true).unwrap_err();
