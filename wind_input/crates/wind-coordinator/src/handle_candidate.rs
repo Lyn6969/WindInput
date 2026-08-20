@@ -2636,11 +2636,24 @@ impl Coordinator {
     /// 英文补空格（`schema.english.commit_space`）**不接本函数**：顶码的触发条件是输入超过
     /// 方案码长上限，而英文引擎的码长上限取自词典最长单词，实际打不到；且顶码后余码要继续
     /// 组合，中间插空格会把一个词劈成两截。已判定为不可达 + 语义不合，不是漏接。
+    ///
+    /// # 简繁转换在本函数内收口
+    ///
+    /// `top_text` 一律传**简体原文**（内部唯一事实），出屏文本由本函数转换——三条来路各自
+    /// `maybe_s2t` 曾经全部漏掉，顶码上屏简体而空格上屏繁体（2026-08-20 反馈）。压进来之后
+    /// 新增来路想漏也漏不掉。顺序不可对调：`record_selection` / `record_commit` 必须吃简体
+    /// 原文，否则词频表会长出一套繁体键，而读端 `apply_freq_rerank` 查的是简体，永远查不到。
+    ///
+    /// `s2t_override` 由调用方按被顶出的候选**如实传入**（语义同 [`Self::cand_s2t_text`]）。
+    /// 现实中三条来路都取不到 1对多变体候选——顶码取 `candidates.first()`，而变体恒插在原字
+    /// **之后**（见 [`Self::expand_s2t_variants`]）——但判据写在候选身上而非「反正取不到」的
+    /// 推断上：顶码哪天改取高亮候选，这里不必跟着想起来改。
     pub(crate) fn commit_top_text(
         &self,
         state: &mut State,
         prefix: &str,
         top_text: String,
+        s2t_override: Option<&str>,
         remainder: &str,
         source: CandidateSource,
     ) -> KeyAction {
@@ -2654,6 +2667,11 @@ impl Coordinator {
                 wind_store::stats::CommitSource::Candidate,
             );
         }
+        // 出屏文本（记账之后取，见上）：变体候选用其覆盖文本，其余按需简繁转换。
+        let out_text = match s2t_override {
+            Some(t) => t.to_string(),
+            None => self.maybe_s2t(state, &top_text),
+        };
         state.input_buffer = remainder.to_string();
         // 余码是缓冲的后缀 → 影子串同步掐头，否则大写会在这里静默丢掉。
         preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
@@ -2670,18 +2688,62 @@ impl Coordinator {
             && self.rt().config.input.top_commit_mode == wind_config::TopCommitMode::DirectCommit
         {
             return KeyAction::CommitThenDeferComposition {
-                commit_text: top_text,
+                commit_text: out_text,
                 deferred_composition: preedit,
                 timeout_ms: DEFERRED_COMPOSITION_FALLBACK_MS,
             };
         }
         KeyAction::InsertText {
-            text: top_text,
+            text: out_text,
             new_composition: has_comp.then_some(preedit),
             mode_changed: false,
             chinese_mode: true,
             has_new_composition: has_comp,
         }
+    }
+
+    /// 顶屏「已转换前缀 + 高亮候选」的**出屏文本**，供进模式类顶屏（临英 / mix / 特殊模式 /
+    /// 临时拼音）共用；返回 `None` = 没有待上屏内容（空缓冲进入），调用方直接返回进模式动作。
+    ///
+    /// # 为什么必须收成一个函数
+    ///
+    /// 这段逻辑曾以逐字相同的形态复制在四处，四份**全部**漏掉了简繁转换（顶屏出简体、空格
+    /// 出繁体，2026-08-20 反馈），其中三份还漏掉了 `record_commit`（输入统计少记一条上屏）。
+    /// 复制出去的加工步骤不会被一起想起来——出屏文本只能有一个落点。
+    ///
+    /// # 两半的转换方式不同，不可合并成整串 `maybe_s2t`
+    ///
+    /// 已转换前缀走 `maybe_s2t`，高亮候选走 [`Self::cand_s2t_text`]。整串一起转会把 1对多
+    /// 变体候选打回默认转换结果（用户高亮的是「齣」，上屏却成「出」）。此处高亮**可以**停在
+    /// 变体候选上——与顶码取 `candidates.first()` 恒取不到变体的情形不同，见
+    /// [`Self::commit_top_text`]。
+    ///
+    /// 记账（`record_selection` / `record_commit`）一律吃简体原文 `cand.text`，同一口径。
+    pub(crate) fn take_committed_with_highlight(&self, state: &mut State) -> Option<String> {
+        let prefix = self.take_committed(state);
+        let mut out = self.maybe_s2t(state, &prefix);
+        if state.candidates.is_empty() {
+            return (!out.is_empty()).then_some(out);
+        }
+        let (start, _) = self.page_range(state);
+        let idx = self
+            .highlighted_global_index(state)
+            .min(state.candidates.len() - 1);
+        let cand = state.candidates[idx].clone();
+        // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+        let freq_code = self.freq_code(&state.input_buffer, &cand);
+        self.record_selection(&freq_code, &cand.text, cand.source);
+        // 顶屏上屏的是一条来源候选（prefix 段已在选词时记过）。
+        // `saturating_sub`：`page_range` 保证 start < len，钳制后 idx < start 不可达，
+        // 但页内位置这种纯展示用的量不值得为它留一个下溢 panic。
+        self.record_commit(
+            &cand.text,
+            state.input_buffer.len() as u32,
+            idx.saturating_sub(start) as i32,
+            wind_store::stats::CommitSource::Candidate,
+        );
+        out.push_str(&self.cand_s2t_text(state, &cand));
+        Some(out)
     }
 
     /// 「顶屏文本 + 进模式新组合」收尾（进特殊模式 / 临时拼音 / mix 融合共用）：与顶码
@@ -2690,6 +2752,9 @@ impl Coordinator {
     /// pre_confirm → `InsertText` 聚合（文本并入 TSF `_pendingCommitPrefix`、留组合内）。
     /// 新组合为空（直达热键进入无引导符）时无组合可重开、无 diff 合并之虞，
     /// 两种模式都直接真提交（对齐顶码无余码分支）。
+    ///
+    /// `text` 必须是**已过简繁转换的出屏文本**——本函数只管 `top_commit_mode` 分流，不碰文本。
+    /// 四个调用方一律经 [`Self::take_committed_with_highlight`] 取，勿自行拼 `prefix + cand.text`。
     pub(crate) fn commit_then_new_composition(&self, text: String, new_comp: String) -> KeyAction {
         if new_comp.is_empty() {
             return KeyAction::InsertText {
@@ -3414,8 +3479,12 @@ mod finalize_candidates_tests {
             bad.join("\n  ")
         );
         // 反向保证：若哪天调用点被重命名/重构掉，本测试不得退化成空跑而静默变绿。
+        //
+        // 下限随**有意的**收口下调过一次：进模式顶屏（临英 / mix / 特殊模式 / 临拼）原本各持
+        // 一份逐字相同的记账 + 拼接代码，合并进 `take_committed_with_highlight` 后四处并作一处，
+        // 12 → 9。下调前务必确认是合并而非漏调——这条断言的用途正是逼人回来说明减少的原因。
         assert!(
-            checked >= 12,
+            checked >= 9,
             "只扫到 {checked} 个 record_selection 调用点，远少于预期——\
              调用点被改名或本测试的扫描方式失效了，先修测试再说"
         );

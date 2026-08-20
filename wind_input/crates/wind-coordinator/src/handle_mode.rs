@@ -394,22 +394,9 @@ impl Coordinator {
                 if !self.rt().config.input.temp_english.enabled {
                     return None;
                 }
-                // 临英没有专用的「顶字进入」出口，就地拼：先顶已转换前缀 + 高亮候选，
-                // 再走空缓冲进入语义。合并方式与 commit_and_enter_mix_mode 一致。
-                let prefix = self.take_committed(state);
-                let committed = if !state.candidates.is_empty() {
-                    let i = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
-                    let t = state.candidates[i].text.clone();
-                    let freq_code = self.freq_code(&state.input_buffer, &state.candidates[i]);
-                    self.record_selection(&freq_code, &t, state.candidates[i].source);
-                    Some(format!("{prefix}{t}"))
-                } else if !prefix.is_empty() {
-                    Some(prefix)
-                } else {
-                    None
-                };
+                // 临英没有专用的「顶字进入」出口，走与 mix / 特殊模式 / 临拼同一个顶屏取文本
+                // 入口，再接空缓冲进入语义。
+                let committed = self.take_committed_with_highlight(state);
                 let enter = self.enter_bound_action(state, action, key_code)?;
                 Some(match committed {
                     Some(text) => {
@@ -462,21 +449,8 @@ impl Coordinator {
         if let Some(act) = self.top_commit_command_guard(state) {
             return act;
         }
-        let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
-        let committed = if !state.candidates.is_empty() {
-            let i = self
-                .highlighted_global_index(state)
-                .min(state.candidates.len() - 1);
-            let t = state.candidates[i].text.clone();
-            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let freq_code = self.freq_code(&state.input_buffer, &state.candidates[i]);
-            self.record_selection(&freq_code, &t, state.candidates[i].source);
-            Some(format!("{prefix}{t}"))
-        } else if !prefix.is_empty() {
-            Some(prefix)
-        } else {
-            None
-        };
+        // 已转换前缀 + 高亮候选一并上屏（含记账与简繁转换）。
+        let committed = self.take_committed_with_highlight(state);
         // enter_mix_mode 内部清空 input_buffer/candidates、建组合区前缀、刷 UI 并返回 UpdateComposition。
         let enter = self.enter_mix_mode(state, idx, key_code);
         match committed {

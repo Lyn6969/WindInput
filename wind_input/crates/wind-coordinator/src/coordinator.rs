@@ -3194,9 +3194,17 @@ impl Coordinator {
                             cand.group_code.clone()
                         };
                         return match self.eval_command_text_only(&cand.phrase_template, &input) {
-                            Some(text) => {
-                                self.commit_top_text(state, &prefix, text, &remainder, cand.source)
-                            }
+                            // 求值文本与 `cand.text`（display 标签）无关，变体覆盖对它没有语义
+                            // → None，走 `commit_top_text` 内的默认转换（对齐 `AutoCommit` 的
+                            // 命令文本同样只过 `maybe_s2t`）。
+                            Some(text) => self.commit_top_text(
+                                state,
+                                &prefix,
+                                text,
+                                None,
+                                &remainder,
+                                cand.source,
+                            ),
                             None => self.top_commit_command_with_remainder(
                                 state, &cand, &prefix, &remainder,
                             ),
@@ -3205,7 +3213,15 @@ impl Coordinator {
                     // 码表候选 / 普通短语：文本顶上屏 + 余码续打。
                     Some(cand) => {
                         let source = cand.source;
-                        return self.commit_top_text(state, &prefix, cand.text, &remainder, source);
+                        let s2t_override = cand.s2t_override.clone();
+                        return self.commit_top_text(
+                            state,
+                            &prefix,
+                            cand.text,
+                            s2t_override.as_deref(),
+                            &remainder,
+                            source,
+                        );
                     }
                     // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
                     None => {}
@@ -3217,6 +3233,7 @@ impl Coordinator {
                     state,
                     &prefix,
                     engine_top,
+                    None, // 引擎码表纯文本，无候选对象可承载变体覆盖
                     &remainder,
                     CandidateSource::CodeTable,
                 );

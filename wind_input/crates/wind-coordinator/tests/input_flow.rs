@@ -8624,3 +8624,85 @@ fn cmd_combo_goes_to_host_issue64() {
         "空缓冲 Ctrl+C 应照旧透传，实际: {ctrl_c:?}"
     );
 }
+
+/// 顶码上屏（`schema.codetable.top_code_commit`）必须与用户**所见的显示首选**同形：
+/// 简繁开启时上屏繁体。
+///
+/// 回归背景：`commit_top_text` 的三条来路曾各自把候选的简体原文直接送去上屏，于是顶码
+/// 出简体、空格出繁体（2026-08-20 反馈）。转换已收进 `commit_top_text` 内部。
+///
+/// 判据是「上屏文本 == 顶码前的显示首选」而非写死汉字——顶出什么取决于码表数据，
+/// 写死会在词库调整时变成假红。
+#[test]
+fn test_s2t_converts_top_code_commit() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    if !coord.debug_set_s2t(true) {
+        eprintln!("跳过：缺少 opencc 数据");
+        return;
+    }
+    // 满码 cccc：显示首选「雙雙」，内部 text 仍是简体「双双」。
+    for c in "cccc".chars() {
+        press_letter(&coord, c);
+    }
+    let simplified = coord.debug_page_texts()[0].clone();
+    let displayed = coord.debug_page_display_texts()[0].clone();
+    assert_ne!(
+        simplified, displayed,
+        "探针失效：cccc 的首选须简繁不同才验得出漏转（码表数据变动？换一个探针）"
+    );
+    // 第 5 码触发顶码：顶出前 4 码的显示首选，余码 c 续打。
+    // 出厂 top_commit_mode=direct_commit → CommitThenDeferComposition；pre_confirm → InsertText。
+    let commit = match press_letter(&coord, 'c') {
+        KeyAction::CommitThenDeferComposition { commit_text, .. } => commit_text,
+        KeyAction::InsertText { text, .. } => text,
+        other => panic!("cccc + c 应触发顶码上屏，实际: {:?}", other),
+    };
+    assert_eq!(
+        commit, displayed,
+        "顶码上屏须与显示首选同形（繁体），不得回落简体"
+    );
+}
+
+/// 顶屏进模式（临拼 / mix / 特殊模式 / 临英四处共用 `take_committed_with_highlight`）
+/// 的上屏文本同样须过简繁转换。
+///
+/// 回归背景：这四处曾各自复制同一段「take_committed + 高亮候选」拼接代码，四份**全部**
+/// 漏掉简繁转换（2026-08-20 反馈）。此处以临拼为代表锁住收口后的行为。
+#[test]
+fn test_s2t_converts_commit_and_enter_mode() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    if !coord.debug_set_s2t(true) {
+        eprintln!("跳过：缺少 opencc 数据");
+        return;
+    }
+    // cc → 显示首选「雙」，内部 text 仍是简体「双」。
+    press_letter(&coord, 'c');
+    press_letter(&coord, 'c');
+    let simplified = coord.debug_page_texts()[0].clone();
+    let displayed = coord.debug_page_display_texts()[0].clone();
+    assert_ne!(
+        simplified, displayed,
+        "探针失效：cc 的首选须简繁不同才验得出漏转（码表数据变动？换一个探针）"
+    );
+    // 反引号：顶屏高亮候选 + 进入临时拼音（与顶码同一 top_commit_mode 分流）。
+    match coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)) {
+        KeyAction::CommitThenDeferComposition { commit_text, .. } => {
+            assert_eq!(
+                commit_text, displayed,
+                "顶屏进模式须上屏显示首选（繁体），不得回落简体"
+            );
+        }
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, displayed, "顶屏进模式须上屏显示首选（繁体）");
+        }
+        other => panic!("有候选按反引号应顶屏 + 进临时拼音，实际: {:?}", other),
+    }
+}

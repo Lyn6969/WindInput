@@ -1110,27 +1110,8 @@ impl Coordinator {
         if let Some(act) = self.top_commit_command_guard(state) {
             return act;
         }
-        let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
-        let committed = if !state.candidates.is_empty() {
-            let (start, _) = self.page_range(state);
-            let idx = (start + state.selected_index).min(state.candidates.len() - 1);
-            let t = state.candidates[idx].text.clone();
-            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let freq_code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
-            self.record_selection(&freq_code, &t, state.candidates[idx].source);
-            // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
-            self.record_commit(
-                &t,
-                state.input_buffer.len() as u32,
-                (idx - start) as i32,
-                wind_store::stats::CommitSource::Candidate,
-            );
-            Some(format!("{prefix}{t}"))
-        } else if !prefix.is_empty() {
-            Some(prefix)
-        } else {
-            None
-        };
+        // 已转换前缀 + 高亮候选一并上屏（含记账与简繁转换）。
+        let committed = self.take_committed_with_highlight(state);
         state.input_buffer.clear();
         state.candidates.clear();
         // 进入临时拼音
