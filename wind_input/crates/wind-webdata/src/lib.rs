@@ -2433,8 +2433,12 @@ impl WebDataRpc for wind_coordinator::Coordinator {}
 ///
 /// 与 [`word_item`] 里 `code` 的处理同源——那里也是把存储域的扁平码投影成带空格的
 /// 音节码给人看。**存储域与显示域本就该分开**，此处只是把同一原则用到 text 上。
+///
+/// 命令栏语法条目只投影换行/制表、反斜杠原样——见 [`wind_store::wdict::escape_text_field`]。
+/// 设置页是这类条目最主要的书写入口，双重转义在这里最致命：文档写「路径要写 `\\`」，
+/// 照做却因为本层先吃掉一个而在 lexer 里变成换行。
 fn ui_text(s: &str) -> String {
-    wind_store::wdict::escape_field(s)
+    wind_store::wdict::escape_text_field(s)
 }
 
 /// 设置页显示域 → 存储域：[`ui_text`] 的逆。
@@ -2443,7 +2447,7 @@ fn ui_text(s: &str) -> String {
 /// `freq.delete`、`temp.promote` 等拿 text 当 **key** 去匹配记录，若拿转义形态去查
 /// 真实文本的库，结果是查不到——表现为「删了没反应」，且不报错。
 fn store_text(s: &str) -> String {
-    wind_store::wdict::unescape_field(s)
+    wind_store::wdict::unescape_text_field(s)
 }
 
 /// UserWordRecord → 前端 UserWordItem。
@@ -3283,6 +3287,47 @@ mod tests {
         assert!(
             after.as_array().unwrap().is_empty(),
             "remove 未命中 → 该入口漏了 store_text"
+        );
+    }
+
+    /// **命令栏语法条目在这条边界上原样穿过**：它的反斜杠归 cmdbar lexer 独占。
+    ///
+    /// 修复前本层与 lexer 各吃一个：用户按文档写 `open("D:\\notes")`，落库剩
+    /// `D:\notes`，lexer 再把 `\n` 解成换行 —— 路径静默损坏，只弹一句「命令执行失败」。
+    /// 判据是「用户在输入框里写的与库里的逐字相同」，出口回显同样不得改写。
+    #[test]
+    fn cmdbar_phrase_backslash_survives_ui_boundary() {
+        let c = coord("phrase_cmd_esc");
+        let src = r#"$CC("[打开临时目录]", open("D:\\notes\\temp"))"#;
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": "cotmp", "text": src, "position": 0, "weight": 1 }),
+        )
+        .unwrap();
+
+        let store = c.user_store().unwrap();
+        assert!(
+            store
+                .list_phrases()
+                .unwrap()
+                .iter()
+                .any(|p| p.code == "cotmp" && p.text == src),
+            "库里应与用户所写逐字相同；失败即本层又吃掉了一个反斜杠"
+        );
+
+        let list = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert_eq!(list[0]["text"], json!(src), "出口回显不得再加反斜杠");
+
+        // 入口 remove 拿列表回的形态操作，仍须命中（出入口成对）
+        c.web_data_rpc("phrase.remove", &json!({ "code": "cotmp", "text": src }))
+            .unwrap();
+        assert!(
+            c.web_data_rpc("phrase.list", &json!({}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "remove 未命中 → 出入口分流判据不一致"
         );
     }
 

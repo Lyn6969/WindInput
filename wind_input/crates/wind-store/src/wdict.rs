@@ -3,6 +3,10 @@
 //!
 //! 文件 = `# 注释` + `wind_dict:` YAML 头 + `\n--- !<tag>\n` 分隔的 TSV 数据段。
 //! TSV 字段转义：`\`→`\\`、换行→`\n`、制表→`\t`；bool→"1"/"0"。
+//!
+//! **词条文本域（text / word）走 [`escape_text_field`] / [`unescape_text_field`]**，
+//! 命令栏语法条目在那里只保护分隔符、反斜杠原样穿过。编码域（code / action / cand_id）
+//! 不可能是命令栏语法，仍用下面这对原始函数。
 
 /// TSV 字段转义（与 Go EscapeField 一致）。
 pub fn escape_field(s: &str) -> String {
@@ -38,6 +42,73 @@ pub fn unescape_field(s: &str) -> String {
         }
     }
     out
+}
+
+/// 词条文本域（`text` / `word`）的 TSV / 设置页转义。
+///
+/// **命令栏语法条目（`$CC` / `$SS` / `$AA` / 含 `{}` 模板）不转义反斜杠**：那条源码里的
+/// `\` 已由 cmdbar lexer 负责（`\\` `\"` `\n` … 见 `wind_cmdbar::decode_escape`），本层
+/// 再转一次就是双重展开——用户按文档写 `open("D:\\notes")`，两层各吃一个反斜杠后 lexer
+/// 拿到的是 `D:\notes`，`\n` 当场变成换行，路径静默损坏。要写对得写四个反斜杠，而同一条
+/// 命令写进 `system.phrases.toml`（不过本层）却只需两个，同一份语法在不同载体规则不同。
+///
+/// 仍然保护换行与制表：`.wdict.yaml` 是 TSV，一条记录一行、Tab 分列，而短语编辑框是
+/// **多行**输入（`dialogs.rs` 的 `text_multi`），源码里排版换行是允许的。不折成 `\n`
+/// 导出的文件会被那个换行切成两行，结构直接坏掉——这条与命令栏语法无关，是文件格式的
+/// 硬约束，故不可省。
+///
+/// 反斜杠不动带来一处**规范化**：源码里的 `\n`（两字符，lexer 的换行转义）经一轮
+/// 导出导入会变成真换行。二者在字符串字面量里语义相同（lexer 把 `\n` 解成换行，真换行
+/// 直接就是换行），且设置页出口又会把真换行显示回 `\n`，用户无感。反过来「不还原 `\n`」
+/// 才是真错：字符串**外部**的排版换行会被固化成字面 `\n`，在表达式位置即语法错误。
+pub fn escape_text_field(s: &str) -> String {
+    if !is_cmdbar_text(s) {
+        return escape_field(s);
+    }
+    if !s.contains(['\n', '\t']) {
+        return s.to_string();
+    }
+    s.replace('\n', r"\n").replace('\t', r"\t")
+}
+
+/// [`escape_text_field`] 的逆。
+pub fn unescape_text_field(s: &str) -> String {
+    if !is_cmdbar_text(s) {
+        return unescape_field(s);
+    }
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            // `\\` 整体放行而不是拆开逐个复制：拆开会让 `\\n` 的后半 `\n` 在下一轮被
+            // 当成换行，把「字面反斜杠 + n」改写成「反斜杠 + 换行」。识别它是为了跳过它。
+            Some('\\') => out.push_str(r"\\"),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 该文本是否按命令栏语法解析（[`escape_text_field`] 一对函数的分流判据）。
+///
+/// 判据须在**存储形态与文件形态上给出同一答案**，否则两侧分流不一致，往返即损坏。
+/// 这里成立：两种形态的差别只有换行/制表与 `\n`/`\t` 的互换，而 `is_cmdbar_grammar`
+/// 看的是顶层 `$CC` 一类 marker 与顶层未转义 `{`，二者都不受影响。
+fn is_cmdbar_text(s: &str) -> bool {
+    wind_cmdbar::is_cmdbar_grammar(s)
 }
 
 pub fn format_bool(b: bool) -> &'static str {
@@ -76,7 +147,7 @@ pub fn export_phrases_wdict(rows: &[PhraseIo], exported_at: &str) -> String {
         s.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n",
             escape_field(&r.code),
-            escape_field(&r.text),
+            escape_text_field(&r.text),
             r.weight,
             r.position,
             format_bool(r.enabled),
@@ -126,7 +197,7 @@ pub fn parse_phrases_wdict(text: &str) -> Result<(Vec<PhraseIo>, usize), String>
         };
         rows.push(PhraseIo {
             code: unescape_field(get("code")),
-            text: unescape_field(get("text")),
+            text: unescape_text_field(get("text")),
             weight: get("weight").trim().parse().unwrap_or(0),
             position: get("position").trim().parse().unwrap_or(0),
             enabled: parse_bool(get("enabled").trim()),
@@ -229,7 +300,7 @@ pub fn export_words_wdict(rows: &[WordIo], exported_at: &str) -> String {
         s.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
             escape_field(&r.code),
-            escape_field(&r.text),
+            escape_text_field(&r.text),
             r.weight,
             r.count,
         ));
@@ -290,7 +361,7 @@ fn parse_word_rows(text: &str, tag: &str) -> Result<(Vec<WordIo>, usize), String
         };
         rows.push(WordIo {
             code: unescape_field(get("code")),
-            text: unescape_field(get("text")),
+            text: unescape_text_field(get("text")),
             weight: get("weight").trim().parse().unwrap_or(0),
             count: get("count").trim().parse().unwrap_or(0),
         });
@@ -338,7 +409,7 @@ pub fn parse_freq_wdict(text: &str) -> Result<(Vec<FreqIo>, usize), String> {
         };
         rows.push(FreqIo {
             code: unescape_field(get("code")),
-            text: unescape_field(get("text")),
+            text: unescape_text_field(get("text")),
             count: get("count").trim().parse().unwrap_or(0),
             last_used: get("last_used").trim().parse().unwrap_or(0),
         });
@@ -390,7 +461,7 @@ pub fn export_dict_wdict(words: &[WordIo], shadow: &[ShadowActionIo], exported_a
         s.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
             escape_field(&r.code),
-            escape_field(&r.text),
+            escape_text_field(&r.text),
             r.weight,
             r.count,
         ));
@@ -410,7 +481,7 @@ pub fn export_dict_wdict(words: &[WordIo], shadow: &[ShadowActionIo], exported_a
             "{}\t{}\t{}\t{}\t{}\n",
             escape_field(&r.action),
             escape_field(&r.code),
-            escape_field(&r.word),
+            escape_text_field(&r.word),
             pos,
             escape_field(&cid),
         ));
@@ -454,7 +525,7 @@ pub fn parse_shadow_wdict(text: &str) -> Result<(Vec<ShadowActionIo>, usize), St
                 .unwrap_or("")
         };
         let action = unescape_field(get("action").trim());
-        let word = unescape_field(get("word"));
+        let word = unescape_text_field(get("word"));
         let code = unescape_field(get("code"));
         if (action != "pin" && action != "del") || code.is_empty() || word.is_empty() {
             skipped += 1;
@@ -536,7 +607,7 @@ fn push_word_row(s: &mut String, r: &WordIo) {
     s.push_str(&format!(
         "{}\t{}\t{}\t{}\n",
         escape_field(&r.code),
-        escape_field(&r.text),
+        escape_text_field(&r.text),
         r.weight,
         r.count,
     ));
@@ -555,7 +626,7 @@ fn push_shadow_row(s: &mut String, r: &ShadowActionIo) {
         "{}\t{}\t{}\t{}\t{}\n",
         escape_field(&r.action),
         escape_field(&r.code),
-        escape_field(&r.word),
+        escape_text_field(&r.word),
         pos,
         escape_field(&cid),
     ));
@@ -617,7 +688,7 @@ pub fn export_dict_sections(
             s.push_str(&format!(
                 "{}\t{}\t{}\t{}\n",
                 escape_field(&r.code),
-                escape_field(&r.text),
+                escape_text_field(&r.text),
                 r.count,
                 r.last_used,
             ));
@@ -773,6 +844,42 @@ mod tests {
         assert_eq!(escape_field("a\nb"), r"a\nb");
         assert_eq!(escape_field(r"a\b"), r"a\\b");
     }
+    /// 命令栏语法条目的反斜杠**零层数变化**：这是「文档写 `\\`、照做就对」的全部依据。
+    ///
+    /// 两层各吃一个是本次修复前的实际行为——用户按文档写两个，落库剩一个，lexer 再把
+    /// `\n` 解成换行，路径静默坏掉且不报错。
+    #[test]
+    fn cmdbar_text_keeps_backslashes() {
+        let src = r#"$CC("[打开]", open("D:\\notes\\temp"))"#;
+        assert_eq!(escape_text_field(src), src, "出口不得再转义反斜杠");
+        assert_eq!(unescape_text_field(src), src, "入口不得再还原反斜杠");
+        // `\\n`（字面反斜杠 + n）不可被拆成「反斜杠 + 换行」
+        let lit = r#"$CC("x", type("a\\nb"))"#;
+        assert_eq!(unescape_text_field(lit), lit);
+    }
+
+    /// 普通词条不受影响：仍按原表转义，`C:\Users` 那类未知序列原样保留。
+    #[test]
+    fn plain_text_still_escaped() {
+        assert_eq!(escape_text_field(r"C:\Users"), r"C:\\Users");
+        assert_eq!(unescape_text_field(r"C:\\Users"), r"C:\Users");
+        assert_eq!(unescape_text_field("甲\\n乙"), "甲\n乙");
+    }
+
+    /// 分隔符保护不可省：短语编辑框是多行输入，命令源码里的真换行若原样写进 TSV
+    /// 会把一条记录切成两行。**文件形态往返自洽**是这里的验收标准。
+    #[test]
+    fn cmdbar_text_protects_separators() {
+        let stored = "$CC(\"打开\",\n\topen(\"https://x\"))";
+        let file = escape_text_field(stored);
+        assert!(
+            !file.contains('\n') && !file.contains('\t'),
+            "真换行/制表必须折成转义序列，否则 TSV 行列结构损坏: {file:?}"
+        );
+        assert_eq!(unescape_text_field(&file), stored, "文件形态往返应还原");
+        assert_eq!(escape_text_field(&unescape_text_field(&file)), file);
+    }
+
     #[test]
     fn bool_format_parse() {
         assert_eq!(format_bool(true), "1");

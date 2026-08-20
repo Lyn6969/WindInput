@@ -940,10 +940,13 @@ fn parse_rime_line(
         // 本处解析三条路径上必须一致，抄第二份就是下次漂移的起点。其「未知转义序列原样保留」
         // 的性质同时把破坏面锁死在 `\n`/`\t`/`\\` 三个序列上：`C:\Users` 的 `\U` 不受影响。
         //
-        // 注：本次刻意**未** bump `cache_fp.rs` 的 `PARSE_SEMANTICS_VERSION`（已核实全部
-        // 系统词库与第三方词库当前零反斜杠，新旧解析器对它们产出完全相同的 .wdat）。
-        // 若日后有用户报「词库里写了 \n 但不生效」，让其删除对应 `.wdat.fp` 即可强制重建。
-        text: wind_store::wdict::unescape_field(text),
+        // 命令栏语法条目（`$CC(...)` 等）在 `unescape_text_field` 里只还原换行/制表、
+        // **反斜杠原样穿过**——那条源码的 `\` 归 cmdbar lexer 管，本层再转一次就是双重
+        // 展开：`open("D:\\notes")` 会先被这里吃掉一个反斜杠，lexer 再把 `\n` 解成换行。
+        //
+        // 注：`PARSE_SEMANTICS_VERSION` 已 +1（见 `cache_fp.rs`）——本次改动会让含
+        // `$CC` 且带反斜杠的词库解析出不同结果，不 bump 则存量 .wdat 静默复用旧结果。
+        text: wind_store::wdict::unescape_text_field(text),
         weight,
         boundary,
     })

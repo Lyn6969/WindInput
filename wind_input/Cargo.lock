@@ -2566,6 +2566,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "uuid",
+ "wind-cmdbar",
 ]
 
 [[package]]

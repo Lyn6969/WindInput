@@ -123,7 +123,7 @@ pub fn parse_words_rime(text: &str) -> Result<(Vec<WordIo>, usize), String> {
             // 反转义在 trim **之后**：`\n` 在 trim 阶段还是反斜杠加字母 n 两个可见字符，
             // 天然免疫空白剥离，到这一步才变成换行。有意的空白由转义序列表达、排版噪声
             // 交给 trim，两者在管线的不同阶段产生，就不需要互相区分。
-            text: crate::wdict::unescape_field(word),
+            text: crate::wdict::unescape_text_field(word),
             weight: parse_weight(get("weight")),
             count: 0,
         });
@@ -186,7 +186,7 @@ pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
         rows.push(WordIo {
             code: normalize_code(code_raw),
             // 同 Rime 路径：trim 在前、反转义在后。见 `parse_words_rime`。
-            text: crate::wdict::unescape_field(word),
+            text: crate::wdict::unescape_text_field(word),
             weight: parse_weight(fields.get(2).map(|s| s.trim()).unwrap_or("")),
             count: 0,
         });

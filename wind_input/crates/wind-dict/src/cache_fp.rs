@@ -33,7 +33,9 @@ fn fp_sidecar(cache: &Path) -> PathBuf {
 /// - 3 = 只剥行尾空白（前导 U+3000 等不再被当缩进削掉）、空 text/code 跳过、
 ///   音节语义补上「code 列含空格」这条正面证据（编码在前的拼音库不再丢简拼与边界）、
 ///   `columns:` 支持流式写法且残缺声明改为整库跳过
-const PARSE_SEMANTICS_VERSION: u32 = 3;
+/// - 4 = 词条文本的反转义对**命令栏语法条目**只还原换行/制表，反斜杠原样穿过
+///   （`$CC(..., open("D:\\notes"))` 不再被本层与 cmdbar lexer 各吃一个反斜杠）
+const PARSE_SEMANTICS_VERSION: u32 = 4;
 
 /// 计算源文件集合的内容指纹：混入解析语义版本 + 调用方 tag + 每个源的 文件名/长度/内容。
 ///
