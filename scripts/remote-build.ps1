@@ -375,6 +375,16 @@ $ArtifactMap = @{
     'm4'  = @('wind_portable.exe');                      'dm4' = @('wind_portable.exe')
 }
 
+# 命令 → 只回传 build[_dev]\ 下的这个子目录。gen-data 只产出 data\, 若照全构建那样整目录回传,
+# 会把编译机上的 exe 一并盖到本机 —— 那些可能比本机刚编的还旧, 正是上面那条注释警告的
+# 「改了没生效」成因, 而且没有任何提示。
+$SubdirMap = @{ 'gd' = 'data'; 'gen-data' = 'data' }
+
+# 只做校验、不产出任何 build[_dev]\ 内容的命令。不登记的话会落到下面的「全构建」整目录回传
+# 分支, 把编译机的 build\ 拉回来盖掉本机产物 —— 一次远程 test 就能让本机的 exe 悄悄变成编译
+# 机上不知哪一版, 而这几个命令恰恰是用得最频繁的。dev.ps1 转发时不传 -NoFetch, 拦不住。
+$NoArtifactCmds = @('k', 'check', 'l', 'clippy', 't', 'test', 'ci', 'fmt-check')
+
 function Receive-Artifacts ([string]$cmd, [string]$outName, [string]$localOut) {
     if (-not (Test-Path $localOut)) { New-Item -ItemType Directory -Path $localOut -Force | Out-Null }
     $files = $ArtifactMap[$cmd]
@@ -392,12 +402,16 @@ function Receive-Artifacts ([string]$cmd, [string]$outName, [string]$localOut) {
         return $true
     }
 
-    # 全构建: 远程打包整个 build[_dev]\ 再拉回 (含 data\, 首次约 30 MB)
+    # 全构建: 远程打包整个 build[_dev]\ 再拉回 (含 data\, 首次约 30 MB)。
+    # 只产出子目录的命令 (见 $SubdirMap) 按子目录收窄, 不碰同目录下的其它产物。
+    $sub      = $SubdirMap[$cmd]
+    $packPath = if ($sub) { "$outName/$sub" } else { $outName }
+    $label    = if ($sub) { "$outName\$sub\" } else { "整目录 $outName\" }
     $rnd  = -join ((48..57) + (97..122) | Get-Random -Count 6 | ForEach-Object { [char]$_ })
     $rTgz = "C:/Windows/Temp/wi-out-$rnd.tar.gz"
     $tgz  = Join-Path $env:TEMP "wi-out-$rnd.tar.gz"
     try {
-        $inner = "tar -czf '$rTgz' -C '$RRoot' '$outName'; exit `$LASTEXITCODE"
+        $inner = "tar -czf '$rTgz' -C '$RRoot' '$packPath'; exit `$LASTEXITCODE"
         if (-not (Invoke-RemotePs $inner -Quiet)) { ErrMsg "  远程打包产物失败"; return $false }
         & scp @SshOpts -q "${Target}:$rTgz" $tgz
         if ($LASTEXITCODE -ne 0) { ErrMsg "  scp 下载产物失败"; return $false }
@@ -405,7 +419,7 @@ function Receive-Artifacts ([string]$cmd, [string]$outName, [string]$localOut) {
         # 改走 cmd/tar 两个原生命令之间的管道, stdin 是 S_ISFIFO 而非 S_ISREG。
         cmd /c type $tgz | tar -xz -C $ProductRoot
         if ($LASTEXITCODE -ne 0) { ErrMsg "  本地解压产物失败"; return $false }
-        Gray "  - 整目录 $outName\ 已回传 ($([math]::Round((Get-Item $tgz).Length/1MB,2)) MB)"
+        Gray "  - $label 已回传 ($([math]::Round((Get-Item $tgz).Length/1MB,2)) MB)"
         Invoke-RemotePs "Remove-Item '$rTgz' -Force -EA SilentlyContinue" -Quiet | Out-Null
         return $true
     }
@@ -429,9 +443,17 @@ function Test-RemoteDataReady ([string]$cmdText) {
     return $true
 }
 
-# 命令 → profile: dev 类命令一律以 d 开头 (d1/dm1/dm2/d8/d9), 其余为 release。
-# 变量名刻意不叫 $profile —— 那是 PowerShell 自动变量 ($PROFILE), 会被遮蔽。
-function Get-ProfileFor ([string]$cmd) { if ($cmd -match '^d') { "dev" } else { "release" } }
+# 命令 → 产物目录名。这个函数回答的是「产物落在 build 还是 build_dev」, **不是**「构建哪个
+# profile」—— 两者绝大多数时候一致 (dev 类命令一律以 d 开头: d1/dm1/dm2/d8/d9), 但 gen-data
+# 是例外: 它不以 d 开头, 而 dev.ps1 的 Do-GenData 默认 outdir 就是 $BuildDevDir。
+#
+# ⚠️ 照搬「d 开头 = dev」的拼写规律曾让远程 gen-data 静默失效: 去编译机的 build\ 取产物,
+# 而它刚写的是 build_dev\data ——【回传的是编译机上一次全构建留下的旧 build\, 还整个盖回
+# 本机】, 且全程 exit 0、日志照打「✓ 完成」。唯一破绽是产出路径与回传路径两行对不上。
+# ★ 判据必须与 dev.ps1 的实际写入目录对齐, 不能与命令的拼写规律对齐。
+function Get-OutDirFor ([string]$cmd) {
+    if ($cmd -match '^d' -or $cmd -in @('gd', 'gen-data')) { "build_dev" } else { "build" }
+}
 
 # 命令 → 真正需要的伴生仓。dm1/dm2 (最常用) 和细粒度 cargo 完全用不到它们, 每次都同步
 # 三个仓纯属浪费; 只有构建 setting/portable 或打包时才需要。
@@ -459,7 +481,7 @@ $cmdText = if ($isRaw) { $Raw } else { $Command }
 $sw      = [System.Diagnostics.Stopwatch]::StartNew()
 if ($isRaw) { $outName = $null; $localOut = $null }
 else {
-    $outName  = if ((Get-ProfileFor $Command) -eq "dev") { "build_dev" } else { "build" }
+    $outName  = Get-OutDirFor $Command
     $localOut = "$ProductRoot\$outName"
 }
 
@@ -531,8 +553,12 @@ $tExec.Stop()
 
 # --- [3/3] 回传产物 ---
 $tFetch = [System.Diagnostics.Stopwatch]::StartNew()
-if ($isRaw -or $NoFetch) {
-    Gray "[3/3] 跳过产物回传$(if($isRaw){' (-Raw 模式不产出 build\ 内容)'}else{' (-NoFetch)'})"
+$noArtifact = (-not $isRaw) -and ($Command -in $NoArtifactCmds)
+if ($isRaw -or $NoFetch -or $noArtifact) {
+    $why = if ($isRaw) { ' (-Raw 模式不产出 build\ 内容)' }
+           elseif ($noArtifact) { " ($Command 只做校验, 不产出 build[_dev]\ 内容)" }
+           else { ' (-NoFetch)' }
+    Gray "[3/3] 跳过产物回传$why"
 } else {
     Say "[3/3] 回传产物 → $localOut ..."
     if (-not (Receive-Artifacts $Command $outName $localOut)) { exit 1 }
@@ -544,7 +570,7 @@ Say "`n完成 ($cmdText), 耗时 $([math]::Round($sw.Elapsed.TotalSeconds,1)) s"
 # 三段耗时: 想提速时先看这行, 别对着占比最小的那段调参数。
 Gray ("  同步 {0:N1}s  ·  远程执行 {1:N1}s  ·  回传 {2:N1}s" -f `
       $tSync.Elapsed.TotalSeconds, $tExec.Elapsed.TotalSeconds, $tFetch.Elapsed.TotalSeconds)
-if ($localOut) { Gray "  产物已在本机 $outName\, 可直接用部署命令 (pdm1 / pdm2 / pd1 ...) 安装。" }
+if ($localOut -and -not $noArtifact) { Gray "  产物已在本机 $outName\, 可直接用部署命令 (pdm1 / pdm2 / pd1 ...) 安装。" }
 
 }
 finally { Exit-RemoteLock }   # ↑↑↑ 锁区结束。失败退出、Ctrl-C、正常收尾都会走到这里
