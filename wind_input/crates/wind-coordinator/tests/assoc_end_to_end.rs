@@ -593,3 +593,32 @@ fn space_commits_true_selects_assoc() {
         other => panic!("实得 {other:?}"),
     }
 }
+
+/// ★ 联想态按引导键进模式**不顶屏**联想候选。
+///
+/// 顶屏的语义前提是「用户打了码、还没选词，按这个键意味着『就选高亮那条吧』」。联想态
+/// 没有码——高亮那条是输入法猜的，此刻按引导键的意图就是进模式。
+///
+/// 标点键那条路（`commit_highlight_then_char`）早有同款守卫，但进模式顶屏走的是另一条
+/// （`take_committed_with_highlight`），判据必须自己带——它此前没有，联想候选会被顶上屏。
+#[test]
+fn entering_mode_does_not_commit_assoc_candidate() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let c = coord("word", "wubi86_pinyin");
+    let hits = enter_assoc(&c);
+    // 反引号 = 临时拼音引导键：只开引导符新组合，不把联想候选顶上屏。
+    match c.handle_key_event(&key_event(0xC0)) {
+        KeyAction::UpdateComposition { text, .. } => {
+            assert_eq!(text, "`", "联想态进临拼应只开引导符组合，实得 {text:?}");
+        }
+        KeyAction::InsertText { text, .. }
+        | KeyAction::CommitThenDeferComposition {
+            commit_text: text, ..
+        } => panic!("联想态按引导键不该顶屏联想候选，却上屏了 {text:?}（联想候选 {hits:?}）"),
+        other => panic!("联想态按反引号应进临时拼音，实得 {other:?}"),
+    }
+}

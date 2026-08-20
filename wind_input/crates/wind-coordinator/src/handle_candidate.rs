@@ -2719,10 +2719,19 @@ impl Coordinator {
     /// [`Self::commit_top_text`]。
     ///
     /// 记账（`record_selection` / `record_commit`）一律吃简体原文 `cand.text`，同一口径。
+    ///
+    /// # ★ 联想态**不顶屏**
+    ///
+    /// 与 [`Self::commit_highlight_then_char`] 同款守卫、同一个理由：顶屏的语义前提是「用户
+    /// 打了码、还没选词，按这个键意味着『就选高亮那条吧』」。联想态**没有码**——高亮那条是
+    /// 输入法猜的，不是用户在选，此刻按引导键的意图就是进模式。
+    ///
+    /// 不必显式 `exit_assoc`：联想候选就住在 `state.candidates` 里，进模式各 `enter_*` 都会
+    /// 清空候选，联想随之隐式退出（见 `handle_assoc` 模块文档）。
     pub(crate) fn take_committed_with_highlight(&self, state: &mut State) -> Option<String> {
         let prefix = self.take_committed(state);
         let mut out = self.maybe_s2t(state, &prefix);
-        if state.candidates.is_empty() {
+        if state.candidates.is_empty() || state.assoc_active() {
             return (!out.is_empty()).then_some(out);
         }
         let (start, _) = self.page_range(state);
