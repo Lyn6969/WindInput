@@ -432,6 +432,12 @@ pub fn encode_clear_composition() -> Vec<u8> {
     ipc.to_bytes().to_vec()
 }
 
+/// 编码 ClearCompositionThenPassThrough 响应：收组合 + 把当前键交还宿主。
+pub fn encode_clear_then_pass_through() -> Vec<u8> {
+    let ipc = IpcHeader::new(CMD_CLEAR_THEN_PASS_THROUGH, 0);
+    ipc.to_bytes().to_vec()
+}
+
 /// 编码 StatusUpdate 响应 (CMD_STATUS_UPDATE 0x0202)
 ///
 /// 格式: StatusHeader(12) + keyHashes(u32*N) + iconLabel(UTF-8)

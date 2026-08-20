@@ -137,6 +137,12 @@ public final class BridgeResponseRouter {
             // 快捷键组合触发的清组合: 组合已清, 但按键交还宿主 (见方法头 hostShortcut)。
             return !hostShortcut
 
+        case DownstreamCmd.clearThenPassThrough:
+            // 联想态回车/退格透传: 组合要收掉, 键要交还宿主 —— 两件事都做。
+            // 与上一条的区别是**服务端显式声明**要交还, 与是不是快捷键组合无关。
+            applyClearComposition(client: client)
+            return false
+
         case DownstreamCmd.keyType:
             // 命令直通车 key.type / clip.paste 文本上屏: 整段 UTF-8, 直接 insertText
             // (不经 composition, 与 commitText 一样落到当前光标处)。

@@ -52,6 +52,21 @@ pub fn to_outcome(action: KeyAction) -> KeyOutcome {
             caret: 0,
         }]),
 
+        // 薄宿主上**降级为吃键**（与 `ClearComposition` 同）：本变体要的是「清组合 + 把键
+        // 交还宿主」，而 [`KeyOutcome`] 的契约是 `consumed == false` 时 `ops` 必为空
+        // ——「不消费但要改文本」在这个类型里表达不出来。
+        //
+        // 不擅自放宽那条契约：真正的消费方是 Android Kotlin 侧（不在本仓），它若按
+        // 「不消费 ⇒ 忽略 ops」实现，联想的占位组合就会悬在输入框里——那正是本变体要修的
+        // 病，降级到吃键只是少一次透传，放错了却是组合残留。
+        //
+        // 要在移动端也拿到透传：先给 `KeyOutcome` 一个显式的「清理后不消费」表达
+        // （新构造函数 + 契约改写），同步 Kotlin 侧，再回来改这一臂。
+        KeyAction::ClearCompositionThenPassThrough => consumed(vec![EditOp::SetComposition {
+            text: String::new(),
+            caret: 0,
+        }]),
+
         // ── 上屏（可带新组合）──
         KeyAction::InsertText {
             text,

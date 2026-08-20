@@ -278,6 +278,8 @@ static REGISTRY: &[ConfigField] = &[
     f("input.association.mode", Enum(&["one_shot", "continuous"])),
     f("input.association.max_count", Int),
     f("input.association.space_commits", Bool),
+    f("input.association.enter_cancels_only", Bool),
+    f("input.association.backspace_cancels_only", Bool),
     f("input.association.hide_after_ms", Int),
     f("input.association.hint", Str),
     f("input.association.history", Bool),

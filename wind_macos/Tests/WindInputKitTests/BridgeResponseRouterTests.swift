@@ -173,6 +173,33 @@ final class BridgeResponseRouterTests: XCTestCase {
         XCTAssertEqual(mock.setMarkedCalls.last?.text, "")
     }
 
+    // MARK: - ClearCompositionThenPassThrough
+
+    /// 联想态回车/退格透传: 组合要清干净, 键要交还宿主 —— 与 `clearComposition` 的区别是
+    /// **不看 hostShortcut**, 服务端已经显式声明了要交还。
+    func testApply_ClearThenPassThrough_ClearsAndReturnsFalse() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        // 联想态挂的是占位组合, 用同样的方式先设上。
+        r.applyUpdateComposition(.init(caretPos: 0, text: " "), client: mock)
+        XCTAssertFalse(r.composition.isEmpty)
+
+        let frame = Frame(cmd: DownstreamCmd.clearThenPassThrough, isAsync: false, payload: Data())
+        XCTAssertFalse(r.apply(frame, to: mock), "键必须交还宿主 (回车要能换行/发送)")
+        XCTAssertTrue(r.composition.isEmpty, "占位组合必须收干净, 否则悬在输入框里")
+        XCTAssertEqual(mock.setMarkedCalls.last?.text, "")
+    }
+
+    /// 普通按键路径 (hostShortcut = false) 同样交还 —— 判据不该落在快捷键与否上。
+    func testApply_ClearThenPassThrough_IgnoresHostShortcutFlag() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        r.applyUpdateComposition(.init(caretPos: 0, text: " "), client: mock)
+        let frame = Frame(cmd: DownstreamCmd.clearThenPassThrough, isAsync: false, payload: Data())
+        XCTAssertFalse(r.apply(frame, to: mock, hostShortcut: true), "两种取值都得交还")
+        XCTAssertTrue(r.composition.isEmpty)
+    }
+
     /// 同一帧在**非**快捷键路径 (Esc 取消) 下仍是消费, 不受上一条影响。
     func testApply_ClearComposition_NotShortcut_StillConsumes() {
         let r = BridgeResponseRouter()

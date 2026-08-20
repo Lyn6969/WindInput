@@ -952,15 +952,18 @@ impl MessageHandler for Coordinator {
             // 行为必然一致。
             keymap::VK_ESCAPE => self.cancel_session(&mut state),
             keymap::VK_BACK => {
-                // 联想态：收掉候选并结束占位组合（吞键）。**必须先于下面的既有分支**——
-                // 那些分支在「缓冲空 + 无已转换段」时给 `PassThrough`，而联想态挂着占位
-                // 组合（见 `handle_assoc::ASSOC_COMPOSITION`），透传会把组合悬在宿主里。
+                // 联想态：收掉候选并结束占位组合。**必须先于下面的既有分支**——那些分支
+                // 在「缓冲空 + 无已转换段」时给 `PassThrough`，而联想态挂着占位组合
+                // （见 `handle_assoc::ASSOC_COMPOSITION`），裸透传会把组合悬在宿主里。
                 //
-                // 这是联想唯一需要单独接的键：其余（翻页/上下移高亮/二三候选/数字选词/
+                // 这一键是吃掉还是连同收窗一起交还宿主，由 `backspace_cancels_only` 定
+                // （默认吃掉，与回车相反的理由见 `assoc_backspace`）。
+                //
+                // 联想只需单独接这两个键：其余（翻页/上下移高亮/二三候选/数字选词/
                 // 空格选高亮/Esc 取消/鼠标点选）的既有分支门槛都只是「候选非空」，
                 // 联想候选就住在 `candidates` 里，天然全部适用。
                 if state.assoc_active() {
-                    return self.assoc_dismiss(&mut state);
+                    return self.assoc_backspace(&mut state);
                 }
                 // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
                 // 缓冲前部、重转），否则删光标前一个字符。
@@ -1072,15 +1075,16 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 联想态：收窗并结束占位组合（吞键）。
+                // 联想态：收窗并结束占位组合，**默认连同把回车交还宿主**
+                // （`enter_cancels_only`，见 `assoc_enter`）。
                 //
                 // 下方各分支的门槛都是「缓冲或已转换前缀非空」，联想两者皆空 ⇒ 会落到最后的
-                // `PassThrough`，而那会把占位组合悬在宿主里（同退格，见 `assoc_dismiss`）。
+                // `PassThrough`，而那只交还键、不收组合，占位组合会悬在宿主里（同退格）。
                 //
                 // 刻意**不**上屏高亮联想：回车是终结性动作，用户按它是要换行/发送，
                 // 不是「就选高亮那条吧」。
                 if state.assoc_active() {
-                    return self.assoc_dismiss(&mut state);
+                    return self.assoc_enter(&mut state);
                 }
                 // Enter：按 enter_behavior 配置（对齐 Go handleEnter）——"clear" 清空编码
                 // (不上屏)；否则(commit)上屏「已转换前缀 + 剩余原码」。

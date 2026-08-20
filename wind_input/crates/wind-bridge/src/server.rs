@@ -1057,6 +1057,7 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
             encode_update_composition(text, *caret_pos)
         }
         KeyAction::ClearComposition => encode_clear_composition(),
+        KeyAction::ClearCompositionThenPassThrough => encode_clear_then_pass_through(),
         KeyAction::PassThrough | KeyAction::NotHandled => encode_pass_through(),
         KeyAction::StatusUpdate(status) => encode_status_update_from_data(status),
         KeyAction::Consumed => encode_consumed(),

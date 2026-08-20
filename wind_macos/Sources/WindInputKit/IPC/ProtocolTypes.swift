@@ -51,6 +51,10 @@ public enum DownstreamCmd {
     public static let commitText: UInt16       = 0x0101
     public static let updateComposition: UInt16 = 0x0102
     public static let clearComposition: UInt16 = 0x0103
+    /// 收组合 + 把**当前这个键**交还宿主 (联想态回车/退格透传)。无载荷。
+    /// Win 侧要靠 SendInput 重放才能不丢键; IMKit 无前置闸门, 清完 marked text
+    /// `return false` 即可 —— 同一个意图, 两种手段。
+    public static let clearThenPassThrough: UInt16 = 0x010D
     public static let commitResult: UInt16     = 0x0105
     public static let commitTextWithCursor: UInt16 = 0x0106
     public static let moveCursor: UInt16       = 0x0107

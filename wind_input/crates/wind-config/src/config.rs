@@ -1763,6 +1763,25 @@ pub struct AssociationConfig {
     /// 这一项没有「更对」的答案——它取决于用户把联想当「顺手就选」还是「别挡我打字」。
     #[serde(default = "default_true")]
     pub space_commits: bool,
+    /// 联想态按**回车**：只收窗（吃键），还是收窗 + 把回车**透传**给宿主。
+    ///
+    /// `false`（默认）= 透传：联想窗收起，同时回车照常换行 / 发送消息。
+    /// `true` = 仅取消联想：回车被吃掉，要按第二次才生效。
+    ///
+    /// 默认透传，是因为回车是**终结性动作**——用户按它是要发送或换行，而联想窗是输入法
+    /// 自己弹出来的、用户并没有在选词。让它吞掉一次回车，等于让一个「建议」挡住了正事。
+    #[serde(default)]
+    pub enter_cancels_only: bool,
+    /// 联想态按**退格**：只收窗（吃键），还是收窗 + 把退格**透传**给宿主。
+    ///
+    /// 取值语义与 [`Self::enter_cancels_only`] 完全对称，但**默认相反**（`true` = 仅取消
+    /// 联想，保持吃键）。
+    ///
+    /// 两者默认值相反是刻意的（2026-08-20 用户拍板）：回车的透传是「把正事办了」，而退格
+    /// 的透传是**删掉刚上屏的字**——一个不可逆的破坏性动作。联想窗弹出时用户的手正停在
+    /// 刚打完的字上，误触退格若直接删字，比多按一次键的代价大得多。要这个行为的人可以开。
+    #[serde(default = "default_true")]
+    pub backspace_cancels_only: bool,
     /// 联想窗自动隐藏的毫秒数；`0` = 不自动隐藏。
     ///
     /// 联想态下候选窗几乎一直挂着，长时间停留会挡住正文。主流输入法的做法是显示几秒后
@@ -1801,6 +1820,8 @@ impl Default for AssociationConfig {
             mode: default_assoc_mode(),
             max_count: default_assoc_max_count(),
             space_commits: true,
+            enter_cancels_only: false,
+            backspace_cancels_only: true,
             hide_after_ms: default_assoc_hide_after_ms(),
             hint: default_assoc_hint(),
             history: true,

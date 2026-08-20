@@ -88,6 +88,11 @@ constexpr uint16_t CMD_PASS_THROUGH       = 0x0002; // Key not handled, pass to 
 constexpr uint16_t CMD_COMMIT_TEXT        = 0x0101; // Commit text
 constexpr uint16_t CMD_UPDATE_COMPOSITION = 0x0102; // Update composition
 constexpr uint16_t CMD_CLEAR_COMPOSITION  = 0x0103; // Clear composition
+// 收掉组合，并把**当前正在处理的这个键**交还宿主（联想态回车/退格透传）。无载荷。
+// 不能靠「ClearComposition + pfEaten=FALSE」凑：OnTestKeyDown 已按「有会话」吃了这个键，
+// 在 OnKeyDown 吐成 FALSE 就是「吃了再吐」翻转，不补发 WM_KEYDOWN 的宿主会直接丢键。
+// 走 hold / 配对跳出那条已验证的路：吃掉原键 + SendInput 重放。
+constexpr uint16_t CMD_CLEAR_THEN_PASS_THROUGH = 0x010D;
 constexpr uint16_t CMD_COMMIT_RESULT      = 0x0105; // Commit result (response to COMMIT_REQUEST)
 // 0x0201 (CMD_MODE_CHANGED) removed: 所有模式切换响应统一走 CMD_STATUS_UPDATE
 constexpr uint16_t CMD_STATUS_UPDATE      = 0x0202; // Full status update
@@ -787,6 +792,7 @@ enum class ResponseType
     CommitText,
     UpdateComposition,
     ClearComposition,
+    ClearCompositionThenPassThrough, // 收组合 + 把当前键交还宿主（重放）
     StatusUpdate,
     SyncHotkeys,
     Consumed,

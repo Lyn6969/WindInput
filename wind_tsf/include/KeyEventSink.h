@@ -152,6 +152,11 @@ private:
     bool _statsTrackEnglish = true;
 
     // State
+    // 本次 OnKeyDown 的响应是 ClearCompositionThenPassThrough：组合已在响应处理里收掉，
+    // 还欠宿主一次按键重放。**只在 OnKeyDown 里置位并当场消费**——`_HandleServiceResponse`
+    // 另有三个非按键调用点（同步握手等），它们拿不到 wParam，标志若残留会在下一次按键上
+    // 误重放。故 OnKeyDown 在调用响应处理**之前**先清零。
+    BOOL _pendingReplayToHost = FALSE;
     BOOL _isComposing;
     BOOL _hasCandidates;         // True if there are candidates to select
     // 配对跳出键（VK 码集合，由 core 经 CONFIG_KEY_JUMP_OUT_KEYS 推送）。英文模式配对直接

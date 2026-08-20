@@ -18,7 +18,8 @@
 //! （词频记账、自动造词、码表调序——联想没有码）。那用 [`CandidateSource::Assoc`]
 //! 一个来源标记就够了，与短语「有文本无码位、恒不记词频」是同一个先例。
 //!
-//! 于是**只剩三处**需要主动接：退格与回车（见 [`Coordinator::assoc_dismiss`]）、
+//! 于是**只剩三处**需要主动接：退格与回车（见 [`Coordinator::assoc_enter`] 与
+//! [`Coordinator::assoc_backspace`]）、
 //! 空缓冲模式激活的让位（见 `try_activate_mode`）、以及标点不顶屏（见
 //! `commit_highlight_then_char` 与标点臂里的同款守卫）。
 //!
@@ -66,7 +67,7 @@ use wind_candidate::{Candidate, CandidateSource};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssocExit {
     /// 退格 / 回车——两个「终结性」键，落回既有分支会给 `PassThrough` 悬空组合，
-    /// 故自己收尾（见 [`Coordinator::assoc_dismiss`]）。
+    /// 故自己收尾（见 [`Coordinator::assoc_enter`] 与 [`Coordinator::assoc_backspace`]）。
     Dismiss,
     /// 空格且 `space_commits = false`：不选联想，出空格。
     NonSelectKey,
@@ -413,12 +414,38 @@ impl Coordinator {
     /// 退格与回车都是**终结性**动作：一个是「删掉」、一个是「换行/发送」。联想态的
     /// 高亮是输入法猜的，不是用户选的，替他选一个是越权。
     ///
-    /// 代价是这两个键在联想态要按两次——第一次收窗、第二次才生效。这与本仓组合态的
-    /// 既有行为一致（正常打字时按 Ctrl+A 同样先清组合、键被吃掉）。
-    pub(crate) fn assoc_dismiss(&self, state: &mut State) -> KeyAction {
+    /// # 这一键是吃掉还是交还宿主，由配置定
+    ///
+    /// `cancels_only = true` 时吃掉（要按第二次才生效），`false` 时连同收窗一起把键交还
+    /// 宿主（[`KeyAction::ClearCompositionThenPassThrough`]）。**判据不在本函数里**——
+    /// 回车与退格的默认值相反，各自的取值见 [`Self::assoc_enter`] / [`Self::assoc_backspace`]。
+    fn assoc_dismiss_with(&self, state: &mut State, cancels_only: bool) -> KeyAction {
         self.exit_assoc(state, AssocExit::Dismiss);
         self.notify_ui_hide();
-        KeyAction::ClearComposition
+        if cancels_only {
+            KeyAction::ClearComposition
+        } else {
+            KeyAction::ClearCompositionThenPassThrough
+        }
+    }
+
+    /// 联想态的**回车**处置（`input.association.enter_cancels_only`，默认 `false` = 透传）。
+    ///
+    /// 默认让回车穿过去：它是终结性动作，用户按它是要发送/换行，而联想窗是输入法自己弹的、
+    /// 用户并没在选词。让一个「建议」吞掉一次回车，正事就被挡住了。
+    pub(crate) fn assoc_enter(&self, state: &mut State) -> KeyAction {
+        let cancels_only = self.rt().config.input.association.enter_cancels_only;
+        self.assoc_dismiss_with(state, cancels_only)
+    }
+
+    /// 联想态的**退格**处置（`input.association.backspace_cancels_only`，默认 `true` = 吃键）。
+    ///
+    /// 与回车默认相反，是刻意的（2026-08-20 用户拍板）：回车透传是「把正事办了」，退格透传
+    /// 却是**删掉刚上屏的字**——不可逆。联想窗弹出时用户的手正停在刚打完的字上，误触退格
+    /// 若直接删字，代价远大于多按一次键。要这个行为的人可以开。
+    pub(crate) fn assoc_backspace(&self, state: &mut State) -> KeyAction {
+        let cancels_only = self.rt().config.input.association.backspace_cancels_only;
+        self.assoc_dismiss_with(state, cancels_only)
     }
 
     /// 上屏一条**联想候选**之后，还要不要再联想一轮。

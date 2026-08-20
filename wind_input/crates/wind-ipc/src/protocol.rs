@@ -259,6 +259,10 @@ pub const CMD_COMMIT_AND_HOLD: u16 = 0x010B;
 /// 余码新组合 deferred_composition 延迟到触发键 keyup（或 timeout_ms 兜底）才开。
 /// 载荷：timeout_ms(u32 LE) + commit_len(u32 LE) + defer_len(u32 LE) + commit_utf8 + defer_utf8
 pub const CMD_COMMIT_THEN_DEFER: u16 = 0x010C;
+/// ClearCompositionThenPassThrough 响应 (0x010D)：收掉组合，并把**当前这个键**交还宿主。
+/// 无载荷——要重放的就是宿主此刻正在处理的那个键，由它自己取 vk；带 vk 反而制造
+/// 「服务端说重放 A、宿主正在处理 B」的错位可能。见 `KeyAction::ClearCompositionThenPassThrough`。
+pub const CMD_CLEAR_THEN_PASS_THROUGH: u16 = 0x010D;
 
 // 状态
 pub const CMD_STATUS_UPDATE: u16 = 0x0202;

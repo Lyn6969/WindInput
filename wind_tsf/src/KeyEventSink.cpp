@@ -1224,7 +1224,25 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
 
     // SYNC: Wait for response and handle it directly
     // This is simpler and matches Weasel's architecture
+    // 先清零重放标志：只有本次响应置的位才算数（见其声明处说明）。
+    _pendingReplayToHost = FALSE;
     *pfEaten = _HandleServiceResponse();
+
+    // ── 联想态回车/退格透传：组合已收口，把这一键还给宿主 ──────────────────────
+    // 置位来自 ResponseType::ClearCompositionThenPassThrough（那里解释了为何必须重放而
+    // 不是吐 FALSE）。放在 hold 重放之前：本条是服务端**显式声明**的意图，而 hold 那条
+    // 是本地按「PassThrough + hold 活跃」推断出来的；两者实际互斥（联想态没有 hold）。
+    if (_pendingReplayToHost)
+    {
+        _pendingReplayToHost = FALSE;
+        _ReplayKeyToHost((WORD)wParam);
+        *pfEaten = TRUE;
+        _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                        CHotkeyManager::ClassifyInputKey(wParam, modifiers),
+                        isChineseMode, hasComposition, _hasCandidates, hasInputSession,
+                        TRUE, L"assoc_clear_then_replay");
+        return S_OK;
+    }
 
     // ── hold 预览态 + 无法代劳的键：吃键 → 收口 → 重放 ─────────────────────────
     // 走到这里意味着服务端回了 PassThrough（缓冲为空），且 _HandleServiceResponse 已在
@@ -2024,6 +2042,21 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         _hasCandidates = FALSE;
         _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
         _pTextService->EndComposition();
+        return TRUE;
+
+    case ResponseType::ClearCompositionThenPassThrough:
+        // 与上一分支同样收组合，区别只在**这一键要还给宿主**（联想态回车/退格透传）。
+        //
+        // 这里仍返回 TRUE（吃掉原键）：OnTestKeyDown 已按「有会话」吃了它，此处吐 FALSE
+        // 就是「吃了再吐」翻转，EverEdit 这类不补发 WM_KEYDOWN 的宿主会直接丢键（实测
+        // vk=0x0D）。改由 OnKeyDown 在收口完成后 SendInput 重放一个干净的按键——宿主先
+        // 看到收口后的文档，再看到一个与组合无关的普通回车/退格。同 hold / 配对跳出。
+        WIND_LOG_DEBUG(L"Received ClearCompositionThenPassThrough from service\n");
+        _isComposing = FALSE;
+        _hasCandidates = FALSE;
+        _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
+        _pTextService->EndComposition();
+        _pendingReplayToHost = TRUE;
         return TRUE;
 
     case ResponseType::StatusUpdate:

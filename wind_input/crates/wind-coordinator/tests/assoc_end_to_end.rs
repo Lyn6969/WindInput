@@ -42,6 +42,24 @@ fn coord(kind: &str, schema: &str) -> std::sync::Arc<Coordinator> {
     coord_mode(kind, schema, "one_shot")
 }
 
+/// 同 [`coord`]，但可再改几项配置（联想态的按键行为开关）。
+fn coord_tweak(
+    kind: &str,
+    schema: &str,
+    tweak: impl FnOnce(&mut Config),
+) -> std::sync::Arc<Coordinator> {
+    let dir = data_dir();
+    let mut cfg = Config::default();
+    cfg.schema.available = vec![schema.to_string()];
+    cfg.schema.active = schema.to_string();
+    cfg.input.default.chinese_mode = true;
+    cfg.input.symbol.smart_mode = false;
+    cfg.input.association.kind = kind.to_string();
+    cfg.input.association.mode = "one_shot".to_string();
+    tweak(&mut cfg);
+    Coordinator::new_headless(cfg, Some(&dir))
+}
+
 fn coord_mode(kind: &str, schema: &str, mode: &str) -> std::sync::Arc<Coordinator> {
     let dir = data_dir();
     let mut cfg = Config::default();
@@ -512,9 +530,13 @@ fn punctuation_does_not_top_commit_assoc() {
     assert!(assoc_texts(&c).is_empty(), "标点该收掉联想窗");
 }
 
-/// 回车：收窗 + 结束占位组合（吞键），**不**上屏高亮联想。
+/// 回车：收窗 + 结束占位组合，**不**上屏高亮联想。
 ///
 /// 回车是终结性动作（换行/发送），联想的高亮是输入法猜的，替用户选一个是越权。
+///
+/// 本条只管「不上屏」这一件事，**刻意接受两种收窗动作**：吃键还是把回车交还宿主由
+/// `enter_cancels_only` 定，各自由 `assoc_enter_*` 两条钉。断言写死成某一个变体，
+/// 会让这条在开关默认值翻转时误报成「上屏了联想」——那是它压根没在测的事。
 #[test]
 fn enter_dismisses_assoc_without_committing() {
     let dir = data_dir();
@@ -529,7 +551,10 @@ fn enter_dismisses_assoc_without_committing() {
     let act = c.handle_key_event(&key_event(0x0D)); // VK_RETURN
     assert!(assoc_texts(&c).is_empty(), "回车该收掉联想窗");
     assert!(
-        matches!(act, KeyAction::ClearComposition),
+        matches!(
+            act,
+            KeyAction::ClearComposition | KeyAction::ClearCompositionThenPassThrough
+        ),
         "回车该结束占位组合而不是上屏联想，实得 {act:?}"
     );
 }
@@ -621,4 +646,88 @@ fn entering_mode_does_not_commit_assoc_candidate() {
         } => panic!("联想态按引导键不该顶屏联想候选，却上屏了 {text:?}（联想候选 {hits:?}）"),
         other => panic!("联想态按反引号应进临时拼音，实得 {other:?}"),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 联想态的回车 / 退格：吃键还是交还宿主
+//
+// 两个键**默认相反**（回车透传、退格吃键），理由见 `AssociationConfig` 的字段文档。
+// 四条用例把两个开关的两种取值都钉死——只测一半会让「开关根本没接线」照样全绿。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ★ 默认：联想态回车**交还宿主**（收窗 + 照常换行/发送），不必按两次。
+#[test]
+fn assoc_enter_passes_through_by_default() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let c = coord("word", "wubi86_pinyin");
+    enter_assoc(&c);
+    match c.handle_key_event(&key_event(0x0D)) {
+        KeyAction::ClearCompositionThenPassThrough => {}
+        other => panic!("联想态回车默认应收窗 + 交还宿主，实得 {other:?}"),
+    }
+    assert!(assoc_texts(&c).is_empty(), "回车后联想窗该收起");
+}
+
+/// ★ `enter_cancels_only = true`：回车只收窗，键被吃掉（要按第二次才生效）。
+#[test]
+fn assoc_enter_cancels_only_when_configured() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    // 两个开关**同时设成与各自默认相反**：这样「回车读了退格那份配置」这类接错线
+    // 也会被抓到——只翻一个开关时，另一个键的默认值恰好能让错误的读取蒙对。
+    let c = coord_tweak("word", "wubi86_pinyin", |cfg| {
+        cfg.input.association.enter_cancels_only = true;
+        cfg.input.association.backspace_cancels_only = false;
+    });
+    enter_assoc(&c);
+    match c.handle_key_event(&key_event(0x0D)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("开 enter_cancels_only 后回车应只收窗吃键，实得 {other:?}"),
+    }
+    assert!(assoc_texts(&c).is_empty(), "回车后联想窗该收起");
+}
+
+/// ★ 默认：联想态退格**吃键**——与回车相反，透传会删掉刚上屏的字（不可逆）。
+#[test]
+fn assoc_backspace_is_eaten_by_default() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let c = coord("word", "wubi86_pinyin");
+    enter_assoc(&c);
+    match c.handle_key_event(&key_event(0x08)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("联想态退格默认应只收窗吃键，实得 {other:?}"),
+    }
+    assert!(assoc_texts(&c).is_empty(), "退格后联想窗该收起");
+}
+
+/// ★ `backspace_cancels_only = false`：退格连同收窗一起交还宿主。
+#[test]
+fn assoc_backspace_passes_through_when_configured() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    // 同上，两个开关一起翻，堵住「退格读了回车那份配置」的假绿。
+    let c = coord_tweak("word", "wubi86_pinyin", |cfg| {
+        cfg.input.association.backspace_cancels_only = false;
+        cfg.input.association.enter_cancels_only = true;
+    });
+    enter_assoc(&c);
+    match c.handle_key_event(&key_event(0x08)) {
+        KeyAction::ClearCompositionThenPassThrough => {}
+        other => panic!("关 backspace_cancels_only 后退格应交还宿主，实得 {other:?}"),
+    }
+    assert!(assoc_texts(&c).is_empty(), "退格后联想窗该收起");
 }

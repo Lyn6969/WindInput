@@ -104,6 +104,24 @@ pub enum KeyAction {
     UpdateComposition { text: String, caret_pos: u32 },
     /// 清除组合
     ClearComposition,
+    /// 清除组合，**并把当前这个键交还宿主**（联想态回车/退格透传）。
+    ///
+    /// # 为什么不能用 `ClearComposition` 或 `PassThrough` 表达
+    ///
+    /// 两者各只做了一半，而这里两件事都要：
+    /// - `ClearComposition` 收了组合，但**吃掉**这个键（Windows/Android 语义如此；
+    ///   macOS 只在 `hostShortcut` 时才交还）。用户按回车要的是换行，不是「关个窗」。
+    /// - `PassThrough` 交还了键，却**不收组合**——联想态挂着占位组合
+    ///   （`handle_assoc::ASSOC_COMPOSITION`），组合会悬在宿主里，编码栏留着「联想输入」。
+    ///
+    /// # 实现手段由各宿主自己选，本变体只声明意图
+    ///
+    /// - **Windows TSF**：`EndComposition()` 后**不能**把 `pfEaten` 吐成 `FALSE`——
+    ///   `OnTestKeyDown` 已按「有会话」吃了这个键，翻转会让不补发 `WM_KEYDOWN` 的宿主
+    ///   （EverEdit 等）直接丢键。故沿用 hold / 配对跳出那条已验证的路：吃掉原键，
+    ///   `SendInput` 重放一个干净的按键，宿主先看到收口后的文档、再看到普通按键。
+    /// - **macOS IMKit**：无前置闸门，`applyClearComposition` 后 `return false` 即可。
+    ClearCompositionThenPassThrough,
     /// 透传给系统
     PassThrough,
     /// 状态更新（携带完整状态含 iconLabel）

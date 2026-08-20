@@ -1236,6 +1236,11 @@ BOOL CIPCClient::_ParseResponse(const IpcHeader& header, const std::vector<uint8
         _LogDebug(L"Response: ClearComposition");
         break;
 
+    case CMD_CLEAR_THEN_PASS_THROUGH:
+        response.type = ResponseType::ClearCompositionThenPassThrough;
+        _LogDebug(L"Response: ClearCompositionThenPassThrough");
+        break;
+
     case CMD_COMMIT_TEXT:
         {
             response.type = ResponseType::CommitText;
