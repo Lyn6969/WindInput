@@ -499,6 +499,24 @@ content = "a\t啊\n"
         assert!(!d.join("bad.schema.toml").exists(), "拒绝的信封不得落盘");
     }
 
+    /// 版本门禁**先于**说明校验(与 zip 路径同判据同顺序):两处都不合法时报版本过高。
+    #[test]
+    fn future_format_version_reported_before_invalid_info() {
+        let (_t, d) = dest();
+        let long_title = "字".repeat(wind_config::patch::INFO_TITLE_MAX_CHARS + 1);
+        let text = format!(
+            "[package]\nformat_version = 3\nkind = \"schema_text\"\ntitle = \"{long_title}\"\n\
+             [[files]]\npath = \"v3.schema.toml\"\ncontent = \"x\"\n"
+        );
+        let err = preview_import_text(&text, &d).unwrap_err().to_string();
+        assert!(err.contains("升级"), "应先报版本过高: {err}");
+        assert!(
+            !err.contains("过长"),
+            "不该拿当前规则去判更高版本的说明: {err}"
+        );
+        assert!(import_text(&text, &d, crate::merge::Strategy::Merge).is_err());
+    }
+
     /// config_patch.toml 作 files 条目:不落盘,原文随预览返回(语义同 zip 包)。
     #[test]
     fn config_patch_entry_is_returned_not_written() {

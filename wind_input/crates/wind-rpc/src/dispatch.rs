@@ -669,6 +669,25 @@ mod tests {
         assert!(!core.config_applied.load(Ordering::SeqCst), "预览只读");
     }
 
+    /// 只写 title 时 `info` 里**没有** description 字段（逐字段 skip，不是整个 info 全有全无）。
+    #[test]
+    fn preview_patch_info_omits_unwritten_field() {
+        let resp = dispatch(
+            &state(),
+            req(
+                "config.previewPatch",
+                json!({ "text": "[package]\ntitle = \"只有标题\"\n[ui.candidate]\nper_page = 9\n" }),
+            ),
+        );
+        let r = resp.result.expect("应成功");
+        assert_eq!(r["info"]["title"], json!("只有标题"));
+        assert!(
+            r["info"].get("description").is_none(),
+            "没写的字段不输出: {}",
+            r["info"]
+        );
+    }
+
     /// 无 `[package]` 段（或段内两字段都缺省）→ 响应里**没有** info 字段，
     /// 前端不必区分「没写」与「写了空串」。
     #[test]

@@ -880,9 +880,22 @@ mod tests {
     }
 
     /// 全空白视同没写（trim 后为空 → None）,不是「一个空标题」。
+    /// 全角空格 U+3000 同样算空白（Rust `trim()` 认它）——中文分发者最容易误打的正是它。
     #[test]
     fn all_whitespace_is_treated_as_absent() {
         assert!(info_of("[package]\ntitle = \"   \"\n").is_none());
+        assert!(
+            info_of("[package]\ntitle = \"\u{3000}\u{3000}\"\n").is_none(),
+            "全角空格也是空白,视同没写"
+        );
+        assert_eq!(
+            info_of("[package]\ntitle = \"\u{3000}有标题\u{3000}\"\n")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("有标题"),
+            "全角空格同样被 trim 掉"
+        );
         assert!(info_of("[package]\ndescription = \"\\n\\n  \"\n").is_none());
         let info = info_of("[package]\ntitle = \"  有标题  \"\ndescription = \"  \"\n").unwrap();
         assert_eq!(info.title.as_deref(), Some("有标题"), "首尾空白 trim");

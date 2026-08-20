@@ -443,9 +443,9 @@ pub fn export_package(
 /// 枚举包内载荷条目(排除 package.toml、目录项),逐条过穿越守卫。
 /// 校验根下至少一个 `*.schema.toml`;对备份包/旧格式给出针对性错误。
 ///
-/// 版本门禁也在这里:preview_import 与 import_package 都必经此函数,是两条导入
-/// 路径的共用点。门禁先于布局校验——更高版本的包布局可能已变,先报"版本过高"
-/// 比报"不是有效的方案包"对得上真实原因。
+/// 版本门禁在它调用的 [`read_package_meta`] 里,恒先于本函数的布局校验——更高版本的包
+/// 布局可能已变,先报"版本过高"比报"不是有效的方案包"对得上真实原因。同理它也先于
+/// 说明校验(说明字段的规则同样可能已变)。
 /// 包内一个载荷条目。
 ///
 /// `name` = zip 条目原名(取字节只能用它);`rel` = 归一化后的 schemas 相对路径
@@ -466,14 +466,8 @@ pub(crate) struct PayloadEntry {
 /// 它还要求 `format_version ≥ 2`:legacy 语义下旧客户端会把它当死文件落盘,生成端
 /// 必须显式声明版本——硬拒绝比「装了但配置没生效」更早暴露问题。
 fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<String>)> {
+    // 版本门禁在 read_package_meta 内(先于说明校验),此处不再重复。
     let meta = read_package_meta(package)?;
-    if meta.package.format_version > PACKAGE_FORMAT_VERSION {
-        anyhow::bail!(
-            "方案包版本过高(format_version={},当前支持 {}),请升级 WindInput",
-            meta.package.format_version,
-            PACKAGE_FORMAT_VERSION
-        );
-    }
     let file = std::fs::File::open(package)?;
     let archive = zip::ZipArchive::new(file)?;
     let mut entries: Vec<PayloadEntry> = Vec::new();
@@ -514,20 +508,33 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<Str
     Ok((entries, config_patch_name))
 }
 
-/// 读取包内可选元信息。宽容只给过去,不给未来:
+/// 读取包内可选元信息,并按序做**版本门禁 → 说明校验**两道检查。
+///
+/// 解析的宽容度(宽容只给过去,不给未来):
 /// - `package.toml` 不存在 → 回落默认值(导入不强制元信息,兼容手工打包);
 /// - 解析失败但原文声明了 `package.format_version` → 硬报错——声明新格式却写坏,
 ///   静默回落会把 format_version 当 legacy 处理,等于绕过版本门禁;
 /// - 解析失败且无该字段(或根本不是 TOML)→ 回落默认值(legacy 宽容,现状不变)。
+///
+/// **两道检查的先后不可换**:更高版本的包,说明字段的规则也可能已放宽,拿当前规则去判
+/// 它本身就是错的;且「版本过高,请升级」对得上真实原因,「title 过长」只会把人带偏。
+/// 这与 [`scan_package`] 文档里「门禁先于布局校验」是同一条原则,信封路径
+/// (`envelope::parse`)也是同一顺序——两条路必须同判据。
 pub fn read_package_meta(package: &Path) -> anyhow::Result<PackageMeta> {
     let Ok(bytes) = crate::bundle::extract_entry(package, PACKAGE_META_NAME) else {
         return Ok(PackageMeta::default());
     };
     let text = String::from_utf8_lossy(&bytes);
     match toml::from_str::<PackageMeta>(&text) {
-        // 说明元信息在此校验:preview 与 import 都必经本函数,是两条路径的共用点
-        // (与 format_version 门禁同一处置)。
         Ok(mut meta) => {
+            if meta.package.format_version > PACKAGE_FORMAT_VERSION {
+                anyhow::bail!(
+                    "方案包版本过高(format_version={},当前支持 {}),请升级 WindInput",
+                    meta.package.format_version,
+                    PACKAGE_FORMAT_VERSION
+                );
+            }
+            // 说明校验在版本门禁之后:preview 与 import 都必经本函数,是两条路径的共用点。
             sanitize_package_info(&mut meta.package)?;
             Ok(meta)
         }
@@ -1514,6 +1521,40 @@ layout = "old"
             !dest.join("bad.schema.toml").exists(),
             "拒绝的包不得落盘任何文件"
         );
+    }
+
+    /// 版本门禁**先于**说明校验:未来版本很可能放宽说明限额,拿当前规则去判更高版本的包
+    /// 本身就是错的,且"请升级"才对得上真实原因。同一个包若两处都不合法,必须报版本过高。
+    #[test]
+    fn future_format_version_reported_before_invalid_info() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("v3-badinfo.zip");
+        let long_title = "字".repeat(wind_config::patch::INFO_TITLE_MAX_CHARS + 1);
+        write_zip(
+            &pkg,
+            &[
+                (
+                    PACKAGE_META_NAME,
+                    format!("[package]\nformat_version = 3\ntitle = \"{long_title}\"\n").as_bytes(),
+                ),
+                ("v3.schema.toml", b"[schema]\nid=\"v3\"\n".as_slice()),
+            ],
+        );
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        for err in [
+            preview_import(&pkg, &dest).unwrap_err().to_string(),
+            import_package(&pkg, &dest, crate::merge::Strategy::Merge)
+                .err()
+                .expect("import 同样应拒绝")
+                .to_string(),
+        ] {
+            assert!(err.contains("升级"), "应先报版本过高: {err}");
+            assert!(
+                !err.contains("过长"),
+                "不该拿当前规则去判更高版本的说明: {err}"
+            );
+        }
     }
 
     /// 包级说明与包内 config_patch 自带的说明**互不干扰**:两级说的不是同一件事,
