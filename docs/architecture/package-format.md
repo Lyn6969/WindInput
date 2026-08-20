@@ -41,10 +41,29 @@
   `StructList` 键（如 `schema.mix_modes`）无此语义，仍为整值替换——**分发包不得携带 StructList 键**
   （同样会覆盖用户数据），生成端与 cookbook 都要遵守。
 
-### 2.3 RPC 契约（P0-P1 已实现；Map 合并与 written 为 2026-08-19 增补）
+### 2.3 说明元信息 `[package]`（保留段，2026-08-20 定稿）
 
-- `config.previewPatch { text }` → `{ entries: [{ key, mapEntry?, current?, next, error? }], ok }`。
+分发内容要能自我介绍——用户看到的不该只是一串键名变更，还要有一句「这是干什么的」。
+
+- 片段可携带**顶层保留段 `[package]`**，字段 `title`（单行标题）与 `description`（多行说明）。
+  三种载体（片段 / 分发包 `package.toml` / 文本信封）**同名同义**，一套语法学一次；
+  片段被放进包里当 `config_patch.toml` 时原样可用。
+- `package` 是片段里**唯一**的保留顶层段：展平时整段跳过，既不产出配置条目、也不报「未知配置键」。
+  config.toml 没有 `package` 域，不存在与真实配置键撞名的可能。
+- 段内**未知子键一律忽略**（向前兼容：将来加字段，旧客户端不炸）。
+- 限额与净化（说明是分发者提供的任意文本，会直接渲染进 UI）：
+  `title` ≤ 200 字符且不含换行，`description` ≤ 4000 字符，超限即**报错**（分发前该自测，不静默截断）；
+  `\r\n` 归一为 `\n`，除 `\n` `\t` 外的 C0 控制字符一律拒绝。
+  UI 侧另有显示行数上限与滚动，core 的限额不替代它。
+- 展示位置：片段导入对话框在预览列表上方显示；包/信封导入确认在顶部显示。
+  包内 `config_patch.toml` 自带的说明属于该片段，显示在「将修改的配置」区块处，
+  与包级说明（来自 `package.toml`）各显各的，**不做合并或优先级判定**——两级说的不是同一件事。
+
+### 2.4 RPC 契约（P0-P1 已实现；Map 合并与 written 为 2026-08-19 增补，`info` 为 2026-08-20 增补）
+
+- `config.previewPatch { text }` → `{ entries: [{ key, mapEntry?, current?, next, error? }], ok, info? }`。
   Map 键的每个条目一行：`key` = 父 Map 键，`mapEntry` = 条目名，`current` = 当前表中该条目的值（缺席 = 新增）。
+  `info: { title?, description? }` 来自片段的 `[package]` 段（§2.3），两字段都缺省时整个 `info` 不出现。
 - `config.applyPatch { text }` → `{ ok, applied, needsRestart, written: [{ key, value }] }` / 整体拒绝（错误列表）。
   `written` 是**落盘后的最终键值**——Map 父键携带合并后的整表。设置端用它回灌配置镜像
   （回声豁免比对的是整键值，Map 合并后客户端无法从 entries 自行拼出整表，必须由 core 回传）。
@@ -55,7 +74,7 @@
 
 - zip，条目名 = schemas 根相对路径（零层级，导入零改写落到 `%APPDATA%\WindInput\schemas\`）。
 - `package.toml`（`PACKAGE_META_NAME`）可选；缺失时按「根目录存在 `*.schema.toml`」识别。现有字段：
-  - `[package]` app_version / platform / created_at
+  - `[package]` app_version / platform / created_at / format_version（§3.2）/ title / description（§2.3）
   - `[schema]` id / version
   - `[refs]` system / missing
 - 导出恒为自包含（系统目录资源读源打包）。
@@ -89,7 +108,7 @@ config_patch 的实现决策（2026-08-19 定稿）：
   （它不是方案资源；落盘即死文件）。
 - **要求 `format_version ≥ 2`**：legacy（v1 / 无 package.toml）包中出现 `config_patch.toml` → 硬拒绝
   并提示包需重新打包——v1 语义下它会被旧客户端当死文件，生成端必须声明版本。
-- **应用编排在设置端，两步走**：确认对话框展示片段逐键 diff（§2.3 previewPatch 结果）→ 用户确认 →
+- **应用编排在设置端，两步走**：确认对话框展示片段逐键 diff（§2.4 previewPatch 结果）→ 用户确认 →
   ① `scheme.import` 写方案文件 → ② `config.applyPatch` 应用片段（继承热重载与镜像回灌）。
   预览有任一错误条目则**整包禁止导入**（分发侧应出厂前测过）。两步之间非原子：文件已装而片段失败时
   如实报错（方案已导入、配置未应用），不回滚文件。core 侧不做跨域原子化——patch 管线的热重载与
@@ -105,6 +124,10 @@ zip 导入完全一致（方案文件 + 词库文件），引擎与缓存管线�
 [package]
 format_version = 2          # 必填。信封无 legacy——缺失即错，高于当前支持即拒绝
 kind = "schema_text"        # 必填。显式声明，侦测不做猜测
+title = "快符方案"           # 可选，说明元信息（§2.3）
+description = """
+分号引导的符号表，含常用标点与配对符号。
+"""
 
 [schema]                    # 可选冗余，免解析 files 即可显示 id/版本
 id = "kf"
@@ -133,7 +156,7 @@ content = '''…词库原文…'''
 导入入口收到内容后按序判定（规则顺序即优先级）：
 
 1. zip 且含 `manifest.toml` / `manifest.json` → 备份包 → 转备份还原流程（或提示去备份页）。
-2. zip 且根含 `*.schema.toml` → 分发包（方案包/配置包）→ `scheme.previewImport` 流程；若同时含 `config_patch.toml`，预览必须附带 §2.3 的逐键 diff。
+2. zip 且根含 `*.schema.toml` → 分发包（方案包/配置包）→ `scheme.previewImport` 流程；若同时含 `config_patch.toml`，预览必须附带 §2.4 的逐键 diff。
 3. zip 且仅含 `config_patch.toml`（无方案文件）→ 纯配置包 → 片段流程。
    **实现状态（2026-08-19）**：core 侧暂未承接此形——`scheme.previewImport` 对无根方案的包报
    「不是有效的方案包」，官方生成端也不产出纯配置 zip；纯配置分发请用片段文本或文本信封（§3.4）。

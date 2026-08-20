@@ -2,7 +2,7 @@
 
 状态：设计定稿（2026-08 讨论产出）；P0-P2 已实施（片段管线 / 统一导入界面 / `.wpkg` 关联 / 协议 schema kind 官方域）。
 2026-08-19 增补：Map 键逐条合并、config_patch 设置端两步编排、文本信封——权威描述均在
-`docs/architecture/package-format.md` §2.2 / §2.3 / §3.3 / §3.4，本文不重复。
+`docs/architecture/package-format.md` §2.2 / §2.3 / §2.4 / §3.3 / §3.4，本文不重复。
 目标：让用户尽量不必手动编辑配置文件——预置内容通过片段与分发包到达，经统一管线安全应用。
 
 ## 1. 核心原则：入口可以多，通路只有一条
@@ -63,7 +63,7 @@ URL 协议、本地文件、`.wpkg` 双击、剪贴板、右键菜单——只�
 ## 4. 校验归属：core 出 RPC，设置仓只渲染
 
 片段解析/校验收在主仓 core 侧（`config.previewPatch` / `config.applyPatch`，契约见
-package-format.md §2.3）。理由：
+package-format.md §2.4）。理由：
 
 1. REGISTRY 与「合法但不登记」白名单的权威在主仓；设置仓 capabilities 快照里复刻校验 = 第二份真相源，必漂移。
 2. 包内 `config_patch.toml` 与剪贴板片段共用同一对 RPC，管线真正只有一份。
