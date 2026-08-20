@@ -24,6 +24,9 @@ fontdb = "0.22"
 
 [dev-dependencies]
 wind-bridge = { path = "../wind-bridge" }
+# 手工构造 .wpkg 用（export_package 写不出带说明的 package.toml）；
+# 与 wind-transfer 同一版本，不引入新的外部依赖。
+zip = "2"
 
 [lints]
 workspace = true

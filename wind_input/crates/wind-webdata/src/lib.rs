@@ -1106,6 +1106,11 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     /// 预览响应的公共形状(zip 与文本信封共用,两条路复用同一个确认对话框)。
+    ///
+    /// **包级说明**(`title` / `description`,来自 package.toml / 信封 `[package]`)提到
+    /// 顶层:确认对话框在顶部显示它。空则不输出该字段——前端不必区分"没写"与"写了空串"。
+    /// 它与 `configPatch.info`(片段自带的说明)**各显各的、不合并**:包级说的是"这个包
+    /// 是什么",片段级说的是"这段配置改了什么"(§2.3)。
     fn scheme_preview_json(
         p: &wind_transfer::scheme::SchemeImportPreview,
     ) -> anyhow::Result<Value> {
@@ -1117,25 +1122,40 @@ pub trait WebDataRpc: WebDataHost {
             "systemRefs": p.system_refs,
             "missing": p.missing,
         });
+        if !p.meta.package.title.is_empty() {
+            out["title"] = json!(p.meta.package.title);
+        }
+        if !p.meta.package.description.is_empty() {
+            out["description"] = json!(p.meta.package.description);
+        }
         if let Some(text) = &p.config_patch {
             out["configPatch"] = Self::config_patch_diff(text)?;
         }
         Ok(out)
     }
 
-    /// 包内配置片段的逐键 diff(`{ text, ok, entries }`),形状与 `config.previewPatch` 同源。
+    /// 包内配置片段的逐键 diff(`{ text, ok, entries, info? }`),形状与 `config.previewPatch`
+    /// 同源。`info` 是**该片段自己**的说明(来自 config_patch.toml 的 `[package]` 段),
+    /// 与包级 title/description 无关,不合并也不做优先级判定。
     ///
     /// 只预览、**不应用**:应用编排在设置端(导入方案文件 → `config.applyPatch`),那条路
     /// 才有热重载与镜像回灌。在文件层复刻它们就是第二份真相源。
     fn config_patch_diff(text: &str) -> anyhow::Result<Value> {
         let fragment = wind_config::patch::parse_fragment(text)
             .map_err(|e| anyhow::anyhow!("包内配置片段无法解析: {e}"))?;
+        // 说明非法即整体错误(与解析失败同级),判据与 config.previewPatch 完全一致。
+        let info = wind_config::patch::extract_info(&fragment)
+            .map_err(|e| anyhow::anyhow!("包内配置片段说明非法: {e}"))?;
         let current = toml::Value::try_from(wind_config::Config::load(
             wind_config::Config::data_dir().as_deref(),
         )?)?;
         let entries = wind_config::patch::preview(&fragment, &current);
         let ok = entries.iter().all(|e| e.error.is_none());
-        Ok(json!({ "text": text, "ok": ok, "entries": entries }))
+        let mut out = json!({ "text": text, "ok": ok, "entries": entries });
+        if let Some(info) = info {
+            out["info"] = serde_json::to_value(info)?;
+        }
+        Ok(out)
     }
 
     fn web_backup_create(&self, params: &Value) -> anyhow::Result<Value> {
@@ -5033,6 +5053,92 @@ moved = [{ id = 'date.lunar', position = 0 }]
             )
             .is_err()
         );
+    }
+
+    /// 分发包的说明元信息:包级 title/description 提到响应顶层,片段自带的说明进
+    /// `configPatch.info`。两者在本测试里**取不同的值**——取错了源也照绿是这类
+    /// "两个来源同名字段"最容易漏的假绿。
+    #[test]
+    fn scheme_preview_import_separates_package_and_patch_info() {
+        let c = coord("schemepkginfo");
+        let t = std::env::temp_dir().join("wind_schemepkginfo_test");
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let pkg = t.join("info.wpkg");
+        {
+            let f = std::fs::File::create(&pkg).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                (
+                    "package.toml",
+                    "[package]\nformat_version = 2\ntitle = \"包级标题\"\ndescription = \"包级说明\"\n",
+                ),
+                (
+                    "zz_info_probe.schema.toml",
+                    "[schema]\nid=\"zz_info_probe\"\n",
+                ),
+                (
+                    "config_patch.toml",
+                    "[package]\ntitle = \"片段级标题\"\ndescription = \"片段级说明\"\n\
+                     [ui.candidate]\nper_page = 9\n",
+                ),
+            ] {
+                use std::io::Write;
+                w.start_file(name, opts).unwrap();
+                w.write_all(body.as_bytes()).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let prev = c
+            .web_data_rpc(
+                "scheme.previewImport",
+                &json!({ "path": pkg.to_string_lossy() }),
+            )
+            .unwrap();
+        assert_eq!(prev["title"], json!("包级标题"), "包级说明提到顶层");
+        assert_eq!(prev["description"], json!("包级说明"));
+        let cp = prev.get("configPatch").expect("含 config_patch 应附 diff");
+        assert_eq!(
+            cp["info"]["title"],
+            json!("片段级标题"),
+            "片段自带的说明进 configPatch.info,不与包级混淆"
+        );
+        assert_eq!(cp["info"]["description"], json!("片段级说明"));
+        // 保留段不产出配置条目:entries 只有真配置键那一条。
+        let entries = cp["entries"].as_array().expect("entries 应为数组");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["key"], json!("ui.candidate.per_page"));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 信封路径的两形:写了说明 → 顶层带出(只写 title 时 description 不出现);
+    /// 没写 → 顶层与 configPatch 都没有说明字段。
+    #[test]
+    fn scheme_preview_import_text_info_present_and_absent() {
+        let c = coord("schemetextinfo");
+        let with_info = "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+                         title = \"快符方案\"\n\
+                         [[files]]\npath = \"zz_kf_info.schema.toml\"\ncontent = \"[schema]\\nid = 'kf'\\n\"\n";
+        let prev = c
+            .web_data_rpc("scheme.previewImportText", &json!({ "text": with_info }))
+            .unwrap();
+        assert_eq!(prev["title"], json!("快符方案"));
+        assert!(
+            prev.get("description").is_none(),
+            "没写的字段不输出: {prev}"
+        );
+
+        let without_info = "[package]\nformat_version = 2\nkind = \"schema_text\"\n\
+                            [[files]]\npath = \"zz_kf_info.schema.toml\"\ncontent = \"[schema]\\nid = 'kf'\\n\"\n\
+                            [[files]]\npath = \"config_patch.toml\"\ncontent = \"ui.candidate.per_page = 9\\n\"\n";
+        let prev = c
+            .web_data_rpc("scheme.previewImportText", &json!({ "text": without_info }))
+            .unwrap();
+        assert!(prev.get("title").is_none(), "无说明不输出 title: {prev}");
+        assert!(prev.get("description").is_none());
+        let cp = prev.get("configPatch").expect("含 config_patch 应附 diff");
+        assert!(cp.get("info").is_none(), "片段没写说明就没有 info: {cp}");
     }
 
     /// 文本信封 RPC 契约(只测只读与错误路径:importText 会真写用户 schemas 目录,
