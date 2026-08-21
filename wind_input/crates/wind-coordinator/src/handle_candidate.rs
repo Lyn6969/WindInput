@@ -12,6 +12,7 @@ use crate::short_code_yield;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
+use wind_engine::manager::ENGLISH_SCHEMA;
 use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
@@ -1527,14 +1528,7 @@ impl Coordinator {
                 let cand = state.candidates[gi].clone();
                 self.commit_temp_pinyin_selected(state, &cand, offset as i32)
             }
-            Some(ModeKind::TempEnglish) => {
-                if let Some(act) = self.temp_english_try_command(state, gi) {
-                    act
-                } else {
-                    let text = state.candidates[gi].text.clone();
-                    self.commit_temp_english_text(state, text)
-                }
-            }
+            Some(ModeKind::TempEnglish) => self.commit_temp_english_selected(state, gi),
             Some(ModeKind::Special(_)) => self.commit_special_candidate(state, gi),
             Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
             // 网址模式无候选列表（不出候选窗），没有可选中的东西。
@@ -1974,7 +1968,16 @@ impl Coordinator {
     /// 普通输入 = `active`；**特殊模式 = 它引用的方案**——特殊方案与主方案同层级，有自己的
     /// 词库和用户数据，只是用特殊按键进入，按 `active` 归属会把它的账全记到主方案头上。
     ///
-    /// ⚠️ **临拼 / 临英 / 快捷输入刻意不在此分流**（2026-08-04 用户拍板）：它们走
+    /// **临英 = 英文方案**（`ENGLISH_SCHEMA`）：临英与英文方案打的是同一份词库、同一个方案
+    /// id，差别只在进入方式（Shift+字母 overlay vs 常驻方案）。归属到同一个桶，才谈得上
+    /// 「临英里选过的词，切到英文方案也受益」。不给它落点的话，读写两端会同时缺席——
+    /// 词频记不进、候选调整存不下，而这两件事各自失效都是完全静默的。
+    ///
+    /// ★ 判据是**模式是不是临英**，不能图省事复用 `overlay_engine_schema`：那个在
+    /// `show_candidates = false` 时返回 `None`（它回答的是「要不要出候选」），拿它当落点，
+    /// 用户一关候选显示，词频就静默换到主方案的桶里去。
+    ///
+    /// ⚠️ **临拼 / 快捷输入刻意不在此分流**（2026-08-04 用户拍板）：它们走
     /// `write_data_schema_id` 的按候选来源分流，实测行为正确（临拼记进 `"pinyin"`、全拼
     /// 双拼共享一份），改动风险大于收益。往这里加模式前先确认那条路径不够用。
     ///
@@ -1982,6 +1985,7 @@ impl Coordinator {
     pub(crate) fn effective_data_schema(&self, state: &State) -> Option<String> {
         match state.active {
             Some(ModeKind::Special(idx)) => self.special_schema(idx),
+            Some(ModeKind::TempEnglish) => Some(ENGLISH_SCHEMA.to_string()),
             _ => None,
         }
     }
@@ -2031,7 +2035,17 @@ impl Coordinator {
                 state.special_buffer.clone(),
                 true,
             ),
-            // 其余 overlay（临拼 / 临英 / 混输 / 网址）没有独立词库落点：`effective_data_schema`
+            // 临时英文：归属恒是内置英文方案（与读写两端同源，见 effective_data_schema）。
+            // 码取**小写化的缓冲**——临英缓冲带大写（Shift+H 进入即 `H`），而英文方案下
+            // `input_buffer` 恒为全小写；不归一的话「临英里置顶的词，切到英文方案不生效」，
+            // 反过来也一样，两个入口各自存了一份键。`raw_code` 保留原形供展示。
+            Some(ModeKind::TempEnglish) => (
+                self.effective_data_schema(state)?,
+                state.temp_english_buffer.to_lowercase(),
+                state.temp_english_buffer.clone(),
+                false,
+            ),
+            // 其余 overlay（临拼 / 混输 / 网址）没有独立词库落点：`effective_data_schema`
             // 对它们返回 None（2026-08-04 用户拍板，见其文档），放行会静默落回主方案。
             // 新增模式时**先补落点、再放行**，顺序不能反。
             _ => return None,
@@ -2040,13 +2054,17 @@ impl Coordinator {
         if code.is_empty() && !special {
             return None;
         }
-        // 调位判据要问的是「**出这批候选的**引擎是不是拼音」。`current_engine_type()` answers
-        // 的是主方案——特殊模式下照抄它，会在「主方案是拼音 + 快符是码表」时把本该可调位的
+        // 调位判据要问的是「**出这批候选的**引擎是不是拼音」。`current_engine_type()` 答的
+        // 是主方案——overlay 下照抄它，会在「主方案是拼音 + 快符是码表」时把本该可调位的
         // 快符候选整体误禁（反之亦然）。`loaded_engine_type` 正是为 overlay 分流准备的。
-        let engine_type = if special {
-            self.engine_mgr.loaded_engine_type(&schema)
-        } else {
+        //
+        // 判据是「归属方案是不是 active」而非「是不是特殊模式」：临英的归属同样不是 active
+        // （主方案可能是五笔），按后者分流会拿五笔的引擎类型去判英文候选。两者相等时
+        // 两个取值本就同源，故对既有的特殊模式路径逐字节等价。
+        let engine_type = if schema == self.engine_mgr.active_schema_id() {
             self.engine_mgr.current_engine_type()
+        } else {
+            self.engine_mgr.loaded_engine_type(&schema)
         };
         Some(CandidateOpScope {
             schema,
@@ -2062,13 +2080,32 @@ impl Coordinator {
     /// 供**无候选可依**的出口使用——「空格上屏原码」上屏的是输入缓冲本身
     /// （`CandidateSource::None`），拿不到来源，只能按方案判定。
     ///
-    /// 判「当前方案是英文方案」这一条不可省：`CandidateSource::English` 在混输、快捷输入、
-    /// 临时英文里同样出现，而那些场景用户正在写中文句子，插个英文词后面平白多个空格是错的。
+    /// 判「用户此刻正在打英文」这一条不可省：`CandidateSource::English` 在混输、快捷输入里
+    /// 同样出现，而那些场景用户正在写中文句子，插个英文词后面平白多个空格是错的。
+    ///
+    /// **临时英文算在内**：它与英文方案打的是同一份词库，用户意图同样是「连着打英文词」，
+    /// 差别只在进入方式。混输/快捷里的英文候选则不算——判据问的是**当前整个输入语境**是不是
+    /// 英文，不是这一条候选来自哪里。
     ///
     /// ⚠️ 注意本项与同段的 `frequency.code_scope` **判据相反**：那个按**候选来源**生效
-    /// （英文候选走到哪都该按同一口径记账），这个按**当前方案**。改动其一时别照着另一个抄。
+    /// （英文候选走到哪都该按同一口径记账），这个按**输入语境**。改动其一时别照着另一个抄。
     pub(crate) fn english_space_enabled(&self) -> bool {
-        self.rt().config.schema.english.commit_space && self.engine_mgr.active_is_english()
+        self.english_space_for(false)
+    }
+
+    /// 同 [`Self::english_space_enabled`]，但把 overlay 语境一并算进去。
+    ///
+    /// 有 `state` 的出口一律用这个；`english_space_enabled` 留给 DLL 侧 IPC 排水那条
+    /// **拿不到模式上下文**的路径。两者共用下面的单一真相源，免得日后漂移成
+    /// 「键盘上屏补了、排水路径没补」。
+    pub(crate) fn english_space_enabled_in(&self, state: &State) -> bool {
+        self.english_space_for(state.active == Some(ModeKind::TempEnglish))
+    }
+
+    /// 补空格判据的单一真相源：开关 + 「英文语境」（英文方案常驻 或 临英 overlay）。
+    fn english_space_for(&self, in_temp_english: bool) -> bool {
+        self.rt().config.schema.english.commit_space
+            && (self.engine_mgr.active_is_english() || in_temp_english)
     }
 
     /// 英文**候选**上屏后是否补一个空格：方案口径之上再要求候选来源是英文。

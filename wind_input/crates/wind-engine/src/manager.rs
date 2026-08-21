@@ -30,6 +30,14 @@ use wind_dict::cached::{CachedDict, ReverseIndex};
 /// 统一落此键空间（P2c）。区别于恰好同名的真实方案 id "pinyin"（如临时拼音默认目标）。
 pub const PINYIN_DATA_SCHEMA: &str = "pinyin";
 
+/// 内置英文方案 id（`data/schemas/english.schema.toml`）。
+///
+/// 它有**两个入口**：作为 active 方案常驻，或被临时英文 overlay 引用——两者打的是同一份
+/// 词库，故用户数据（词频 / 候选调整）也归同一个桶，见 `Coordinator::effective_data_schema`。
+/// 融合英文候选（混输 / 快捷输入）同样引用它，但那些场景用户在写中文句子，只借词库不共享
+/// 上屏行为。
+pub const ENGLISH_SCHEMA: &str = "english";
+
 /// 双拼方案未声明 `layout` 时的缺省布局。
 ///
 /// 独立成常量而非各处写字面量：设置页要显示「当前选的是哪个」，那个判断与引擎实际

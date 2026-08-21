@@ -11,7 +11,8 @@ use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
-use wind_candidate::Candidate;
+use wind_candidate::{Candidate, CandidateSource};
+use wind_engine::manager::ENGLISH_SCHEMA;
 use wind_ipc::protocol::{MOD_SHIFT, MOD_SHORTCUT};
 use wind_keys::keymap;
 use wind_transform::fullwidth::to_full_width;
@@ -768,38 +769,74 @@ impl Coordinator {
         }];
         let mut seen = std::collections::HashSet::new();
         seen.insert(buf.clone());
-        let mut push = |text: String, cands: &mut Vec<Candidate>| {
-            if !seen.insert(text.clone()) {
+        // 去重按精确文本；入列时补 `natural_order`（= 入列序）。取整条 `Candidate` 而非
+        // 只取文本：词库候选的 `source` / `code` 是词频记账与重排的依据，在这里丢掉的话
+        // 下游再也拿不回来。
+        let mut push_cand = |mut c: Candidate, cands: &mut Vec<Candidate>| {
+            if !seen.insert(c.text.clone()) {
                 return;
             }
-            let order = cands.len() as i32;
-            cands.push(Candidate {
-                text,
-                natural_order: order,
-                ..Default::default()
-            });
+            c.natural_order = cands.len() as i32;
+            cands.push(c);
         };
         if let Some(schema) = self.overlay_engine_schema(state) {
             // 大小写变形（全小写 / 首字母大写 / 全大写，去掉与原文相同者）。
             // 可关：变形项每条都占一个候选位，每页 5 条时能吃掉一半。
+            //
+            // 与首候选（原文）一样**不带 `source` / `code`**：它们没有词库来源，记账端据此
+            // 把它们排除在词频之外（见 `record_temp_english_selection`）。
             if self.rt().config.input.temp_english.case_variants {
                 for v in en_case_variants(&buf) {
-                    push(v, &mut cands);
+                    push_cand(
+                        Candidate {
+                            text: v,
+                            ..Default::default()
+                        },
+                        &mut cands,
+                    );
                 }
             }
+            // 词库段起点：下面的词频重排与候选调整**只作用于这一段**。
+            let dict_start = cands.len();
+            let code = buf.to_lowercase();
             let result = self
                 .engine_mgr
-                .convert_with(&schema, &buf.to_lowercase(), 60);
+                .convert_with(&schema, &code, ENGINE_MAX_CANDIDATES);
             for c in result.candidates {
-                push(c.text, &mut cands);
+                // 来源与码原样带上：临英与英文方案共用一个词频桶，记账要的正是这两样
+                // （见 `record_temp_english_selection`）。此前只取 `text`，候选身份在这里
+                // 就丢了，上屏出口再想记词频已无从记起。
+                push_cand(c, &mut cands);
             }
+            // 词频重排 + 候选调整（置顶/隐藏），归属方案与写端同源，见 `effective_data_schema`。
+            //
+            // ★ 只切词库段：原文与大小写变形必须钉在最前——「首候选恒是用户所打原文」是临英
+            // 的硬承诺（打词库里没有的词时，它是唯一能上屏的东西）。手法与主路径把「自动补充
+            // 候选」排除在重排之外同型。顺带地，置顶也就只在词库候选内部生效，不会把原文挤走。
+            //
+            // ★ 码取**小写化缓冲**：临英缓冲带大写（Shift+H 进入即 `H`），而英文方案下
+            // `input_buffer` 恒为全小写。不归一的话两个入口各存一份键，「临英里学到的、
+            // 切到英文方案不生效」，而这种失效是完全静默的。
+            let mut dict_part: Vec<Candidate> = cands.split_off(dict_start);
+            self.apply_freq_rerank_in(Some(ENGLISH_SCHEMA), &mut dict_part, &code);
+            self.apply_shadow_in(Some(ENGLISH_SCHEMA), &mut dict_part, &code);
+            cands.extend(dict_part);
         }
         // 统一展开汇聚点：临时英文词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
         state.candidates = self.finalize_candidates(cands, &buf);
     }
 
     /// 临英文本上屏（可选全角）+ 退出模式。临英所有上屏出口的单一真相源。
-    pub(crate) fn commit_temp_english_text(&self, state: &mut State, t: String) -> KeyAction {
+    ///
+    /// `append_space` = `schema.english.commit_space` 的临英落点，**按出口给**而非在这里
+    /// 统一判：与英文方案同口径——选词类出口（空格 / 数字键 / 次三选键 / 鼠标）补，
+    /// 回车与标点顶屏不补（前者是终结性动作，后者补了会得到 `hello ,`）。
+    pub(crate) fn commit_temp_english_text(
+        &self,
+        state: &mut State,
+        t: String,
+        append_space: bool,
+    ) -> KeyAction {
         let text = if state.full_width {
             to_full_width(&t)
         } else {
@@ -807,6 +844,19 @@ impl Coordinator {
         };
         // 临时英文上屏（独占模式，无分段 committed）：来源临英，英文无编码故 code_len=0。
         self.record_commit(&text, 0, -1, wind_store::stats::CommitSource::TempEnglish);
+        // 补空格排在**记账之后**：带空格的文本进统计表就是一条对不上的脏键。词频侧同理，
+        // 那边更早一步记在 `record_temp_english_selection`（本仓已有三处这样的孤儿键漏网史）。
+        // 全角态下补全角空格——此时上屏的英文本就是全角形，跟着转才一致。
+        let text = if append_space && !text.is_empty() {
+            let sp = if state.full_width {
+                to_full_width(" ")
+            } else {
+                " ".to_string()
+            };
+            format!("{text}{sp}")
+        } else {
+            text
+        };
         self.exit_temp_english(state);
         self.notify_ui_hide();
         if text.is_empty() {
@@ -814,6 +864,44 @@ impl Coordinator {
         } else {
             Self::commit_action(text, true)
         }
+    }
+
+    /// 临英**选中某条候选**的上屏出口：命令守卫 → 词频记账 → 补空格 → 上屏退出。
+    ///
+    /// 五个选词出口（空格 / 回车(`space_as_input`) / 数字键 / 次三选键 / 鼠标点选）一律走
+    /// 这里。此前它们各自 `candidates[gi].text.clone()` 后直接上屏文本，**候选身份在出口
+    /// 处就丢了**——这才是临英一直没有词频的根因，不是漏调了哪一行。
+    pub(crate) fn commit_temp_english_selected(&self, state: &mut State, gi: usize) -> KeyAction {
+        if let Some(act) = self.temp_english_try_command(state, gi) {
+            return act;
+        }
+        let cand = state.candidates[gi].clone();
+        self.record_temp_english_selection(state, &cand);
+        let append = self.english_space_enabled_in(state);
+        self.commit_temp_english_text(state, cand.text, append)
+    }
+
+    /// 临英选词的词频记账——与英文方案**同一个桶**（`ENGLISH_SCHEMA`），故临英里选过的词，
+    /// 切到英文方案照样受益，反之亦然。
+    ///
+    /// ★ **只记词库来的候选**：原文与大小写变形没有词库来源（`code` 空、`source` 为 `None`），
+    /// 记进去就是一条读端按候选码永远查不中的孤儿键，只会逐日累积垃圾。判据是来源，与
+    /// 「短语有文本无码位、恒不记词频」同一先例。
+    ///
+    /// ★ 取码前**先小写化缓冲**：`freq_code` 在 `code_scope = "input"` 下拿的就是这个串，
+    /// 而英文方案那侧 `input_buffer` 恒为全小写。不归一 ⇒ `Hel` 与 `hel` 是两个键，两个入口
+    /// 永远学不到一块去。
+    fn record_temp_english_selection(&self, state: &State, cand: &Candidate) {
+        if cand.source != CandidateSource::English {
+            return;
+        }
+        let code = state.temp_english_buffer.to_lowercase();
+        self.record_selection_in(
+            Some(ENGLISH_SCHEMA),
+            &self.freq_code(&code, cand),
+            &cand.text,
+            cand.source,
+        );
     }
 
     /// 临英选中候选（全局下标 `gi`）的命令前置守卫：`$CC` 命令候选 → 执行动作（退出临英后异步跑），
@@ -878,10 +966,11 @@ impl Coordinator {
             this.notify_ui_update(state);
             KeyAction::UpdateComposition { text: d, caret_pos }
         };
-        // 上屏文本（可选全角）+ 退出。真身是 `commit_temp_english_text`（keyup 选词路径也要用，
-        // 见 `select_page_candidate`）；这里保留同名闭包，免得改动本函数内十几处调用点。
-        let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
-            this.commit_temp_english_text(state, t)
+        // **原文类**上屏（不经候选：回车、以及 `show_candidates` 关闭时的兜底）。选中候选
+        // 一律走 `commit_temp_english_selected`——那条路要记词频，而这里没有候选可记。
+        // 补空格按出口给：回车不补（终结性动作），空格兜底补（对应英文方案「空格上屏原码」）。
+        let commit_text = |this: &Self, state: &mut State, t: String, sp: bool| -> KeyAction {
+            this.commit_temp_english_text(state, t, sp)
         };
         // Ctrl/Alt 组合守卫（见 `overlay_ctrl_alt_guard`）：必须最先。临英是独占模式、
         // 无分段 committed，待输入内容只看自己的缓冲。
@@ -935,20 +1024,18 @@ impl Coordinator {
                 if self.rt().config.input.temp_english.space_as_input {
                     Self::temp_english_insert(state, ' ');
                     refresh(self, state)
+                } else if !state.candidates.is_empty() {
+                    // 空格：上屏当前高亮候选（首候选=原始输入）；命令候选执行动作。
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    self.commit_temp_english_selected(state, idx)
                 } else {
-                    // 空格：上屏当前高亮候选（首候选=原始输入）；命令候选执行动作
-                    let text = if !state.candidates.is_empty() {
-                        let idx = self
-                            .highlighted_global_index(state)
-                            .min(state.candidates.len() - 1);
-                        if let Some(act) = self.temp_english_try_command(state, idx) {
-                            return act;
-                        }
-                        state.candidates[idx].text.clone()
-                    } else {
-                        state.temp_english_buffer.clone()
-                    };
-                    commit_text(self, state, text)
+                    // 无候选（`show_candidates` 关闭）：上屏缓冲原文。这正是英文方案
+                    // 「空格上屏原码」的对应出口，故同样补空格。
+                    let text = state.temp_english_buffer.clone();
+                    let sp = self.english_space_enabled_in(state);
+                    commit_text(self, state, text, sp)
                 }
             }
             keymap::VK_RETURN => {
@@ -972,19 +1059,18 @@ impl Coordinator {
                     let idx = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
-                    if let Some(act) = self.temp_english_try_command(state, idx) {
-                        return act;
-                    }
-                    let text = state.candidates[idx].text.clone();
-                    return commit_text(self, state, text);
+                    // 此配置下回车接过的是**选词**职责，故走选中出口（记词频、补空格），
+                    // 与空格键在默认配置下的行为对齐——同一个动作换了个键，不该换语义。
+                    return self.commit_temp_english_selected(state, idx);
                 }
-                // 回车：上屏原始输入文本（不取候选）；缓冲空时上屏触发键字符（触发键透传）
+                // 回车：上屏原始输入文本（不取候选）；缓冲空时上屏触发键字符（触发键透传）。
+                // **不补空格**：回车是终结性动作，与英文方案 `VK_RETURN` 空码分支同口径。
                 let text = if state.temp_english_buffer.is_empty() {
                     state.temp_english_prefix.clone()
                 } else {
                     state.temp_english_buffer.clone()
                 };
-                commit_text(self, state, text)
+                commit_text(self, state, text, false)
             }
             keymap::VK_A..=keymap::VK_Z => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
@@ -1010,11 +1096,7 @@ impl Coordinator {
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
                 if !digits_as_input && state.candidates.len() > 1 && gi < end {
-                    if let Some(act) = self.temp_english_try_command(state, gi) {
-                        return act;
-                    }
-                    let text = state.candidates[gi].text.clone();
-                    commit_text(self, state, text)
+                    self.commit_temp_english_selected(state, gi)
                 } else {
                     Self::temp_english_insert(state, ch);
                     refresh(self, state)
@@ -1053,11 +1135,7 @@ impl Coordinator {
                     let (start, end) = self.page_range(state);
                     let gi = start + offset;
                     if gi < end {
-                        if let Some(act) = self.temp_english_try_command(state, gi) {
-                            return act;
-                        }
-                        let text = state.candidates[gi].text.clone();
-                        return commit_text(self, state, text);
+                        return self.commit_temp_english_selected(state, gi);
                     }
                 }
                 // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
@@ -1076,7 +1154,13 @@ impl Coordinator {
                         if let Some(act) = self.temp_english_try_command(state, idx) {
                             return act;
                         }
-                        state.candidates[idx].text.clone()
+                        let cand = state.candidates[idx].clone();
+                        // 顶屏也是一次选中 —— 记词频，但**不补空格**（会得到 `hello ,`）。
+                        // 与主输入路 `commit_highlight_then_char` 逐条同口径：那里同样是
+                        // 记账、不补。本臂自建上屏动作、不走 `commit_temp_english_text`，
+                        // 故两件事都得在这里显式做。
+                        self.record_temp_english_selection(state, &cand);
+                        cand.text
                     } else {
                         state.temp_english_buffer.clone()
                     };
