@@ -438,4 +438,5 @@ called before the asynchronous state of the key is updated」），返回非零�
 
 - [schema-key-actions.md](schema-key-actions.md) —— 第一张表（无会话态），本表的形态来源
 - [enter-behavior-clear-semantics.md](enter-behavior-clear-semantics.md) —— §6.1 的论据来源
+- [key-resolver-unification.md](key-resolver-unification.md) —— 两张表之上的解析层统一（`KeyResolver`），方案级扩展见其 §7
 - [../redesign/key-pipeline.md](../redesign/key-pipeline.md) —— S5「按钮自定义」的原始预留

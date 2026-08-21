@@ -602,3 +602,8 @@ A 类反过来排到最后——它是功能完整性，不是任何人的诉求
 press2 门控」「设置页冲突检测」这三个场景第一次看得见**方案级** `[key_actions]` 的绑定
 ——它们原先只读全局 `trigger_keys`。
 
+
+## 8. 相关文档
+
+- [session-key-actions.md](session-key-actions.md) —— 第二张表（有会话态），状态归属判据
+- [key-resolver-unification.md](key-resolver-unification.md) —— 两张表之上的解析层统一（`KeyResolver`），含 hotkeys 架构全景
