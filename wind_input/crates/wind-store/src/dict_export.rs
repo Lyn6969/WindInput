@@ -119,6 +119,7 @@ impl Store {
                                 text: r.text,
                                 weight: r.weight,
                                 count: r.count,
+                                boundary: None,
                             })
                             .collect(),
                     );

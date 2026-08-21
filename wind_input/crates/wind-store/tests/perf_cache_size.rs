@@ -52,6 +52,7 @@ fn rows() -> Vec<WordIo> {
                 text: format!("词{i}"),
                 weight: 100,
                 count: 0,
+                boundary: None,
             }
         })
         .collect()

@@ -274,6 +274,26 @@ enum BoundaryResolution {
 同理，§3 的求解链落在 **webdata**（`web_dict_import` / `web_dict_preview_import`），
 不在 store —— 求解需要 `engine_mgr`。
 
+### 4.4 ★★ 求解结果不能用 code 当载体传递（单音节陷阱）
+
+第一版接线把求解出的边界写回 `code`（`join_code_by_boundary(flat, b)`），让落库端照常
+`split_spaced_code` 拆出来。**这对单音节词是错的**：
+
+```
+join_code_by_boundary("xian", 0b1) == "xian"   // 单音节没有内部空格可插
+split_spaced_code("xian")          == ("xian", 0)   // 读回来是 0
+```
+
+既有测试 `wdict.rs` 里就记录着这条行为（「单音节边界不经文本往返」）。后果不是报错而是
+**静默退化**：单字词的边界补齐失效，而 `filled` 计数照样 +1、预览照样告诉用户「已补上」。
+
+⇒ `WordIo` 新增 `boundary: Option<u64>` 字段，求解结果走这条旁路，`None` 时才回退到
+code 里的空格（旧路径逐字节不变）。`import_user_words` 与 `preview_import_user_words`
+两侧都要读，判据必须一致，否则预览的 `willUpdate` 会与实际落库不符。
+
+★ 一般化：**空格作为边界载体是有损的**——它能表达「音节之间的缝」，表达不了「整串
+就是一个音节」。凡是把边界经文本往返的路径都有这个洞（导出→导入亦然，那是既有缺陷）。
+
 ## 5. 导入闸口：三档处置
 
 | 档 | 判据 | 处置 |
@@ -389,8 +409,10 @@ P2a 用过这招，「这一逼问才发现 `on_word_selected` 这条此前无�
    ⚠️ 写这类测试必须用**歧义切分码**：`cainiaoyizhan` / `lanshoubing` 这种
    `maximum_match` 恰好猜对的样本测不出任何东西（同 `pinyin-code-domains.md` 记的假绿模式）。
 2. 拿实测求解率决定 §5 的默认选项与文案。**这是唯一需要真实数据才能定的决策。**
-3. `normalize_code` 策略参数化 + `is_valid_code` 替换（§4.3）。
-4. 导入闸口接求解链 + 预览三档字段（§5）。
+3. ~~`normalize_code` 策略参数化（§4.3）。~~ ✅ **已完成**（`CodePolicy`）。
+   ⚠️ `is_valid_code` **有意保留**：store 层拿不到引擎，判据② 只能在 webdata 层做。
+   分工变成：store 只做**归一化** + 拦乱码，webdata 做**准入**。
+4. ~~导入闸口接求解链 + 预览三档字段（§5）。~~ ✅ **已完成**（仅 Rime/TSV 路径，见 §10）。
 5. wind-setting UI 对话框。
 6. 其余写入路径装探测器（§6）。
 7. 存量迁移动作（§7）。
@@ -401,6 +423,10 @@ P2a 用过这招，「这一逼问才发现 `on_word_selected` 这条此前无�
   （`generate_word_pinyin` 要枚举 410 音节的笛卡尔积，`MAX_READING_COMBOS` 封顶）。
   第 4 层的 DAG 只在单行的短码上建，**很可能比第 3 层便宜，把 4 提到 3 前面大概率更快**。
   需在 19 万词量级实测后定序。
+- **本次接线只覆盖 Rime/TSV 路径**，WindDict 格式分支（`import_dict_sections_wdict`，
+  多段导入）**未接契约**。理由：自家格式的 code 列本就带空格、边界随之流出，是问题的
+  次要面；而它是多段管线，接线面比 Rime/TSV 大得多。⚠️ 代价是用户手工编辑 wdict 文件
+  写出无空格码时不会被补齐，也不会被拦。
 - `import_temp_words` 与 freq 段是否同款问题**未读代码**。freq 表按设计不带 boundary
   （「不给词频表扩容加字段」是既定决策），临时词表应与用户词同款。
 - `backup.rs:330 import_user_words_wdict`（整机还原）走 store 直连、**绕过 webdata**。

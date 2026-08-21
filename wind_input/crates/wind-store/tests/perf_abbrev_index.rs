@@ -50,6 +50,7 @@ fn seed(s: &Store, n: usize) {
                 text: format!("词{i}"),
                 weight: 100,
                 count: 0,
+                boundary: None,
             }
         })
         .collect();

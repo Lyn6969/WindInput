@@ -15,6 +15,21 @@
 
 use serde_json::{Value, json};
 use wind_coordinator::handle_quick_format::QuickFormatEdit;
+/// [`WebData::apply_pinyin_entry_contract`] 的处置统计，逐项对应导入预览的三档
+/// （见 `docs/design/pinyin-entry-boundary-contract.md` §5）。
+#[derive(Debug, Default)]
+pub struct EntryContractStats {
+    /// 不合法、未入库的行数。
+    pub rejected: usize,
+    /// 求解成功、补上了边界的行数。
+    pub filled: usize,
+    /// 多解已按读音权重择一的行数（是 `filled` 的子集）。
+    pub ambiguous: usize,
+    /// 入库了但仍无边界的行数（码超 64 字节等）。
+    pub no_boundary: usize,
+    /// 被拒行的样例（至多 5 条）——UI 要能让用户看出「是不是选错了文件」。
+    pub samples: Vec<String>,
+}
 use wind_coordinator::web_host::WebDataHost;
 
 /// 解析方案的权威引擎类型（schema.toml 的 engine.type 可能为空，
@@ -631,6 +646,91 @@ pub trait WebDataRpc: WebDataHost {
 
     /// 导入。WindDict 多段：`sections` 选要应用的类型（默认文件所含全部段）；
     /// Rime/TSV：仅用户词库。返回 `{sections:[...]}` 逐段结果。
+    /// 目标方案是否拼音族——决定归一化策略与是否执行准入判据。
+    fn target_is_pinyin(&self, schema_id: &str) -> bool {
+        self.engine_mgr()
+            .schema_engine_type(schema_id)
+            .map(|t| t == "pinyin")
+            .unwrap_or(false)
+    }
+
+    /// 按目标引擎挑编码归一化策略（`wind-store` 拿不到 `engine_mgr`，故由这一层决定）。
+    fn code_policy_for(&self, schema_id: &str) -> wind_store::import_formats::CodePolicy {
+        if self.target_is_pinyin(schema_id) {
+            wind_store::import_formats::CodePolicy::PINYIN
+        } else {
+            wind_store::import_formats::CodePolicy::CODETABLE
+        }
+    }
+
+    /// 拼音词条入库契约：补齐音节边界、剔除不合法行。
+    /// 见 `docs/design/pinyin-entry-boundary-contract.md`。
+    ///
+    /// 非拼音方案原样放行——码表词组码没有音节语义，`boundary = 0` 是**正确语义**。
+    ///
+    /// ★ 求解出的边界通过**把 code 写回带空格形态**传给落库端，而不是给
+    /// `import_user_words` 加参数：空格本就是本仓的边界载体，`split_spaced_code` 在
+    /// 落库时会把它拆回 `flat key + boundary`。既有管线一行都不用改。
+    fn apply_pinyin_entry_contract(
+        &self,
+        schema_id: &str,
+        rows: Vec<wind_store::wdict::WordIo>,
+    ) -> (Vec<wind_store::wdict::WordIo>, EntryContractStats) {
+        let mut st = EntryContractStats::default();
+        if !self.target_is_pinyin(schema_id) {
+            return (rows, st);
+        }
+        // 层 1：文件自带空格的行，切分是词库作者写下的真值 —— 直接采信，不进求解。
+        let mut flats: Vec<String> = Vec::with_capacity(rows.len());
+        let mut pending: Vec<usize> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            let (flat, explicit) = wind_store::wdict::split_spaced_code(&r.code);
+            if explicit == 0 {
+                pending.push(i);
+            }
+            flats.push(flat);
+        }
+        let pairs: Vec<(&str, &str)> = pending
+            .iter()
+            .map(|&i| (flats[i].as_str(), rows[i].text.as_str()))
+            .collect();
+        let solved = self.engine_mgr().resolve_boundaries(schema_id, &pairs);
+
+        let mut verdicts: Vec<Option<wind_engine::BoundaryResolution>> = vec![None; rows.len()];
+        for (k, &i) in pending.iter().enumerate() {
+            verdicts[i] = solved.get(k).copied();
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, mut r) in rows.into_iter().enumerate() {
+            let Some(v) = verdicts[i] else {
+                out.push(r); // 层 1
+                continue;
+            };
+            if v == wind_engine::BoundaryResolution::Unresolvable {
+                st.rejected += 1;
+                if st.samples.len() < 5 {
+                    st.samples.push(format!("{} {}", r.code, r.text));
+                }
+                continue;
+            }
+            let b = v.boundary();
+            if b != 0 {
+                // ★ 走 `WordIo::boundary` 而不是把 code 改写成带空格形态：空格载体
+                // 表达不了单音节（`xian` 的 0b1 经 join→split 退化为 0），单字词的
+                // 补齐会静默失效、而这里还会把它算进 filled。
+                r.boundary = Some(b);
+                st.filled += 1;
+            } else {
+                st.no_boundary += 1;
+            }
+            if matches!(v, wind_engine::BoundaryResolution::Ambiguous(_)) {
+                st.ambiguous += 1;
+            }
+            out.push(r);
+        }
+        (out, st)
+    }
+
     fn web_dict_import(&self, params: &Value) -> anyhow::Result<Value> {
         use wind_store::dict_export::DictSection;
         use wind_transfer::merge::Strategy;
@@ -678,8 +778,12 @@ pub trait WebDataRpc: WebDataHost {
             Ok(dict_report_json(&rep))
         } else {
             // Rime/TSV：仅用户词库。
-            let (_fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let (_fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(
+                content,
+                self.code_policy_for(schema_id),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            let (rows, contract) = self.apply_pinyin_entry_contract(schema_id, rows);
             if replace {
                 store.clear_user_words(&data_schema)?;
             }
@@ -689,7 +793,13 @@ pub trait WebDataRpc: WebDataHost {
                 "added": c.added,
                 "updated": c.updated,
                 "unchanged": c.unchanged,
-                "skipped": skipped,
+                // 解析期跳过的（列数不足/乱码）与准入判据拒收的合并计入 skipped，
+                // 另按类别分列——UI 要能告诉用户「少了的词是为什么少的」。
+                "skipped": skipped + contract.rejected,
+                "rejected": contract.rejected,
+                "boundaryFilled": contract.filled,
+                "boundaryAmbiguous": contract.ambiguous,
+                "noBoundary": contract.no_boundary,
             } ] }))
         }
     }
@@ -756,16 +866,29 @@ pub trait WebDataRpc: WebDataHost {
                 "targetEngine": target, "compatible": compatible,
             }))
         } else {
-            let (fmt2, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let (fmt2, rows, skipped) = wind_store::import_formats::parse_words_auto(
+                content,
+                self.code_policy_for(schema_id),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            let total = rows.len();
+            // 预览必须跑与导入**完全相同**的准入判据，否则「预计入库 N 条」会骗人。
+            let (rows, contract) = self.apply_pinyin_entry_contract(schema_id, rows);
             let (c, samples) = store.preview_import_user_words(&data_schema, &rows)?;
             // Rime/TSV 无来源引擎元信息，兼容性交由用户判断（不拦截）。
             Ok(json!({
                 "format": fmt2.as_str(),
                 "sections": [ {
-                    "key": "userWords", "count": rows.len(),
+                    "key": "userWords", "count": total,
                     "willAdd": c.added, "willUpdate": c.updated, "unchanged": c.unchanged,
-                    "skipped": skipped, "samples": samples,
+                    "skipped": skipped + contract.rejected, "samples": samples,
+                    // 三档处置的计数（见设计文档 §5）：rejected 一律不入库，
+                    // noBoundary 是「入库了但仍缺边界」，ambiguous 是「多解已择一」。
+                    "rejected": contract.rejected,
+                    "rejectedSamples": contract.samples,
+                    "boundaryFilled": contract.filled,
+                    "boundaryAmbiguous": contract.ambiguous,
+                    "noBoundary": contract.no_boundary,
                 } ],
                 "compatible": true,
             }))

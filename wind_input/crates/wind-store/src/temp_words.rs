@@ -242,6 +242,7 @@ impl Store {
                 text: r.text,
                 weight: r.weight,
                 count: 0,
+                boundary: None,
             })
             .collect();
         Ok(wdict::export_words_wdict(&rows, exported_at))
@@ -452,6 +453,7 @@ mod tests {
                 text: "西安宁".into(),
                 weight: 700,
                 count: 3,
+                boundary: None,
             }],
         )
         .unwrap();

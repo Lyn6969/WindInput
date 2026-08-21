@@ -210,13 +210,22 @@ pub fn parse_phrases_wdict(text: &str) -> Result<(Vec<PhraseIo>, usize), String>
 ///
 /// count = 选词次数（调频热度）；随导出流转，导入时取 max 合并（见 `import_user_words`）。
 /// created_at 属纯本机数据（创建时间），**不**导出。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WordIo {
     pub code: String,
     pub text: String,
     pub weight: i32,
     /// 选词次数（调频）。外部格式（Rime/TSV）无此列时为 0。
     pub count: u32,
+    /// 显式音节边界，优先于 `code` 里的空格。`None` = 未提供，落库时按空格推断。
+    ///
+    /// ★★ **为什么不能只靠 code 里的空格当载体**：空格表达不了「单音节」。
+    /// `join_code_by_boundary("xian", 0b1)` 产出的是无空格的 `xian`，
+    /// `split_spaced_code` 再读回来就是 `0`（既有测试
+    /// `single_syllable_boundary_does_not_survive_text_roundtrip` 记录着这条行为）。
+    /// 导入闸口求解出的单字词边界若走 code 传递，会**静默退化为 0 而调用方以为补上了**。
+    /// 故求解结果一律走本字段。
+    pub boundary: Option<u64>,
 }
 
 const WORD_COLUMNS: &[&str] = &["code", "text", "weight", "count"];
@@ -364,6 +373,7 @@ fn parse_word_rows(text: &str, tag: &str) -> Result<(Vec<WordIo>, usize), String
             text: unescape_text_field(get("text")),
             weight: get("weight").trim().parse().unwrap_or(0),
             count: get("count").trim().parse().unwrap_or(0),
+            boundary: None,
         });
     }
     Ok((rows, skipped))
@@ -897,12 +907,14 @@ mod tests {
                 text: "工".into(),
                 weight: 100,
                 count: 42,
+                boundary: None,
             },
             WordIo {
                 code: "ml".into(),
                 text: "多行\n带\t制表".into(),
                 weight: 0,
                 count: 0,
+                boundary: None,
             },
         ];
         let s = export_words_wdict(&rows, "2026-07-11T00:00:00+08:00");
@@ -947,6 +959,7 @@ mod tests {
             text: "工".into(),
             weight: 100,
             count: 7,
+            boundary: None,
         }];
         let shadow = vec![
             ShadowActionIo {
