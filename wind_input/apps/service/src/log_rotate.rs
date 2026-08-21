@@ -403,3 +403,91 @@ mod tests {
         );
     }
 }
+
+/// 清理 TSF DLL 留下的**过期**日志（`wind_tsf.<宿主名>.<pid>.log` 及其 `.old`）。
+///
+/// # 为什么这件事在 core 做，而不在 DLL 里
+///
+/// TSF 的日志文件改成每进程一个之后（消除了跨进程锁与每行开关文件的开销），文件数会
+/// 随「用过的宿主 × pid」增长，需要有人回收。但 DLL 的 `CFileLogger::Init` 跑在
+/// `DllMain(DLL_PROCESS_ATTACH)` 里 —— loader lock 之下不能做目录遍历这种耗时不可控
+/// 的事。core 是个正常进程，启动时从容做一次即可。
+///
+/// # 判据是修改时间，不是 pid 是否还活着
+///
+/// 「查这个 pid 还在不在」看似更精确，实则是错的：pid 会被系统复用，而且刚退出的宿主
+/// 那份日志恰恰是排查刚才那次故障最需要的。按时间留一段窗口既简单又不会误删现场。
+///
+/// 正在被写的文件也能删掉——DLL 侧开句柄时带了 `FILE_SHARE_DELETE`；但活跃宿主的日志
+/// 修改时间就是此刻，不会落进过期窗口，所以正常情况下轮不到它。
+///
+/// 失败一律忽略：日志清理不该阻塞启动，更不该让服务起不来。
+pub fn prune_stale_tsf_logs(log_dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // 只碰 TSF 自己那批。前缀与 `WIND_LOG_FILE_PREFIX` 对齐（跨语言契约，无编译期
+        // 约束）；带 `.` 是为了不误伤将来可能出现的 `wind_tsf_xxx.log` 这类别的文件。
+        if !name.starts_with("wind_tsf.") || !name.ends_with(".log") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > max_age);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod prune_tsf_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// 只删过期的 TSF 日志，且只认 `wind_tsf.` 前缀——core 自己的日志、别人的文件
+    /// 都不能碰。
+    #[test]
+    fn prunes_only_stale_tsf_logs() {
+        let dir = std::env::temp_dir().join(format!("wind_prune_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old_ts = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
+        let mk = |name: &str, stale: bool| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            if stale {
+                let f = std::fs::File::options().write(true).open(&p).unwrap();
+                f.set_modified(old_ts).unwrap();
+            }
+            p
+        };
+
+        let stale_tsf = mk("wind_tsf.feishu.1234.log", true);
+        let stale_old = mk("wind_tsf.feishu.1234.old.log", true);
+        let fresh_tsf = mk("wind_tsf.notepad.5678.log", false);
+        let core_log = mk("wind_input.log", true); // core 自己的，即使过期也不该碰
+        let other = mk("wind_tsf.feishu.1234.txt", true); // 非 .log
+
+        let removed = prune_stale_tsf_logs(&dir, Duration::from_secs(60 * 60 * 24 * 7));
+
+        assert_eq!(removed, 2, "应只删两个过期的 TSF 日志");
+        assert!(!stale_tsf.exists(), "过期 TSF 日志未删");
+        assert!(!stale_old.exists(), "过期轮转产物未删");
+        assert!(fresh_tsf.exists(), "活跃宿主的日志被误删——那正是排查现场");
+        assert!(core_log.exists(), "core 自己的日志不归本函数管");
+        assert!(other.exists(), "非 .log 文件不该被碰");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

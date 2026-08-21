@@ -568,6 +568,13 @@ fn init_logger() {
 
     log_rotate::rotate_on_startup(&mut rotate, &log_path);
 
+    // 顺带回收 TSF DLL 留下的过期日志。它按进程拆文件（每宿主 × pid 一个），文件数会
+    // 累积，而 DLL 自己在 loader lock 下没法做目录遍历——见 prune_stale_tsf_logs。
+    let pruned = log_rotate::prune_stale_tsf_logs(
+        &log_dir,
+        std::time::Duration::from_secs(60 * 60 * 24 * 7),
+    );
+
     let (writer, _guard) = tracing_appender::non_blocking(rotate);
     // 丢弃计数器：worker 线程一旦出事，channel 断开后 lossy 模式会静默丢掉此后每一条
     // 日志，`wind_input.log` 就永久停在某一行而进程照常运行。守护线程据此留痕。
@@ -595,6 +602,9 @@ fn init_logger() {
 
     info!(
         log_dir = %log_dir.display(),
+        // 顺带报出清掉了几个 TSF 旧日志：这是唯一能看出「清理确实在跑」的地方，
+        // 不打的话它坏掉了也没人知道（目录里文件变多是很久以后才察觉的事）。
+        pruned_tsf_logs = pruned,
         level = %level,
         max_size_mb = cfg_debug.log_max_size_mb,
         max_files = cfg_debug.log_max_files,

@@ -11,7 +11,8 @@ CFileLogger::CFileLogger()
     : _mode(LogMode::None)
     , _level(LogLevel::Info)
     , _initialized(false)
-    , _hMutex(nullptr)
+    , _hFile(nullptr)
+    , _written(0)
     , _pid(0)
     , _ringHead(0)
     , _ringCount(0)
@@ -54,25 +55,26 @@ void CFileLogger::Init()
     // Read config (mode + level)
     _ReadConfig();
 
-    // If mode is none, skip mutex creation entirely
+    // If mode is none, skip file handle creation entirely
     if (_mode == LogMode::None)
         return;
 
-    // Create named mutex for file write synchronization (only needed for file mode)
+    // 打开**常开**的追加句柄。
     //
-    // 互斥体名仍按变体区分——这里和日志**文件名**是两码事：文件名靠父目录隔离即可，
-    // 而互斥体名活在**机器级**内核对象命名空间里，两版本共用一个名字就会为写各自
-    // 不同的文件而互相阻塞。别因为文件名统一了就顺手把这里也合并。
+    // ⚠ 本函数跑在 `DllMain(DLL_PROCESS_ATTACH)` 里，即 loader lock 之下。这里只做内核
+    // 对象操作（开文件），**不能**加载别的 DLL、创建线程或等待同步对象——旧日志的清理
+    // 因此不放在 DLL 侧，交给 core 服务启动时做。
+    //
+    // 不再需要互斥锁：日志文件已按 pid 拆开（见 _BuildPaths），本进程独占该文件，
+    // 没有可竞争的对象。此前那把 `Local\WindInput*TSFLogMutex` 是所有宿主进程共用的，
+    // 而抢锁发生在 TSF 输入线程上——切换窗口时新旧宿主同时爆发写日志，几个进程的输入
+    // 线程互相排队，超时上限 500ms。
     if (_mode == LogMode::File || _mode == LogMode::All)
     {
-#ifdef WIND_DEV_VARIANT
-        _hMutex = CreateMutexW(nullptr, FALSE, L"Local\\WindInputDevTSFLogMutex");
-#else
-        _hMutex = CreateMutexW(nullptr, FALSE, L"Local\\WindInputTSFLogMutex");
-#endif
-        if (_hMutex == nullptr)
+        _hFile = _OpenLogFile();
+        if (_hFile == nullptr)
         {
-            OutputDebugStringW(L"[WindInput][FileLogger] Failed to create mutex, file logging disabled\n");
+            OutputDebugStringW(L"[WindInput][FileLogger] Failed to open log file, file logging disabled\n");
             // Fall back to debugstring-only if we had All mode
             if (_mode == LogMode::All)
                 _mode = LogMode::DebugString;
@@ -99,10 +101,10 @@ void CFileLogger::Shutdown()
         Write(LogLevel::Info, L"FileLogger shutdown");
     }
 
-    if (_hMutex != nullptr)
+    if (_hFile != nullptr)
     {
-        CloseHandle(_hMutex);
-        _hMutex = nullptr;
+        CloseHandle(_hFile);
+        _hFile = nullptr;
     }
 
     _mode = LogMode::None;
@@ -155,36 +157,75 @@ void CFileLogger::_WriteToDebugString(LogLevel level, const wchar_t* message)
 
 void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
 {
-    if (_hMutex == nullptr)
+    if (_hFile == nullptr)
         return;
 
-    // Acquire mutex (with timeout to avoid blocking input)
-    DWORD waitResult = WaitForSingleObject(_hMutex, MUTEX_TIMEOUT_MS);
-    if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED)
-        return; // Skip rather than block
+    // 常规路径只剩**一次 WriteFile**。
+    //
+    // 此前这里是：抢跨进程互斥锁 → GetFileAttributesExW 查大小 → CreateFileW →
+    // WriteFile → CloseHandle → ReleaseMutex，一行日志四次系统调用外加一次跨进程同步，
+    // 全在 TSF 输入线程上。日志文件按 pid 拆开后，本进程独占，锁与开关文件都不再需要。
+    DWORD written = 0;
+    if (!WriteFile(_hFile, utf8Line, (DWORD)utf8Len, &written, nullptr))
+        return;
 
-    // Check rotation before opening
-    _RotateIfNeeded();
+    // 轮转判定用**累计字节数**，不再查文件大小：本进程独占该文件，写了多少自己最清楚。
+    // 溢出保护：_written 是 DWORD，MAX_LOG_SIZE 只有 5MB，正常路径下轮转会先发生；
+    // 但若某次 WriteFile 异常地大，饱和累加可避免绕回后长期不轮转。
+    if (_written > MAXDWORD - written)
+        _written = MAXDWORD;
+    else
+        _written += written;
 
-    // Open file in append mode
-    HANDLE hFile = CreateFileW(
+    if (_written >= MAX_LOG_SIZE)
+        _RotateNow();
+}
+
+// 打开常开的追加句柄。失败返回 nullptr（而非 INVALID_HANDLE_VALUE，省得每个调用点
+// 各判一次哨兵值）。
+//
+// FILE_APPEND_DATA 而非 GENERIC_WRITE：追加语义由内核保证，不必自己维护写指针。
+// FILE_SHARE_READ 让排查时能一边跑一边 tail 日志；FILE_SHARE_DELETE 让文件在被打开
+// 的状态下仍可被改名或删除——core 侧清理旧日志时不会因为某个宿主还开着而失败。
+HANDLE CFileLogger::_OpenLogFile()
+{
+    HANDLE h = CreateFileW(
         _logPath,
         FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         nullptr
     );
+    if (h == INVALID_HANDLE_VALUE)
+        return nullptr;
 
-    if (hFile != INVALID_HANDLE_VALUE)
+    // 续写已有文件时把已有大小计入，否则重启宿主会让轮转阈值从零重新开始数，
+    // 文件可以长到远超 MAX_LOG_SIZE。
+    LARGE_INTEGER size;
+    _written = GetFileSizeEx(h, &size) && size.QuadPart < MAXDWORD
+        ? (DWORD)size.QuadPart
+        : 0;
+    return h;
+}
+
+// 立即轮转：关句柄 → 覆盖式改名到 .old → 重开。
+//
+// 只有本进程持有这个文件，所以不需要与任何人协调——这正是「每进程一个文件」换来的
+// 简化。此前的 _RotateIfNeeded 要在共享文件上做，还得先靠互斥锁排他。
+void CFileLogger::_RotateNow()
+{
+    if (_hFile != nullptr)
     {
-        DWORD written;
-        WriteFile(hFile, utf8Line, (DWORD)utf8Len, &written, nullptr);
-        CloseHandle(hFile);
+        CloseHandle(_hFile);
+        _hFile = nullptr;
     }
-
-    ReleaseMutex(_hMutex);
+    DeleteFileW(_oldPath);
+    MoveFileW(_logPath, _oldPath);
+    _hFile = _OpenLogFile();
+    // 重开失败则文件日志就此停摆（_hFile 为 nullptr，后续 _WriteToFile 直接返回）。
+    // 不改 _mode：DebugString 那一路与文件无关，不该被文件问题连累关掉。
 }
 
 void CFileLogger::_BuildPaths()
@@ -196,8 +237,42 @@ void CFileLogger::_BuildPaths()
     _snwprintf_s(_logDir, _countof(_logDir), _TRUNCATE,
         L"%ls\\" WIND_LOG_DIR_NAME L"\\logs", appData);
 
+    // 日志文件**每进程一个**：`wind_tsf.<宿主名>.<pid>.log`。
+    //
+    // TSF DLL 被每个宿主进程各加载一份，此前它们共写一个文件，只能靠一把跨进程互斥锁
+    // 串行化——而写日志发生在输入线程上，切换窗口时新旧宿主同时爆发写入，几个进程的
+    // 输入线程互相排队。拆开之后没有共享资源，锁与「每行开关文件」一并不再需要。
+    //
+    // 带宿主名是为了排查时一眼认出是谁（wind_tsf.feishu.12345.log）；**还要带 pid**，
+    // 因为同一个程序可以多开，Chrome 那类多进程宿主更是一开就是一串——只带名字会撞回
+    // 共享，锁也就白去了。
+    wchar_t hostExe[MAX_PATH] = {};
+    wchar_t hostName[HOST_NAME_MAX + 1];
+    wcscpy_s(hostName, L"host");
+    if (GetModuleFileNameW(nullptr, hostExe, _countof(hostExe)) > 0)
+    {
+        const wchar_t* base = wcsrchr(hostExe, L'\\');
+        base = base ? base + 1 : hostExe;
+        size_t n = 0;
+        // 取文件名主干，且**逐字符白名单**：进程名要进文件路径，混进路径分隔符或通配符
+        // 会把日志写去别的目录，也会让 core 侧按前缀清理时匹配到意外的文件。
+        for (const wchar_t* c = base; *c != L'\0' && *c != L'.' && n < HOST_NAME_MAX; ++c)
+        {
+            if ((*c >= L'a' && *c <= L'z') || (*c >= L'A' && *c <= L'Z') ||
+                (*c >= L'0' && *c <= L'9') || *c == L'_' || *c == L'-')
+            {
+                hostName[n++] = *c;
+            }
+        }
+        if (n > 0)
+            hostName[n] = L'\0';
+    }
+
     _snwprintf_s(_logPath, _countof(_logPath), _TRUNCATE,
-        L"%ls\\" WIND_LOG_FILE_NAME, _logDir);
+        L"%ls\\" WIND_LOG_FILE_PREFIX L".%ls.%lu.log", _logDir, hostName, _pid);
+
+    _snwprintf_s(_oldPath, _countof(_oldPath), _TRUNCATE,
+        L"%ls\\" WIND_LOG_FILE_PREFIX L".%ls.%lu.old.log", _logDir, hostName, _pid);
 
     _snwprintf_s(_configPath, _countof(_configPath), _TRUNCATE,
         L"%ls\\" WIND_LOG_CONFIG_NAME, _logDir);
@@ -283,27 +358,6 @@ void CFileLogger::_ReadConfig()
 
         line = strtok_s(nullptr, "\r\n", &ctx);
     }
-}
-
-void CFileLogger::_RotateIfNeeded()
-{
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW(_logPath, GetFileExInfoStandard, &fad))
-        return;
-
-    LARGE_INTEGER fileSize;
-    fileSize.LowPart = fad.nFileSizeLow;
-    fileSize.HighPart = fad.nFileSizeHigh;
-
-    if (fileSize.QuadPart < MAX_LOG_SIZE)
-        return;
-
-    wchar_t oldPath[MAX_PATH];
-    _snwprintf_s(oldPath, _countof(oldPath), _TRUNCATE,
-        L"%ls\\" WIND_LOG_OLD_FILE_NAME, _logDir);
-
-    DeleteFileW(oldPath);
-    MoveFileW(_logPath, oldPath);
 }
 
 void CFileLogger::_FormatTimestamp(wchar_t* buf, size_t bufSize)

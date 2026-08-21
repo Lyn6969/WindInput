@@ -15,8 +15,9 @@
 #else
 #define WIND_LOG_DIR_NAME       L"WindInput"
 #endif
-#define WIND_LOG_FILE_NAME      L"wind_tsf.log"
-#define WIND_LOG_OLD_FILE_NAME  L"wind_tsf.old.log"
+// 日志文件名前缀。实际文件是 `<前缀>.<宿主名>.<pid>.log`（轮转产物再加 `.old`）——
+// 每进程一个，见 CFileLogger::_BuildPaths。core 侧清理旧日志时按这个前缀匹配。
+#define WIND_LOG_FILE_PREFIX    L"wind_tsf"
 #define WIND_LOG_CONFIG_NAME    L"tsf_log_config"
 
 // ============================================================================
@@ -24,7 +25,7 @@
 //
 // Output modes (controlled by config file):
 //   none        - No output (default, near-zero overhead)
-//   file        - Write to %LOCALAPPDATA%\<WIND_LOG_DIR_NAME>\logs\<WIND_LOG_FILE_NAME>
+//   file        - Write to %LOCALAPPDATA%\<WIND_LOG_DIR_NAME>\logs\<前缀>.<宿主名>.<pid>.log
 //   debugstring - OutputDebugStringW only (viewable in DebugView)
 //   all         - Both file and OutputDebugStringW
 //
@@ -109,13 +110,16 @@ private:
     void _BuildPaths();
 
     // Rotate log file if needed (caller must hold mutex)
-    void _RotateIfNeeded();
 
     // Write to file (caller must hold mutex)
     void _WriteToFile(const char* utf8Line, int utf8Len);
 
     // Write to OutputDebugStringW
     void _WriteToDebugString(LogLevel level, const wchar_t* message);
+    // 打开常开的追加句柄；失败返回 nullptr。顺带把已有文件大小计入 _written。
+    HANDLE _OpenLogFile();
+    // 立即轮转（关句柄 → 改名到 .old → 重开）。本进程独占文件，无需与他人协调。
+    void _RotateNow();
 
     // Format timestamp
     static void _FormatTimestamp(wchar_t* buf, size_t bufSize);
@@ -126,10 +130,18 @@ private:
     LogMode _mode;
     LogLevel _level;
     bool    _initialized;
-    HANDLE  _hMutex;        // For file write synchronization
+    // 常开的追加句柄。此前是「每行 CreateFile/WriteFile/CloseHandle 各一次 + 抢一把
+    // 跨进程互斥锁」，而这一切都发生在 **TSF 输入线程**上——切换窗口时新旧宿主同时
+    // 爆发写日志，几个进程的输入线程互相排队，用户能直接感到卡顿。
+    // 日志文件改为每进程一个之后，这个句柄独占，于是锁与每行开关文件一并消失。
+    HANDLE  _hFile;
+    // 已写入字节数，用于轮转判定。**精确而非估算**：本进程独占该文件，没有别人往里写。
+    // 此前每行都要 GetFileAttributesExW 查一次真实大小，现在一次系统调用都不需要。
+    DWORD   _written;
     DWORD   _pid;
     wchar_t _logDir[MAX_PATH];
     wchar_t _logPath[MAX_PATH];
+    wchar_t _oldPath[MAX_PATH];
     wchar_t _configPath[MAX_PATH];
 
     // Ring buffer for in-memory log capture (always active)
@@ -141,5 +153,6 @@ private:
     CRITICAL_SECTION _ringLock;
 
     static constexpr DWORD MAX_LOG_SIZE = 5 * 1024 * 1024; // 5MB
-    static constexpr DWORD MUTEX_TIMEOUT_MS = 500;
+    // 宿主进程名在文件名里的截断长度（超长的 exe 名不该把路径顶到 MAX_PATH）。
+    static constexpr size_t HOST_NAME_MAX = 48;
 };
