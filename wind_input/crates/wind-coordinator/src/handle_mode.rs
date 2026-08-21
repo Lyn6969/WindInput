@@ -1005,9 +1005,21 @@ impl Coordinator {
     }
 
     pub(crate) fn cycle_schema(&self) {
-        if let Some(next) = self.engine_mgr.cycle_schema() {
-            self.finish_user_schema_switch(&next, "Cycled to schema");
+        // 「无处可去」（`available` 里没有别的方案）时**仍然收尾**，与
+        // [`Self::switch_schema_by_id`] 的幂等分支同一判据：用户按的是切换键，意图是
+        // 「用这个方案打字」，而英文半角态 / CapsLock 开着时需要发生的恰恰只剩收尾里
+        // 那部分（归位中文、取消大写）。什么都不做就是「按了没反应」。
+        //
+        // 空 id 时跳过：那说明连活跃方案都没有（引擎尚未装配），此时 finish 会把
+        // `schema.active` 写成空串——配置从此指向一个不存在的方案。
+        let target = self
+            .engine_mgr
+            .cycle_schema()
+            .unwrap_or_else(|| self.engine_mgr.active_schema_id());
+        if target.is_empty() {
+            return;
         }
+        self.finish_user_schema_switch(&target, "Cycled to schema");
     }
 
     /// 切到指定方案。方案直达热键（`keys.schema_hotkeys`）与直通命令
@@ -1035,8 +1047,21 @@ impl Coordinator {
     /// 先判幂等再切，是为了让失败提示说得准：`engine_mgr.switch_schema` 对「已是当前方案」
     /// 和「方案加载失败」都返回 false，不分开判就只能二选一——要么给正常的重复按键弹一个
     /// 假报错，要么让方案文件损坏时按键毫无反应。
+    ///
+    /// ★★ 但**幂等 ≠ 什么都不做**：已是目标方案时仍要走收尾。
+    ///
+    /// 这个键的语义是「我要用这个方案打字」，不只是「把 active 改成它」。英文半角态或
+    /// CapsLock 开着时，方案本来就对——需要发生的恰恰只有 `finish_user_schema_switch`
+    /// 里那部分：归位中文、取消大写。早退回去等于「在最该生效的场景下按键毫无反应」，
+    /// 而这正是 2026-08-21 真机报障的第二次现场（第一次是那段归位被 CapsLock 开关门控，
+    /// 见 `finish_user_schema_switch`；修完那处却漏了这条早退，于是同一个症状复发）。
+    ///
+    /// 判据：**修好一个动作的收尾之后，要回头看它有没有「提前返回」的分支绕过那段收尾。**
+    /// 托盘 `select_schema` 当时同批改对了（`active == id || switch_schema(..)`），这里没有，
+    /// 于是又成了一处入口漂移——两处现已同构。
     pub(crate) fn switch_schema_by_id(&self, schema_id: &str) {
         if self.engine_mgr.active_schema_id() == schema_id {
+            self.restore_state_for_same_schema();
             return;
         }
         if self.engine_mgr.switch_schema(schema_id) {
@@ -1153,6 +1178,47 @@ impl Coordinator {
     /// 抽出来是因为「切方案」有三个入口，行为却各自漂移过：`switch_schema` 不持久化
     /// `schema.active`、`select_schema` 无条件归位中文而循环键按配置、只有循环键清 preedit
     /// 和取消 CapsLock。新增的直达热键不再添第四份，与循环键共用这里。
+    /// 已在目标方案时的**状态归位**：方案不用换，只把输入状态带回「能用这个方案打字」。
+    ///
+    /// # 为什么不能直接 return
+    ///
+    /// 「切到某方案」的语义是「我要用这个方案打字」，不只是「把 active 改成它」。英文
+    /// 半角态或 CapsLock 开着时，方案本来就对——需要发生的恰恰只剩这里这点归位。早退
+    /// 回去就是「在这个键最该生效的场景下按了毫无反应」，真机上报过两次
+    /// （见 `schema_switch_entries_do_not_early_return_past_the_finish`）。
+    ///
+    /// # 为什么不复用 `finish_user_schema_switch`
+    ///
+    /// 那个函数还会持久化 `schema.active`、重挂拆字库/注释库/辅助码表、刷新工具栏标签
+    /// ——方案根本没变，这些全是白做，而重写 `schema.active` 更是实打实的副作用：直通
+    /// 命令 `ime.schema` 可被脚本反复调用，旧实现每次都重写一遍配置文件。
+    ///
+    /// ★ **没有实际变化时完全静默**：本来就是中文态、大写也没开，那就什么都不该发生，
+    /// 连状态泡都不该弹。判据是「有没有真的改动状态」，不是「有没有被调用」。
+    fn restore_state_for_same_schema(&self) {
+        let caps_cancelled = self.force_cancel_caps_lock();
+        let follow = self.rt().config.input.punct.follow_mode;
+        let to_chinese = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let flip = !state.chinese_mode;
+            if flip {
+                state.chinese_mode = true;
+                if follow {
+                    state.chinese_punct = true;
+                }
+            }
+            flip
+        };
+        if !caps_cancelled && !to_chinese {
+            return;
+        }
+        self.record_app_mode(true);
+        self.record_last_state();
+        self.push_state_update();
+        self.show_status();
+        self.notify_toolbar();
+    }
+
     fn finish_user_schema_switch(&self, schema_id: &str, log_verb: &str) {
         // 注：往返键的来源记录**不在这里清**。本函数只覆盖五条切方案路径中的两条，
         // 清在这里等于只清一半；改由 `schema_generation` 代际校验统一失效，
@@ -2092,6 +2158,37 @@ mod schema_switch_finish_guard {
             }
         }
         panic!("fn {name} 的花括号不配平");
+    }
+
+    /// ★★ 幂等分支**不得**绕过收尾。
+    ///
+    /// 「切到某方案」的语义是「我要用这个方案打字」，不只是「把 active 改成它」。已是
+    /// 目标方案时，需要发生的恰恰只剩收尾里那部分（归位中文、取消大写）——早退回去就是
+    /// 「英文半角态/大写态下按方案热键毫无反应」，而那正是这个键最该生效的场景。
+    ///
+    /// 真机上这个症状出现过**两次**：第一次是收尾里的归位被 CapsLock 开关门控（见
+    /// `finish_user_schema_switch_is_not_gated_by_capslock_option`），修好之后**同一个
+    /// 症状复发**，因为 `switch_schema_by_id` 还有一条 `if active == target { return; }`
+    /// 的早退绕过了刚修好的收尾。
+    ///
+    /// ⇒ 可复用判据：**修好一个动作的收尾之后，回头找它有没有提前返回的分支绕过那段收尾。**
+    #[test]
+    fn schema_switch_entries_do_not_early_return_past_the_finish() {
+        for name in ["switch_schema_by_id", "select_schema"] {
+            let body = body_of(name);
+            assert!(
+                body.contains("finish_user_schema_switch"),
+                "{name} 必须走统一收尾"
+            );
+            // 幂等分支**不能是裸 return**：要么与切换尝试共用一个条件（都落到 finish），
+            // 要么单独做状态归位。两者都行，唯独「什么都不做」不行。
+            let idempotent_handled = body.contains("restore_state_for_same_schema")
+                || body.contains("active_schema_id() == id || self.engine_mgr.switch_schema(&id)");
+            assert!(
+                idempotent_handled,
+                "{name}: 「已是该方案」时既没归位也没走收尾 ⇒ 英文态/大写态下按方案热键                 毫无反应。要么调 restore_state_for_same_schema，要么与切换尝试共用条件"
+            );
+        }
     }
 
     /// ★ 本次真机故障的直接守卫：切方案的状态归位**不得**受 CapsLock 那个开关门控。
