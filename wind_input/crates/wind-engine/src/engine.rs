@@ -136,6 +136,51 @@ pub struct ConvertOptions {
     pub allow_partial_final: Option<bool>,
 }
 
+/// [`Engine::resolve_boundary`] 的结果。见
+/// `docs/design/pinyin-entry-boundary-contract.md` §3.1。
+///
+/// ★★ 五个变体**必须分开处置**，合并任意两个都会出错。最容易合并错的是最后两个：
+/// `NoInfo` 与 `Unresolvable` 都给不出边界，但前者**合法**（照常入库，`boundary = 0`
+/// 走既有降级路径），后者**非法**（拒收）。把 `NoInfo` 当非法会拒掉所有码表词库；
+/// 把 `Unresolvable` 当无信息则等于这套契约白做。
+///
+/// `Ambiguous` 与 `Derived` 的区别只在可信度，两者都应入库——分开是为了让导入预览能
+/// 如实报数，不是为了拦截。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryResolution {
+    /// 词典点查到的真值。
+    Exact(u64),
+    /// 求解出的唯一解。
+    Derived(u64),
+    /// 约束筛完仍多解，已按读音权重择一。
+    Ambiguous(u64),
+    /// **合法但边界无法表达**：非拼音方案（码表码无音节语义），或码超 64 字节
+    /// （bitmask 装不下，既定语义是整体降级，见 `wdict::split_spaced_code`）。
+    NoInfo,
+    /// **不合法**：不满足拼音词条判据（切不出与字数相符的音节序列 / 含无读音字符）。
+    Unresolvable,
+}
+
+impl BoundaryResolution {
+    /// 取边界值；`NoInfo` / `Unresolvable` 均为 0。
+    pub fn boundary(self) -> u64 {
+        match self {
+            Self::Exact(b) | Self::Derived(b) | Self::Ambiguous(b) => b,
+            Self::NoInfo | Self::Unresolvable => 0,
+        }
+    }
+
+    /// 该词条是否应当入库。**只有 `Unresolvable` 被拒**。
+    pub fn accepted(self) -> bool {
+        !matches!(self, Self::Unresolvable)
+    }
+
+    /// 入库后是否仍缺边界信息（供导入预览统计「可补但没补上」的行）。
+    pub fn lacks_boundary(self) -> bool {
+        matches!(self, Self::NoInfo)
+    }
+}
+
 /// 基础引擎接口
 pub trait Engine: Send + Sync {
     /// 转换输入为候选词列表
@@ -187,6 +232,20 @@ pub trait Engine: Send + Sync {
     /// （词频表是唯一不带 boundary 的持久层）。
     fn syllable_boundary_of(&self, _code: &str, _text: &str) -> u64 {
         0
+    }
+
+    /// 为待入库的 `(code, text)` **求解**音节边界，兼作拼音词条合法性判据。
+    ///
+    /// 与相邻两者的分工（三者必须并存，勿合并）：
+    /// - [`Self::syllable_boundary_of`]：**点查**词典真值，查不到即 0，不推断。
+    /// - [`Self::generate_word_pinyin`]：从**词**反推读音（多音字靠权重猜）。
+    /// - 本方法：拿着 `(code, text)` **求解切分**——读音已由 code 给定，只需定边界。
+    ///
+    /// 默认实现返回 [`BoundaryResolution::NoInfo`]。★ 这对码表/五笔等非拼音方案是**正确
+    /// 语义**（码表词组码没有音节概念，`boundary = 0` 本就合法），⚠️ 绝不可改成
+    /// `Unresolvable`——那会让码表词库导入被整体拒收。
+    fn resolve_boundary(&self, _code: &str, _text: &str) -> BoundaryResolution {
+        BoundaryResolution::NoInfo
     }
 
     /// 运行时启停某扩展词库（按 dict id），**无需重建引擎**：直接翻 composite 中对应

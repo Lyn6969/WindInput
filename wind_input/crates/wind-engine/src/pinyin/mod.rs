@@ -25,7 +25,7 @@ pub mod shuangpin;
 pub mod syllable;
 pub mod viterbi;
 
-use crate::engine::{ConvertOptions, ConvertResult, Engine, EngineType};
+use crate::engine::{BoundaryResolution, ConvertOptions, ConvertResult, Engine, EngineType};
 use dag::{Dag, SegGraph};
 use fuzzy::FuzzyConfig;
 use generate::CharPinyinIndex;
@@ -3324,6 +3324,47 @@ impl Engine for PinyinEngine {
             .find(|h| h.text == text)
             .map(|h| h.boundary)
             .unwrap_or(0)
+    }
+
+    /// 求解 `(code, text)` 的音节边界，兼作拼音词条合法性判据。
+    ///
+    /// ★★ 层序是 **层 2 → 层 4 → 层 3**，与设计文档 §3.1 的可信度排序**有意不同**：
+    /// 层 3（`generate_word_pinyin`）要枚举读音笛卡尔积再回查词典，是三者里最贵的；
+    /// 层 4 只在一个短码上建图，便宜得多，且唯一解时同样确定。故让层 4 先跑，
+    /// **只在它给出多解时才请层 3 消歧** —— 绝大多数词条因此根本不触发层 3。
+    ///
+    /// ⚠️ 层 4 无解即判非法、不再试层 3。这是可证的而非偷懒：若推导码 flat 后等于
+    /// `code`，其音节序列本身就是一条「音节数 == 字数」的合法路径，与层 4 无解矛盾。
+    fn resolve_boundary(&self, code: &str, text: &str) -> BoundaryResolution {
+        // 层 2：词典真值点查——最便宜也最权威。
+        let exact = self.syllable_boundary_of(code, text);
+        if exact != 0 {
+            return BoundaryResolution::Exact(exact);
+        }
+        // bitmask 装不下 ⇒ 合法但无边界（既定降级语义），既不求解也不拒收。
+        if code.len() > 64 {
+            return BoundaryResolution::NoInfo;
+        }
+        let idx = self
+            .char_pinyin_idx
+            .get_or_init(|| CharPinyinIndex::build(&self.dict));
+        // 层 4：字数约束求解。
+        let Some((solved, ambiguous)) =
+            generate::boundary_by_char_count(idx, &self.trie, code, text)
+        else {
+            return BoundaryResolution::Unresolvable;
+        };
+        if !ambiguous {
+            return BoundaryResolution::Derived(solved);
+        }
+        // 层 3：仅在多解时出场——推导码与目标码逐字相同，则其切分是确定的。
+        if let Some(spaced) = generate::generate_word_pinyin(&self.dict, idx, text) {
+            let (flat, derived) = wind_store::wdict::split_spaced_code(&spaced);
+            if flat == code && derived != 0 {
+                return BoundaryResolution::Derived(derived);
+            }
+        }
+        BoundaryResolution::Ambiguous(solved)
     }
 
     /// 为词语生成带空格的全拼音节码（多音字按词典权重消歧）。
