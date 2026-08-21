@@ -855,8 +855,13 @@ pub trait WebDataRpc: WebDataHost {
                     // 读不到方案就不提示——凭空报一个不存在的冲突比不报更糟。
                     None => Vec::new(),
                 };
+                // 按键总览（只读旁路）：本方案下每个绑过的键当前干什么、来自哪一层。
+                // 组装在这里而不是设置页：全局那份要经 `effective_session_actions` 折算，
+                // 展开规则只该有一处。见 [`keys_overview`]。
+                let overview = keys_overview(&v);
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("leadingCodeKeys".to_string(), json!(leading_keys));
+                    obj.insert("keysOverview".to_string(), Value::Array(overview));
                 }
                 Ok(v)
             }
@@ -2472,7 +2477,87 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
 /// 它再无影响，而用户根本没动过这些项。
 ///
 /// 在服务端剥而不是要求调用方自觉：这是契约边界，任何客户端都该受保护。
-pub const READONLY_SIDECAR_FIELDS: &[&str] = &["effectiveCodetable", "leadingCodeKeys"];
+pub const READONLY_SIDECAR_FIELDS: &[&str] =
+    &["effectiveCodetable", "leadingCodeKeys", "keysOverview"];
+
+/// 按键总览：这个方案下每个绑过的键**当前**干什么、来自哪一层。
+///
+/// # 为什么由内核组装
+///
+/// 设置页读得到两层的原始表，却算不出全局那份的**折算结果**：`page_keys = ["minus_equal"]`
+/// 这类组名要展开成 `minus` / `equal`，展开规则住在 `KeysConfig::effective_session_actions`。
+/// 设置页再写一份组名展开表就是两处慢慢漂移——跨仓契约无编译期约束，本仓已栽过
+/// （同 `leadingCodeKeys` 那条：边界上传语义结果，不传待解析的原料）。
+///
+/// # 为什么只读
+///
+/// 一个键的当前动作可能来自折算、也可能来自方案层，反写就要决定写哪一层，那就是第二个
+/// 真相源，会重蹈 `trigger_keys` 五处并存的覆辙。设置页据此展示并**跳转**到对应编辑处。
+/// 判据见 `docs/design/key-resolver-unification.md` §4.3。
+///
+/// # 动词不翻译
+///
+/// 给动词原值（`page_prev`）而不是中文名：文案值域已经在设置页的下拉里（两处各一份中文名
+/// 必然漂移），而这里给的是**语义结果**——哪个键、什么动作、来自哪层。翻译归 UI。
+fn keys_overview(schema_cfg: &Value) -> Vec<Value> {
+    let Ok(mut cfg) = wind_config::Config::load(wind_config::Config::data_dir().as_deref()) else {
+        // 读不到全局配置就整表不给：只列方案层会让用户以为「全局什么都没配」，
+        // 半份数据比没有更误导。
+        return Vec::new();
+    };
+    // 与 `ConfigBundle::build` 一样先 normalize：那里还有存量迁移（旧字段折算进
+    // `key_actions` / `session_actions`），跳过它算出来的表与运行时不一致。
+    cfg.normalize();
+
+    let schema_table = |key: &str| -> std::collections::BTreeMap<String, String> {
+        schema_cfg
+            .get(key)
+            .and_then(|x| x.as_object())
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut out = Vec::new();
+    push_overview_layer(
+        &mut out,
+        "lead",
+        &cfg.keys.key_actions,
+        &schema_table("key_actions"),
+    );
+    push_overview_layer(
+        &mut out,
+        "session",
+        &cfg.keys.effective_session_actions(),
+        &schema_table("session_actions"),
+    );
+    out
+}
+
+/// 一张表的两层仲裁：方案层表了态就用方案的，否则用全局的。
+///
+/// ★ 方案层的**显式 `none` 也是表态**（＝本方案禁用），不回落全局。这与内核
+/// `Coordinator::session_action_for` / `bound_action_with_source` 的处置逐条一致；
+/// 若在这里改成「none 视同没配」，总览显示的就与实际行为相反。
+fn push_overview_layer(
+    out: &mut Vec<Value>,
+    table: &str,
+    global: &std::collections::BTreeMap<String, String>,
+    schema: &std::collections::BTreeMap<String, String>,
+) {
+    let mut keys: std::collections::BTreeSet<&String> = global.keys().collect();
+    keys.extend(schema.keys());
+    for k in keys {
+        let (action, from) = match schema.get(k) {
+            Some(v) => (v.as_str(), "schema"),
+            None => (global.get(k).map(String::as_str).unwrap_or(""), "global"),
+        };
+        out.push(json!({ "key": k, "table": table, "action": action, "from": from }));
+    }
+}
 
 fn strip_readonly_fields(cfg: &Value) -> Value {
     let Some(o) = cfg.as_object() else {
