@@ -18,6 +18,7 @@ CFileLogger::CFileLogger()
     , _ringCount(0)
 {
     _logDir[0] = L'\0';
+    _fileDir[0] = L'\0';
     _logPath[0] = L'\0';
     _configPath[0] = L'\0';
     memset(_ringBuffer, 0, sizeof(_ringBuffer));
@@ -49,7 +50,8 @@ void CFileLogger::Init()
     if (_logDir[0] == L'\0')
         return;
 
-    // Ensure log directory exists
+    // Ensure log directory exists（配置文件就在这一层；日志文件的子目录留到真要写时再建，
+    // 见 _OpenLogFile —— mode=none 时不该给每个宿主进程都平白造一个空目录）
     CreateDirectoryW(_logDir, nullptr);
 
     // Read config (mode + level)
@@ -189,6 +191,12 @@ void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
 // 的状态下仍可被改名或删除——core 侧清理旧日志时不会因为某个宿主还开着而失败。
 HANDLE CFileLogger::_OpenLogFile()
 {
+    // 目录可能还不存在：core 未必启动过，用户也可能刚清理过日志目录。
+    // CreateDirectoryW **不建中间层**，故父子各建一次；已存在时返回 FALSE，忽略即可。
+    // 放在这里而不是 Init：轮转重开也走这条路，删了目录仍能自愈。
+    CreateDirectoryW(_logDir, nullptr);
+    CreateDirectoryW(_fileDir, nullptr);
+
     HANDLE h = CreateFileW(
         _logPath,
         FILE_APPEND_DATA,
@@ -237,6 +245,11 @@ void CFileLogger::_BuildPaths()
     _snwprintf_s(_logDir, _countof(_logDir), _TRUNCATE,
         L"%ls\\" WIND_LOG_DIR_NAME L"\\logs", appData);
 
+    // 日志文件再下沉一层到 `logs\tsf_log\`：按进程拆开后文件数是「用过的宿主 × pid」
+    // 量级，跟 core 的 wind_input.log 平铺在一起会把主日志淹掉。
+    _snwprintf_s(_fileDir, _countof(_fileDir), _TRUNCATE,
+        L"%ls\\" WIND_LOG_SUBDIR_NAME, _logDir);
+
     // 日志文件**每进程一个**：`wind_tsf.<宿主名>.<pid>.log`。
     //
     // TSF DLL 被每个宿主进程各加载一份，此前它们共写一个文件，只能靠一把跨进程互斥锁
@@ -269,10 +282,10 @@ void CFileLogger::_BuildPaths()
     }
 
     _snwprintf_s(_logPath, _countof(_logPath), _TRUNCATE,
-        L"%ls\\" WIND_LOG_FILE_PREFIX L".%ls.%lu.log", _logDir, hostName, _pid);
+        L"%ls\\" WIND_LOG_FILE_PREFIX L".%ls.%lu.log", _fileDir, hostName, _pid);
 
     _snwprintf_s(_oldPath, _countof(_oldPath), _TRUNCATE,
-        L"%ls\\" WIND_LOG_FILE_PREFIX L".%ls.%lu.old.log", _logDir, hostName, _pid);
+        L"%ls\\" WIND_LOG_FILE_PREFIX L".%ls.%lu.old.log", _fileDir, hostName, _pid);
 
     _snwprintf_s(_configPath, _countof(_configPath), _TRUNCATE,
         L"%ls\\" WIND_LOG_CONFIG_NAME, _logDir);

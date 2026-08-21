@@ -18,6 +18,11 @@
 // 日志文件名前缀。实际文件是 `<前缀>.<宿主名>.<pid>.log`（轮转产物再加 `.old`）——
 // 每进程一个，见 CFileLogger::_BuildPaths。core 侧清理旧日志时按这个前缀匹配。
 #define WIND_LOG_FILE_PREFIX    L"wind_tsf"
+// TSF 日志的**专属子目录**（`logs\tsf_log\`）。日志按进程拆开后，文件数是
+// 「用过的宿主 × pid」量级，跟 core 的 wind_input.log 混在一层会把主日志淹掉。
+#define WIND_LOG_SUBDIR_NAME    L"tsf_log"
+// 配置文件仍留在 `logs\` 下，**不跟着进子目录**：它是用户手工创建的日志总开关，
+// 路径散见于各 AGENTS.md 与排查步骤；跟着搬会让存量用户的开关静默失效。
 #define WIND_LOG_CONFIG_NAME    L"tsf_log_config"
 
 // ============================================================================
@@ -25,7 +30,7 @@
 //
 // Output modes (controlled by config file):
 //   none        - No output (default, near-zero overhead)
-//   file        - Write to %LOCALAPPDATA%\<WIND_LOG_DIR_NAME>\logs\<前缀>.<宿主名>.<pid>.log
+//   file        - Write to %LOCALAPPDATA%\<WIND_LOG_DIR_NAME>\logs\tsf_log\<前缀>.<宿主名>.<pid>.log
 //   debugstring - OutputDebugStringW only (viewable in DebugView)
 //   all         - Both file and OutputDebugStringW
 //
@@ -33,8 +38,8 @@
 //   mode=none
 //   level=debug
 //
-// Multi-process safety: Named Mutex + append-mode file I/O
-// Auto-rotation: 5MB max, rotates to wind_tsf.old.log
+// Multi-process safety: 每进程一个日志文件，本进程独占 → 无需任何跨进程同步
+// Auto-rotation: 5MB max, rotates to <前缀>.<宿主名>.<pid>.old.log
 //
 // Ring Buffer: Always captures last RING_BUFFER_LINES log entries in memory,
 //   regardless of mode. Press Ctrl+Shift+F12 to dump via text insertion.
@@ -139,7 +144,10 @@ private:
     // 此前每行都要 GetFileAttributesExW 查一次真实大小，现在一次系统调用都不需要。
     DWORD   _written;
     DWORD   _pid;
+    // `...\logs`：配置文件所在目录（日志文件已下沉到 _fileDir）
     wchar_t _logDir[MAX_PATH];
+    // `...\logs\tsf_log`：日志文件所在目录，与 core 的主日志分开
+    wchar_t _fileDir[MAX_PATH];
     wchar_t _logPath[MAX_PATH];
     wchar_t _oldPath[MAX_PATH];
     wchar_t _configPath[MAX_PATH];

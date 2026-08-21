@@ -568,8 +568,9 @@ fn init_logger() {
 
     log_rotate::rotate_on_startup(&mut rotate, &log_path);
 
-    // 顺带回收 TSF DLL 留下的过期日志。它按进程拆文件（每宿主 × pid 一个），文件数会
-    // 累积，而 DLL 自己在 loader lock 下没法做目录遍历——见 prune_stale_tsf_logs。
+    // 顺带回收 TSF DLL 留下的过期日志。它按进程拆文件（每宿主 × pid 一个，落在
+    // `logs/tsf_log/`），文件数会累积，而 DLL 自己在 loader lock 下没法做目录遍历。
+    // 传的是 logs 根目录，函数会连老版本平铺在这一层的存量一并扫——见 prune_stale_tsf_logs。
     let pruned = log_rotate::prune_stale_tsf_logs(
         &log_dir,
         std::time::Duration::from_secs(60 * 60 * 24 * 7),

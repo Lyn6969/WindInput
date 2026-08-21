@@ -144,13 +144,16 @@ C++ implementation files for the TSF DLL。所有文件编译链接进唯一目�
 
 ### FileLogger.cpp
 - `CFileLogger::Instance()` - 获取单例
-- `CFileLogger::Init()` - 读取配置文件，构建日志路径，初始化 Named Mutex
-- `CFileLogger::Shutdown()` - 关闭 Mutex 句柄，清理资源
-- `CFileLogger::Write()` - 线程安全写入（持有 Named Mutex，append 模式）
+- `CFileLogger::Init()` - 读取配置文件，构建日志路径，打开**常开**的追加句柄
+- `CFileLogger::Shutdown()` - 关闭文件句柄，清理资源
+- `CFileLogger::Write()` - 写入（本进程独占自己那个文件，**无跨进程锁**）
 - `CFileLogger::IsEnabled()` - 内联快速路径检查（mode=none 时零开销）
 - `_ReadConfig()` - 解析 `%LOCALAPPDATA%\WindInput\logs\tsf_log_config`（mode/level 两个键）
-- `_BuildPaths()` - 构建 logDir/logPath/configPath
-- `_RotateIfNeeded()` - 超过 5MB 时将 wind_tsf.log 重命名为 wind_tsf.old.log
+- `_BuildPaths()` - 构建 logDir（`logs\`，放配置）/ fileDir（`logs\tsf_log\`，放日志）/
+  logPath（`wind_tsf.<宿主名>.<pid>.log`）/ oldPath / configPath
+- `_OpenLogFile()` - 建目录（父子各一次，`CreateDirectoryW` 不建中间层）+ 开
+  `FILE_APPEND_DATA` 句柄，并把已有文件大小计入 `_written`
+- `_RotateNow()` - `_written` 超过 5MB 时关句柄→改名到 `.old.log`→重开（本进程独占，无需协调）
 - `_WriteToFile()` - UTF-8 写入文件
 - `_WriteToDebugString()` - 调用 `OutputDebugStringW`
 - `_FormatTimestamp()` - 生成 `[HH:MM:SS.mmm]` 格式时间戳

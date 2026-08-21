@@ -137,12 +137,19 @@ cmake --build . --config Release      # → build/Release/wind_tsf.dll
 ### File Logging (FileLogger)
 - `CFileLogger` - 运行时可配置的文件日志单例（`FileLogger.h` / `FileLogger.cpp`）
 - 四种输出模式：`none`（默认，零开销）/ `file` / `debugstring` / `all`
-- 日志文件：`%LOCALAPPDATA%\WindInput\logs\wind_tsf.log`
-- 配置文件：`%LOCALAPPDATA%\WindInput\logs\tsf_log_config`（mode/level 两个键）
+- 日志文件：`%LOCALAPPDATA%\WindInput\logs\tsf_log\wind_tsf.<宿主名>.<pid>.log`——
+  **每进程一个**，且单独放在 `tsf_log\` 子目录里（文件数是「用过的宿主 × pid」量级，
+  与 core 的 `wind_input.log` 平铺会把主日志淹掉）
+- 配置文件：`%LOCALAPPDATA%\WindInput\logs\tsf_log_config`（mode/level 两个键）——
+  **留在 `logs\` 这一层不跟着进子目录**：它是用户手工创建的日志总开关，搬走会让存量失效
 - dev 变体只换目录（`WindInputDev\logs\`），**文件名与配置名同正式版**——目录已隔离，
-  文件名不再重复带 `_dev`；互斥体名仍按变体区分（机器级命名空间，见 `FileLogger.cpp` 注释）
-- 多进程安全：Named Mutex + append 模式文件 I/O
-- 自动轮转：超过 5MB 时重命名为 `wind_tsf.old.log`
+  文件名不再重复带 `_dev`
+- 多进程安全：**每进程独占自己那个文件，无需任何跨进程同步**。此前是一把
+  `Local\WindInput*TSFLogMutex` 串行化所有宿主，而抢锁发生在 TSF 输入线程上
+- 常开追加句柄（`FILE_APPEND_DATA`），一行日志只剩一次 `WriteFile`
+- 自动轮转：超过 5MB 时重命名为 `wind_tsf.<宿主名>.<pid>.old.log`
+- 过期文件的回收由 **core 服务启动时**做（`log_rotate::prune_stale_tsf_logs`，默认 7 天）：
+  DLL 的 `Init()` 跑在 loader lock 下，不能做目录遍历
 - 在 `dllmain.cpp` 的 DLL_PROCESS_ATTACH / DLL_PROCESS_DETACH 中 Init/Shutdown
 
 ## CLSID / GUID 正式化
@@ -263,7 +270,8 @@ When implementing features or fixes in wind_tsf:
 
 ### Debugging IPC Issues
 1. Enable file logging: create `%LOCALAPPDATA%\WindInput\logs\tsf_log_config` with `mode=file` and `level=debug`
-2. View log at `%LOCALAPPDATA%\WindInput\logs\wind_tsf.log`
+2. View log at `%LOCALAPPDATA%\WindInput\logs\tsf_log\wind_tsf.<host>.<pid>.log`（每个宿主进程一个文件；
+   按时间戳合并多个宿主：`sort -m -k1,2 tsf_log/wind_tsf.*.log`，格式与 `wind_input.log` 逐字对齐）
 3. For real-time output: set `mode=debugstring` and use DebugView.exe
 4. Monitor Named Pipes with NamedPipeMon.exe
 5. Check Go service logs for parsing errors

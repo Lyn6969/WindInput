@@ -404,7 +404,17 @@ mod tests {
     }
 }
 
+/// TSF 日志的专属子目录名。**跨语言契约**，必须与 C++ 侧 `WIND_LOG_SUBDIR_NAME`
+/// （`wind_tsf/include/FileLogger.h`）逐字一致——两边没有任何编译期约束，改一边不改
+/// 另一边的后果是清理静默失效、文件无限堆积。
+const TSF_LOG_SUBDIR: &str = "tsf_log";
+
 /// 清理 TSF DLL 留下的**过期**日志（`wind_tsf.<宿主名>.<pid>.log` 及其 `.old`）。
+///
+/// 传入的是 `logs` 根目录。函数会扫两层：
+/// - `logs/tsf_log/` —— 当前落点；
+/// - `logs/` 本身 —— 更早的版本把 TSF 日志平铺在这里（包括所有进程共写一个
+///   `wind_tsf.log` 的那一版）。不扫这层的话，存量机器上那些文件永远没人回收。
 ///
 /// # 为什么这件事在 core 做，而不在 DLL 里
 ///
@@ -423,7 +433,12 @@ mod tests {
 ///
 /// 失败一律忽略：日志清理不该阻塞启动，更不该让服务起不来。
 pub fn prune_stale_tsf_logs(log_dir: &Path, max_age: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(log_dir) else {
+    prune_tsf_logs_in(&log_dir.join(TSF_LOG_SUBDIR), max_age) + prune_tsf_logs_in(log_dir, max_age)
+}
+
+/// 在**单个**目录里清理过期的 TSF 日志。不递归——调用方显式指定要扫哪几层。
+fn prune_tsf_logs_in(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     let now = std::time::SystemTime::now();
@@ -455,16 +470,18 @@ mod prune_tsf_tests {
     use std::time::{Duration, SystemTime};
 
     /// 只删过期的 TSF 日志，且只认 `wind_tsf.` 前缀——core 自己的日志、别人的文件
-    /// 都不能碰。
+    /// 都不能碰。同时钉住**两层都要扫**：`logs/tsf_log/`（当前落点）与 `logs/`
+    /// （老版本平铺的存量，含所有进程共写的那个 `wind_tsf.log`）。
     #[test]
     fn prunes_only_stale_tsf_logs() {
         let dir = std::env::temp_dir().join(format!("wind_prune_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let sub = dir.join(TSF_LOG_SUBDIR);
+        std::fs::create_dir_all(&sub).unwrap();
 
         let old_ts = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
-        let mk = |name: &str, stale: bool| {
-            let p = dir.join(name);
+        let mk = |base: &Path, name: &str, stale: bool| {
+            let p = base.join(name);
             std::fs::write(&p, b"x").unwrap();
             if stale {
                 let f = std::fs::File::options().write(true).open(&p).unwrap();
@@ -473,21 +490,44 @@ mod prune_tsf_tests {
             p
         };
 
-        let stale_tsf = mk("wind_tsf.feishu.1234.log", true);
-        let stale_old = mk("wind_tsf.feishu.1234.old.log", true);
-        let fresh_tsf = mk("wind_tsf.notepad.5678.log", false);
-        let core_log = mk("wind_input.log", true); // core 自己的，即使过期也不该碰
-        let other = mk("wind_tsf.feishu.1234.txt", true); // 非 .log
+        // 当前落点：logs/tsf_log/
+        let stale_tsf = mk(&sub, "wind_tsf.feishu.1234.log", true);
+        let stale_old = mk(&sub, "wind_tsf.feishu.1234.old.log", true);
+        let fresh_tsf = mk(&sub, "wind_tsf.notepad.5678.log", false);
+        // 老版本平铺在 logs/ 的存量
+        let legacy_shared = mk(&dir, "wind_tsf.log", true);
+        let legacy_fresh = mk(&dir, "wind_tsf.wechat.99.log", false);
+        let core_log = mk(&dir, "wind_input.log", true); // core 自己的，即使过期也不该碰
+        let other = mk(&sub, "wind_tsf.feishu.1234.txt", true); // 非 .log
 
         let removed = prune_stale_tsf_logs(&dir, Duration::from_secs(60 * 60 * 24 * 7));
 
-        assert_eq!(removed, 2, "应只删两个过期的 TSF 日志");
+        assert_eq!(removed, 3, "两层加起来应只删三个过期的 TSF 日志");
         assert!(!stale_tsf.exists(), "过期 TSF 日志未删");
         assert!(!stale_old.exists(), "过期轮转产物未删");
+        assert!(
+            !legacy_shared.exists(),
+            "老版本平铺在 logs/ 的存量没被回收——不扫这层就永远没人管它"
+        );
         assert!(fresh_tsf.exists(), "活跃宿主的日志被误删——那正是排查现场");
+        assert!(legacy_fresh.exists(), "未过期的存量同样不该删");
         assert!(core_log.exists(), "core 自己的日志不归本函数管");
         assert!(other.exists(), "非 .log 文件不该被碰");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 子目录名是 Rust 与 C++ 之间的**跨语言契约**，两边各写各的字面量，没有任何编译期
+    /// 约束。改一边不改另一边不会报错，只会让清理静默失效、文件无限堆积——所以在这里
+    /// 扫源码钉死。
+    #[test]
+    fn subdir_name_matches_cpp_header() {
+        const HEADER: &str = include_str!("../../../../wind_tsf/include/FileLogger.h");
+        let expect = format!("#define WIND_LOG_SUBDIR_NAME    L\"{TSF_LOG_SUBDIR}\"");
+        assert!(
+            HEADER.contains(&expect),
+            "FileLogger.h 里的 WIND_LOG_SUBDIR_NAME 与 TSF_LOG_SUBDIR 对不上，\
+             应含：{expect}"
+        );
     }
 }
