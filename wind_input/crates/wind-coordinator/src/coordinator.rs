@@ -47,6 +47,7 @@ use wind_store::stats::CommitSource;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui_types::CandidateItem;
+use wind_ui_types::ToolbarState;
 use wind_ui_types::{GlobalHotkeyEntry, UiCommand, UiEvent};
 use wind_ui_types::{ToastKind, ToastPosition};
 
@@ -778,6 +779,19 @@ pub(crate) fn should_reapply_initial(
 }
 
 /// 中央协调器
+/// 上一次推给 UI 的工具栏指令（供 `notify_toolbar` 去重）。
+///
+/// 区分「隐藏」与「显示某状态」两种，而不是只存 `Option<ToolbarState>`：后者无法表达
+/// 「上次推的是 Hide」，于是 Hide→Show→Hide 中的第二个 Hide 会被误判成「和上次一样」
+/// （上次其实是 Show）而跳过——工具栏就再也藏不掉了。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ToolbarPush {
+    Hidden,
+    /// `Box` 是为了压小枚举体积：`ToolbarState` 带 String，比 `Hidden` 大得多，
+    /// clippy 的 large_enum_variant 会因此告警。
+    Shown(Box<ToolbarState>),
+}
+
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
     pub(crate) push_server: Arc<PushServer>,
@@ -1045,6 +1059,13 @@ pub struct Coordinator {
     /// 在 `show_status` 做文本比对而非判断"这次变的是哪个字段"，是因为后者要给全部
     /// 十余个调用点传参，而文本比对一处生效、且将来新增状态项零成本。
     pub(crate) last_status_text: Mutex<String>,
+    /// 上一次推给 UI 的工具栏指令，用于**去重**。`None` = 本次会话还没推过。
+    ///
+    /// 宿主焦点抖动会把同一份状态连推数次（真机：飞书 200ms 内 5 轮
+    /// focus_lost/gained，每轮一组 HideToolbar + UpdateToolbar + HideCandidates），
+    /// 全部挤在 UI 线程上，表现就是「切换时占用高、语言栏图标迟钝」——图标更新排在
+    /// 这些重复消息后面。内容没变就不必再推。
+    pub(crate) last_toolbar_push: Mutex<Option<ToolbarPush>>,
     /// `toggle_schema:<id>` 的**来源**：`(从哪个方案按进来, 写入时的方案变更代际)`。
     ///
     /// 刻意只存运行时、不落配置：它描述的是「用户此刻的往返意图」，不是偏好。持久化会让
@@ -1678,6 +1699,7 @@ impl Coordinator {
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             last_status_text: Mutex::new(String::new()),
+            last_toolbar_push: Mutex::new(None),
             schema_toggle_origin: Mutex::new(None),
             theme_style: Mutex::new(theme_style_init),
             theme_index_labels: Mutex::new(Vec::new()),
@@ -2324,6 +2346,35 @@ impl Coordinator {
     /// 大写会与他的意图相反，故留给配置；切方案则不然——没有任何解释能让「切到五笔之后
     /// 继续打大写英文」成立。把两者共用一个开关，就是本开关（出厂 false）关着时
     /// 「英文态/大写态下方案切换看着毫无反应」的成因。
+    /// 工具栏推送去重：与上次推的相同则返回 `false`（调用方跳过下发）。
+    ///
+    /// 只做「内容比对」，**不判断该不该显示**——那是 `notify_toolbar` 四项合取的事。
+    /// 相同即跳过是安全的：UI 侧的工具栏是纯粹的状态镜像，没有需要靠重复消息驱动的
+    /// 动画或计时。
+    ///
+    /// ⚠️ 配置热重载后要 `reset_toolbar_push_dedup`：那条路径可能改变工具栏的呈现
+    /// （显隐开关、全屏策略），而 `ToolbarState` 里并不带这些量，光比内容会把该重推的
+    /// 那一次判成「没变」——同 `last_status_text` 在 reload 里被清空的理由。
+    pub(crate) fn take_toolbar_push_if_changed(&self, want: ToolbarPush) -> bool {
+        let mut last = self
+            .last_toolbar_push
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.as_ref() == Some(&want) {
+            return false;
+        }
+        *last = Some(want);
+        true
+    }
+
+    /// 清空工具栏推送去重缓存，使下一次 `notify_toolbar` 必定下发。
+    pub(crate) fn reset_toolbar_push_dedup(&self) {
+        *self
+            .last_toolbar_push
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     pub(crate) fn cancel_caps_on_switch(&self) -> bool {
         if !self.rt().config.input.capslock.cancel_on_mode_switch {
             return false;
@@ -2690,6 +2741,9 @@ impl Coordinator {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
+                // 工具栏去重缓存同理：热重载可能改变工具栏的显隐策略，而 ToolbarState
+                // 不带那些量，不清就会把该重推的那一次判成「内容没变」。
+                self.reset_toolbar_push_dedup();
                 // 注释词库跟随全局配置，**不在 schema_dirty 分支内**：`[[ui.comment_dicts]]`
                 // 改动本身不会把 schema 标脏，放进那个分支等于「改了挂载列表没反应，
                 // 直到下次切方案才生效」。自身按路径序列做变更检测，未变即空操作。

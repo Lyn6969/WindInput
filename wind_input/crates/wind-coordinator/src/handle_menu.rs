@@ -3,6 +3,7 @@
 //! 主菜单 / 候选右键菜单的构建与分派、工具栏点击/刷新/位置持久化。
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
+use crate::coordinator::ToolbarPush;
 use crate::coordinator::{Coordinator, FILTER_MODES};
 use crate::theme_style::ThemeStyle;
 use wind_bridge::handler::MessageHandler;
@@ -1760,7 +1761,14 @@ impl Coordinator {
                 hide_fullscreen
             );
             drop(s);
-            let _ = self.ui_tx.send(UiCommand::HideToolbar);
+            // 内容没变就不再推：焦点抖动时这条 Hide 会被连发数次（真机：飞书 200ms 内
+            // 5 轮 focus_lost，每轮一条），全挤在 UI 线程上。见 `last_toolbar_push`。
+            if self.take_toolbar_push_if_changed(ToolbarPush::Hidden) {
+                let _ = self.ui_tx.send(UiCommand::HideToolbar);
+            }
+            // ⚠ 去重**只挡 UI 推送这一条**：下面两个各有自己的去重与触发条件
+            // （HUD 看的是诊断开关、图标看的是 label/角标），跟着一起跳过就会出现
+            // 「工具栏没变但图标该变了却没变」。
             self.push_input_diag_hud_if_visible(); // 见函数末尾同一行的说明
             // 语言栏图标同样收口于此，且**两个出口都要**——「不可输入」恰恰走的是本分支，
             // 只在下面那个出口补的话，图标永远等不到变「英」。同 HUD 刷新的理由。
@@ -1807,7 +1815,9 @@ impl Coordinator {
         // 焦点换屏则先把工具栏挪到那块屏（内部按显示器 key 去重，未换屏时零下发）。
         // 必须先于 UpdateToolbar：反序会先在旧屏渲染一帧再跳。
         self.sync_toolbar_monitor();
-        let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
+        if self.take_toolbar_push_if_changed(ToolbarPush::Shown(Box::new(tb.clone()))) {
+            let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
+        }
         // HUD 刷新收口于此（两个出口各一次）。诊断 HUD 展示的 ime_active /
         // has_edit_context 正是上面那道合取的输入，而**凡是改动它们的路径都必须调
         // notify_toolbar 才能生效**，所以这里是唯一不会漏的落点。
@@ -2123,6 +2133,92 @@ mod tests {
             settings_cmdline(None, "--dark"),
             "--dark",
             "无页时附加参数不得被丢弃"
+        );
+    }
+}
+
+#[cfg(test)]
+mod toolbar_push_dedup_tests {
+    use crate::coordinator::{Coordinator, ToolbarPush};
+    use wind_ui_types::ToolbarState;
+
+    fn state(label: &str) -> ToolbarPush {
+        ToolbarPush::Shown(Box::new(ToolbarState {
+            chinese_mode: true,
+            icon_label: label.to_string(),
+            caps_lock: false,
+            full_width: false,
+            chinese_punct: true,
+            s2t_enabled: false,
+            s2t_shown: false,
+            input_blocked: false,
+        }))
+    }
+
+    /// 去重的两个方向都要成立：挡住重复、放行变化。
+    ///
+    /// 只测「挡住重复」会让一个恒返回 false 的实现也绿——那种缺陷的表现是工具栏
+    /// 彻底不更新，比重复推送严重得多。
+    #[test]
+    fn dedups_repeats_but_lets_changes_through() {
+        let c = Coordinator::new_headless(wind_config::Config::default(), None);
+        // 构造过程本身会推一次工具栏，缓存已非空——先归零，否则测的是构造顺序而非去重。
+        c.reset_toolbar_push_dedup();
+
+        assert!(c.take_toolbar_push_if_changed(state("五")), "首次必须下发");
+        assert!(
+            !c.take_toolbar_push_if_changed(state("五")),
+            "内容相同应被挡下——焦点抖动时这条会被连推数次"
+        );
+        assert!(
+            c.take_toolbar_push_if_changed(state("英")),
+            "label 变了必须下发"
+        );
+    }
+
+    /// ★ `Hidden` 与 `Shown` 必须是两个可区分的值。
+    ///
+    /// 若只缓存 `Option<ToolbarState>`（用 None 表示隐藏），Hide→Show→Hide 里的第二个
+    /// Hide 会和「上次是 Show」比出「不同」……但反过来 Show→Hide→Show 的第二个 Show
+    /// 又会因为中间那次 Hide 把缓存清成 None 而恒被判成变化。真正致命的是前者的对偶：
+    /// 用 None 兼表「没推过」和「推过 Hide」，首帧的 Hide 会被误判成重复而跳过，
+    /// 工具栏就再也藏不掉。这里把两种状态的交替钉死。
+    #[test]
+    fn hidden_and_shown_are_distinguishable() {
+        let c = Coordinator::new_headless(wind_config::Config::default(), None);
+        c.reset_toolbar_push_dedup(); // 同上：构造已推过一次
+
+        assert!(
+            c.take_toolbar_push_if_changed(ToolbarPush::Hidden),
+            "首帧 Hide 必须下发"
+        );
+        assert!(
+            !c.take_toolbar_push_if_changed(ToolbarPush::Hidden),
+            "重复 Hide 挡下"
+        );
+        assert!(
+            c.take_toolbar_push_if_changed(state("五")),
+            "Hide→Show 必须下发"
+        );
+        assert!(
+            c.take_toolbar_push_if_changed(ToolbarPush::Hidden),
+            "Show→Hide 必须下发，否则工具栏藏不掉"
+        );
+    }
+
+    /// 配置热重载后必须重推：热重载可能改变工具栏的显隐策略（`ui.toolbar.visible`、
+    /// 全屏策略），而那些量**不在** `ToolbarState` 里——光比内容会把该重推的那一次
+    /// 判成「没变」。同 `last_status_text` 在 reload 里被清空的理由。
+    #[test]
+    fn reset_forces_next_push() {
+        let c = Coordinator::new_headless(wind_config::Config::default(), None);
+        c.reset_toolbar_push_dedup();
+        assert!(c.take_toolbar_push_if_changed(state("五")));
+        assert!(!c.take_toolbar_push_if_changed(state("五")));
+        c.reset_toolbar_push_dedup();
+        assert!(
+            c.take_toolbar_push_if_changed(state("五")),
+            "reset 之后同样的内容也必须下发一次"
         );
     }
 }
