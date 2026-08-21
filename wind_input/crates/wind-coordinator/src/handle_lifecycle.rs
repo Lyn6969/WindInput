@@ -323,9 +323,9 @@ impl Coordinator {
         // `hotkey_action_entry` 的动词白名单只认 3 个，而单键那条路的 `BoundAction` 值域
         // 更大 ⇒ `ctrl+alt+e = "temp_english"` 静默失效、`z = "temp_english"` 正常。
         // 见 docs/design/key-resolver-unification.md §2.5。
-        for (name, action) in self.engine_mgr.active_key_actions() {
-            if crate::key_resolver::key_action_name_to_vk(&name) == Some(key_code) {
-                return Some((BoundAction::parse(&action), true));
+        for (name, action) in self.engine_mgr.active_key_actions().iter() {
+            if crate::key_resolver::key_action_name_to_vk(name) == Some(key_code) {
+                return Some((BoundAction::parse(action), true));
             }
         }
         // 全局 `keys.key_actions` 的单键条目。方案没表态时才落到这里——方案覆盖全局是

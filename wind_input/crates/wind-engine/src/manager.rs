@@ -268,7 +268,11 @@ pub struct EngineManager {
     /// 整个 `Schema`——`read_schema` 本身不带任何缓存。
     ///
     /// 与 `schema_type_cache` 等同批失效（`invalidate_schema`）。
-    key_actions_cache: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    ///
+    /// 值用 `Arc` 而非裸表：消费点在按键热路径上，返回 owned 表意味着**命中缓存也要
+    /// clone 一遍整张表**（含每个键名与动词的 `String` 分配）。缓存本身是为了省去读盘与
+    /// TOML 解析，clone 会把省下来的一部分又还回去。
+    key_actions_cache: Mutex<HashMap<String, Arc<std::collections::BTreeMap<String, String>>>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
     /// overlay 方案注册表缓存（见 [`Self::overlay_modes`]）。
@@ -1930,7 +1934,9 @@ impl EngineManager {
     /// 「这张码表怎么工作」。混输方案想配就在自己的文件里配。
     ///
     /// 读不到方案（文件缺失/解析失败）时返回空表 = 不覆盖任何键，各键照常走全局链。
-    pub fn active_key_actions(&self) -> std::collections::BTreeMap<String, String> {
+    /// 返回 `Arc`：本表在按键热路径上被查，`Arc::clone` 只加一次引用计数，而返回 owned
+    /// 表要复制整张表连同每个 `String`。调用方按 `&*` / `.iter()` 用即可。
+    pub fn active_key_actions(&self) -> Arc<std::collections::BTreeMap<String, String>> {
         let id = self.active_schema_id();
         if let Some(cached) = self
             .key_actions_cache
@@ -1938,15 +1944,17 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .get(&id)
         {
-            return cached.clone();
+            return Arc::clone(cached);
         }
-        let table = Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
-            .map(|s| s.key_actions)
-            .unwrap_or_default();
+        let table = Arc::new(
+            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+                .map(|s| s.key_actions)
+                .unwrap_or_default(),
+        );
         self.key_actions_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, table.clone());
+            .insert(id, Arc::clone(&table));
         table
     }
 

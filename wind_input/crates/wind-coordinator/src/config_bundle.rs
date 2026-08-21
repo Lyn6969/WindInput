@@ -79,6 +79,17 @@ pub(crate) struct ConfigBundle {
 /// 就得在每次切方案后重推，漏一次的表现是「刚切完方案这个键不灵、点下别的窗口又灵了」。
 /// 并集是静态的，代价只是别的方案里多转发一个不动作的 keyup（keydown 侧纯修饰键一律
 /// 放行，宿主无感）。理由详见 [`EngineManager::all_key_action_keys`]。
+///
+/// ⚠️ **枚举源是 `available`，overlay 方案（`hidden = true`）不在内——这是自洽，不是漏。**
+/// overlay 方案的 `[key_actions]` 没有消费路径：`active_key_actions()` 按 `EngineManager`
+/// 的**活跃方案**取表，而进特殊模式只改 `State.active`（`ModeKind::Special`），不动活跃方案
+/// ⇒ overlay 模式下查的仍是主方案那张表。把枚举源换成 `installed_schemas` 会让一批查不到
+/// 消费点的键进转发集，是纯粹的多余转发。
+///
+/// ⇒ 将来真要支持 overlay 自己的 `[key_actions]`，**枚举源与消费路径两处都得改**；
+/// 届时若把本函数收编成 `reachability()`，那个名字承诺「全集」而实现只覆盖 `available`，
+/// 需要一并处置（叫 `reachability_of_available()`，或在注释里写明）。
+/// 见 `docs/design/key-resolver-unification.md` §8。
 pub(crate) fn schema_bound_modifier_vks(mgr: &EngineManager) -> std::collections::BTreeSet<u32> {
     mgr.all_key_action_keys()
         .iter()
