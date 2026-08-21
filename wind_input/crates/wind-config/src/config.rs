@@ -666,7 +666,10 @@ pub enum BoundAction {
     /// 单向切走之后目标方案没有这条绑定，这个键就再也按不动了——「五笔里配 `rshift`→
     /// 英文方案，而英文方案没配 `rshift` ⇒ 回不来」。方案级要往返语义，用
     /// [`Self::ToggleSchema`]，它靠运行时来源兜底回程。
-    /// 方案级出现本动词时由 `bound_action_yield_reason` 让位并 warn。
+    /// 方案级出现本动词时由 `bound_key_decision` 让位并 warn。⚠️ 那道守卫**必须留在**
+    /// `bound_action_yield_reason` **之外**：后者开头就是
+    /// `vk_to_prefix_char_with_letters(key_code)?`，对修饰键恒返回 `None`，而本动词恰恰
+    /// 只在修饰键上才走得到——挪进去等于这道守卫永不执行。
     SwitchSchema(String),
     /// A 类状态切换（`toggle_punct` / `take_screenshot` 那类）。
     ///

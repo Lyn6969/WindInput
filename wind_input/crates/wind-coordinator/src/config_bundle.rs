@@ -65,6 +65,12 @@ pub(crate) struct ConfigBundle {
     /// 行为与历史一致）。这是 DLL 吃键与本侧出字的**同源判据**，且在英文标点键的热路径上每键
     /// 都要查——故预计算，别在按键时重新遍历 `custom_mappings`。有序集合使推送字节可复现。
     pub(crate) custom_en_punct_chars: std::collections::BTreeSet<char>,
+    /// 分层按键配置的解析器（当前只收全局 `keys.key_actions` 的预编译引导键表）。
+    ///
+    /// 与 `session_keys` 同源的理由：动作值域在 `wind-config`、键名解析在 `wind-keys`，
+    /// 本 crate 是唯一同时看得见两者的地方。设计见
+    /// `docs/design/key-resolver-unification.md`。
+    pub(crate) key_resolver: crate::key_resolver::KeyResolver,
 }
 
 /// 所有方案 `[key_actions]` 里绑过的纯修饰键 VK（并集）。
@@ -169,6 +175,9 @@ impl ConfigBundle {
                 .into_iter()
                 .chain(wind_punct::english_smart_source_chars(&config.input))
                 .collect();
+        // 预编译放在 `normalize()` 之后：`trigger_keys` 收编等存量迁移会往 `key_actions`
+        // 折算，早于迁移编译就会漏掉那批键。
+        let key_resolver = crate::key_resolver::KeyResolver::build(&config);
         Self {
             config,
             compiled_hotkeys,
@@ -178,6 +187,7 @@ impl ConfigBundle {
             jump_out_keys,
             jump_out_on_right_symbol,
             custom_en_punct_chars,
+            key_resolver,
         }
     }
 }

@@ -318,10 +318,13 @@ impl Coordinator {
     /// 见 docs/design/schema-key-actions.md §4.3。合并两层来源时若丢掉这个区分，
     /// 全局引导键就会变成「绑定优先」，把方案自己的码元抢走。
     pub(crate) fn bound_action_with_source(&self, key_code: u32) -> Option<(BoundAction, bool)> {
+        // 键名→VK 走与全局层**同一个**解析口（`key_action_name_to_vk`）：两层各留一份解析
+        // 规则，就是「同一张表按维度分裂」。同类**现存**缺陷有一个未修的样本：
+        // `hotkey_action_entry` 的动词白名单只认 3 个，而单键那条路的 `BoundAction` 值域
+        // 更大 ⇒ `ctrl+alt+e = "temp_english"` 静默失效、`z = "temp_english"` 正常。
+        // 见 docs/design/key-resolver-unification.md §2.5。
         for (name, action) in self.engine_mgr.active_key_actions() {
-            let vk = keymap::key_name_to_vk_with_letters(&name)
-                .or_else(|| keymap::modifier_name_to_vk(&name));
-            if vk == Some(key_code) {
+            if crate::key_resolver::key_action_name_to_vk(&name) == Some(key_code) {
                 return Some((BoundAction::parse(&action), true));
             }
         }
@@ -329,25 +332,15 @@ impl Coordinator {
         // 本设计的基本层级，与码表行为、注释模板等其它方案级配置同构。
         //
         // 只认单键：组合键条目由热键通路消费（`Compiler::compile` 已按形态分流），
-        // 在这里再认一次就是同一个键两条路都触发。
-        for (name, action) in &self.rt().config.keys.key_actions {
-            if !matches!(
-                wind_config::hotkey::route_of_key_action(name),
-                Some(wind_config::hotkey::KeyActionRoute::LeadingKey)
-                    | Some(wind_config::hotkey::KeyActionRoute::ModifierKeyUp)
-            ) {
-                continue;
-            }
-            let vk = keymap::key_name_to_vk_with_letters(name)
-                .or_else(|| keymap::modifier_name_to_vk(name));
-            if vk == Some(key_code) {
-                let parsed = BoundAction::parse(action);
-                if parsed.is_enabled() {
-                    return Some((parsed, false));
-                }
-                // 显式 `none`：全局层也能禁用，语义与方案级同——不再往下回落。
-                return Some((BoundAction::None, false));
-            }
+        // 在这里再认一次就是同一个键两条路都触发。该过滤连同键名→VK、动词→`BoundAction`
+        // 的解析，都已在 `ConfigBundle::build` 的 `KeyResolver` 里做完——**本函数在按键
+        // 热路径上**，原先每键都要线性遍历整张表并逐条做字符串解析。
+        if let Some(action) = self.rt().key_resolver.global_lead(key_code) {
+            // 查得到就是全局层**表了态**，`none` 同样是表态：语义与方案级同，
+            // 不再往下回落到 `z_key_action`。故 `BoundAction::None` 也原样返回，
+            // 不能在这里过滤掉（`parse` 把空 id 与未知动词一并归为 `None`，
+            // 与折算前 `is_enabled()` 分支的结果逐值相同）。
+            return Some((action, false));
         }
         // 表里没写 z 时，回落到专用字段（其自身已含全局→方案的折叠）。
         if key_code == keymap::VK_Z {

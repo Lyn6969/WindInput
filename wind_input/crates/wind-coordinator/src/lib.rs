@@ -38,6 +38,7 @@ pub mod hotkey_match;
 pub mod input_diag;
 pub(crate) mod key_convert;
 pub mod key_gate;
+pub(crate) mod key_resolver;
 pub mod layout;
 pub mod pipeline;
 pub(crate) mod preedit_cursor;
