@@ -13,6 +13,7 @@ CFileLogger::CFileLogger()
     , _initialized(false)
     , _hFile(nullptr)
     , _written(0)
+    , _lastCheckTick(0)
     , _pid(0)
     , _ringHead(0)
     , _ringCount(0)
@@ -162,6 +163,22 @@ void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
     if (_hFile == nullptr)
         return;
 
+    // 文件可能在我们眼皮底下被外部删除（手动清日志、core 回收过期日志）。Windows 删掉的
+    // 是**目录里的名字**，文件对象本身还被我们的句柄吊着，于是 WriteFile 照样返回成功，
+    // 每一行都静默写进一个谁也看不见的幽灵文件——不主动发现就永远发现不了。
+    //
+    // 节流用 GetTickCount：它读的是内核共享的用户页，**不是系统调用**，可以每行都问；
+    // 真正的查询每秒最多一次，与日志频率无关。安静的宿主同样能在一秒内接回来——而它恰恰
+    // 是最容易被 core 按修改时间当成过期文件删掉的那类。
+    DWORD now = GetTickCount();
+    if (now - _lastCheckTick >= FILE_CHECK_INTERVAL_MS)
+    {
+        _lastCheckTick = now;
+        _ResyncFile();
+        if (_hFile == nullptr)
+            return; // 重开失败，本行丢弃；下次写入会再试一次
+    }
+
     // 常规路径只剩**一次 WriteFile**。
     //
     // 此前这里是：抢跨进程互斥锁 → GetFileAttributesExW 查大小 → CreateFileW →
@@ -215,7 +232,39 @@ HANDLE CFileLogger::_OpenLogFile()
     _written = GetFileSizeEx(h, &size) && size.QuadPart < MAXDWORD
         ? (DWORD)size.QuadPart
         : 0;
+    // 刚对过表，自检窗口从现在起算（省掉开完就立刻再查一次）
+    _lastCheckTick = GetTickCount();
     return h;
+}
+
+// 与磁盘上的真实状态对一次表。一次 GetFileInformationByHandleEx 同时办三件事：
+// 认出文件被删（重开）、认出文件被外部清空（校正累计字节数）、拿到真实大小。
+//
+// 判据实测（Win11/NTFS，见提交说明）：外部删除后 `NumberOfLinks` 归零 **且**
+// `DeletePending` 置位。前者对应现代的 POSIX 删除语义（名字立即从目录消失），后者对应
+// 经典语义（名字留到最后一个句柄关闭）；两个一起判，两种语义都盖住。
+void CFileLogger::_ResyncFile()
+{
+    FILE_STANDARD_INFO info;
+    if (!GetFileInformationByHandleEx(_hFile, FileStandardInfo, &info, sizeof(info)))
+        return; // 查不到就维持原状——不值得为一次查询失败把日志关掉
+
+    if (info.NumberOfLinks == 0 || info.DeletePending)
+    {
+        // 已成幽灵。丢掉旧句柄按原路径重开，顺带把可能被一起删掉的目录建回来
+        // （_OpenLogFile 里有父子两次 CreateDirectoryW）。幽灵里的内容找不回来，
+        // 但那本来就是被人主动删掉的。
+        CloseHandle(_hFile);
+        _hFile = _OpenLogFile();
+        return;
+    }
+
+    // 没被删，但可能被**清空**——排查时截断日志是常规操作。追加句柄天然从新的文件末尾
+    // 写起（实测内容干净、无 NUL 空洞），不需要做什么；只有 _written 会停在旧的累计值上
+    // 导致轮转提前触发，所以这里以真实大小为准。
+    _written = info.EndOfFile.QuadPart < (LONGLONG)MAXDWORD
+        ? (DWORD)info.EndOfFile.QuadPart
+        : MAXDWORD;
 }
 
 // 立即轮转：关句柄 → 覆盖式改名到 .old → 重开。

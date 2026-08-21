@@ -41,6 +41,10 @@
 // Multi-process safety: 每进程一个日志文件，本进程独占 → 无需任何跨进程同步
 // Auto-rotation: 5MB max, rotates to <前缀>.<宿主名>.<pid>.old.log
 //
+// 外部改动日志文件是**受支持**的（每秒自检一次，见 _ResyncFile）：
+//   删除文件或整个 tsf_log 目录 → 一秒内自动重建，不必重启宿主
+//   清空文件（截断到 0）        → 直接从头续写，不留空洞；排查时可随时截断
+//
 // Ring Buffer: Always captures last RING_BUFFER_LINES log entries in memory,
 //   regardless of mode. Press Ctrl+Shift+F12 to dump via text insertion.
 // ============================================================================
@@ -123,6 +127,8 @@ private:
     void _WriteToDebugString(LogLevel level, const wchar_t* message);
     // 打开常开的追加句柄；失败返回 nullptr。顺带把已有文件大小计入 _written。
     HANDLE _OpenLogFile();
+    // 与磁盘真实状态对表：文件被删则重开，被外部清空则校正 _written。每秒最多一次。
+    void _ResyncFile();
     // 立即轮转（关句柄 → 改名到 .old → 重开）。本进程独占文件，无需与他人协调。
     void _RotateNow();
 
@@ -143,6 +149,9 @@ private:
     // 已写入字节数，用于轮转判定。**精确而非估算**：本进程独占该文件，没有别人往里写。
     // 此前每行都要 GetFileAttributesExW 查一次真实大小，现在一次系统调用都不需要。
     DWORD   _written;
+    // 上次与磁盘对表的时刻（GetTickCount）。见 _ResyncFile —— 外部删除/清空只能主动
+    // 发现，而按**时间**节流的好处是自愈延迟与日志频率无关：安静的宿主同样一秒内接回来。
+    DWORD   _lastCheckTick;
     DWORD   _pid;
     // `...\logs`：配置文件所在目录（日志文件已下沉到 _fileDir）
     wchar_t _logDir[MAX_PATH];
@@ -161,6 +170,8 @@ private:
     CRITICAL_SECTION _ringLock;
 
     static constexpr DWORD MAX_LOG_SIZE = 5 * 1024 * 1024; // 5MB
+    // 自检间隔。日志文件被外部删掉后最多丢这么久的日志。
+    static constexpr DWORD FILE_CHECK_INTERVAL_MS = 1000;
     // 宿主进程名在文件名里的截断长度（超长的 exe 名不该把路径顶到 MAX_PATH）。
     static constexpr size_t HOST_NAME_MAX = 48;
 };

@@ -148,6 +148,11 @@ cmake --build . --config Release      # → build/Release/wind_tsf.dll
   `Local\WindInput*TSFLogMutex` 串行化所有宿主，而抢锁发生在 TSF 输入线程上
 - 常开追加句柄（`FILE_APPEND_DATA`），一行日志只剩一次 `WriteFile`
 - 自动轮转：超过 5MB 时重命名为 `wind_tsf.<宿主名>.<pid>.old.log`
+- **外部改动日志文件是受支持的**（`_ResyncFile`，每秒自检一次）：
+  - 删掉文件或整个 `tsf_log\` 目录 → 一秒内自动重建，**不必重启宿主**
+  - 清空文件（截断到 0）→ 追加句柄天然从头续写，不留 NUL 空洞，排查时可随时截断
+  - 不做自检的话，删除后写入会**静默进入一个已摘名的幽灵文件**：`WriteFile` 照常返回
+    成功、目录里却什么都没有，很容易误判成「这功能压根没跑」
 - 过期文件的回收由 **core 服务启动时**做（`log_rotate::prune_stale_tsf_logs`，默认 7 天）：
   DLL 的 `Init()` 跑在 loader lock 下，不能做目录遍历
 - 在 `dllmain.cpp` 的 DLL_PROCESS_ATTACH / DLL_PROCESS_DETACH 中 Init/Shutdown

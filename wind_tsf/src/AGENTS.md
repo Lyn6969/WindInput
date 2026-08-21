@@ -153,6 +153,12 @@ C++ implementation files for the TSF DLL。所有文件编译链接进唯一目�
   logPath（`wind_tsf.<宿主名>.<pid>.log`）/ oldPath / configPath
 - `_OpenLogFile()` - 建目录（父子各一次，`CreateDirectoryW` 不建中间层）+ 开
   `FILE_APPEND_DATA` 句柄，并把已有文件大小计入 `_written`
+- `_ResyncFile()` - 与磁盘真实状态对表，**每秒最多一次**（节流用 `GetTickCount`，它读共享
+  用户页不是系统调用，故可以每行都问）。一次 `GetFileInformationByHandleEx(FileStandardInfo)`
+  同时判三件事：`NumberOfLinks==0 || DeletePending` → 文件被删，关句柄重开（连目录一起重建）；
+  否则以 `EndOfFile` 校正 `_written`（覆盖外部截断）。
+  **不做这件事的后果**：文件被删后 `WriteFile` 仍返回成功，日志静默进入已摘名的幽灵文件，
+  目录里什么都看不到——极易误判成「功能没跑」
 - `_RotateNow()` - `_written` 超过 5MB 时关句柄→改名到 `.old.log`→重开（本进程独占，无需协调）
 - `_WriteToFile()` - UTF-8 写入文件
 - `_WriteToDebugString()` - 调用 `OutputDebugStringW`
