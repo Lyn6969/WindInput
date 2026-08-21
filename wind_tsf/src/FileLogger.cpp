@@ -68,10 +68,12 @@ void CFileLogger::Init()
     // 对象操作（开文件），**不能**加载别的 DLL、创建线程或等待同步对象——旧日志的清理
     // 因此不放在 DLL 侧，交给 core 服务启动时做。
     //
-    // 不再需要互斥锁：日志文件已按 pid 拆开（见 _BuildPaths），本进程独占该文件，
-    // 没有可竞争的对象。此前那把 `Local\WindInput*TSFLogMutex` 是所有宿主进程共用的，
-    // 而抢锁发生在 TSF 输入线程上——切换窗口时新旧宿主同时爆发写日志，几个进程的输入
-    // 线程互相排队，超时上限 500ms。
+    // 句柄常开是主要收益：此前每行日志都要开关一次文件，而 Defender 在每次文件打开时
+    // 插一次扫描，实测单次 CreateFile+CloseHandle 就是 203μs（详见 _WriteToFile 的实测表）。
+    //
+    // 顺带不再需要互斥锁：日志文件已按 pid 拆开（见 _BuildPaths），本进程独占该文件，
+    // 没有可竞争的对象。那把 `Local\WindInput*TSFLogMutex` 本身很便宜（无竞争 293ns），
+    // 它的害处是把上面那 246μs 的临界区跨进程串行化了。
     if (_mode == LogMode::File || _mode == LogMode::All)
     {
         _hFile = _OpenLogFile();
@@ -182,8 +184,18 @@ void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
     // 常规路径只剩**一次 WriteFile**。
     //
     // 此前这里是：抢跨进程互斥锁 → GetFileAttributesExW 查大小 → CreateFileW →
-    // WriteFile → CloseHandle → ReleaseMutex，一行日志四次系统调用外加一次跨进程同步，
-    // 全在 TSF 输入线程上。日志文件按 pid 拆开后，本进程独占，锁与开关文件都不再需要。
+    // WriteFile → CloseHandle → ReleaseMutex，全在 TSF 输入线程上。
+    //
+    // 实测各成分（Win11 + Defender 实时保护开启，单进程无竞争，ns/行）：
+    //     互斥锁 抢+放                 293
+    //     GetFileAttributesExW      43,167
+    //     CreateFileW + CloseHandle 203,426
+    //     合计                     230,695   →  现在 3,579
+    //
+    // ⚠ 别把账算在锁上：无竞争时它只占 0.1%。真正的开销是**每行开一次文件**——
+    // Defender 会在每次文件打开时插一次扫描，200μs 由此而来。锁的作用是放大：
+    // 那 246μs 的临界区被它串行化，N 个宿主同时写日志就是 N×246μs 的排队。
+    // 所以「拆文件」才是主要收益，「去锁」只是拆文件之后顺带不再需要。
     DWORD written = 0;
     if (!WriteFile(_hFile, utf8Line, (DWORD)utf8Len, &written, nullptr))
         return;
@@ -301,9 +313,9 @@ void CFileLogger::_BuildPaths()
 
     // 日志文件**每进程一个**：`wind_tsf.<宿主名>.<pid>.log`。
     //
-    // TSF DLL 被每个宿主进程各加载一份，此前它们共写一个文件，只能靠一把跨进程互斥锁
-    // 串行化——而写日志发生在输入线程上，切换窗口时新旧宿主同时爆发写入，几个进程的
-    // 输入线程互相排队。拆开之后没有共享资源，锁与「每行开关文件」一并不再需要。
+    // TSF DLL 被每个宿主进程各加载一份，此前它们共写一个文件，于是既要靠一把跨进程互斥锁
+    // 串行化，也没法常开句柄（别人要写同一个文件）。拆开之后没有共享资源，句柄可以常开，
+    // 锁也一并不再需要——真正省下的是「每行开关文件」那 246μs，见 _WriteToFile 的实测表。
     //
     // 带宿主名是为了排查时一眼认出是谁（wind_tsf.feishu.12345.log）；**还要带 pid**，
     // 因为同一个程序可以多开，Chrome 那类多进程宿主更是一开就是一串——只带名字会撞回
