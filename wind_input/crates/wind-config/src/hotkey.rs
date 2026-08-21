@@ -32,7 +32,15 @@ use tracing::{debug, warn};
 /// 而热键分发端认的是 `enter_special:<id>`。两条通路的分发端不同，动词形态也就不同——
 /// 映射放在编译期，分发端零改动。
 fn hotkey_action_entry(action: &str) -> Option<(String, u32)> {
+    // 两个切方案动词都**不带 CHINESE_ONLY**：切方案在中英两态下都该生效——尤其
+    // 「英文方案 → 中文方案」，要求恰恰是在非中文态下也能按。带上就是「切得过去、
+    // 切不回来」。与 `switch_engine` 循环键同策略。
     if let Some(id) = action.strip_prefix("toggle_schema:")
+        && !id.trim().is_empty()
+    {
+        return Some((action.to_string(), 0));
+    }
+    if let Some(id) = action.strip_prefix("switch_schema:")
         && !id.trim().is_empty()
     {
         return Some((action.to_string(), 0));
@@ -363,26 +371,17 @@ impl Compiler {
             });
         }
 
-        // ── KeyDown：方案直达热键（切换 active 方案）──
-        // **不带 CHINESE_ONLY**：与 `switch_engine` 循环键同策略（见上面第一组）。切方案是
-        // 中英文两态下都该生效的操作——尤其"英文方案 → 中文方案"，要求恰恰是在非中文态下
-        // 也能按。加了 CHINESE_ONLY 就会变成「切得过去、切不回来」。
-        // 遍历顺序取决于 HashMap，故排序后再编译：热键冲突时（两个方案配了同一个键）
-        // 谁先入列决定谁生效，不排序会让同一份配置在不同进程里表现不同。
-        let mut schema_hotkeys: Vec<(&String, &String)> = h.schema_hotkeys.iter().collect();
-        schema_hotkeys.sort_by(|a, b| a.0.cmp(b.0));
-        for (schema_id, key) in schema_hotkeys {
-            if schema_id.is_empty() {
-                continue;
-            }
-            if let Some(raw) = parse_hotkey(key) {
-                result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw,
-                    match_hash: raw,
-                    action: format!("switch_schema:{schema_id}"),
-                });
-            }
-        }
+        // ── 方案直达热键在这里**没有**独立编译段 ──
+        // `keys.schema_hotkeys` 已并入下方的 `keys.key_actions`（动词 `switch_schema:<id>`），
+        // 由 `Config::migrate_schema_hotkeys_into_key_actions` 在加载期折算。
+        //
+        // 合表的理由见那个函数，其中一条正是本段自己造成的：它与 key_actions 编译进**同一张**
+        // key_down 表，而 `match_key_down` 是 `.find()` 先注册者赢——本段排在前面，于是同一个
+        // 键两处都配时 key_actions 那条静默失效。另一条是本段**不问键形态**地把解析结果塞进
+        // key_down 表（下方 key_actions 走 `route_of_key_action` 三分），单字符键进表会被 TSF
+        // 当热键吞掉，那个符号从此打不出来。
+        //
+        // ⚠ 别在这里"顺手"把它加回来：加回来这两个洞就一起回来了。
 
         // ── KeyDown：按键功能表（keys.key_actions）──
         // **不带 CHINESE_ONLY**，理由与上面方案直达热键同：`toggle_schema` 的回程恰恰要在
@@ -1187,36 +1186,6 @@ mod tests {
         );
     }
 
-    /// 方案直达热键编出 `switch_schema:<id>`，且**不带 CHINESE_ONLY**。
-    ///
-    /// 这个 policy 位是本条测试的重点：带上它，切到英文方案后热键就不再响应，
-    /// 用户切得过去、切不回来。特殊模式热键需要它（overlay 只在中文输入中途有意义），
-    /// 方案切换恰恰相反——同一个位，两种机制下后果相反。
-    ///
-    /// ⚠️ 本测试的**函数体一度整个丢失**：注释与 `#[test]` 还在，函数被后加的
-    /// `key_actions_compile_toggle_schema_...` 顶替，两个 `#[test]` 落在同一个 fn 上。
-    /// 编译器只报一句 `duplicated attribute` 警告，而读代码的人看到注释会以为这条契约
-    /// 有守门——**「注释还在」是比「没有测试」更坏的状态**。2026-08-10 补回。
-    #[test]
-    fn schema_hotkeys_compile_without_chinese_only_policy() {
-        let mut cfg = Config::default();
-        cfg.keys
-            .schema_hotkeys
-            .insert("english".to_string(), "ctrl+shift+n".to_string());
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "switch_schema:english")
-            .expect("schema_hotkeys 应编出 switch_schema:<id>");
-        assert_eq!(
-            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
-            0,
-            "带上 CHINESE_ONLY 会让用户切到英文方案后回不来"
-        );
-        assert_eq!(e.tsf_hash, e.match_hash, "无 policy 位时两个 hash 应相等");
-    }
-
     /// `keys.key_actions` 编出对应动词，且与方案直达热键同策略（不带 CHINESE_ONLY）。
     ///
     /// policy 位对 `toggle_schema` 比对 `switch_schema` 更要命：带上它，切到英文方案后
@@ -1266,18 +1235,40 @@ mod tests {
         assert_eq!(compiled.key_down.len(), base, "三条非法项都不该进热键表");
     }
 
+    /// 存量 `keys.schema_hotkeys` 经 `normalize` 折算成 `key_actions` 的
+    /// `switch_schema:<id>` 后编译，且**不带 CHINESE_ONLY**。
+    ///
+    /// 这个 policy 位是本条测试的重点：带上它，切到英文方案后热键就不再响应，
+    /// 用户切得过去、切不回来。特殊模式热键需要它（overlay 只在中文输入中途有意义），
+    /// 方案切换恰恰相反——同一个位，两种机制下后果相反。
+    ///
+    /// ★ **必须调 `normalize()`**：折算发生在那里（生产路径由 `ConfigBundle::build`
+    /// 统一调用），`compile()` 自己不做。少这一行，测的就是「没人折算过的空表」，
+    /// 而它恒不产出条目——`expect` 会红，但红的原因与契约无关。
+    ///
+    /// ⚠️ 本测试的**函数体一度整个丢失**：注释与 `#[test]` 还在，函数被后加的
+    /// `key_actions_compile_toggle_schema_...` 顶替，两个 `#[test]` 落在同一个 fn 上。
+    /// 编译器只报一句 `duplicated attribute` 警告，而读代码的人看到注释会以为这条契约
+    /// 有守门——**「注释还在」是比「没有测试」更坏的状态**。2026-08-10 补回。
+    /// 2026-08-21 合并：另有一条断言完全相同、只是少了下面那组反向对照的同名测试
+    /// （`schema_hotkeys_compile_without_chinese_only_policy`，只差一个 s），已删。
     #[test]
     fn schema_hotkey_compiles_without_chinese_only_policy() {
         let mut cfg = Config::default();
         cfg.keys
-            .schema_hotkeys
+            .legacy_schema_hotkeys
             .insert("english".to_string(), "ctrl+shift+n".to_string());
+        cfg.normalize();
+        assert!(
+            cfg.keys.legacy_schema_hotkeys.is_empty(),
+            "折算后旧表应清空，否则两处会各编一条进同一张 key_down 表"
+        );
         let compiled = Compiler::new(cfg).compile();
         let e = compiled
             .key_down
             .iter()
             .find(|e| e.action == "switch_schema:english")
-            .expect("keys.schema_hotkeys 应编出 switch_schema:<id>");
+            .expect("schema_hotkeys 应折算成 key_actions 的 switch_schema:<id>");
         assert_eq!(
             e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
             0,
@@ -1301,29 +1292,122 @@ mod tests {
         );
     }
 
-    /// 多个方案热键按 schema id 排序编译——`HashMap` 迭代序不稳定，两个方案配了同一个
-    /// 键时谁先入列决定谁生效，不排序会让同一份配置在不同进程启动时表现不同。
+    /// 迁移**保留单向语义**，不悄悄升级成往返。
     ///
-    /// 用 7 个 id：这条测试本质上是「乱序输入应得到有序输出」，而未排序的 `HashMap` 仍有
-    /// 可能碰巧吐出升序。7 个元素把假绿概率压到 1/5040，n 少了这测试就不算数。
+    /// 这两个动词在协调器侧分派到不同函数（`switch_schema_by_id` 不记来源、不认回程键；
+    /// `toggle_schema_by_id` 记来源、再按一次回去）。把存量的单向键改成往返，是让用户
+    /// 「一直用的键突然多出一个回程」——静默改变既有行为，比不迁移更糟。
     #[test]
-    fn schema_hotkeys_compile_in_sorted_order() {
+    fn migration_keeps_one_way_semantics() {
+        let mut cfg = Config::default();
+        cfg.keys
+            .legacy_schema_hotkeys
+            .insert("wubi86".to_string(), "ctrl+shift+r".to_string());
+        cfg.normalize();
+        assert_eq!(
+            cfg.keys.key_actions.get("ctrl+shift+r").map(String::as_str),
+            Some("switch_schema:wubi86"),
+            "存量方案热键是单向的，迁移后必须仍是 switch_schema 而非 toggle_schema"
+        );
+        let compiled = Compiler::new(cfg).compile();
+        assert!(
+            compiled
+                .key_down
+                .iter()
+                .any(|e| e.action == "switch_schema:wubi86"),
+            "折算后的动词要能编进 key_down 表——hotkey_action_entry 少认一个前缀，             表现就是「迁移看着成功、热键毫无反应」"
+        );
+    }
+
+    /// 用户在 `key_actions` 里显式配过的键，不被存量迁移覆盖。
+    #[test]
+    fn migration_does_not_override_explicit_key_actions() {
+        let mut cfg = Config::default();
+        cfg.keys.key_actions.insert(
+            "ctrl+shift+r".to_string(),
+            "toggle_schema:pinyin".to_string(),
+        );
+        cfg.keys
+            .legacy_schema_hotkeys
+            .insert("wubi86".to_string(), "ctrl+shift+r".to_string());
+        cfg.normalize();
+        assert_eq!(
+            cfg.keys.key_actions.get("ctrl+shift+r").map(String::as_str),
+            Some("toggle_schema:pinyin"),
+            "显式配置优先于存量迁移"
+        );
+    }
+
+    /// ★ 单字符键**不得**进 key_down 表：进表后 TSF 会把它当热键吞掉，那个符号就再也
+    /// 打不出来了。旧的 `schema_hotkeys` 编译段没有这道守卫（无条件 `parse_hotkey` 后
+    /// 直接 push），存量配置里可能真躺着这种条目——迁移是唯一能让它可见的时机。
+    #[test]
+    fn migration_drops_single_char_key_that_would_swallow_the_character() {
+        let mut cfg = Config::default();
+        cfg.keys
+            .legacy_schema_hotkeys
+            .insert("wubi86".to_string(), "backslash".to_string());
+        cfg.normalize();
+        assert!(
+            !cfg.keys.key_actions.contains_key("backslash"),
+            "单字符键作方案热键会让该字符打不出来，必须丢弃并 warn"
+        );
+        let compiled = Compiler::new(cfg).compile();
+        assert!(
+            !compiled
+                .key_down
+                .iter()
+                .any(|e| e.action.starts_with("switch_schema:")),
+            "更要紧的是它不能出现在 key_down 表里——那才是吞掉字符的地方"
+        );
+    }
+
+    /// 存量方案热键的折算必须**可复现**：`HashMap` 迭代序不稳定，多个方案抢同一个键时
+    /// 谁先入列决定谁生效，不排序会让同一份配置在不同进程启动时表现不同。
+    ///
+    /// 折算落进 `key_actions`（`BTreeMap`）之后，「编译顺序」本身已由键名保证有序，
+    /// 无需再测；**真正还需要守的是争用的赢家恒定**——那取决于折算时的遍历顺序。
+    ///
+    /// 重复 20 轮而不是跑一次：7 个 id 争一个键时，未排序的 `HashMap` 仍有 1/7 的概率
+    /// 碰巧先吐出 `aaa`，单轮断言的假绿概率高到这测试不算数。20 轮压到 7^-20。
+    #[test]
+    fn schema_hotkeys_migration_is_reproducible() {
         let ids = ["zzz", "aaa", "mmm", "ddd", "sss", "ggg", "ppp"];
+
+        // ① 各配各的键：折算后全部到齐，一条不漏。
         let mut cfg = Config::default();
         for id in ids {
             cfg.keys
-                .schema_hotkeys
+                .legacy_schema_hotkeys
                 .insert(id.to_string(), format!("ctrl+shift+{}", &id[..1]));
         }
+        cfg.normalize();
         let compiled = Compiler::new(cfg).compile();
-        let order: Vec<&str> = compiled
+        let mut got: Vec<&str> = compiled
             .key_down
             .iter()
             .filter_map(|e| e.action.strip_prefix("switch_schema:"))
             .collect();
+        got.sort();
         let mut expect = ids.to_vec();
         expect.sort();
-        assert_eq!(order, expect, "应按 schema id 升序编译");
+        assert_eq!(got, expect, "每个方案热键都应折算出一条 switch_schema:<id>");
+
+        // ② 全挤在同一个键上：赢家必须恒定（schema id 升序里的第一个）。
+        for round in 0..20 {
+            let mut cfg = Config::default();
+            for id in ids {
+                cfg.keys
+                    .legacy_schema_hotkeys
+                    .insert(id.to_string(), "ctrl+shift+r".to_string());
+            }
+            cfg.normalize();
+            assert_eq!(
+                cfg.keys.key_actions.get("ctrl+shift+r").map(String::as_str),
+                Some("switch_schema:aaa"),
+                "第 {round} 轮：争用赢家应恒为 schema id 升序的第一个，否则同一份配置在                 不同进程启动时表现不同"
+            );
+        }
     }
 
     /// 动词 id 为空（`special:`）不产生条目；`temp_pinyin.hotkey` 默认空同理。

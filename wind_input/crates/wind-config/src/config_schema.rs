@@ -302,7 +302,11 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.delete_candidate", Str),
     f("keys.take_screenshot", Str),
     f("keys.global_hotkeys", StrList),
-    f("keys.schema_hotkeys", Map),
+    // `keys.schema_hotkeys` 已废弃并**从登记表移除**（与当年 `schema.special_modes` 同样
+    // 的处置）：它已并入下面的 key_actions，由 `Config::migrate_schema_hotkeys_into_key_actions`
+    // 在加载期折算。serde 字段仍保留，故旧配置照常读得进来；移出登记表则让 `config.setItems`
+    // 不再接受对它的写入——写旧键的客户端会收到 skipped 而不是静默成功，这正是我们想要的
+    // 可见性（本仓最忌讳「写进去了、没人读」）。
     f("keys.key_actions", Map),
     f("keys.session_actions", Map),
     f("keys.select_key_groups", StrList),

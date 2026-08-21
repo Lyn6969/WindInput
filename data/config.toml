@@ -592,19 +592,25 @@ take_screenshot = "ctrl+shift+f11"
 # 写入其它名字只会进 warn 日志并被忽略。activate_ime 不在此列（走系统
 # DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。空 = 全部走普通键盘钩子。
 global_hotkeys = []
-# 方案直达热键：key = 方案 id，value = 热键串。按下即把该方案切成当前方案，
-# 效果等同用 switch_engine 循环键一路切到它（同样遵循 commit_on_switch、同样持久化）。
-# 例：schema_hotkeys = { english = "ctrl+shift+n", wubi86 = "ctrl+shift+w" }
-# 与 [[schema.special_modes]] 的 hotkey 是两回事：那个进 overlay、打完一段自动退回；
-# 这个是换方案，不再按一次不会回来。
-schema_hotkeys = {}
+# ⚠ schema_hotkeys（方案直达热键）已并入下面的 key_actions，不再单列。
+#   旧配置照常工作：加载时自动折算成 key_actions 的 switch_schema:<方案id>，
+#   不写回文件（回退旧版本仍可用）；下次用设置页保存时旧字段自然消失。
+#   合并的理由：两处配的是同一件事、只差单向/往返，却编译进同一张热键表，
+#   同一个键两处都配时后者静默失效；且旧表不校验键形态，写单个字符键会让
+#   那个字符再也打不出来。
 # 按键功能表：key = 热键串，value = 动词。与上面「一个功能一个字段」的写法不同，
-# 这是「这个键干什么」的通用表，将来方案文件的 [key_actions] 用同一套动词值域
+# 这是「这个键干什么」的通用表，方案文件的 [key_actions] 用同一套动词值域
 # （见 docs/design/schema-key-actions.md）。
 # 当前支持的动词：
-#   toggle_schema:<方案id>  切到该方案；**再按一次回到来源方案**
-# 例：key_actions = { "ctrl+shift+n" = "toggle_schema:english" }
-# 与 schema_hotkeys 的区别就是那个回程：那个切过去不再按一次不会回来，这个会。
+#   switch_schema:<方案id>  切到该方案，**单向**（原 schema_hotkeys 的语义）
+#   toggle_schema:<方案id>  切到该方案，**再按一次回到来源方案**
+#   special:<方案id>        进该方案的 overlay（打完一段自动退回）
+# 例：key_actions = { "ctrl+shift+r" = "switch_schema:wubi86" }
+# 单向与往返的差别只在回程：前者切过去就完了，后者再按一次回到你原来那个方案。
+# ⚠ switch_schema 只能写在这里（全局）。方案文件的 [key_actions] 按活跃方案查表，
+#   单向切走之后目标方案没有这条绑定，那个键就再也按不动了——方案级请用 toggle_schema。
+# 键的形态决定它走哪条通路：组合键 → 热键表；纯修饰键（rshift）→ 轻敲；
+#   单个字符键 → 引导键链（切方案类动词不可用，那条链在英文模式下走不到）。
 # 无法识别的动词只进 warn 日志并被忽略。
 key_actions = {}
 # 会话态按键功能表：key = 键名，value = 动词。管的是「**正在打字**（有编码或候选）时这个

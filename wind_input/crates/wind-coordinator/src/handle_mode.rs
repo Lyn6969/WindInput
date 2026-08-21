@@ -431,7 +431,9 @@ impl Coordinator {
             //
             // 注：走到本函数说明缓冲非空，而 A 类的 keydown 分派要求空缓冲——打字打到
             // 一半按下绑定键，意图多半是输入而非切状态。
-            BoundAction::ToggleSchema(_) | BoundAction::Action(_) => None,
+            BoundAction::ToggleSchema(_)
+            | BoundAction::SwitchSchema(_)
+            | BoundAction::Action(_) => None,
         }
     }
 

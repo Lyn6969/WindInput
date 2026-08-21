@@ -636,7 +636,8 @@ impl Default for PinyinGlobalConfig {
 /// - `"temp_english"`：进临时英文
 /// - `"mix:<id>"`：进指定融合模式（`mix:quick_mix` = 内置「快捷」）
 /// - `"special:<id>"`：进指定特殊模式
-/// - `"toggle_schema:<id>"`：切到指定方案，再按回来（仅方案级 `[key_actions]` 用）
+/// - `"toggle_schema:<id>"`：切到指定方案，再按回来
+/// - `"switch_schema:<id>"`：切到指定方案，单向（仅全局 `keys.key_actions`，见该变体说明）
 ///
 /// 未知值一律解析成 [`BoundAction::None`]（不静默变成别的功能）；指向不存在的 id 由消费端
 /// 的门卫拦下（`mix_members` / `ensure_schema`），并在加载期 `warn`。
@@ -656,11 +657,17 @@ pub enum BoundAction {
     Special(String),
     /// 切到指定方案，**再按回到来源**（携带目标方案 id）。
     ///
-    /// 与全局热键的 `switch_schema:<id>`（单向）刻意不同名：方案级绑定 + 单向切换
-    /// 会锁死用户（五笔里配 `rshift`→英文方案，而英文方案没配 `rshift` ⇒ 回不来）。
     /// 往返语义由**运行时来源**兜底，不要求目标方案配对称的绑定。
     /// 见 docs/design/schema-key-actions.md §5。
     ToggleSchema(String),
+    /// 切到指定方案，**单向**（携带目标方案 id）。原 `keys.schema_hotkeys` 的语义。
+    ///
+    /// ⚠️ **只在全局 `keys.key_actions` 里合法**。方案级 `[key_actions]` 按活跃方案查表，
+    /// 单向切走之后目标方案没有这条绑定，这个键就再也按不动了——「五笔里配 `rshift`→
+    /// 英文方案，而英文方案没配 `rshift` ⇒ 回不来」。方案级要往返语义，用
+    /// [`Self::ToggleSchema`]，它靠运行时来源兜底回程。
+    /// 方案级出现本动词时由 `bound_action_yield_reason` 让位并 warn。
+    SwitchSchema(String),
     /// A 类状态切换（`toggle_punct` / `take_screenshot` 那类）。
     ///
     /// 携带动词原文，由协调器转交 `dispatch_hotkey` ——那里是这批动作的既有单点，
@@ -696,14 +703,14 @@ impl BoundAction {
     ///
     /// | 动作 | 限修饰键 | why |
     /// |---|---|---|
-    /// | `toggle_mode` / `switch_engine` / `toggle_schema:*` | 是 | 正是用来离开/返回英文态的 |
+    /// | `toggle_mode` / `switch_engine` / `toggle_schema:*` / `switch_schema:*` | 是 | 正是用来离开/返回英文态的 |
     /// | `toggle_punct` / `toggle_s2t` / `take_screenshot` … | 否 | 本就只在中文态有意义（全局那份也带 `CHINESE_ONLY`） |
     ///
     /// 这与「键有没有字符」是**正交的两问**，合起来才定得了插入点，见
     /// docs/design/schema-key-actions.md §4.1。
     pub fn requires_modifier_key(&self) -> bool {
         match self {
-            Self::ToggleSchema(_) => true,
+            Self::ToggleSchema(_) | Self::SwitchSchema(_) => true,
             Self::Action(a) => matches!(a.as_str(), "toggle_mode" | "switch_engine"),
             _ => false,
         }
@@ -734,6 +741,14 @@ impl BoundAction {
                 Self::None
             } else {
                 Self::ToggleSchema(id.to_string())
+            };
+        }
+        if let Some(id) = s.strip_prefix("switch_schema:") {
+            let id = id.trim();
+            return if id.is_empty() {
+                Self::None
+            } else {
+                Self::SwitchSchema(id.to_string())
             };
         }
         let lower = s.to_lowercase();
@@ -2479,21 +2494,22 @@ pub struct KeysConfig {
     pub take_screenshot: String,
     #[serde(default)]
     pub global_hotkeys: Vec<String>,
-    /// **方案直达热键**：`schema_id` → 热键串（如 `{ english = "ctrl+shift+n" }`）。
+    /// **已废弃**：方案直达热键（`schema_id` → 热键串）已并入 [`Self::key_actions`]，
+    /// 动词 `switch_schema:<方案id>`。由 [`Config::migrate_schema_hotkeys_into_key_actions`]
+    /// 在加载期折算（`normalize` → `ConfigBundle::build`，配置生效的单一入口）。
     ///
-    /// 按下即把该方案切成当前方案（等价于用 `switch_engine` 循环键一路切到它），
-    /// 与循环切换共用同一条 `switch_schema` 路径，因而也共用「切换时是否上屏」
-    /// （`commit_on_switch`）与持久化 `schema.active` 的行为。
+    /// 字段保留只为**读得出存量值以便折算**——删掉的话 serde 会静默丢弃这一段，用户
+    /// 升级后热键全失效且查不到原因。处置与 `schema.legacy_special_modes` 同构：
+    /// `rename` 保住 TOML/JSON 里的原键名，`skip_serializing_if` 让它不再被写出，于是
+    /// 它也自动退出 `config_schema` 的登记表对应关系（那道守卫按序列化产物比对）。
     ///
-    /// 与特殊模式的 `hotkey` 是**两种不同的进入**，别混：那个是 overlay，打完一段就退回原
-    /// 方案；这个是换方案，不按第二次不会回来。英文方案属于后者——「切过去打一段英文，
-    /// 再切回中文」正是它存在的理由。
-    ///
-    /// 空串 = 不注册。指向不存在 / 未启用方案的条目在切换时安全失败（`switch_schema`
-    /// 加载不到引擎即原样返回），不做启动期校验——方案可被删除或停用，校验只会在
-    /// 那种时刻制造无从修复的启动告警。
-    #[serde(default)]
-    pub schema_hotkeys: HashMap<String, String>,
+    /// ⚠️ **不要**在新代码里读它。折算之后本表恒为空；消费端一律读 `key_actions`。
+    #[serde(
+        rename = "schema_hotkeys",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub legacy_schema_hotkeys: HashMap<String, String>,
     /// **按键功能表**：热键串 → 动词（如 `{ "ctrl+shift+n" = "toggle_schema:english" }`）。
     ///
     /// 与上面那批「一个功能一个字段」的热键不同，这是「键 → 干什么」的通用表——同一套
@@ -2755,7 +2771,7 @@ impl Default for KeysConfig {
             delete_candidate: default_delete_candidate(),
             take_screenshot: default_take_screenshot(),
             global_hotkeys: Vec::new(),
-            schema_hotkeys: HashMap::new(),
+            legacy_schema_hotkeys: HashMap::new(),
             key_actions: BTreeMap::new(),
             session_actions: BTreeMap::new(),
             select_key_groups: default_select_key_groups(),
@@ -4008,6 +4024,10 @@ impl Config {
         // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
         // 这里看到的 trigger_keys 已只剩符号键。
         self.migrate_trigger_keys_into_key_actions();
+        // 须在 migrate_trigger_keys_into_key_actions **之后**：两者写同一张表，而本条的
+        // 「已显式配过就不覆盖」要能看见上一步折算进来的条目，否则同一个键会被后到的
+        // 方案热键顶掉引导键。
+        self.migrate_schema_hotkeys_into_key_actions();
         // ⛔ 这里**不再**把四组键组配置折算进 `session_actions`。折算是**消费层的视图**，
         // 不是存储层的改写——见 `KeysConfig::effective_session_actions` 的文档。
         self.warn_legacy_special_modes();
@@ -4050,6 +4070,76 @@ impl Config {
         );
         // 清空：留着会让后续任何「有没有配过」的判断读到假信号。
         self.schema.legacy_special_modes.clear();
+    }
+
+    /// 存量迁移：`keys.schema_hotkeys` → `keys.key_actions` 的 `switch_schema:<id>`。
+    ///
+    /// # 为什么要合并
+    ///
+    /// 两处配的是**同一件事**（按一个键切到某方案），只差单向/往返，却各自复制了一整套
+    /// 配置形态，代价有三：
+    ///
+    /// 1. 两者编译进**同一张** key_down 表，`match_key_down` 用 `.find()` 先注册者赢，
+    ///    而 `schema_hotkeys` 排在前面 ⇒ 同一个键两处都配时，`key_actions` 那条**静默**
+    ///    失效，用户无从察觉。合表之后同一个键在 TOML 层面就只能有一个值。
+    /// 2. `schema_hotkeys` 无条件把解析结果塞进 key_down 表，**不问键形态**。在里面写
+    ///    一个单字符键（`backslash`）会让 TSF 把它当热键吞掉，那个符号从此打不出来；
+    ///    写纯修饰键则是谁都不处理的静默失效。`key_actions` 走 `route_of_key_action`
+    ///    三分通路，本就没有这个洞。
+    /// 3. 设置页两个入口（「进入方式」与「按键功能」）差别只在往返与否，界面上毫无体现。
+    ///
+    /// # 折算规则
+    ///
+    /// 折算在**内存里**做，不写回配置文件——与本文件其余 `migrate_*` 同策略（`normalize`
+    /// 是零 IO、幂等、纯内存的）。用户的 config.toml 保持原样，回退一个版本照常工作；
+    /// 旧字段的真正消失发生在用户下次用设置页保存时（GUI 按新工作态全量写回）。
+    ///
+    /// 单向语义原样保留（`switch_schema:`），**不悄悄升级成往返**：那会让原本「切过去
+    /// 就完了」的键突然多出回程，属于静默改变既有行为。
+    ///
+    /// 已在 `keys.key_actions` 里显式配过的键**不覆盖**：用户的新配置优先于存量迁移。
+    /// 键名解析不了、或形态不合法（单字符键会被 TSF 吞掉）的条目丢弃并 warn——那正是
+    /// 上面第 2 条那个洞里已经躺着的存量数据，迁移是**唯一**能让它可见的时机。
+    fn migrate_schema_hotkeys_into_key_actions(&mut self) {
+        if self.keys.legacy_schema_hotkeys.is_empty() {
+            return;
+        }
+        // HashMap 迭代序不稳定，排序后再折算：两个方案配了同一个键时谁先入列决定谁生效，
+        // 不排序会让同一份配置在不同进程启动时表现不同（与 hotkey.rs 原编译段同一理由）。
+        let mut entries: Vec<(String, String)> =
+            std::mem::take(&mut self.keys.legacy_schema_hotkeys)
+                .into_iter()
+                .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (schema_id, key) in entries {
+            let schema_id = schema_id.trim().to_string();
+            let key = key.trim().to_lowercase();
+            if schema_id.is_empty() || key.is_empty() || key == "none" {
+                continue; // 空条目本就不生效（解绑写成空串的历史遗留）
+            }
+            match crate::hotkey::route_of_key_action(&key) {
+                None => {
+                    warn!("配置迁移：方案热键 {key:?}（{schema_id}）无法解析为按键，已丢弃");
+                    continue;
+                }
+                // 单字符键进 key_down 表会被 TSF 当热键吞掉，那个符号就再也打不出来。
+                // 旧的 schema_hotkeys 没有这道守卫，存量里可能真躺着这种条目。
+                Some(crate::hotkey::KeyActionRoute::LeadingKey) => {
+                    warn!(
+                        "配置迁移：方案热键 {key:?}（{schema_id}）是单个字符键，                         作方案热键会让该字符再也打不出来，已丢弃。                         请改用组合键，或在 keys.key_actions 里写 toggle_schema:{schema_id}"
+                    );
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if self.keys.key_actions.contains_key(&key) {
+                debug!("配置迁移：{key:?} 已在 keys.key_actions 显式配置，保留用户设置");
+                continue;
+            }
+            let action = format!("switch_schema:{schema_id}");
+            debug!("配置迁移：方案热键 {key:?} → keys.key_actions = {action:?}");
+            self.keys.key_actions.insert(key, action);
+        }
     }
 
     /// 存量迁移：四处 `trigger_keys` → `keys.key_actions`（设计文档五c「全局层收编」）。

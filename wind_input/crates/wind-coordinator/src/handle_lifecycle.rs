@@ -253,6 +253,22 @@ impl Coordinator {
             debug!("key_action: vk=0x{key_code:02X} 让位 —— 全局绑定遇方案首码（跨层仲裁）");
             return BoundKeyDecision::Yield;
         }
+        // 方案级 `[key_actions]` 里的**单向**切换会锁死用户：本表按活跃方案查，单向切走
+        // 之后目标方案没有这条绑定，这个键就再也按不动了（「五笔里配 rshift→英文方案，
+        // 而英文方案没配 rshift ⇒ 回不来」）。全局表没有这个问题——它在所有方案下都生效。
+        //
+        // 判据放在 `bound_action_yield_reason` **之外**：那个函数开头就
+        // `vk_to_prefix_char_with_letters(key_code)?`，对修饰键恒返回 None（修饰键没有字符），
+        // 而 `switch_schema` 恰恰只在修饰键上才走得到这里——写进去等于这道守卫永不执行。
+        //
+        // 让位（吞键）而非 NotBound：落回全局链多半会撞上 `toggle_mode`，用户配的是
+        // 「切方案」却切了中英文，比没反应更难排查。
+        if from_schema && matches!(action, BoundAction::SwitchSchema(_)) {
+            warn!(
+                "key_actions: 方案级绑定不支持 switch_schema（单向切走就回不来了），                 键 0x{key_code:02X} 上忽略。改用 toggle_schema:<id>（往返），                 或把这条写进全局 keys.key_actions"
+            );
+            return BoundKeyDecision::Yield;
+        }
         match self.bound_action_yield_reason(key_code, &action) {
             Some(reason) => {
                 debug!("key_action: vk=0x{key_code:02X} 让位 —— {reason}");
@@ -480,6 +496,10 @@ impl Coordinator {
                 warn!("key_actions: toggle_schema:{id} 只能绑修饰键（无字符键），此处忽略");
                 None
             }
+            BoundAction::SwitchSchema(id) => {
+                warn!("key_actions: switch_schema:{id} 只能绑修饰键（无字符键），此处忽略");
+                None
+            }
             // A 类同样不在这里执行：`dispatch_hotkey` 自加锁，本函数持锁。
             // keydown 走 `bound_lock_free_action_for_keydown`（判定后 drop 锁），
             // keyup 走 `handle_bound_modifier_key_up`，两条都在锁外。
@@ -499,6 +519,22 @@ impl Coordinator {
         }
         debug!("key_actions: toggle_schema -> {id}");
         self.toggle_schema_by_id(id, trigger_vk);
+        Some(KeyAction::StatusUpdate(self.build_status()))
+    }
+
+    /// 执行 C 类 `switch_schema`（单向）。锁约束同 [`Self::run_toggle_schema_action`]。
+    ///
+    /// 与往返版的唯一差别是不记来源、不认回程键。**方案级 `[key_actions]` 里出现本动词
+    /// 时不会走到这里**——`bound_action_yield_reason` 已让位并 warn，理由见
+    /// [`BoundAction::SwitchSchema`]：方案级按活跃方案查表，单向切走后目标方案没有这条
+    /// 绑定，键就再也按不动了。
+    fn run_switch_schema_action(&self, id: &str) -> Option<KeyAction> {
+        if !self.engine_mgr.ensure_schema(id) {
+            warn!("key_actions: switch_schema 目标 {id} 加载失败，不动作");
+            return None;
+        }
+        debug!("key_actions: switch_schema -> {id}");
+        self.switch_schema_by_id(id);
         Some(KeyAction::StatusUpdate(self.build_status()))
     }
 
@@ -531,7 +567,7 @@ impl Coordinator {
     pub(crate) fn is_lock_free_bound(&self, action: &BoundAction) -> bool {
         matches!(
             action,
-            BoundAction::ToggleSchema(_) | BoundAction::Action(_)
+            BoundAction::ToggleSchema(_) | BoundAction::SwitchSchema(_) | BoundAction::Action(_)
         )
     }
 
@@ -542,6 +578,7 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::ToggleSchema(id) => self.run_toggle_schema_action(id, trigger_vk),
+            BoundAction::SwitchSchema(id) => self.run_switch_schema_action(id),
             BoundAction::Action(a) => self.run_dispatch_action(a),
             _ => None,
         }
