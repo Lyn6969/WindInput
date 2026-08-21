@@ -273,6 +273,11 @@ pub struct EngineManager {
     /// clone 一遍整张表**（含每个键名与动词的 `String` 分配）。缓存本身是为了省去读盘与
     /// TOML 解析，clone 会把省下来的一部分又还回去。
     key_actions_cache: Mutex<HashMap<String, Arc<std::collections::BTreeMap<String, String>>>>,
+    /// 方案级 `[session_actions]` 表缓存（schema_id → 表）。
+    ///
+    /// 与 [`Self::key_actions_cache`] 同构、**同批失效**：两个失效点（`invalidate_schema`
+    /// 按 id 移除、配置热重载整表清空）都要接，漏一处的表现是「设置页改了不生效」。
+    session_actions_cache: Mutex<HashMap<String, Arc<std::collections::BTreeMap<String, String>>>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
     /// overlay 方案注册表缓存（见 [`Self::overlay_modes`]）。
@@ -454,6 +459,7 @@ impl EngineManager {
             freq_cache: Mutex::new(HashMap::new()),
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
+            session_actions_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             overlay_cache: Mutex::new(None),
             override_dir,
@@ -1594,6 +1600,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        self.session_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
         self.name_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1710,7 +1720,12 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         // 方案文件/override 可能随配置重载而变（设置页改完即热重载），按键功能表一并失效。
+        // 两张表同批：会话态那张漏清的表现是「设置页改了翻页键，重启才生效」。
         self.key_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.session_actions_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -1958,6 +1973,37 @@ impl EngineManager {
         table
     }
 
+    /// 当前方案的**会话态按键表**（`[session_actions]`，方案文件内联 + `schema_overrides`
+    /// 已合并）。
+    ///
+    /// 与 [`Self::active_key_actions`] 的取表规则逐条相同（不下钻 primary_schema、读不到
+    /// 方案返回空表 = 不覆盖任何键、返回 `Arc` 避免热路径 clone）。两张表分开而不是合成
+    /// 一张带状态维度的表，理由见 `Schema::session_actions` 的文档。
+    ///
+    /// 空表 = 该方案不覆盖任何会话态键，各键照常走全局
+    /// `KeysConfig::effective_session_actions()`。
+    pub fn active_session_actions(&self) -> Arc<std::collections::BTreeMap<String, String>> {
+        let id = self.active_schema_id();
+        if let Some(cached) = self
+            .session_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return Arc::clone(cached);
+        }
+        let table = Arc::new(
+            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+                .map(|s| s.session_actions)
+                .unwrap_or_default(),
+        );
+        self.session_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::clone(&table));
+        table
+    }
+
     /// **所有**可用方案的 `[key_actions]` 里出现过的键名（并集，去重）。
     ///
     /// 用途只有一个：算出「需要让 TSF 转发 keyup 的修饰键」。转发集必须是并集而非
@@ -1992,20 +2038,61 @@ impl EngineManager {
 
     /// 不走 `key_actions_cache`：该缓存按活跃方案 id 存单份，而这里要的是跨方案的并集。
     pub fn all_key_action_keys(&self) -> std::collections::BTreeSet<String> {
+        self.all_action_keys().0
+    }
+
+    /// **所有**可用方案的 `[session_actions]` 里出现过的键名（并集，去重）。
+    ///
+    /// 与 [`Self::all_key_action_keys`] 同一个用途与同一条理由：转发集必须是并集而非活跃
+    /// 方案那一份，否则切方案后 C++ 手里是旧表，要等下次焦点切换才生效。
+    ///
+    /// ⚠️ **本表的并集代价与 key_actions 那张不同**：那张最终只取纯修饰键
+    /// （`schema_bound_modifier_vks` 的 `filter_map`），keyup 侧多转发无害；而本表支持
+    /// 减号、方括号、分号等**可打印符号键**，它们带 `FORWARD_ONLY` 进 keydown 表。
+    /// 无会话时必须放行给下游按标点处理，否则表现是**丢键**，且只在没绑该键的方案下复现。
+    pub fn all_session_action_keys(&self) -> std::collections::BTreeSet<String> {
+        self.all_action_keys().1
+    }
+
+    /// 两张表的键名并集，一次遍历同时收齐。
+    ///
+    /// 合并而不是各写一遍：两者都要 `read_schema` 扫全部可用方案（含 override 深合并），
+    /// 分开调用就是把同一批文件读两遍。调用点都在配置生效期（构造 / 热重载），不是热路径，
+    /// 但没有理由白读一遍。
+    fn all_action_keys(
+        &self,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) {
         let ids = self
             .available
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut out = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
+        let mut session = std::collections::BTreeSet::new();
         for id in ids {
             if let Some(s) =
                 Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
             {
-                out.extend(s.key_actions.into_keys());
+                keys.extend(s.key_actions.into_keys());
+                // ⚠️ 会话态侧**滤掉显式 `none`**，`key_actions` 侧不滤：两者的消费者对
+                // 「被禁用的键」敏感度不同。本集合要据此决定装不装 CapsLock 全局钩子——
+                // 方案写了 `capslock = "none"` 却照装，就是白担一个全局钩子的风险。
+                // 而 key_actions 那份最终只取纯修饰键进 keyup 转发集，多转发一个不动作的
+                // 键宿主无感，滤它反而要多解析一遍动词。
+                //
+                // 按方案独立判定：方案 A 绑了、方案 B 写 none，并集仍含该键（A 要用）。
+                session.extend(
+                    s.session_actions
+                        .into_iter()
+                        .filter(|(_, verb)| wind_config::SessionAction::parse(verb).is_enabled())
+                        .map(|(name, _)| name),
+                );
             }
         }
-        out
+        (keys, session)
     }
 
     pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
@@ -4378,6 +4465,70 @@ mod tests {
             toml::from_str("[[dictionaries]]\nid = \"ext1\"\nenabled = true\n").unwrap();
         merge_toml(&mut base, over);
         assert!(base.get("dictionaries").is_none());
+    }
+
+    /// 方案级 `[session_actions]`：逐键合并 + 显式 `none` 留在表里 + 并集滤掉 `none`。
+    ///
+    /// 三条断言各守一个会被「简化」掉的点：
+    /// - override 逐键合并（整段替换会让方案作者内联的其余键消失）；
+    /// - 显式 `none` **必须留在表里**——过滤掉它，消费点就会以为「方案没提这个键」而回落
+    ///   全局，用户写的禁用完全失效；
+    /// - 但**并集要滤掉** `none`——并集的消费者据此决定装不装 CapsLock 全局钩子、要不要让
+    ///   TSF 转发，被禁用的键两者都不需要。两处方向相反，合并成一套就必错一头。
+    #[test]
+    fn active_session_actions_merges_per_key_and_union_drops_none() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_sa_data");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        let mut f = std::fs::File::create(schemas.join("sa.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]\nid = \"sa\"\n[engine]\ntype = \"codetable\"\n\
+             [session_actions]\nminus = \"page_prev\"\nequal = \"page_next\"\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_sa_overrides");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "sa".to_string();
+        cfg.schema.available = vec!["sa".to_string()];
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
+
+        let inline = mgr.active_session_actions();
+        assert_eq!(inline.get("minus").map(String::as_str), Some("page_prev"));
+        assert_eq!(inline.get("equal").map(String::as_str), Some("page_next"));
+
+        // 用户 override：改 minus 的动作、禁用 equal、不提方案作者写的其余键。
+        let ov: toml::Value =
+            toml::from_str("[session_actions]\nminus = \"page_next\"\nequal = \"none\"\n").unwrap();
+        mgr.write_schema_override("sa", &ov).unwrap();
+
+        let merged = mgr.active_session_actions();
+        assert_eq!(
+            merged.get("minus").map(String::as_str),
+            Some("page_next"),
+            "override 应逐键覆盖"
+        );
+        assert_eq!(
+            merged.get("equal").map(String::as_str),
+            Some("none"),
+            "显式 none 必须留在表里——滤掉它，消费点会回落全局，用户的禁用就失效了"
+        );
+
+        let union = mgr.all_session_action_keys();
+        assert!(union.contains("minus"), "启用的键要进可达性并集");
+        assert!(
+            !union.contains("equal"),
+            "显式 none 的键不该进并集——否则白装一个全局钩子 / 白转发一个不动作的键"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
     }
 
     /// 方案级 `[key_actions]`：方案文件内联 + override **逐键合并**，不是整段替换。

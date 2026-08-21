@@ -61,6 +61,24 @@ pub struct Schema {
     /// 用 `BTreeMap`：顺序无语义（优先级由分派插入点决定），键唯一由类型保证。
     #[serde(default)]
     pub key_actions: std::collections::BTreeMap<String, String>,
+    /// **方案级会话态按键表**（`[session_actions]`）：按键名 → 动词。
+    ///
+    /// 与 [`Self::key_actions`] 是两张表而不是一张带状态维度的表，因为两者的到达条件不同：
+    /// 本表只在**有会话时**（有编码或候选）生效，那时用户停留在处境里反复按键、有肌肉记忆；
+    /// `key_actions` 则是无会话态的引导键。判据见 `docs/design/session-key-actions.md` §2。
+    /// 值域与语义见 [`crate::SessionAction`]。
+    ///
+    /// **逐键合并**，与 `key_actions` 一致：方案只写想改的键，其余继承全局
+    /// `keys.session_actions` 与四组键组配置的展开结果。⚠️ 故「本方案禁用某个全局绑定」
+    /// 必须写显式 `"none"`——`merge_toml` 只能新增/覆盖，**无法表达删除**，靠从 override
+    /// 里删掉那一行是删不掉 base 里那条的。
+    ///
+    /// ⚠️ 本表参与**可达性并集**：所有方案绑过的键都要让 TSF 转发，否则切方案后 C++ 手里
+    /// 还是旧表。代价是别的方案里也转发这些键——keyup 侧无害，但本表支持减号、方括号等
+    /// **可打印符号键**，它们带 `FORWARD_ONLY` 进 keydown 表，无会话时必须放行给下游按标点
+    /// 处理，否则就是丢键。见 `docs/design/key-resolver-unification.md` §8 注意点 5。
+    #[serde(default)]
+    pub session_actions: std::collections::BTreeMap<String, String>,
     /// **overlay 激活面**（`[overlay]`）：本方案可被引导键/直达热键叠加激活时的呈现配置。
     ///
     /// **段存在即声明「我是 overlay 方案」**——这同时是实例集合的枚举依据

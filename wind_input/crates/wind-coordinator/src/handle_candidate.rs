@@ -1500,9 +1500,7 @@ impl Coordinator {
     /// 与折算前逐字一致——各模式要不要让位给输入字符，由各自的消费点判（如临英的
     /// `temp_english_char_allowed`），不在这里一刀切。
     pub(crate) fn select_key_offset(&self, key_code: u32) -> Option<usize> {
-        self.rt()
-            .session_keys
-            .classify(key_code, false, true)?
+        self.session_action_for(key_code, false, true)?
             .candidate_ordinal()
             .map(|n| n as usize - 1)
     }
@@ -1621,9 +1619,7 @@ impl Coordinator {
     /// 李戴过一次（用选词键组的解析器解以词定字配置，`brackets` 静默失效）。收编进同一张
     /// 表后，两者靠**动词**区分而不再靠解析器区分，那类错配从结构上消失了。
     pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
-        self.rt()
-            .session_keys
-            .classify(key_code, false, true)?
+        self.session_action_for(key_code, false, true)?
             .char_ordinal()
             .map(|n| n as usize - 1)
     }

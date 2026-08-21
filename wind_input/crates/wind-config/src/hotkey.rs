@@ -297,6 +297,44 @@ fn key_hash(modifiers: u32, key_code: u32) -> u32 {
     (modifiers << 16) | (key_code & 0xFFFF)
 }
 
+/// 把一条**会话态**键名编译成 TSF 转发条目。返回 `(该进 key_up 表吗, 条目)`。
+///
+/// ★ **分流规则的单一来源**：全局 `keys.session_actions` 与方案级 `[session_actions]`
+/// 共用本函数。两处各写一份的表现是「同一个键名在全局配能用、写进方案文件就不转发」——
+/// 而 TSF 不转发的键在服务端根本收不到，与「配错了」完全同形。
+///
+/// 按**键的形态**分两条路，与 `keys.key_actions` 的三分通路同构：
+/// - keyup-only 键（CapsLock / 纯修饰键）→ `key_up`，带 `SESSION` 位，让 C++ 区分
+///   「toggle 语义」（恒吃 keydown）与「会话语义」（仅有会话时吃）；
+/// - 其余（功能键 + 可打印符号键）→ `key_down`，带 `FORWARD_ONLY` 位。
+///
+/// ⚠️ `FORWARD_ONLY` 那条**必须**保留「无会话时放行给下游按标点处理」的语义：本函数收的
+/// 键名含减号、方括号、分号等可打印符号，吃掉就是丢键。见
+/// `docs/design/key-resolver-unification.md` §8 注意点 5。
+pub fn compile_session_key(name: &str) -> Option<(bool, HotkeyEntry)> {
+    let (vk, shift) = session_key_to_vk(name)?;
+    if let Some(hash) = session_key_up_hash(vk) {
+        Some((
+            true,
+            HotkeyEntry {
+                tsf_hash: hash | HOTKEY_POLICY_SESSION,
+                match_hash: hash,
+                action: SESSION_ACTION.to_string(),
+            },
+        ))
+    } else {
+        let raw = key_hash(if shift { MOD_SHIFT } else { 0 }, vk);
+        Some((
+            false,
+            HotkeyEntry {
+                tsf_hash: raw | HOTKEY_POLICY_FORWARD_ONLY,
+                match_hash: raw,
+                action: String::new(),
+            },
+        ))
+    }
+}
+
 /// 热键编译器
 pub struct Compiler {
     config: Config,
@@ -464,22 +502,13 @@ impl Compiler {
             if !crate::config::SessionAction::parse(verb).is_enabled() {
                 continue;
             }
-            let Some((vk, shift)) = session_key_to_vk(name) else {
+            let Some((to_key_up, entry)) = compile_session_key(name) else {
                 continue;
             };
-            if let Some(hash) = session_key_up_hash(vk) {
-                result.key_up.push(HotkeyEntry {
-                    tsf_hash: hash | HOTKEY_POLICY_SESSION,
-                    match_hash: hash,
-                    action: SESSION_ACTION.to_string(),
-                });
+            if to_key_up {
+                result.key_up.push(entry);
             } else {
-                let raw = key_hash(if shift { MOD_SHIFT } else { 0 }, vk);
-                result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw | HOTKEY_POLICY_FORWARD_ONLY,
-                    match_hash: raw,
-                    action: String::new(),
-                });
+                result.key_down.push(entry);
             }
         }
 

@@ -183,6 +183,32 @@ impl<A> Default for KeyBinds<A> {
 /// （动作值域在 `wind-config`，见 [`KeyBinds`] 的泛型说明）。
 pub type NavKeys = KeyBinds<NavAction>;
 
+impl<A> Bind<A> {
+    /// 还原成 [`SessionKey`]，供共用的匹配谓词使用。
+    ///
+    /// `Bind` 把三个字段摊平存而不是内嵌 `SessionKey`，是编译期布局的选择；匹配规则
+    /// 不该跟着摊平成两份。
+    fn as_session_key(&self) -> SessionKey {
+        SessionKey {
+            vk: self.key,
+            shift: self.shift,
+            printable: self.printable,
+        }
+    }
+}
+
+impl SessionKey {
+    /// 这条键定义是否匹配一次按键事件。
+    ///
+    /// ★ **匹配规则的单一来源**：[`KeyBinds::classify`] 的 `.find()` 谓词走本方法，方案级
+    /// `[session_actions]` 按键名逐条比对时也走本方法。三个条件（VK、shift、可打印键在
+    /// 文本模式下让位）分散成两份的表现是「同一个键在方案级和全局下行为不一致」，而那种
+    /// 不一致只在同时配了两层的用户那里复现。
+    pub fn matches(&self, key_code: u32, shift: bool, include_printable: bool) -> bool {
+        self.vk == key_code && self.shift == shift && (include_printable || !self.printable)
+    }
+}
+
 impl<A: Copy> KeyBinds<A> {
     /// 从 (键名, 动作) 对编译。键名解析走 [`session_key_name_to_vk`]。
     ///
@@ -218,7 +244,10 @@ impl<A: Copy> KeyBinds<A> {
     pub fn classify(&self, key_code: u32, shift: bool, include_printable: bool) -> Option<A> {
         self.binds
             .iter()
-            .find(|b| b.key == key_code && b.shift == shift && (include_printable || !b.printable))
+            .find(|b| {
+                b.as_session_key()
+                    .matches(key_code, shift, include_printable)
+            })
             .map(|b| b.action)
     }
 }

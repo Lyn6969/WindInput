@@ -354,6 +354,39 @@ impl Coordinator {
         None
     }
 
+    /// 这个键在**会话态**（有编码或候选）绑了什么动作；未绑定返回 `None`。
+    ///
+    /// 两层，**逐键合并**（与 `[key_actions]` 一致）：
+    /// 1. 方案文件 / `schema_overrides` 的 `[session_actions]`
+    /// 2. 全局 `keys.session_actions`（已含 `page_keys` 等四组键组配置的展开结果）
+    ///
+    /// ★ 方案层查得到就是**表了态**，显式 `"none"` 同样是表态 ⇒ 返回 `None` 且
+    /// **不再回落全局**。靠「从 override 里删掉那一行」是禁不掉全局绑定的：`merge_toml`
+    /// 只能新增/覆盖。语义与 [`Self::bound_action_with_source`] 的全局 `none` 逐条对应。
+    ///
+    /// ⚠️ **本方法是「当前方案下这个键干什么」，不是「这个键要不要转发」**。后者必须取
+    /// 所有方案的并集（[`crate::config_bundle::schema_bound_modifier_vks`] 那条理由），
+    /// 且并集的消费者另有其人——`capslock_bound` 决定装不装全局钩子，按活跃方案取值会让
+    /// 切方案反复装卸钩子。别拿本方法去回答可达性问题。
+    pub(crate) fn session_action_for(
+        &self,
+        key_code: u32,
+        shift: bool,
+        include_printable: bool,
+    ) -> Option<wind_config::SessionAction> {
+        if let Some(a) = crate::key_resolver::schema_session_lookup(
+            &self.engine_mgr.active_session_actions(),
+            key_code,
+            shift,
+            include_printable,
+        ) {
+            return a.is_enabled().then_some(a);
+        }
+        self.rt()
+            .session_keys
+            .classify(key_code, shift, include_printable)
+    }
+
     /// 绑了动作的键是否**让位**给正常输入（此时既不进模式、也不落全局引导键链）。
     ///
     /// 两条判据，都只对**字母键**成立——符号键在码表里不产出编码，按下只可能是为了触发功能：

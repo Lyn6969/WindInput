@@ -9,17 +9,24 @@
 //! `wind-engine` 也不依赖 `wind-keys`，故方案级表的 VK 预编译同样落不到 `EngineManager`。
 //! 本 crate 是唯一同时看得见两边的地方——与 `ConfigBundle::session_keys` 同源的理由。
 //!
-//! ## 当前范围（第 1 步）
+//! ## 当前范围
 //!
-//! 只收**全局层**（`keys.key_actions`）。方案级 `[key_actions]` 仍留在
-//! `Coordinator::bound_action_with_source`：它按活跃方案查表，需要 `EngineManager`。
+//! | 表 | 落点 | 形态 |
+//! |---|---|---|
+//! | 全局 `keys.key_actions` | [`KeyResolver::global_lead`] | **预编译**成 VK 表 |
+//! | 方案级 `[session_actions]` | [`schema_session_lookup`] | 按键名逐条比对 |
+//! | 方案级 `[key_actions]` | `Coordinator::bound_action_with_source` | 按键名逐条比对 |
 //!
-//! ⚠️ **方案层不在这里加缓存**。`EngineManager` 已有 `key_actions_cache`（随
-//! `invalidate_schema` 失效）；在其上再叠一层 VK 预编译，就多出一个必须同步失效的镜像态。
-//! 现成的 `schema_generation` **不能**当失效判据——它只在**活跃方案改变**时 +1，
-//! 而设置页改 `schema_overrides` 走的是 `invalidate_schema`，不 bump 它。用它做判据的表现
-//! 是「设置页改了不生效、重启才生效」，本仓已有同型教训。要做方案层预编译，得先给
-//! `EngineManager` 加一个在 `invalidate_schema` 里 bump 的独立代际。
+//! **两层怎么叠**（谁覆盖谁、显式 `none` 如何处置）在 `Coordinator` 侧——
+//! `bound_action_with_source` 与 `session_action_for`。它们要按活跃方案取表、需要
+//! `EngineManager`，而本模块只依赖 `Config`。
+//!
+//! ⚠️ **方案层不在这里加缓存**。`EngineManager` 已有 `key_actions_cache` /
+//! `session_actions_cache`（随 `invalidate_schema` 失效）；在其上再叠一层 VK 预编译，
+//! 就多出一个必须同步失效的镜像态。现成的 `schema_generation` **不能**当失效判据——
+//! 它只在**活跃方案改变**时 +1，而设置页改 `schema_overrides` 走的是 `invalidate_schema`，
+//! 不 bump 它。用它做判据的表现是「设置页改了不生效、重启才生效」，本仓已有同型教训。
+//! 要做方案层预编译，得先给 `EngineManager` 加一个在 `invalidate_schema` 里 bump 的独立代际。
 
 use std::collections::HashMap;
 
@@ -64,6 +71,35 @@ impl KeyResolver {
 /// 但查表查不到、什么都不发生」——已在测试里复现过一次。
 pub(crate) fn key_action_name_to_vk(name: &str) -> Option<u32> {
     keymap::key_name_to_vk_with_letters(name).or_else(|| keymap::modifier_name_to_vk(name))
+}
+
+/// 在方案级 `[session_actions]` 表里查一个键。
+///
+/// 返回 `Some` 即**本方案对这个键表了态**，包括表态为 [`SessionAction::None`]（用户写的
+/// 显式 `"none"`）——那表示「本方案禁用该键」，调用方**不得再回落全局**。这与
+/// [`KeyResolver::global_lead`] 对 `BoundAction::None` 的处置是同一条规则：
+/// `merge_toml` 只能新增/覆盖、无法表达删除，所以「禁用」只能靠显式值承载。
+///
+/// 匹配走 [`keymap::SessionKey::matches`]，与全局表的 `KeyBinds::classify` 是同一个谓词。
+/// 这里不预编译成 `KeyBinds`：方案级表随活跃方案与 `schema_overrides` 变，而
+/// `EngineManager` 现有的失效信号（`invalidate_schema`）在协调器侧没有对应的代际可比对，
+/// 加缓存就多一个必须同步失效的镜像态。表本身通常只有几条，`EngineManager` 那层已经
+/// 挡掉了读盘与 TOML 解析。见 `docs/design/key-resolver-unification.md` §7。
+pub(crate) fn schema_session_lookup(
+    table: &std::collections::BTreeMap<String, String>,
+    key_code: u32,
+    shift: bool,
+    include_printable: bool,
+) -> Option<wind_config::SessionAction> {
+    for (name, verb) in table {
+        let Some(k) = keymap::session_key_name_to_vk(name) else {
+            continue;
+        };
+        if k.matches(key_code, shift, include_printable) {
+            return Some(wind_config::SessionAction::parse(verb));
+        }
+    }
+    None
 }
 
 /// 把 `keys.key_actions` 编译成 VK 表。
@@ -177,5 +213,72 @@ mod tests {
     fn unknown_key_name_is_skipped() {
         let t = compile_global_lead(&table(&[("no_such_key", "temp_pinyin")]));
         assert!(t.is_empty(), "认不出的键名不该进表：{t:?}");
+    }
+
+    // ── 方案级会话态查表 ──
+
+    /// ★★ 方案级显式 `none` 是**表态**，必须返回 `Some(None)`。
+    ///
+    /// 返回 `Option::None` 会让调用方以为「本方案没提这个键」而回落全局，于是用户写的
+    /// 禁用完全失效。而靠「从 override 里删掉那一行」是禁不掉的——`merge_toml` 只能
+    /// 新增/覆盖。这条一旦被「简化」成过滤掉 none，症状是「方案里禁了还是会翻页」。
+    #[test]
+    fn schema_session_explicit_none_is_a_stated_position() {
+        let k = keymap::session_key_name_to_vk("minus").expect("minus 应能解析");
+        assert_eq!(
+            schema_session_lookup(&table(&[("minus", "none")]), k.vk, false, true),
+            Some(wind_config::SessionAction::None),
+            "显式 none 必须表态，否则调用方会回落全局"
+        );
+    }
+
+    /// 方案没提的键返回 `None`，调用方据此回落全局。
+    #[test]
+    fn schema_session_absent_key_falls_through() {
+        let k = keymap::session_key_name_to_vk("minus").expect("minus 应能解析");
+        assert_eq!(
+            schema_session_lookup(&table(&[("equal", "page_next")]), k.vk, false, true),
+            None,
+            "方案没提的键必须回落全局"
+        );
+    }
+
+    /// ★ `include_printable = false` 时可打印键让位——临英/快捷输入要这些字符本身。
+    /// 谓词与全局表的 `KeyBinds::classify` 同源（`SessionKey::matches`），此处守的是
+    /// 方案级这条路没有绕开它。
+    #[test]
+    fn schema_session_printable_yields_in_text_modes() {
+        let t = table(&[("minus", "page_prev")]);
+        let k = keymap::session_key_name_to_vk("minus").expect("minus 应能解析");
+        assert!(
+            k.printable,
+            "前置条件：minus 必须是可打印键，否则本用例测不到让位"
+        );
+        assert_eq!(
+            schema_session_lookup(&t, k.vk, false, true),
+            Some(wind_config::SessionAction::PagePrev)
+        );
+        assert_eq!(
+            schema_session_lookup(&t, k.vk, false, false),
+            None,
+            "文本模式下可打印键必须让位给输入字符"
+        );
+    }
+
+    /// `shift+` 前缀参与匹配：`shift+tab` 与 `tab` 是两条不同的绑定。
+    #[test]
+    fn schema_session_shift_prefix_is_part_of_the_key() {
+        let t = table(&[("shift+tab", "page_prev")]);
+        let k = keymap::session_key_name_to_vk("shift+tab").expect("shift+tab 应能解析");
+        assert!(k.shift, "前置条件：shift+ 前缀须被解析出来");
+        assert_eq!(
+            schema_session_lookup(&t, k.vk, true, true),
+            Some(wind_config::SessionAction::PagePrev)
+        );
+        assert_eq!(
+            schema_session_lookup(&t, k.vk, false, true),
+            None,
+            "没按 shift 时不该命中 shift+tab"
+        );
     }
 }

@@ -20,7 +20,7 @@ mod message_handler;
 mod push_config;
 
 // 平移到子模块的项以原路径保真（handle_* 均经 `crate::coordinator::` 引用，勿改回直连）。
-pub(crate) use crate::config_bundle::{ConfigBundle, schema_bound_modifier_vks};
+pub(crate) use crate::config_bundle::{ConfigBundle, schema_key_union};
 pub(crate) use crate::key_convert::{
     char_to_main_vk, en_case_variants, full_width_source_char, numpad_char, numpad_to_main,
     printable_char, punct_char, wind_mods_to_win32,
@@ -1391,8 +1391,8 @@ impl Coordinator {
         // （如微信 caret_use_top）。
         let app_compat = wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
         // 配置的轻量派生缓存集中到 ConfigBundle（支持运行时热替换）。
-        let schema_mods = schema_bound_modifier_vks(&engine_mgr);
-        let bundle = ConfigBundle::build(config.clone(), &schema_mods);
+        let schema_keys = schema_key_union(&engine_mgr);
+        let bundle = ConfigBundle::build(config.clone(), &schema_keys);
         info!(
             "Compiled hotkeys: {} key_down, {} key_up",
             bundle.compiled_hotkeys.key_down.len(),
@@ -2705,8 +2705,8 @@ impl Coordinator {
     pub(crate) fn refresh_config_in_memory(&self, mutate: impl FnOnce(&mut Config)) {
         let mut cfg = self.rt().config.clone();
         mutate(&mut cfg);
-        let mods = schema_bound_modifier_vks(&self.engine_mgr);
-        let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &mods));
+        let keys = schema_key_union(&self.engine_mgr);
+        let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &keys));
         *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
         // 状态气泡去重缓存只在"内容配置不变"的前提下有效：改了 ui.status.items 之类后，
         // 同一状态该合成出不同文本，留着旧缓存会把改动后的第一次显示误判成"内容没变"而吞掉。
@@ -2730,8 +2730,8 @@ impl Coordinator {
                 let cand_was_fixed = old.config.ui.candidate.is_fixed_position();
                 drop(old);
 
-                let mods = schema_bound_modifier_vks(&self.engine_mgr);
-                let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &mods));
+                let keys = schema_key_union(&self.engine_mgr);
+                let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &keys));
                 let new_cfg = bundle.config.clone();
                 *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
                 info!("User config hot-reloaded (schema_dirty={})", schema_dirty);
@@ -3026,10 +3026,7 @@ impl Coordinator {
         include_printable: bool,
     ) -> Option<KeyAction> {
         let shift = data.modifiers & MOD_SHIFT != 0;
-        let action = self
-            .rt()
-            .session_keys
-            .classify(data.key_code, shift, include_printable)?;
+        let action = self.session_action_for(data.key_code, shift, include_printable)?;
         if action.requires_candidates() && state.candidates.is_empty() {
             return None;
         }
@@ -3421,7 +3418,6 @@ impl Coordinator {
             // 默认集只有字母，不可能与符号类功能冲突——顺带免掉一整轮反查。
             return Vec::new();
         }
-        let rt = self.rt();
         let mut out = Vec::new();
         for ch in charset.chars() {
             if ch.is_ascii_alphabetic() {
@@ -3442,7 +3438,11 @@ impl Coordinator {
             // 会话态绑定：翻页/移高亮/取消都在组码期间抢这个键，故都算占用。
             // 措辞按实际动作分——设置页把这行原样显示给用户，笼统写「会话态按键」
             // 等于让用户自己去查是哪个功能占了。
-            if let Some(a) = rt.session_keys.classify(vk, false, true) {
+            // ★ 走**当前方案**的语义表（含方案级 `[session_actions]`），不是跨方案并集：
+            // 本函数比较的另一方是 `active_input_chars()`——活跃方案的码元集。两边必须同
+            // 方案才谈得上冲突，拿并集去比会报出「别的方案里占了」这种当前根本不存在的冲突。
+            // 可达性并集另有其人（`schema_session_vks`），别把两者混用。
+            if let Some(a) = self.session_action_for(vk, false, true) {
                 owners.push(match a {
                     wind_config::SessionAction::Cancel => "取消键",
                     _ => "翻页/高亮键",
@@ -4879,11 +4879,17 @@ impl Coordinator {
     ///
     /// 判据取**编译后的绑定表**而非原始配置串：动词写错、键名写错的条目在 `ConfigBundle::build`
     /// 里已被剔除，那些情况不该装钩子（用户的配置根本不会生效，装了纯属白担全局钩子的风险）。
+    /// ★ **方案级取并集，不取活跃方案那一份。** 钩子是进程级资源，且
+    /// `SetWindowsHookExW` 重复装会留下卸不掉的旧钩子（见 `sync_capslock_hook`）——
+    /// 按活跃方案取值就成了「方案 A 配了、方案 B 没配 ⇒ 每次切方案装卸一次」，
+    /// 表现是「切完方案 CapsLock 时灵时不灵」。这与 C++ 转发表取并集是同一条判据
+    /// （资源进程级 + 切换不幂等），只是它落在 Rust 侧。
     pub fn capslock_bound(&self) -> bool {
-        self.rt()
-            .session_keys
+        let rt = self.rt();
+        rt.session_keys
             .classify(keymap::VK_CAPITAL, false, true)
             .is_some()
+            || rt.schema_session_vks.contains(&keymap::VK_CAPITAL)
     }
 
     /// 按配置装/卸 CapsLock 全局钩子（启动与配置热重载时调用）。

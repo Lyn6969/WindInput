@@ -71,6 +71,14 @@ pub(crate) struct ConfigBundle {
     /// 本 crate 是唯一同时看得见两者的地方。设计见
     /// `docs/design/key-resolver-unification.md`。
     pub(crate) key_resolver: crate::key_resolver::KeyResolver,
+    /// **所有**方案 `[session_actions]` 里绑过的键 VK（并集，已滤显式 `none`）。
+    ///
+    /// 供需要「任一方案绑过没有」的消费者用，当前是 `Coordinator::capslock_bound`
+    /// （决定装不装 CapsLock 全局钩子）。★ 那里**必须**用并集而不是活跃方案那一份：
+    /// 钩子是进程级资源且 `SetWindowsHookExW` 重复装会留下卸不掉的旧钩子，按活跃方案
+    /// 取值就成了「切方案反复装卸」。同 `schema_bound_modifier_vks` 那条理由，只是它
+    /// 落在 Rust 侧而非 C++ 边界。
+    pub(crate) schema_session_vks: std::collections::BTreeSet<u32>,
 }
 
 /// 所有方案 `[key_actions]` 里绑过的纯修饰键 VK（并集）。
@@ -123,15 +131,41 @@ fn warn_unknown_session_actions(config: &Config) {
     }
 }
 
+/// 跨方案的按键**并集**：可达性的数据源。
+///
+/// ★ 与「当前方案下这个键干什么」是两回事，别混用。语义表按活跃方案查
+/// （`Coordinator::bound_action_with_source` / `session_action_for`）；本结构回答的是
+/// 「这个键要不要送到服务端 / 要不要装进程级资源」，必须覆盖**所有**方案，否则切方案后
+/// 手里是旧表，表现为「刚切完方案这个键不灵、点下别的窗口又灵了」。
+///
+/// 在配置生效期算一次（构造 / 热重载），不是热路径——但它要 `read_schema` 扫全部可用方案，
+/// 别在按键路径上调。
+#[derive(Default)]
+pub(crate) struct SchemaKeyUnion {
+    /// 所有方案 `[key_actions]` 里绑过的纯修饰键 VK。
+    pub(crate) modifier_vks: std::collections::BTreeSet<u32>,
+    /// 所有方案 `[session_actions]` 里绑过的**键名**（`EngineManager` 侧已滤掉显式 `none`）。
+    ///
+    /// 存键名而非 VK：编译 TSF 转发条目要区分 `shift+tab` 与 `tab`，而 VK 集合把
+    /// `shift+` 前缀丢了。VK 形式在 `ConfigBundle` 里另存一份供快速判定。
+    pub(crate) session_key_names: std::collections::BTreeSet<String>,
+}
+
+/// 算一次跨方案并集。
+pub(crate) fn schema_key_union(mgr: &EngineManager) -> SchemaKeyUnion {
+    SchemaKeyUnion {
+        modifier_vks: schema_bound_modifier_vks(mgr),
+        session_key_names: mgr.all_session_action_keys(),
+    }
+}
+
 impl ConfigBundle {
-    /// `schema_bound_modifiers` = 所有方案 `[key_actions]` 里出现过的**纯修饰键** VK
+    /// `schema_keys` 打包两份跨方案并集（见 [`SchemaKeyUnion`]）。
+    /// 其中 `modifier_vks` = 所有方案 `[key_actions]` 里出现过的**纯修饰键** VK
     /// （见 [`Coordinator::schema_bound_modifier_vks`]）。它们要追加进 `key_up` 转发集，
     /// 否则 TSF 根本不把这些键的 keyup 送过来——`CompiledHotkeys` 编译自全局 config，
     /// 方案文件不在其中，这是 keyup 类绑定唯一的可达性来源。
-    pub(crate) fn build(
-        mut config: Config,
-        schema_bound_modifiers: &std::collections::BTreeSet<u32>,
-    ) -> Self {
+    pub(crate) fn build(mut config: Config, schema_keys: &SchemaKeyUnion) -> Self {
         // 归一化 + 存量迁移。放在这里而不是只在 `Config::load()` 里：本函数是**所有**
         // 配置生效的必经之路（启动、热重载、RPC 改配置后的 `refresh_config_in_memory`、
         // 测试直接构造）。挂在 load 上会漏掉后三条——设置页保存一次就绕过了迁移，
@@ -141,7 +175,7 @@ impl ConfigBundle {
         // action 用专门的 `schema_bound` 而不是 `toggle_mode`：`is_toggle_mode_keycode` 按
         // action 过滤，混用会让「只在某方案里绑了 rshift」的键在所有方案里都切中英文
         // （与 `select_key_groups` 那次踩的是同一个坑，见该函数的 ⚠ 注释）。
-        for vk in schema_bound_modifiers {
+        for vk in &schema_keys.modifier_vks {
             // 修饰键的 hash 要带通用位+具体位，与 `compile_toggle_mode_key` 同构：
             // C++ `GetCurrentModifiers()` 对修饰键同时返回两者，只带一边匹配不上。
             if let Some(hash) = hotkey::compile_modifier_key_up_hash(*vk) {
@@ -150,6 +184,39 @@ impl ConfigBundle {
                     match_hash: hash,
                     action: "schema_bound".to_string(),
                 });
+            }
+        }
+        // 方案级 `[session_actions]` 的键也要进转发表，否则 TSF 根本不把它们送到服务端，
+        // 表现是「方案里配了完全没反应」。与 modifier_vks 同一条理由（取并集而非活跃方案
+        // 那一份），但这批键形态更杂——编译规则走 `hotkey::compile_session_key`，与全局
+        // 那段**同源**，避免「同一个键名全局能用、写进方案就不转发」。
+        //
+        // 去重按 `tsf_hash`：全局已登记过的键不再追加。重复条目本身不改变行为（`.find()`
+        // 先到先得，而两条一模一样），但会让推给 C++ 的表凭空变大，也让「切方案前后推送
+        // 字节不变」这条验证手段失去意义。
+        let mut schema_session_vks = std::collections::BTreeSet::new();
+        {
+            let mut seen_up: std::collections::HashSet<u32> =
+                compiled_hotkeys.key_up.iter().map(|e| e.tsf_hash).collect();
+            let mut seen_down: std::collections::HashSet<u32> = compiled_hotkeys
+                .key_down
+                .iter()
+                .map(|e| e.tsf_hash)
+                .collect();
+            for name in &schema_keys.session_key_names {
+                if let Some(k) = keymap::session_key_name_to_vk(name) {
+                    schema_session_vks.insert(k.vk);
+                }
+                let Some((to_key_up, entry)) = hotkey::compile_session_key(name) else {
+                    continue;
+                };
+                if to_key_up {
+                    if seen_up.insert(entry.tsf_hash) {
+                        compiled_hotkeys.key_up.push(entry);
+                    }
+                } else if seen_down.insert(entry.tsf_hash) {
+                    compiled_hotkeys.key_down.push(entry);
+                }
             }
         }
         warn_unknown_session_actions(&config);
@@ -199,6 +266,7 @@ impl ConfigBundle {
             jump_out_on_right_symbol,
             custom_en_punct_chars,
             key_resolver,
+            schema_session_vks,
         }
     }
 }
@@ -208,6 +276,69 @@ mod reload_tests {
     //! 热重载基础：验证 ConfigBundle 能从 Config 正确重建轻量派生缓存。
     //! （reload_user_config 走磁盘 IO 不在此测；这里测其核心——从配置重建派生状态。）
     use super::*;
+
+    /// 方案级 `[session_actions]` 的键**必须**进 TSF 转发表。
+    ///
+    /// 不进表的后果不是「优先级低」而是**服务端根本收不到这个键**——C++ 按转发表决定送不
+    /// 送过来。表现是「方案里配了完全没反应」，与配错了同形，用户无从分辨。
+    #[test]
+    fn schema_session_keys_enter_the_forward_table() {
+        let cfg = Config::default();
+        let bare = ConfigBundle::build(cfg.clone(), &Default::default());
+        // `home` 是功能键（非可打印）⇒ 走 key_down + FORWARD_ONLY 那条，且不在出厂的任何
+        // 键组里（page_keys = pageupdown/minus_equal、highlight_keys = arrows/tab、
+        // select_key_groups = semicolon_quote）。
+        let vk = keymap::session_key_name_to_vk("home").unwrap().vk;
+        assert!(
+            !bare
+                .compiled_hotkeys
+                .key_down
+                .iter()
+                .any(|e| e.match_hash == vk),
+            "前置条件：被测键须是出厂默认未登记的，否则测不到「新增登记」这件事"
+        );
+        let union = SchemaKeyUnion {
+            modifier_vks: Default::default(),
+            session_key_names: ["home".to_string()].into_iter().collect(),
+        };
+        let with_schema = ConfigBundle::build(cfg, &union);
+        assert!(
+            with_schema
+                .compiled_hotkeys
+                .key_down
+                .iter()
+                .any(|e| e.match_hash == vk),
+            "方案级会话态键必须进 key_down 转发表，否则服务端根本收不到"
+        );
+        assert!(
+            with_schema.schema_session_vks.contains(&vk),
+            "VK 形式也要留一份，供 capslock_bound 那类「任一方案绑过没有」的判定"
+        );
+    }
+
+    /// ★ 去重：方案绑的键若全局已登记，不再追加第二条。
+    ///
+    /// 重复条目不改变行为（`.find()` 先到先得且两条一模一样），但会让推给 C++ 的表随方案
+    /// 数量膨胀，也让「切方案前后推送字节不变」这条验证手段失去意义——那正是并集策略是否
+    /// 生效的唯一凭据。
+    #[test]
+    fn schema_session_key_already_registered_globally_is_not_duplicated() {
+        let mut cfg = Config::default();
+        cfg.keys
+            .session_actions
+            .insert("home".to_string(), "page_prev".to_string());
+        let global_only = ConfigBundle::build(cfg.clone(), &Default::default());
+        let union = SchemaKeyUnion {
+            modifier_vks: Default::default(),
+            session_key_names: ["home".to_string()].into_iter().collect(),
+        };
+        let both = ConfigBundle::build(cfg, &union);
+        assert_eq!(
+            both.compiled_hotkeys.key_down.len(),
+            global_only.compiled_hotkeys.key_down.len(),
+            "全局已登记的键，方案级不该再追加一条"
+        );
+    }
 
     #[test]
     fn config_bundle_rebuilds_pairs_from_config() {
