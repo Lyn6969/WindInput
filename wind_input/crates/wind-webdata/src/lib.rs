@@ -549,32 +549,41 @@ pub trait WebDataRpc: WebDataHost {
     /// 两条边界来源，按可信度取：
     /// 1. **用户在码里打了空格**（`ni hao`）—— 显式声明的切分，直接采信。同时必须拆成扁平
     ///    码：带空格的串若原样落库，key 就成了 `ni hao`，前缀查询再也匹配不到它。
-    /// 2. 无空格 → 退回 [`Self::infer_boundary_for`] 的「手输码 == 推导码则借用」兜底。
+    /// 2. 无空格 → 交给 [`wind_engine::Engine::resolve_boundary`] 的四层求解链。
+    ///
+    /// ★ 这里原本是一个私有的 `infer_boundary_for`，只做「手输码 == 引擎推导码则借用其
+    /// 切分」这一条判据——**那正是求解链的层 3**，是重复实现。收敛掉之后手输码额外获得
+    /// 层 2（词典点查）与层 4（字数约束求解）两条来源：以前用户手打 `xianning` +「西安宁」
+    /// 因推导码对不上而拿 0，现在能解出 `xi|an|ning`。
+    ///
+    /// ⚠️ **有意不在这里拒收** `Unresolvable`：本函数服务于设置页手动加词，那是用户明确
+    /// 的意图，静默拒绝会变成「点了保存没反应」。合法性拦截只放在导入闸口（那里有预览
+    /// 可以如实告知）。此处非法码照旧落 `boundary = 0`，与改动前等价。
     fn normalize_add_code(&self, schema: &str, code: &str, text: &str) -> (String, u64) {
         let (flat, explicit) = wind_store::wdict::split_spaced_code(code);
         if explicit != 0 {
             return (flat, explicit);
         }
-        let b = self.infer_boundary_for(schema, &flat, text);
-        (flat, b)
-    }
-
-    /// 为设置端手输的 (code, text) 推断音节边界。
-    ///
-    /// 手输码通常是扁平 ASCII，**用户多数时候无从表达音节边界**（能表达时走
-    /// [`Self::normalize_add_code`] 的空格分支）。但若手输码恰与引擎推导的码逐字相同，
-    /// 其切分就是确定的，可直接借用推导出的边界——多数手动加词用的正是系统给出的码
-    /// （`dict.encode`），故这条兜底能覆盖大半。
-    ///
-    /// 不一致（用户自定义切分/生僻音）或非拼音方案 → 0，消费方降级回 DAG。
-    fn infer_boundary_for(&self, schema: &str, code: &str, text: &str) -> u64 {
-        self.engine_mgr()
-            .generate_word_pinyin(schema, text)
-            // 引擎给的是带空格的音节码，须拆成扁平码再与手输码比对（手输码恒无空格）。
-            .map(|spaced| wind_store::wdict::split_spaced_code(&spaced))
-            .filter(|(derived, _)| derived == code)
-            .map(|(_, b)| b)
-            .unwrap_or(0)
+        let res = self
+            .engine_mgr()
+            .resolve_boundaries(schema, &[(flat.as_str(), text)])
+            .into_iter()
+            .next()
+            .unwrap_or(wind_engine::BoundaryResolution::NoInfo);
+        // 探测器：手输码落在契约之外时留一条痕。**不改变行为**（照旧落 boundary=0），
+        // 它是「有多少手输码求解不出」的唯一观测点——这类词的简拼会退化成 DAG 现猜，
+        // 而那在歧义码上必错，用户侧的表现是「加了词但简拼召不回」，无从追溯。
+        //
+        // ⚠️ 用 `debug!` 而非 `info!`：本行含 code 与 text，属用户词库内容。
+        // INFO 生产默认开启，不得记录用户输入类信息。
+        if res == wind_engine::BoundaryResolution::Unresolvable {
+            tracing::debug!(
+                "加词：拼音码求解失败，按无边界落库 code={} text={}",
+                flat,
+                text
+            );
+        }
+        (flat, res.boundary())
     }
 
     fn web_dict_update(&self, params: &Value) -> anyhow::Result<Value> {
@@ -2942,8 +2951,8 @@ mod tests {
     /// 写入侧必须拆成扁平 key，否则 `niha` 前缀匹配不到这条记录、逐键出候选就废了。
     /// 反过来 remove/search 收到带空格的串也必须拆，不然删不掉、搜不着。
     ///
-    /// 顺带确认一条增益：用户打的空格被当作**显式声明的切分**采信，比
-    /// `infer_boundary_for` 的「手输码 == 推导码才借用」兜底更强。
+    /// 顺带确认一条增益：用户打的空格被当作**显式声明的切分**采信，优先于
+    /// `normalize_add_code` 的求解链。
     #[test]
     fn dict_spaced_code_display_flat_storage_roundtrip() {
         let c = coord("spaced_roundtrip");
