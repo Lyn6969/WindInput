@@ -1794,6 +1794,9 @@ function Show-Menu {
     Write-Host "      进程排除与路径无关, 新建 worktree 自动生效, 无需重跑" -ForegroundColor DarkGray
     Write-Host "    wtinit  新 worktree 首次全量构建 (需 sccache)"
     Write-Host "      实测 366s → 258s (-30%); 完成后自动切回 incremental" -ForegroundColor DarkGray
+    if ($WIND_REMOTE_HOST) {
+        Write-Host "    runlock  Ctrl+C 中断远程构建后锁卡死时, 强制释放编译机互斥锁"
+    }
     Write-Host "`n  杂项:" -ForegroundColor Yellow
     Write-Host "    clean  q=退出"
     Write-Host "============================================" -ForegroundColor Cyan
@@ -1894,6 +1897,15 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "avc"                           { if (Do-Defender check)  { 0 } else { 1 }; break }
         "avr"                           { if (Do-Defender remove) { 0 } else { 1 }; break }
         { $_ -in @("wtinit", "worktree-init") } { if (Do-WorktreeInit) { 0 } else { 1 }; break }
+        # 强制释放编译机互斥锁 (Ctrl+C 中断构建后卡死时用)。这条命令本身刻意不进 $RemoteCommands
+        # 白名单转发表 —— 它不是"要转发去远程跑的构建", 而是直接操作远程锁, 走 remote-build.ps1
+        # 自己的 -Unlock 分支。未配置远程编译机时该分支会安静地报"无锁可清"。
+        { $_ -in @("runlock", "unlock-remote") } {
+            if (Test-Path "$ScriptDir\remote-build.ps1") {
+                & "$ScriptDir\remote-build.ps1" -Unlock | Out-Host; $LASTEXITCODE
+            } else { ErrMsg "remote-build.ps1 不存在 (未入库或不在本仓)"; 1 }
+            break
+        }
         default { 127 }
     }
 }

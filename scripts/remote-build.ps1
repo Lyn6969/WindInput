@@ -42,6 +42,9 @@
 param(
     [Parameter(ParameterSetName = 'Dev', Mandatory, Position = 0)] [string]$Command,
     [Parameter(ParameterSetName = 'Raw', Mandatory)] [string]$Raw,
+    # 强制清除编译机上的互斥锁 (锁被 Ctrl+C 中断卡死、或已确认持有者已死时的手动逃生口)。
+    # 不做任何构建, 只删那个锁文件。见下方「编译机互斥锁」一节。
+    [Parameter(ParameterSetName = 'Unlock', Mandatory)] [switch]$Unlock,
     # 跳过源码同步 (上次同步后没改代码时可省 2~3 秒)
     [switch]$NoSync,
     # 只编译不回传
@@ -91,6 +94,10 @@ if (-not (Test-RemoteReady)) {
         Gray "WIND_NO_REMOTE 已设 —— 本次在本机执行。"
     } else {
         Gray "未配置远程编译机 —— 本机执行。(要启用见 scripts\build.local.ps1.example)"
+    }
+    if ($PSCmdlet.ParameterSetName -eq 'Unlock') {
+        Gray "没有远程编译机可清 —— 本机执行不涉及锁。"
+        exit 0
     }
     # ⚠️ 哨兵必须在调 dev.ps1 之前设上: dev.ps1 的转发闸门看的正是这个环境变量, 不设它就会
     #    dev.ps1 → remote-build.ps1 → dev.ps1 无限递归。finally 还原, 免得污染调用者的会话。
@@ -204,6 +211,15 @@ $LockFile = "$RRoot.buildlock"
 $LockHolder = "$env:COMPUTERNAME/$env:USERNAME/pid$PID"
 $script:LockOwned = $false
 
+# 陈旧判据: 锁文件创建时刻起 30 分钟未变 (一次冷全构建的量级)。
+#
+# ⚠️ 2026-08-21 教训: Ctrl+C/断线中断构建时, 锁可能要卡到这 30 分钟耗尽才会自愈——试过让
+# 【本地】在退出前抢一次 SSH 通知远程删锁 (CancelKeyPress/TreatControlCAsInput), 也试过让
+# 【远程】开一个后台心跳持续续期、把陈旧阈值砍到 90 秒——机制本身实测有效, 但用户反馈
+# "主要只有我自己用, 这套太复杂了", 于是撤回, 改回最简单的方案: 卡住了就手动
+# `.\scripts\remote-build.ps1 -Unlock` (或 `dev.ps1 runlock`) 清一下, 不搞自动化。
+# 复杂版的设计与实测记录留在项目记忆 project_remote_build_machine.md, 以后若换成多人共用
+# 这台编译机、手动清锁不再够用时, 可以按那份记录原样抄回来。
 function Enter-RemoteLock {
     # 最多等 20 分钟 (一次冷全构建的量级); 超时宁可报错也不硬闯, 免得两个构建互相拆台。
     foreach ($try in 1..120) {
@@ -226,7 +242,7 @@ try {
         Start-Sleep -Seconds 10
     }
     ErrMsg "  [锁] 等待编译机超过 20 分钟仍未空闲, 已放弃。"
-    ErrMsg "       若确认对方已死: 在编译机上删除 $LockFile"
+    ErrMsg "       若确认对方已死: .\scripts\remote-build.ps1 -Unlock"
     return $false
 }
 
@@ -234,6 +250,24 @@ function Exit-RemoteLock {
     if (-not $script:LockOwned) { return }
     $script:LockOwned = $false
     Invoke-RemotePs "Remove-Item -LiteralPath '$LockFile' -Force -EA SilentlyContinue" -Quiet | Out-Null
+}
+
+# ---------- -Unlock: 手动逃生口, 不做任何构建 ----------
+# 旧文档曾让用户"确认对方已死后去编译机上手动删文件" —— 大多数人根本没法/不敢直接 SSH
+# 上去删文件。这里给一条安全的等价操作: 只删锁文件, 不碰源码/产物, 走已有的 SSH 通道。
+if ($PSCmdlet.ParameterSetName -eq 'Unlock') {
+    Say "`n========== 强制释放编译机锁 ($WIND_REMOTE_HOST) =========="
+    if ($slot) { Gray "  槽位 $slot → $RRoot" }
+    $r = Get-RemoteValue @"
+if (Test-Path -LiteralPath '$LockFile') {
+  `$holder = (Get-Content -LiteralPath '$LockFile' -Raw -EA SilentlyContinue)
+  Remove-Item -LiteralPath '$LockFile' -Force; "REMOVED:`$holder"
+} else { 'NONE' }
+"@
+    if ($null -eq $r) { ErrMsg "连接编译机失败 —— 无法确认或清除锁。"; exit 1 }
+    elseif ($r -eq 'NONE') { Gray "锁文件不存在, 无需处理: $LockFile" }
+    else { Say "已删除锁文件 (原持有者: $($r -replace '^REMOVED:','')): $LockFile" }
+    exit 0
 }
 
 # ---------- 源码同步 ----------
@@ -574,4 +608,6 @@ if ($localOut -and -not $noArtifact) { Gray "  产物已在本机 $outName\, 可
 
 }
 finally { Exit-RemoteLock }   # ↑↑↑ 锁区结束。失败退出、Ctrl-C、正常收尾都会走到这里
+# ⚠️ Ctrl+C/断线中断时, 上面这次释放不一定跑得到 (本地进程如何退出不受这段代码控制),
+# 卡住了就手动 .\scripts\remote-build.ps1 -Unlock (或 dev.ps1 runlock) 清掉, 见该函数定义。
 exit 0
