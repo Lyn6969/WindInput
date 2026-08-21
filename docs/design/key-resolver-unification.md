@@ -10,7 +10,10 @@
 > [session-key-actions.md](session-key-actions.md)（第二张表，有会话态）。本文不重复那两篇的
 > 立论，只处理**两张表之上的解析层**。
 >
-> 状态：**§7 第 1 步已实施**（`wind-coordinator/src/key_resolver.rs`），2–4 步未做。
+> 状态：**§7 第 1–3 步已实施**（`wind-coordinator/src/key_resolver.rs` +
+> `Coordinator::session_action_for` + `Schema::session_actions`）。
+> 第 4 步（设置仓只读按键总览）未做；主仓之外的三个仓（工具站 / 设置仓 / 文档站）
+> 尚未同步，清单见 §7。
 
 ## 1. 现状：同一个模式已经实现了四遍
 
@@ -266,18 +269,28 @@ KeyResolver
 `session_keys.classify()` 现有**五个**调用点。它们不是统一加一个方案参数就完事——
 **两处根本不在按键路径上**：
 
-| 位置 | 用途 | 走哪个方法 |
-|---|---|---|
-| `coordinator.rs` 按键分类 | 这个键在会话态干什么 | `session(schema, vk)` |
-| `handle_candidate.rs` `select_key_offset` | 选词键 → 第几个候选 | `session(schema, vk)` |
-| `handle_candidate.rs` `select_char_index` | 以词定字 → 第几个字 | `session(schema, vk)` |
-| `coordinator.rs` 冲突归属（`owners.push`） | 设置页「这个键被谁占了」 | ⚠️ **语义待定**，见下 |
-| `coordinator.rs` `capslock_bound()` | 装不装 CapsLock 全局钩子 | ★ **必须 `reachability()`**（§4.2） |
+| 位置 | 用途 | 走哪个方法 | 实施 |
+|---|---|---|---|
+| `coordinator.rs` 按键分类 | 这个键在会话态干什么 | `session_action_for`（当前方案） | ✅ |
+| `handle_candidate.rs` `select_key_offset` | 选词键 → 第几个候选 | `session_action_for` | ✅ |
+| `handle_candidate.rs` `select_char_index` | 以词定字 → 第几个字 | `session_action_for` | ✅ |
+| `coordinator.rs` 冲突归属（`owners.push`） | **启动期日志**：码元 × 功能键冲突 | `session_action_for`（当前方案） | ✅ |
+| `coordinator.rs` `capslock_bound()` | 装不装 CapsLock 全局钩子 | ★ **并集** `schema_session_vks` | ✅ |
 
-⚠️ **冲突归属那处要先定语义再动手**：设置页拿它提示用户「这个键已被翻页键占用」。方案级绑定
-进来后，「占用」是指**当前方案**（准确但随方案漂移，用户在设置页看到的提示会因为切了方案而变）
-还是**任一方案**（稳定但会误报「被占用」）。⇒ 倾向后者 + 提示里点明是哪个方案，但**这是第 3 步
-要拍板的第二个未定项**，与 §7 那个合并语义的未定项并列。
+### ★ 冲突归属：本文初稿把两个功能混成了一个未定项
+
+初稿把冲突归属标成「语义待定：当前方案 vs 任一方案」，并倾向后者。查证后这个未定项**不成立**：
+
+`code_char_conflicts` 的消费者是 `warn_code_char_conflicts`——**启动期写日志**，不是设置页。
+而它比较的另一方是 `active_input_chars()`，即**活跃方案的码元集**。两边必须同方案才谈得上
+冲突：拿并集去比，会报出「别的方案里占了」这种当前根本不存在的冲突。⇒ 走当前方案，无悬念。
+
+「任一方案占用即提示、并点明方案名」（已拍板）适用的是**设置页配某个键时的占用提示**——
+那属于 §7 第 4 步的按键总览，是另一个功能，届时它需要的是「键 → (方案, 动作)」的归属映射，
+而不是本表这个 `Vec<&'static str>`。
+
+★ 判据：**在设计文档里给一处代码标「语义待定」之前，先确认它的消费者是谁**。两个功能长得
+像（都在回答「这个键被占了吗」），但一个是启动期日志、一个是设置页交互，取值范围正好相反。
 
 ### 两条路的起点不一样干净 —— 这是分期顺序的真正理由
 
@@ -303,7 +316,7 @@ KeyResolver
 |---|---|---|
 | **1** ✅ | 建 `key_resolver.rs`；**全局层** `keys.key_actions` 预编译成 VK 表；`bound_action_with_source` 的全局分支改查表；两层共用同一个键名→VK 解析口 | 纯重构，`schema_key_actions` 27 项 + 新增 5 项单测 + `wind-coordinator` 全量 900+ 全绿 |
 | **2** ◐ | 已做：`active_key_actions()` 改返 `Arc`（消除每键 clone 整表）。**剩下的搬家并进第 3 步**，见下 | `wind-engine` / `wind-coordinator` 全绿 |
-| **3** | 方案级 `[session_actions]`：`Schema` 加字段 → `EngineManager` 供全方案原始表 → `KeyResolver` 的 `schema_session` map → `none` 哨兵 | 切方案后翻页键按方案表走；**且 C++ 推送字节在切方案前后不变**（并集策略生效的证据） |
+| **3** ✅ | 方案级 `[session_actions]`：`Schema` 加字段 → `EngineManager` 供表+并集 → `session_action_for` 两层逐键合并 → `none` 哨兵 → 并集进转发表与 `capslock_bound` | 新增 4 项 `key_resolver` 单测、1 项 engine 合并/并集用例、2 项转发表用例；四 crate 全量 1500+ 全绿 |
 | **4** | 设置仓：只读按键总览 | 与 1–3 解耦，可后置 |
 
 第 1、2 步不改任何行为，可以合并提交；第 3 步才是新功能。
@@ -346,11 +359,11 @@ KeyResolver
 ★ 判据：**一次重构若其收益完全依赖于下一步，就该和下一步一起做**——「先把结构搬好」听起来
 稳妥，实际是让同一批代码承受两次改动、两次回归风险，而中间态没有任何消费者受益。
 
-### 第 3 步的两个未定项（做到那里再拍板）
+### 第 3 步的两个未定项 —— 均已定
 
-1. **合并粒度**：方案级 `[session_actions]` 与全局是**逐键合并**（与 `[key_actions]` 一致）还是
-   **整段替换**。逐键合并更一致，但它意味着「方案想完全接管翻页键」必须把不要的键逐个写 `none`。
-2. **冲突归属的语义**：见 §6 消费点分流表。
+1. **合并粒度：逐键合并**（用户 2026-08-21 拍板），与 `[key_actions]` 一致。方案只写想改的键，
+   其余继承全局；「方案想完全接管翻页键」要把不要的键逐个写 `none`。
+2. **冲突归属**：查证后未定项不成立，见 §6。
 
 ### ⚠️ 第 3 步的跨仓落点（`Schema` 加字段会牵动三个外仓）
 
