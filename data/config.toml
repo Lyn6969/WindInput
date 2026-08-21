@@ -592,9 +592,9 @@ take_screenshot = "ctrl+shift+f11"
 # 写入其它名字只会进 warn 日志并被忽略。activate_ime 不在此列（走系统
 # DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。空 = 全部走普通键盘钩子。
 global_hotkeys = []
-# ⚠ schema_hotkeys（方案直达热键）已并入下面的 key_actions，不再单列。
-#   旧配置照常工作：加载时自动折算成 key_actions 的 switch_schema:<方案id>，
-#   不写回文件（回退旧版本仍可用）；下次用设置页保存时旧字段自然消失。
+# ⚠ schema_hotkeys（方案直达热键）已废弃并入下面的 key_actions，写作
+#   switch_schema:<方案id>。**不做自动迁移**：残留的旧段只在启动日志里告警一次，
+#   请按告警提示手改。
 #   合并的理由：两处配的是同一件事、只差单向/往返，却编译进同一张热键表，
 #   同一个键两处都配时后者静默失效；且旧表不校验键形态，写单个字符键会让
 #   那个字符再也打不出来。

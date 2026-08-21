@@ -2494,16 +2494,16 @@ pub struct KeysConfig {
     pub take_screenshot: String,
     #[serde(default)]
     pub global_hotkeys: Vec<String>,
-    /// **已废弃**：方案直达热键（`schema_id` → 热键串）已并入 [`Self::key_actions`]，
-    /// 动词 `switch_schema:<方案id>`。由 [`Config::migrate_schema_hotkeys_into_key_actions`]
-    /// 在加载期折算（`normalize` → `ConfigBundle::build`，配置生效的单一入口）。
+    /// **已废弃且不再生效**：方案直达热键已并入 [`Self::key_actions`]，动词
+    /// `switch_schema:<方案id>`。**不做自动迁移**，只在加载期告警一次
+    /// （[`Config::warn_legacy_schema_hotkeys`]）。
     ///
-    /// 字段保留只为**读得出存量值以便折算**——删掉的话 serde 会静默丢弃这一段，用户
-    /// 升级后热键全失效且查不到原因。处置与 `schema.legacy_special_modes` 同构：
-    /// `rename` 保住 TOML/JSON 里的原键名，`skip_serializing_if` 让它不再被写出，于是
-    /// 它也自动退出 `config_schema` 的登记表对应关系（那道守卫按序列化产物比对）。
+    /// 字段保留只为**读得出残留值以便告警**——删掉的话 serde 会静默丢弃这一段，用户
+    /// 的热键失效且查不到原因。处置与 `schema.legacy_special_modes` 同构：`rename` 保住
+    /// TOML/JSON 里的原键名，`skip_serializing_if` 让它不再被写出，于是它也自动退出
+    /// `config_schema` 的登记表对应关系（那道守卫按序列化产物比对）。
     ///
-    /// ⚠️ **不要**在新代码里读它。折算之后本表恒为空；消费端一律读 `key_actions`。
+    /// ⚠️ **不要**在新代码里读它。告警之后本表恒为空；消费端一律读 `key_actions`。
     #[serde(
         rename = "schema_hotkeys",
         default,
@@ -4024,10 +4024,7 @@ impl Config {
         // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
         // 这里看到的 trigger_keys 已只剩符号键。
         self.migrate_trigger_keys_into_key_actions();
-        // 须在 migrate_trigger_keys_into_key_actions **之后**：两者写同一张表，而本条的
-        // 「已显式配过就不覆盖」要能看见上一步折算进来的条目，否则同一个键会被后到的
-        // 方案热键顶掉引导键。
-        self.migrate_schema_hotkeys_into_key_actions();
+        self.warn_legacy_schema_hotkeys();
         // ⛔ 这里**不再**把四组键组配置折算进 `session_actions`。折算是**消费层的视图**，
         // 不是存储层的改写——见 `KeysConfig::effective_session_actions` 的文档。
         self.warn_legacy_special_modes();
@@ -4072,74 +4069,35 @@ impl Config {
         self.schema.legacy_special_modes.clear();
     }
 
-    /// 存量迁移：`keys.schema_hotkeys` → `keys.key_actions` 的 `switch_schema:<id>`。
+    /// 残留的 `keys.schema_hotkeys` 告警（**不迁移**）。
     ///
-    /// # 为什么要合并
+    /// 该键已废弃：方案直达热键并入 `keys.key_actions` 的 `switch_schema:<方案id>`。
+    /// 刻意不做自动折算——保留一条兼容路径的代价是永远要维护两套配置形态的等价性，
+    /// 而它能省下的只是用户手改两行。处置与 [`Self::warn_legacy_special_modes`] 一致。
     ///
-    /// 两处配的是**同一件事**（按一个键切到某方案），只差单向/往返，却各自复制了一整套
-    /// 配置形态，代价有三：
-    ///
-    /// 1. 两者编译进**同一张** key_down 表，`match_key_down` 用 `.find()` 先注册者赢，
-    ///    而 `schema_hotkeys` 排在前面 ⇒ 同一个键两处都配时，`key_actions` 那条**静默**
-    ///    失效，用户无从察觉。合表之后同一个键在 TOML 层面就只能有一个值。
-    /// 2. `schema_hotkeys` 无条件把解析结果塞进 key_down 表，**不问键形态**。在里面写
-    ///    一个单字符键（`backslash`）会让 TSF 把它当热键吞掉，那个符号从此打不出来；
-    ///    写纯修饰键则是谁都不处理的静默失效。`key_actions` 走 `route_of_key_action`
-    ///    三分通路，本就没有这个洞。
-    /// 3. 设置页两个入口（「进入方式」与「按键功能」）差别只在往返与否，界面上毫无体现。
-    ///
-    /// # 折算规则
-    ///
-    /// 折算在**内存里**做，不写回配置文件——与本文件其余 `migrate_*` 同策略（`normalize`
-    /// 是零 IO、幂等、纯内存的）。用户的 config.toml 保持原样，回退一个版本照常工作；
-    /// 旧字段的真正消失发生在用户下次用设置页保存时（GUI 按新工作态全量写回）。
-    ///
-    /// 单向语义原样保留（`switch_schema:`），**不悄悄升级成往返**：那会让原本「切过去
-    /// 就完了」的键突然多出回程，属于静默改变既有行为。
-    ///
-    /// 已在 `keys.key_actions` 里显式配过的键**不覆盖**：用户的新配置优先于存量迁移。
-    /// 键名解析不了、或形态不合法（单字符键会被 TSF 吞掉）的条目丢弃并 warn——那正是
-    /// 上面第 2 条那个洞里已经躺着的存量数据，迁移是**唯一**能让它可见的时机。
-    fn migrate_schema_hotkeys_into_key_actions(&mut self) {
+    /// 但也**不能静默丢弃**：用户的 config.toml 里那一段还在，看起来像仍然生效。
+    /// 一条 warn 是「让失效可见」的最低成本手段——「配了没反应且查不到原因」正是本仓
+    /// 反复栽过的那类缺陷，而这里恰好是唯一能让它可见的时机。
+    fn warn_legacy_schema_hotkeys(&mut self) {
         if self.keys.legacy_schema_hotkeys.is_empty() {
             return;
         }
-        // HashMap 迭代序不稳定，排序后再折算：两个方案配了同一个键时谁先入列决定谁生效，
-        // 不排序会让同一份配置在不同进程启动时表现不同（与 hotkey.rs 原编译段同一理由）。
-        let mut entries: Vec<(String, String)> =
-            std::mem::take(&mut self.keys.legacy_schema_hotkeys)
-                .into_iter()
-                .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (schema_id, key) in entries {
-            let schema_id = schema_id.trim().to_string();
-            let key = key.trim().to_lowercase();
-            if schema_id.is_empty() || key.is_empty() || key == "none" {
-                continue; // 空条目本就不生效（解绑写成空串的历史遗留）
-            }
-            match crate::hotkey::route_of_key_action(&key) {
-                None => {
-                    warn!("配置迁移：方案热键 {key:?}（{schema_id}）无法解析为按键，已丢弃");
-                    continue;
-                }
-                // 单字符键进 key_down 表会被 TSF 当热键吞掉，那个符号就再也打不出来。
-                // 旧的 schema_hotkeys 没有这道守卫，存量里可能真躺着这种条目。
-                Some(crate::hotkey::KeyActionRoute::LeadingKey) => {
-                    warn!(
-                        "配置迁移：方案热键 {key:?}（{schema_id}）是单个字符键，                         作方案热键会让该字符再也打不出来，已丢弃。                         请改用组合键，或在 keys.key_actions 里写 toggle_schema:{schema_id}"
-                    );
-                    continue;
-                }
-                Some(_) => {}
-            }
-            if self.keys.key_actions.contains_key(&key) {
-                debug!("配置迁移：{key:?} 已在 keys.key_actions 显式配置，保留用户设置");
-                continue;
-            }
-            let action = format!("switch_schema:{schema_id}");
-            debug!("配置迁移：方案热键 {key:?} → keys.key_actions = {action:?}");
-            self.keys.key_actions.insert(key, action);
-        }
+        let mut pairs: Vec<String> = self
+            .keys
+            .legacy_schema_hotkeys
+            .iter()
+            .map(|(id, key)| format!("{id} = {key:?}"))
+            .collect();
+        // HashMap 迭代序不稳定，排序后再报：同一份配置每次启动都该给出同样的告警文本，
+        // 否则日志比对时会以为配置变过。
+        pairs.sort();
+        warn!(
+            "keys.schema_hotkeys 已废弃且不再生效（残留 {} 条：{}）。             改法：写进 keys.key_actions，如 \"ctrl+shift+r\" = \"switch_schema:<方案id>\"             （单向切换；要「再按一次回到来源」则用 toggle_schema:<方案id>）。             也可在设置页「方案 → 选中方案 → 设置 → 进入方式」重配一次。",
+            pairs.len(),
+            pairs.join(", ")
+        );
+        // 清空：留着会让后续任何「有没有配过」的判断读到假信号。
+        self.keys.legacy_schema_hotkeys.clear();
     }
 
     /// 存量迁移：四处 `trigger_keys` → `keys.key_actions`（设计文档五c「全局层收编」）。
