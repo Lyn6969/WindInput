@@ -555,29 +555,29 @@ impl Coordinator {
         list[next].1.clone()
     }
 
-    /// 选择第 N 个输入方案（隐含切到中文模式）。
+    /// 选择第 N 个输入方案（托盘/菜单入口；隐含切到中文模式）。
+    ///
+    /// 收尾走 [`Self::finish_user_schema_switch`]，与直达热键/循环键同一套——此前这里手写
+    /// 了一份，与那边的差异（无条件归位中文 vs 受 CapsLock 开关门控、不取消大写、不记
+    /// per-app 模式、不清 preedit）正是「托盘切得动、热键切不动」的由来。
     pub(crate) fn select_schema(&self, index: usize) {
         let list = self.engine_mgr.available_schemas().to_vec();
         if index >= list.len() {
             return;
         }
         let id = list[index].clone();
-        self.engine_mgr.switch_schema(&id);
-        self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
-        self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
-        self.invalidate_aux_code_table(); // 辅助码表各方案不同，切方案必须重挂（见函数注释）
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.chinese_mode = true;
-            s.input_buffer.clear();
-            s.candidates.clear();
-        }
-        self.push_state_update();
-        self.notify_toolbar();
-        self.notify_ui_hide();
-        self.show_status();
-        if let Err(e) = Config::set_user_string(&["schema", "active"], &id) {
-            warn!("select_schema: 持久化 schema.active 失败: {}", e);
+        // 先判幂等再切：`switch_schema` 对「已是当前方案」和「加载失败」都返回 false，
+        // 不分开判就只能二选一。重选当前方案仍要走收尾（用户点它多半就是想归位中文）；
+        // 加载失败则必须提示且**不写盘**——否则 `schema.active` 指向一个没生效的方案，
+        // 下次重启又莫名切了过去（同 `cmd_set_schema` 栽过的次生撕裂）。
+        if self.engine_mgr.active_schema_id() == id || self.engine_mgr.switch_schema(&id) {
+            self.finish_user_schema_switch(&id, "Selected schema");
+        } else {
+            let name = self.engine_mgr.schema_name(&id);
+            self.show_tip(&format!(
+                "{}加载失败",
+                if name.is_empty() { &id } else { &name }
+            ));
         }
     }
 
@@ -1158,15 +1158,29 @@ impl Coordinator {
         self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
         self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
         self.invalidate_aux_code_table(); // 辅助码表各方案不同，切方案必须重挂（见函数注释）
-        // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，
-        // 配置开启时取消 CapsLock，且若当前为英文模式一并归位中文。
-        let caps_cancelled = self.cancel_caps_on_switch();
+        // ── 归位到「能用新方案打字」的状态：无条件，不受任何配置门控 ──────────────
+        //
+        // 切方案的语义前提就是「我要用这个方案打字」，而英文半角与 CapsLock 开启这两种
+        // 状态下按键都不进引擎（前者在 handle_key_event 的英文分水岭原样透传，后者被 C++
+        // 的 capsLockLetterPassthrough 同步透传，服务端连事件都收不到）。不归位的话，方案
+        // 确实换了、`schema.active` 也写了盘，用户却观察不到任何变化——**真机报障原话是
+        // 「方案切换热键在英文状态或大写状态不生效」，实为切了但看不见**。
+        //
+        // ⚠ 这两件事**曾经**共用 `input.capslock.cancel_on_mode_switch`（出厂 false），
+        // 于是出厂配置下这段恒不执行。判据教训：**一个动作的语义前提不可配置，可配置的
+        // 只能是副作用**。那个开关的正当作用域是切中英模式（用户可能正想打大写英文），
+        // 与切方案无关，故这里改调不看开关的 `force_cancel_caps_lock`。
+        //
+        // 托盘 `select_schema` 一直是无条件归位中文的——「托盘切得动、热键切不动」正是
+        // 两条路收尾不一致的直接后果。它现已并入本函数，三个入口至此同一套收尾。
+        let caps_cancelled = self.force_cancel_caps_lock();
         let bundle = self.rt();
-        let cancel_cfg = bundle.config.input.capslock.cancel_on_mode_switch;
         let follow = bundle.config.input.punct.follow_mode;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let to_chinese = cancel_cfg && !state.chinese_mode;
-        if caps_cancelled || to_chinese {
+        // 只在**实际发生** false→true 翻转时才动标点与记账：chinese_mode 本就是 true 时，
+        // chinese_punct 可能是用户用 toggle_punct 单独设的，切方案不该把它重置回去。
+        let to_chinese = !state.chinese_mode;
+        if to_chinese {
             state.chinese_mode = true;
             if follow {
                 state.chinese_punct = true;
@@ -2028,5 +2042,110 @@ mod mix_numpad_tests {
             Coordinator::resolve_mix_member("english", "shoudao"),
             "english"
         );
+    }
+}
+
+/// 切方案收尾的**编译期**守卫。
+///
+/// 为什么是源码扫描而不是跑一遍 `finish_user_schema_switch`：那个函数末尾会
+/// `Config::set_user_string(["schema","active"])` **真的写用户 config.toml**（测试进程里
+/// `user_config_dir()` 就是真实的 `%APPDATA%`，没有隔离钩子）。跑一次就把开发者自己的
+/// 活跃方案改掉——甚至可能因为 `set_user_value` 的「等于默认即删键」而把他手配的
+/// `schema.active` 整条抹掉。守卫要防的东西不值这个代价。
+#[cfg(test)]
+mod schema_switch_finish_guard {
+    const SRC: &str = include_str!("handle_mode.rs");
+
+    /// 截取 `fn <name>` 之后括号配平的函数体，**并剥掉整行注释**。
+    ///
+    /// 剥注释不是洁癖：本文件的注释里就成段解释着「为什么不能读那个开关」，纯文本扫描
+    /// 会把这段解释本身判成违规（初版守卫正是这样红的）。**判据要落在代码上，不能落在
+    /// 讲述判据的文字上**——否则维护者只能靠删注释来让测试变绿。
+    fn body_of(name: &str) -> String {
+        let at = SRC
+            .find(&format!("fn {name}"))
+            .unwrap_or_else(|| panic!("源码里找不到 fn {name}（改名了？守卫需同步更新）"));
+        let open = SRC[at..]
+            .find('{')
+            .unwrap_or_else(|| panic!("fn {name} 没有函数体"))
+            + at;
+        let mut depth = 0usize;
+        for (i, ch) in SRC[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return SRC[open..open + i + 1]
+                            .lines()
+                            .filter(|l| !l.trim_start().starts_with("//"))
+                            .collect::<Vec<_>>()
+                            .join(
+                                "
+",
+                            );
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fn {name} 的花括号不配平");
+    }
+
+    /// ★ 本次真机故障的直接守卫：切方案的状态归位**不得**受 CapsLock 那个开关门控。
+    ///
+    /// 病理：`input.capslock.cancel_on_mode_switch` 出厂 `false`，而归位中文 + 取消大写
+    /// 曾整个裹在 `if 该开关 {}` 里，于是出厂配置下英文半角态/大写态按方案直达热键，
+    /// 方案真的换了、`schema.active` 也写了盘，用户却观察不到任何变化——那两种状态下
+    /// 按键根本不进引擎（英文半角在 `handle_key_event` 的分水岭原样透传，大写被 C++ 的
+    /// `capsLockLetterPassthrough` 同步透传）。用户报障原话即「热键在英文状态或大写状态
+    /// 不生效」。
+    ///
+    /// 判据：**一个动作的语义前提不可配置，可配置的只能是副作用。**「我要用这个方案打字」
+    /// 是切方案的语义前提；那个开关的正当作用域只有切中英模式（那里用户可能正想打大写英文）。
+    #[test]
+    fn finish_user_schema_switch_is_not_gated_by_capslock_option() {
+        let body = body_of("finish_user_schema_switch");
+        assert!(
+            !body.contains("cancel_on_mode_switch"),
+            "切方案的归位不得读 input.capslock.cancel_on_mode_switch——它出厂关闭，\
+             一读就等于「英文态/大写态下方案切换毫无反应」"
+        );
+        assert!(
+            !body.contains("cancel_caps_on_switch"),
+            "切方案取消大写要走无条件的 force_cancel_caps_lock；cancel_caps_on_switch 带开关判定"
+        );
+        assert!(
+            body.contains("force_cancel_caps_lock"),
+            "大写开着时不取消，切完方案照样打大写英文——用户看到的仍是「切换不生效」"
+        );
+        assert!(
+            body.contains("state.chinese_mode = true"),
+            "英文半角态不归位中文，按键全程原样透传，新方案根本不参与出字"
+        );
+    }
+
+    /// 三个方案切换入口（托盘 / 直达热键 / 循环键）必须共用同一条收尾。
+    ///
+    /// 这三处历史上各自漂移过（持久化、归位中文、取消大写、清 preedit 四件事的组合各不
+    /// 相同），本次故障的可见形态正是「托盘切得动、热键切不动」——托盘那份手写收尾是
+    /// **无条件**归位中文的，热键那份受开关门控。合并之后同一个 bug 不会再只修一半。
+    #[test]
+    fn all_schema_switch_entries_share_one_finish() {
+        let body = body_of("select_schema");
+        assert!(
+            body.contains("finish_user_schema_switch"),
+            "托盘选方案必须走统一收尾，不得再手写一份"
+        );
+        assert!(
+            !body.contains("chinese_mode = true"),
+            "手写归位＝又一份会漂移的收尾；归位属于 finish_user_schema_switch"
+        );
+        for name in ["switch_schema_by_id", "cycle_schema"] {
+            assert!(
+                body_of(name).contains("finish_user_schema_switch"),
+                "{name} 也必须走统一收尾"
+            );
+        }
     }
 }

@@ -2313,15 +2313,30 @@ impl Coordinator {
         }
     }
 
-    /// 「切换模式时取消大小写锁定」（input.capslock.cancel_on_mode_switch）：
+    /// 「切换**中英模式**时取消大小写锁定」（input.capslock.cancel_on_mode_switch）：
     /// CapsLock 开着时 `effective_chinese = chinese_mode && !caps_lock` 恒为英文大写，
-    /// 切中英/切方案"看似无效"。开启该配置后，切换动作先物理敲击 CapsLock 取消系统
+    /// 切中英"看似无效"。开启该配置后，切换动作先物理敲击 CapsLock 取消系统
     /// 锁定并同步镜像，让切换真正生效。返回是否执行了取消（供调用方决定归位语义）。
     /// 需在未持有 state 锁时调用。
+    ///
+    /// ⚠ **切方案不走这里**，走无条件的 [`Self::force_cancel_caps_lock`]。判据是「这个动作
+    /// 的语义前提是不是『我要用中文打字』」：切中英模式时用户可能正是要打大写英文，取消
+    /// 大写会与他的意图相反，故留给配置；切方案则不然——没有任何解释能让「切到五笔之后
+    /// 继续打大写英文」成立。把两者共用一个开关，就是本开关（出厂 false）关着时
+    /// 「英文态/大写态下方案切换看着毫无反应」的成因。
     pub(crate) fn cancel_caps_on_switch(&self) -> bool {
         if !self.rt().config.input.capslock.cancel_on_mode_switch {
             return false;
         }
+        self.force_cancel_caps_lock()
+    }
+
+    /// 取消大小写锁定，**不看配置开关**。仅供语义前提为「我要用中文打字」的动作调用
+    /// （目前只有切方案，见 `finish_user_schema_switch`）。
+    ///
+    /// CapsLock 未开时返回 false 且不注入——「没开着」与「开关关着」在调用方看来都是
+    /// 「本次没取消」，两者都不该触发归位记账。
+    pub(crate) fn force_cancel_caps_lock(&self) -> bool {
         {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if !s.caps_lock {
@@ -2340,14 +2355,14 @@ impl Coordinator {
             if let Some(t) = *last
                 && t.elapsed() < std::time::Duration::from_millis(300)
             {
-                debug!("cancel_on_mode_switch: 注入防抖期内，跳过");
+                debug!("cancel_caps_lock: 注入防抖期内，跳过");
                 return false;
             }
             *last = Some(std::time::Instant::now());
         }
-        // SendInput 敲击 VK_CAPITAL；失败（非 Windows/注入受限）不动镜像，行为退回未配置。
+        // SendInput 敲击 VK_CAPITAL；失败（非 Windows/注入受限）不动镜像，行为退回「没取消」。
         if let Err(e) = wind_keys::key_inject::tap_caps_lock() {
-            warn!("cancel_on_mode_switch: 注入 CapsLock 失败: {e}");
+            warn!("cancel_caps_lock: 注入 CapsLock 失败: {e}");
             return false;
         }
         // 乐观同步镜像（后续按键立即按新状态处理）；注入回环的 CapsLock key_up

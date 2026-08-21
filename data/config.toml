@@ -518,6 +518,9 @@ candidate_layout = "follow"
 # [[schema.special_modes]] 下也可用。说明见 https://windinput.com/docs/settings/appearance/candidate-comment
 
 [input.capslock]
+# 切中英模式（Shift 等切换键）时是否顺手取消大写锁定。仅此一处作用域——
+# 切方案（直达热键 / 循环键 / 托盘）一律无条件取消大写并归位中文，不看本项：
+# 那两件事是「用新方案打字」的前提，不是可选副作用。
 cancel_on_mode_switch = false
 
 [input.temp_pinyin]
