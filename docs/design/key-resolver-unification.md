@@ -302,7 +302,7 @@ KeyResolver
 | 步 | 改动 | 验证 |
 |---|---|---|
 | **1** ✅ | 建 `key_resolver.rs`；**全局层** `keys.key_actions` 预编译成 VK 表；`bound_action_with_source` 的全局分支改查表；两层共用同一个键名→VK 解析口 | 纯重构，`schema_key_actions` 27 项 + 新增 5 项单测 + `wind-coordinator` 全量 900+ 全绿 |
-| **2** | `session_keys` 并入；`reachability()` 收编 `schema_bound_modifier_vks` + `compiled_hotkeys` 的 hash 列表 | **推给 C++ 的字节应与改前逐字节一致**（排序已保证可复现） |
+| **2** ◐ | 已做：`active_key_actions()` 改返 `Arc`（消除每键 clone 整表）。**剩下的搬家并进第 3 步**，见下 | `wind-engine` / `wind-coordinator` 全绿 |
 | **3** | 方案级 `[session_actions]`：`Schema` 加字段 → `EngineManager` 供全方案原始表 → `KeyResolver` 的 `schema_session` map → `none` 哨兵 | 切方案后翻页键按方案表走；**且 C++ 推送字节在切方案前后不变**（并集策略生效的证据） |
 | **4** | 设置仓：只读按键总览 | 与 1–3 解耦，可后置 |
 
@@ -327,10 +327,24 @@ KeyResolver
 再叠一层的边际收益是每键省几次字符串解析，**而代价是一个新的「改了不生效」风险源**。
 先做前者是划算的，后者要等失效信号到位。
 
-⚠️ **遗留未动**：`EngineManager::active_key_actions()` 返回的是 owned `BTreeMap`
-（命中缓存也走 `cached.clone()`），故方案层**每次按键仍 clone 整张表**。这比字符串解析更值得
-消除，但它要改 `EngineManager` 的公开签名（返回 `Arc` 或改成闭包访问），连带动几处断言，
-放在第 2 步一并做。
+✅ **已在第 2 步消除**：`active_key_actions()` 改返 `Arc<BTreeMap>`，命中缓存只加一次引用计数。
+测试无需改（`.get()` / `.is_empty()` 经 `Deref` 照常可用），失效链路由
+`active_key_actions_merges_schema_file_and_override_per_key` 守住。
+
+### ★ 第 2 步剩下的两项为什么并进第 3 步
+
+原计划第 2 步还要「`session_keys` 并入 `KeyResolver`」与「`reachability()` 收编
+`schema_bound_modifier_vks`」。这两项**单独做是纯搬家**——它们的收益（两表同源、加维度只改
+一处）要到第 3 步真正引入方案维度时才兑现。
+
+而第 3 步会把 `session_keys.classify(vk, ..)` 改成 `session(schema, vk)`，**那 5 个调用点本来
+就要动一遍**。先搬一次、第 3 步再改一次，是把一次改动拆成两次，中间那版还谁都不服务。
+
+⇒ 合并到第 3 步一次完成。第 2 步只保留有独立收益的部分（`Arc` 改造）与把查证结论固化进代码
+注释（`schema_bound_modifier_vks` 的枚举源说明）。
+
+★ 判据：**一次重构若其收益完全依赖于下一步，就该和下一步一起做**——「先把结构搬好」听起来
+稳妥，实际是让同一批代码承受两次改动、两次回归风险，而中间态没有任何消费者受益。
 
 ### 第 3 步的两个未定项（做到那里再拍板）
 
@@ -389,26 +403,33 @@ KeyResolver
    ⇒ **第 3 步的真机验证必须覆盖：在没绑这个键的方案里、无会话时，打这个符号能正常出字。**
    不验的话症状是丢键，且只在部分方案下复现。
 
-### ★★ 第 2 步会把一个既有缺口「改名掩盖」
+### ★★ `reachability()` 这个名字会承诺它做不到的事
 
 `reachability()` 要收编的 `schema_bound_modifier_vks` → `EngineManager::all_key_action_keys()`，
 而后者**只遍历 `self.available`**。overlay 方案 `hidden = true`、**不进 `available`**
-⇒ **overlay 方案自己 `[key_actions]` 里的键根本不在并集里**，C++ 不转发。
+⇒ overlay 方案自己 `[key_actions]` 里的键不在这个并集里。
 
-这条缺口已有人写在案（`manager.rs` overlay 注册表的注释：「⚠️ `all_key_action_keys` 至今仍只遍历
-`available`——将来若要收 overlay 方案自己的 `[key_actions]`，那里也得换源」），但**换源至今没做**。
+⚠️ **但这不是「配了不生效」的缺口，别照这个定性去修**（本节初稿正是这么定性的，查证后推翻）：
 
-★ **照搬进 `reachability()` 会让它更危险，而不是持平**：现在这个函数叫
-`all_key_action_keys`，旁边还挂着提醒；改名成 `reachability()` 之后，名字承诺的是「全集」，
-读者不会再去查它的枚举源。**给一个有缺口的实现换一个更强的名字，是重构里最典型的负收益动作。**
+> overlay 方案的 `[key_actions]` **根本没有消费路径**。`bound_action_with_source` 查的是
+> `EngineManager::active_key_actions()`，它按 `EngineManager::active`（活跃方案）取表；
+> 而进特殊模式只改 **`State.active`**（`ModeKind::Special(idx)`），**不动活跃方案**。
+> ⇒ overlay 模式下查的仍是主方案那张表。既然不消费，不转发就是**自洽**的，不是漏。
 
-⇒ 第 2 步必须二选一，不能默认照搬：
-- **(a) 顺手换源**为 `installed_schemas`（与 overlay 注册表同源），一并解决；
-- **(b) 保持现状但改名要诚实**——叫 `reachability_of_available()`，并把这条缺口写进它的文档注释。
+`manager.rs` overlay 注册表那条注释（「⚠️ `all_key_action_keys` 至今仍只遍历 `available`——
+**将来若要收** overlay 方案自己的 `[key_actions]`，那里也得换源」）措辞是准确的：它说的是
+将来要收时得换源，不是现在漏了。
 
-⚠️ 且第 3 步会**放大**它：overlay 方案（特殊模式）恰恰是最可能需要方案级 `[session_actions]`
-的场景（模式内自定义翻页/取消键）。若第 3 步沿用同一个枚举源，**新功能在 overlay 方案下直接不可用**，
-且表现为「配了完全没反应」——与 §2.5 那个静默失效同形。**建议取 (a)。**
+★ 真正的风险在**命名**：`all_key_action_keys` 是描述性的（读者自然会去看它遍历什么），而
+`reachability()` 承诺的是「全集」。将来真要支持 overlay 的 `[key_actions]` 时，**枚举源与消费
+路径两处都要改**，名字不该提前替其中一处打包票。
+
+⇒ 第 2 步的处置：收编时**要么叫 `reachability_of_available()`**，要么保留 `reachability()`
+但在文档注释里写明枚举源是 `available` 以及为什么这样是自洽的。**不要**顺手「修」成
+`installed_schemas`——那会让一批没有消费路径的键进转发集，是纯粹的多余转发。
+
+★ 判据（本节自己踩了一次）：**看到「A 有配置项、B 不收 A」先别急着叫缺陷，先查 A 有没有
+消费路径**。没有消费路径的配置项不被收集是一致，不是漏。
 
 ### 跨 crate 契约（无编译期约束）
 
