@@ -15,7 +15,8 @@ use std::collections::HashMap;
 
 use wind_dict::cached::CachedDict;
 
-use super::syllable::STANDARD_SYLLABLES;
+use super::dag::{Dag, SegGraph};
+use super::syllable::{STANDARD_SYLLABLES, SyllableTrie};
 
 /// 整词读音消歧时笛卡尔积组合数上限（防生僻多音字长词性能塌方）。
 const MAX_READING_COMBOS: usize = 64;
@@ -319,6 +320,104 @@ fn infer_by_subword_segmentation(
         }
     }
     Some(b.finish())
+}
+
+/// 层 4 求解的路径枚举上限（见 [`super::dag::SegGraph::paths_with_edges`]）。
+/// 取 16：正常词条码 ≤ 12 字节，同字数的合法切分极少超过个位数；超限即按「多解」处置。
+const MAX_BOUNDARY_PATHS: usize = 16;
+
+/// 按「音节数 == 汉字数」求解 `(code, text)` 的音节边界。返回 `(boundary, ambiguous)`。
+///
+/// 这是**导入闸口的第 4 层**（见 `docs/design/pinyin-entry-boundary-contract.md` §3.1）。
+///
+/// ## 为什么这不是猜
+///
+/// [`super::dag::Dag::maximum_match`] 只看 code，在等长路径间无从取舍（`xian` 切成
+/// `xi|an` 还是 `xian`，覆盖字符数都是 4），故只能算猜。而这里手上有 `text`，汉字词的
+/// **音节数恒等于汉字数**——`xianning` + 「西安宁」(3 字) 只有 `xi|an|ning` 一条 3 音节
+/// 路径，`xian|ning` 因只有 2 音节被约束直接排除。切分由此从启发式降为可判定问题。
+///
+/// ## 与 [`generate_word_pinyin`] 的关系：方向相反，互补
+///
+/// 那个是「字 → 码」（多音字必须靠权重猜），这个是「码 → 切分」（读音已由词库作者写定，
+/// 只需切分）。两者共用 [`CharPinyinIndex`]。**恰恰是最难的多音字，在有 code 的这条路上
+/// 不构成问题**：`chongqing` + 「重庆」直接切出 `chong|qing`，无需知道「重」是多音字。
+///
+/// ## 返回 `None` 的两种含义，调用方必须分开处置
+///
+/// 本函数只管求解，不区分「非法」与「码太长装不下 bitmask」——后者由调用方在进来之前
+/// 按 `code.len() > 64` 拦掉（那是**合法但无边界**，既定语义是降级为 0，见
+/// [`wind_store::wdict::split_spaced_code`] 的同款契约），到这里的 `None` 一律是非法。
+pub fn boundary_by_char_count(
+    index: &CharPinyinIndex,
+    trie: &SyllableTrie,
+    code: &str,
+    text: &str,
+) -> Option<(u64, bool)> {
+    let runes: Vec<char> = text.chars().collect();
+    if runes.is_empty() || code.is_empty() || code.len() > 64 {
+        return None;
+    }
+    // 判据①（设计文档 §2.1）：每个字符都要有读音。`你好a` 在此被拒。
+    // ⚠️ `readings` 只收**单字词典条目**，故这条同时也是「该字在本方案词典里存在」——
+    // 判据比「是不是汉字」略严，这是有意的：词典里没有的字，其词条在本方案下打不出来。
+    if runes.iter().any(|&c| index.readings(c).is_none()) {
+        return None;
+    }
+    let graph = SegGraph::from_dag(&Dag::build(code, trie));
+    let paths = graph.paths_with_edges(0, code.len(), runes.len(), MAX_BOUNDARY_PATHS);
+    if paths.is_empty() {
+        return None; // 判据②不满足：切不出与字数相符的音节序列
+    }
+    // 达到上限说明还有没枚举到的路径 ⇒ 即便下面筛出唯一，也不能宣称唯一。
+    let truncated = paths.len() >= MAX_BOUNDARY_PATHS;
+
+    // 读音验证：每个音节必须是对应字的读音之一。按「各字读音下标之和」升序择优
+    // （`readings` 已按词典权重降序，下标越小越常用），与 `infer_whole_word_code`
+    // 的笛卡尔积按字典序枚举是同一套偏好。
+    let mut scored: Vec<(usize, &Vec<usize>)> = paths
+        .iter()
+        .filter_map(|p| reading_score(index, &runes, code, p).map(|s| (s, p)))
+        .collect();
+
+    let (best, multi) = if scored.is_empty() {
+        // 读音表不认可任何一条切分（方言音 / 词库作者用了非常用读音 / 词典单字表不全）。
+        // ★ 切分本身在音节图上合法，不能因此否决——否则会把「码没错、只是读音冷门」的
+        // 词条误判成非法。退回「唯一即采信、多解算歧义」。
+        (&paths[0], paths.len() > 1)
+    } else {
+        scored.sort_by_key(|(s, _)| *s);
+        (scored[0].1, scored.len() > 1)
+    };
+    Some((mask_of(best), multi || truncated))
+}
+
+/// 一条切分的读音代价：各音节在对应字读音表中的下标之和；任一音节不是该字的读音则 `None`。
+fn reading_score(
+    index: &CharPinyinIndex,
+    runes: &[char],
+    code: &str,
+    offsets: &[usize],
+) -> Option<usize> {
+    if offsets.len() != runes.len() {
+        return None;
+    }
+    let mut score = 0usize;
+    for (i, &off) in offsets.iter().enumerate() {
+        let end = offsets.get(i + 1).copied().unwrap_or(code.len());
+        let syl = code.get(off..end)?;
+        let pos = index.readings(runes[i])?.iter().position(|r| r == syl)?;
+        score += pos;
+    }
+    Some(score)
+}
+
+/// 音节起点偏移 → boundary bitmask（语义同 `DictEntry::boundary`）。
+fn mask_of(offsets: &[usize]) -> u64 {
+    offsets
+        .iter()
+        .filter(|&&o| o < 64)
+        .fold(0u64, |m, &o| m | (1u64 << o))
 }
 
 #[cfg(test)]

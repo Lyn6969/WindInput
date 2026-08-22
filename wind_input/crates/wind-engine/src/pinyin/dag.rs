@@ -408,4 +408,123 @@ impl SegGraph {
         }
         Some(out)
     }
+
+    /// 枚举 `p→q` 之间**恰好 `n` 条边**的全部路径，各返回音节起点偏移（相对 `p`），
+    /// 形态与 [`Self::any_path`] 一致。
+    ///
+    /// 与同族两个函数的分工——它们各自只处理**一条**路径（`mask_path` 验证给定的一条、
+    /// `any_path` 任取最短的一条），本函数是**按约束求解**：调用方手上有一个来自图外的
+    /// 约束（词条的汉字数 = 音节数），它通常能把候选路径筛到唯一。
+    /// 见 `docs/design/pinyin-entry-boundary-contract.md` §3.1。
+    ///
+    /// ★ 这正是它与 [`Self::maximum_match`] 的分界：那个只看 code、在等长路径间无从取舍
+    /// （`xian` 切 `xi|an` 还是 `xian` 覆盖字符数相同），故只能算猜；有了 `n` 就是解方程。
+    ///
+    /// `limit` 封顶结果数：分支爆炸只可能出现在畸形长码上（正常词条码 ≤ 12 字节、每位置
+    /// 至多几条音节边）。超限即截断，调用方按「多解」处理——**截断不可静默当成唯一解**。
+    pub fn paths_with_edges(&self, p: usize, q: usize, n: usize, limit: usize) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        if q < p || q > self.len || limit == 0 {
+            return out;
+        }
+        if n == 0 {
+            if p == q {
+                out.push(Vec::new());
+            }
+            return out;
+        }
+        // 每条边至少覆盖 1 字节 ⇒ 距离放不下 n 条边时无解，省掉整棵搜索树。
+        if q - p < n {
+            return out;
+        }
+        let mut cur = Vec::with_capacity(n);
+        self.walk_paths(p, q, n, p, &mut cur, &mut out, limit);
+        out
+    }
+
+    /// [`Self::paths_with_edges`] 的 DFS 主体：`cur` 累积起点偏移，`pos` 为当前位置。
+    #[allow(clippy::too_many_arguments)]
+    fn walk_paths(
+        &self,
+        start: usize,
+        q: usize,
+        remain: usize,
+        pos: usize,
+        cur: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+        limit: usize,
+    ) {
+        if remain == 0 {
+            if pos == q {
+                out.push(cur.clone());
+            }
+            return;
+        }
+        // 剩余距离放不下剩余边数（每边至少 1 字节）→ 本分支必然走不通。
+        if q.saturating_sub(pos) < remain {
+            return;
+        }
+        for &nxt in self.edges_from(pos) {
+            if nxt > q {
+                break; // edges 已排序，后面只会更远
+            }
+            cur.push(pos - start);
+            self.walk_paths(start, q, remain - 1, nxt, cur, out, limit);
+            cur.pop();
+            if out.len() >= limit {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pinyin::syllable::SyllableTrie;
+
+    fn graph(input: &str) -> SegGraph {
+        SegGraph::from_dag(&Dag::build(input, &SyllableTrie::new()))
+    }
+
+    /// 定长枚举必须给出**全部**同音节数的切分，不能只给最大匹配那一条。
+    ///
+    /// `angan` 上 `an|gan` 与 `ang|an` 都是合法的 2 音节切分——正是这种歧义让
+    /// `maximum_match` 无从取舍，也正是字数约束之外还需要读音消歧的原因。
+    #[test]
+    fn enumerates_every_split_of_the_same_length() {
+        let mut ps = graph("angan").paths_with_edges(0, 5, 2, 16);
+        ps.sort();
+        assert_eq!(ps, vec![vec![0, 2], vec![0, 3]], "an|gan 与 ang|an");
+    }
+
+    /// 字数约束的核心作用：同一个码，不同音节数各自得唯一解。
+    #[test]
+    fn constraint_selects_by_syllable_count() {
+        let g = graph("xian");
+        assert_eq!(g.paths_with_edges(0, 4, 2, 16), vec![vec![0, 2]], "xi|an");
+        assert_eq!(g.paths_with_edges(0, 4, 1, 16), vec![vec![0]], "xian");
+        // `xianning` 的 3 音节解唯一——2 音节的 xian|ning 被约束排除在外。
+        let g2 = graph("xianning");
+        assert_eq!(g2.paths_with_edges(0, 8, 3, 16), vec![vec![0, 2, 4]]);
+        assert_eq!(g2.paths_with_edges(0, 8, 2, 16), vec![vec![0, 4]]);
+    }
+
+    /// 无解与边界情形：切不出的码、放不下的边数、零边。
+    #[test]
+    fn rejects_impossible_constraints() {
+        assert!(graph("wgkq").paths_with_edges(0, 4, 1, 16).is_empty());
+        // 每条边至少 1 字节 ⇒ 4 字节放不下 5 条边
+        assert!(graph("xian").paths_with_edges(0, 4, 5, 16).is_empty());
+        // n == 0 只在 p == q 时有一条空路径
+        let empty: Vec<Vec<usize>> = vec![Vec::new()];
+        assert_eq!(graph("xian").paths_with_edges(0, 0, 0, 16), empty);
+        assert!(graph("xian").paths_with_edges(0, 4, 0, 16).is_empty());
+    }
+
+    /// `limit` 必须真的封顶——调用方据此判「多解」，截断不可静默当成唯一解。
+    #[test]
+    fn limit_caps_results() {
+        assert_eq!(graph("angan").paths_with_edges(0, 5, 2, 1).len(), 1);
+    }
 }

@@ -32,6 +32,46 @@ impl DictFormat {
     }
 }
 
+/// 编码归一化策略。
+///
+/// ★ **为什么由调用方传入而不是在这里判引擎**：`wind-store` 拿不到 `engine_mgr`
+/// （落库规则须对两类方案通用，见 `docs/design/pinyin-code-domains.md`）。故本层只认识
+/// 「策略」，不认识「引擎」——由 `wind-webdata` 按目标方案的引擎类型挑一个常量传进来。
+#[derive(Debug, Clone, Copy)]
+pub struct CodePolicy {
+    /// 视作音节分隔符、归一成空格的字符。
+    ///
+    /// ★ 这不是「清洗」而是**信息升级**：Rime 的 `ni'hao` 里那个撇号与空格一样是词库
+    /// 作者标注的音节真值，转成空格后 [`crate::wdict::split_spaced_code`] 才吃得到边界。
+    /// 留着它则会成为 flat key 的一部分（flat 域的不变量是「剥除 `'` 后的串」），
+    /// 那条词永远查不到。
+    pub syllable_separators: &'static str,
+    /// 是否小写化。查询侧判据全链路是 `is_ascii_lowercase`，而用户词表是**裸字节前缀
+    /// 匹配、不做大小写归一** ⇒ 大写码落库后在设置页看得见，却永远打不出来。
+    pub lowercase: bool,
+}
+
+impl CodePolicy {
+    /// 拼音族：撇号是音节分隔符，码恒为小写。
+    pub const PINYIN: Self = Self {
+        syllable_separators: "'",
+        lowercase: true,
+    };
+    /// 码表 / 五笔 / 快符等：码的字符集由方案自定（快符码里就有 `@`），**不做任何改写**
+    /// ——与本策略引入之前的行为逐字节一致。
+    pub const CODETABLE: Self = Self {
+        syllable_separators: "",
+        lowercase: false,
+    };
+}
+
+impl Default for CodePolicy {
+    /// 默认取最保守的一档：不改写。新调用点忘了传也不会改变既有语义。
+    fn default() -> Self {
+        Self::CODETABLE
+    }
+}
+
 /// 按内容探测词库格式。
 pub fn detect_dict_format(text: &str) -> DictFormat {
     let text = strip_bom(text);
@@ -58,13 +98,16 @@ pub fn detect_dict_format(text: &str) -> DictFormat {
 
 /// 探测格式并解析为 words 行。返回 (格式, 行, 跳过数)。
 /// Unknown 格式报错并列出支持的格式。
-pub fn parse_words_auto(text: &str) -> Result<(DictFormat, Vec<WordIo>, usize), String> {
+pub fn parse_words_auto(
+    text: &str,
+    policy: CodePolicy,
+) -> Result<(DictFormat, Vec<WordIo>, usize), String> {
     let text = strip_bom(text);
     let fmt = detect_dict_format(text);
     let (rows, skipped) = match fmt {
         DictFormat::WindDict => crate::wdict::parse_words_wdict(text)?,
-        DictFormat::Rime => parse_words_rime(text)?,
-        DictFormat::Tsv => parse_words_tsv(text)?,
+        DictFormat::Rime => parse_words_rime(text, policy)?,
+        DictFormat::Tsv => parse_words_tsv(text, policy)?,
         DictFormat::Unknown => {
             return Err(
                 "无法识别的词库格式（支持 WindDict .wdict.yaml / Rime .dict.yaml / TSV 文本）"
@@ -80,7 +123,7 @@ pub fn parse_words_auto(text: &str) -> Result<(DictFormat, Vec<WordIo>, usize), 
 /// 头 = 整行 `...` 之前；缺 `columns:` 声明用 Rime 默认列 `[text, code, weight]`。
 /// 编码列去内部空格（拼音音节 `ni hao` → `nihao`）；缺 text/code 的行跳过；
 /// 权重解析失败回退 0。
-pub fn parse_words_rime(text: &str) -> Result<(Vec<WordIo>, usize), String> {
+pub fn parse_words_rime(text: &str, policy: CodePolicy) -> Result<(Vec<WordIo>, usize), String> {
     let text = strip_bom(text);
     let mut lines = text.lines();
     let mut header_lines: Vec<&str> = Vec::new();
@@ -119,13 +162,14 @@ pub fn parse_words_rime(text: &str) -> Result<(Vec<WordIo>, usize), String> {
             continue;
         }
         rows.push(WordIo {
-            code: normalize_code(code_raw),
+            code: normalize_code(code_raw, policy),
             // 反转义在 trim **之后**：`\n` 在 trim 阶段还是反斜杠加字母 n 两个可见字符，
             // 天然免疫空白剥离，到这一步才变成换行。有意的空白由转义序列表达、排版噪声
             // 交给 trim，两者在管线的不同阶段产生，就不需要互相区分。
             text: crate::wdict::unescape_text_field(word),
             weight: parse_weight(get("weight")),
             count: 0,
+            boundary: None,
         });
     }
     Ok((rows, skipped))
@@ -163,7 +207,7 @@ fn rime_columns_from_header(header: &[&str]) -> Vec<String> {
 ///
 /// 列数 <2、code/text 为空、code 含非可打印 ASCII（乱码/列序颠倒防护）的行跳过；
 /// 权重缺省或解析失败回退 0。
-pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
+pub fn parse_words_tsv(text: &str, policy: CodePolicy) -> Result<(Vec<WordIo>, usize), String> {
     let text = strip_bom(text);
     let mut rows = Vec::new();
     let mut skipped = 0usize;
@@ -184,11 +228,12 @@ pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
             continue;
         }
         rows.push(WordIo {
-            code: normalize_code(code_raw),
+            code: normalize_code(code_raw, policy),
             // 同 Rime 路径：trim 在前、反转义在后。见 `parse_words_rime`。
             text: crate::wdict::unescape_text_field(word),
             weight: parse_weight(fields.get(2).map(|s| s.trim()).unwrap_or("")),
             count: 0,
+            boundary: None,
         });
     }
     Ok((rows, skipped))
@@ -202,8 +247,17 @@ pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
 /// [`crate::wdict::split_spaced_code`] 在落库时拆成 flat key + 边界。
 ///
 /// 对码表码（五笔等，本就无空格）幂等，行为与改动前一致。
-fn normalize_code(code: &str) -> String {
-    code.split_whitespace().collect::<Vec<_>>().join(" ")
+fn normalize_code(code: &str, policy: CodePolicy) -> String {
+    let mut s = if policy.syllable_separators.is_empty() {
+        code.to_string()
+    } else {
+        code.replace(|c| policy.syllable_separators.contains(c), " ")
+    };
+    if policy.lowercase {
+        s = s.to_ascii_lowercase();
+    }
+    // 空白折叠放在最后：分隔符刚被换成空格，这一步顺带把 `ni''hao` 这类连写归一。
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 编码合法性：可打印 ASCII（0x20-0x7E）。拦乱码与"词在前码在后"的列序颠倒文件。
@@ -260,7 +314,7 @@ mod tests {
     /// （key 仍是扁平的 `nihao`，见 docs/design/pinyin-code-domains.md §2.2）。
     #[test]
     fn rime_default_columns_keeps_syllable_spaces() {
-        let (rows, skipped) = parse_words_rime(RIME_SAMPLE).unwrap();
+        let (rows, skipped) = parse_words_rime(RIME_SAMPLE, CodePolicy::PINYIN).unwrap();
         assert_eq!(skipped, 0);
         assert_eq!(rows.len(), 2);
         // 默认列序 text 在前；音节空格保留，供落库端拆出边界
@@ -281,7 +335,7 @@ mod tests {
     #[test]
     fn import_unescapes_text_on_both_paths() {
         let rime = "---\nname: t\n...\n甲\\n乙\tjy\t10\nC:\\Users\tcu\t20\n";
-        let (rows, _) = parse_words_rime(rime).unwrap();
+        let (rows, _) = parse_words_rime(rime, CodePolicy::PINYIN).unwrap();
         assert_eq!(rows[0].text, "甲\n乙", "Rime 路径须反转义 \\n");
         assert_eq!(
             rows[1].text, "C:\\Users",
@@ -289,7 +343,7 @@ mod tests {
         );
 
         let tsv = "jy\t甲\\n乙\t10\ncu\tC:\\Users\t20\n";
-        let (rows, _) = parse_words_tsv(tsv).unwrap();
+        let (rows, _) = parse_words_tsv(tsv, CodePolicy::PINYIN).unwrap();
         assert_eq!(rows[0].text, "甲\n乙", "TSV 路径须反转义 \\n");
         assert_eq!(rows[1].text, "C:\\Users");
     }
@@ -299,7 +353,7 @@ mod tests {
     #[test]
     fn import_trims_bare_space_but_keeps_escaped_whitespace() {
         let tsv = "jy\t  甲乙  \t10\nbd\t丙\\t丁\t20\n";
-        let (rows, _) = parse_words_tsv(tsv).unwrap();
+        let (rows, _) = parse_words_tsv(tsv, CodePolicy::PINYIN).unwrap();
         assert_eq!(rows[0].text, "甲乙", "字段两侧的裸空格按既有语义剥除");
         assert_eq!(
             rows[1].text, "丙\t丁",
@@ -309,15 +363,53 @@ mod tests {
 
     #[test]
     fn normalize_code_folds_whitespace_and_is_idempotent_for_flat() {
-        assert_eq!(normalize_code("ni  hao"), "ni hao");
-        assert_eq!(normalize_code("  ni hao  "), "ni hao");
-        assert_eq!(normalize_code("abcd"), "abcd");
+        let p = CodePolicy::PINYIN;
+        assert_eq!(normalize_code("ni  hao", p), "ni hao");
+        assert_eq!(normalize_code("  ni hao  ", p), "ni hao");
+        assert_eq!(normalize_code("abcd", p), "abcd");
+    }
+
+    /// ★ 撇号是**音节真值**，不是噪声：Rime 的 `ni'hao` 与 `ni hao` 表达同一件事。
+    /// 归一成空格后落库端才拆得出边界；留着它则会进 flat key，那条词永远查不到。
+    #[test]
+    fn pinyin_policy_upgrades_apostrophe_to_boundary() {
+        let p = CodePolicy::PINYIN;
+        assert_eq!(normalize_code("ni'hao", p), "ni hao");
+        assert_eq!(normalize_code("xi'an'ning", p), "xi an ning");
+        // 连写与混用都归一到单空格
+        assert_eq!(normalize_code("ni''hao", p), "ni hao");
+        assert_eq!(normalize_code("ni' hao", p), "ni hao");
+        // 落库端据此拆出边界——这正是本条归一化的目的
+        assert_eq!(
+            crate::wdict::split_spaced_code(&normalize_code("ni'hao", p)),
+            ("nihao".to_string(), 0b101)
+        );
+    }
+
+    /// ★ 大写码落库后在设置页看得见却永远打不出来：查询侧判据全链路是
+    /// `is_ascii_lowercase`，而用户词表是裸字节前缀匹配、不做大小写归一。
+    #[test]
+    fn pinyin_policy_lowercases() {
+        assert_eq!(normalize_code("NiHao", CodePolicy::PINYIN), "nihao");
+        assert_eq!(normalize_code("NI HAO", CodePolicy::PINYIN), "ni hao");
+    }
+
+    /// ⚠️ 码表策略**不做任何改写**——快符码里就有 `@`，五笔方案也可能自定义字符集。
+    /// 与本策略引入之前逐字节一致。
+    #[test]
+    fn codetable_policy_leaves_code_untouched() {
+        let p = CodePolicy::CODETABLE;
+        assert_eq!(normalize_code("ni'hao", p), "ni'hao");
+        assert_eq!(normalize_code("NiHao", p), "NiHao");
+        assert_eq!(normalize_code("@ab", p), "@ab");
+        // 空白折叠是两类策略共有的（列内排版噪声与引擎无关）
+        assert_eq!(normalize_code("  a  b ", p), "a b");
     }
 
     #[test]
     fn rime_explicit_columns_reorder() {
         let s = "---\nname: t\ncolumns:\n  - code\n  - text\n  - weight\n...\nnihao\t你好\t7\n";
-        let (rows, _) = parse_words_rime(s).unwrap();
+        let (rows, _) = parse_words_rime(s, CodePolicy::PINYIN).unwrap();
         assert_eq!(rows[0].code, "nihao");
         assert_eq!(rows[0].text, "你好");
         assert_eq!(rows[0].weight, 7);
@@ -326,7 +418,7 @@ mod tests {
     #[test]
     fn rime_skips_incomplete_and_comment_lines() {
         let s = "---\nname: t\n...\n# 注释行\n\n只有词没有码\n好\tni hao\n";
-        let (rows, skipped) = parse_words_rime(s).unwrap();
+        let (rows, skipped) = parse_words_rime(s, CodePolicy::PINYIN).unwrap();
         // 缺 code 的行跳过;缺 weight 列回退 0
         assert_eq!(rows.len(), 1);
         assert_eq!(skipped, 1);
@@ -335,20 +427,20 @@ mod tests {
 
     #[test]
     fn rime_missing_separator_is_error() {
-        assert!(parse_words_rime("name: t\n你好\tni hao\t1\n").is_err());
+        assert!(parse_words_rime("name: t\n你好\tni hao\t1\n", CodePolicy::PINYIN).is_err());
     }
 
     #[test]
     fn rime_float_weight_truncates() {
         let s = "---\nname: t\n...\n你好\tni hao\t520.9\n";
-        let (rows, _) = parse_words_rime(s).unwrap();
+        let (rows, _) = parse_words_rime(s, CodePolicy::PINYIN).unwrap();
         assert_eq!(rows[0].weight, 520, "浮点权重截断取整");
     }
 
     #[test]
     fn tsv_basic_and_optional_weight() {
         let s = "# 注释\nnihao\t你好\t10\nshijie\t世界\n";
-        let (rows, skipped) = parse_words_tsv(s).unwrap();
+        let (rows, skipped) = parse_words_tsv(s, CodePolicy::PINYIN).unwrap();
         assert_eq!(skipped, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].weight, 10);
@@ -358,7 +450,7 @@ mod tests {
     #[test]
     fn tsv_skips_bad_lines() {
         let s = "单列无制表符x\n你好\tnihao\t1\nab\t好\t2\n";
-        let (rows, skipped) = parse_words_tsv(s).unwrap();
+        let (rows, skipped) = parse_words_tsv(s, CodePolicy::PINYIN).unwrap();
         // 第 1 行列数不足;第 2 行 code 为汉字(列序颠倒防护)→ 均跳过
         assert_eq!(rows.len(), 1);
         assert_eq!(skipped, 2);
@@ -367,12 +459,12 @@ mod tests {
 
     #[test]
     fn auto_dispatch_matches_detection() {
-        let (fmt, rows, _) = parse_words_auto(RIME_SAMPLE).unwrap();
+        let (fmt, rows, _) = parse_words_auto(RIME_SAMPLE, CodePolicy::PINYIN).unwrap();
         assert_eq!(fmt, DictFormat::Rime);
         assert_eq!(rows.len(), 2);
-        let (fmt, rows, _) = parse_words_auto("a\t工\t5\n").unwrap();
+        let (fmt, rows, _) = parse_words_auto("a\t工\t5\n", CodePolicy::PINYIN).unwrap();
         assert_eq!(fmt, DictFormat::Tsv);
         assert_eq!(rows[0].code, "a");
-        assert!(parse_words_auto("既无头也无制表符\n").is_err());
+        assert!(parse_words_auto("既无头也无制表符\n", CodePolicy::PINYIN).is_err());
     }
 }

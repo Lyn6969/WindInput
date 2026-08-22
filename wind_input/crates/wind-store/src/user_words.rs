@@ -333,7 +333,10 @@ impl Store {
                 for r in rows {
                     // code 列可能是带空格的音节码（`ni hao`）→ 拆成扁平 key + 边界。
                     // 无空格（五笔码/旧版导出）→ boundary=0，与改动前等价。
-                    let (code, in_b) = wdict::split_spaced_code(&r.code);
+                    let (code, spaced_b) = wdict::split_spaced_code(&r.code);
+                    // ★ 显式边界优先：空格载体表达不了「单音节」（`xian` 的 0b1 经
+                    // join→split 会退化成 0），故导入闸口求解出的边界走 `WordIo::boundary`。
+                    let in_b = r.boundary.unwrap_or(spaced_b);
                     let key = enc_key(schema, &code, &r.text);
                     let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                     match existing {
@@ -393,8 +396,10 @@ impl Store {
             let mut samples = Vec::new();
             for r in rows {
                 // 与 import_user_words 同款拆分：key 必须用扁平码，否则带空格的行
-                // 一律查不到既有记录、全部误报为 added。
-                let (code, in_b) = wdict::split_spaced_code(&r.code);
+                // 一律查不到既有记录、全部误报为 added。显式边界同样优先（判据必须与
+                // 落库端逐项一致，否则预览的 willUpdate 会与实际不符）。
+                let (code, spaced_b) = wdict::split_spaced_code(&r.code);
+                let in_b = r.boundary.unwrap_or(spaced_b);
                 let key = enc_key(schema, &code, &r.text);
                 let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                 let will_write = match existing {
@@ -450,6 +455,7 @@ impl Store {
                 text: r.text,
                 weight: r.weight,
                 count: r.count,
+                boundary: None,
             })
             .collect())
     }
@@ -557,6 +563,7 @@ mod tests {
             text: "你好".into(),
             weight: 500, // weight/count 均不变，只有 boundary 可补
             count: 0,
+            boundary: None,
         }];
         let (pc, _) = s.preview_import_user_words("pinyin", &rows).unwrap();
         let ic = s.import_user_words("pinyin", &rows).unwrap();
@@ -698,6 +705,7 @@ mod tests {
                 text: "西安宁".into(),
                 weight: 700,
                 count: 0,
+                boundary: None,
             }],
         )
         .unwrap();
@@ -912,6 +920,76 @@ mod tests {
         let _ = std::fs::remove_file(&path2);
     }
 
+    /// ★★ 显式 `WordIo::boundary` 优先于 code 里的空格，且**单音节边界必须能存活**。
+    ///
+    /// 空格载体表达不了单音节：`join_code_by_boundary("xian", 0b1)` 产出无空格的
+    /// `xian`，`split_spaced_code` 读回来是 0。导入闸口求解出的单字词边界若走 code
+    /// 传递会**静默退化为 0，而调用方以为补上了**。本条锁住那条旁路。
+    ///
+    /// ⚠️ 对照组是本测试的要害：不给显式边界时确实退化为 0——那正是旁路存在的理由。
+    /// 少了对照组，这条测试无法证明「显式边界」比「code 空格」多做了任何事。
+    #[test]
+    fn explicit_boundary_survives_where_spaces_cannot() {
+        let path = tmp("wind_uw_explicit_b.redb");
+        let s = Store::open(&path).unwrap();
+        let row = |code: &str, text: &str, b: Option<u64>| crate::wdict::WordIo {
+            code: code.into(),
+            text: text.into(),
+            weight: 100,
+            count: 0,
+            boundary: b,
+        };
+        s.import_user_words(
+            "pinyin",
+            &[
+                // 单音节：显式 0b1
+                row("xian", "先", Some(0b1)),
+                // 对照：同样单音节码，不给显式边界
+                row("gong", "工", None),
+                // 多音节：显式边界与 code 空格都能表达，显式优先
+                row("nihao", "你好", Some(0b101)),
+            ],
+        )
+        .unwrap();
+        let b = |code: &str, text: &str| {
+            s.get_user_words("pinyin", code)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.text == text)
+                .unwrap()
+                .boundary
+        };
+        assert_eq!(b("xian", "先"), 0b1, "单音节边界必须存活");
+        assert_eq!(
+            b("gong", "工"),
+            0,
+            "不给显式边界 ⇒ 空格载体推不出单音节，退化为 0"
+        );
+        assert_eq!(b("nihao", "你好"), 0b101);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 显式边界缺省时仍按 code 里的空格推断——旧路径逐字节不变。
+    #[test]
+    fn spaced_code_still_carries_boundary_when_no_explicit() {
+        let path = tmp("wind_uw_spaced_b.redb");
+        let s = Store::open(&path).unwrap();
+        s.import_user_words(
+            "pinyin",
+            &[crate::wdict::WordIo {
+                code: "ni hao".into(),
+                text: "你好".into(),
+                weight: 100,
+                count: 0,
+                boundary: None,
+            }],
+        )
+        .unwrap();
+        let got = s.get_user_words("pinyin", "nihao").unwrap();
+        assert_eq!(got[0].boundary, 0b101, "key 拆成扁平、边界从空格来");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn import_user_words_merges_max_weight() {
         let path = tmp("wind_uw_merge.redb");
@@ -924,6 +1002,7 @@ mod tests {
                 text: "工".into(),
                 weight: 30,
                 count: 0,
+                boundary: None,
             }],
             "2026-07-11T00:00:00+08:00",
         );
@@ -949,6 +1028,7 @@ mod tests {
                 text: "工".into(),
                 weight: 30,
                 count: 0,
+                boundary: None,
             },
             // 新键 → added
             crate::wdict::WordIo {
@@ -956,6 +1036,7 @@ mod tests {
                 text: "了".into(),
                 weight: 5,
                 count: 0,
+                boundary: None,
             },
         ];
         let c = s.import_user_words("wb", &rows).unwrap();
@@ -972,6 +1053,7 @@ mod tests {
             text: "工".into(),
             weight: 200,
             count: 0,
+            boundary: None,
         }];
         let c2 = s.import_user_words("wb", &rows2).unwrap();
         assert_eq!((c2.added, c2.updated, c2.unchanged), (0, 1, 0));
@@ -990,18 +1072,21 @@ mod tests {
                 text: "工".into(),
                 weight: 30,
                 count: 0,
+                boundary: None,
             },
             crate::wdict::WordIo {
                 code: "b".into(),
                 text: "了".into(),
                 weight: 5,
                 count: 0,
+                boundary: None,
             },
             crate::wdict::WordIo {
                 code: "a".into(),
                 text: "工".into(),
                 weight: 300,
                 count: 0,
+                boundary: None,
             },
         ];
         let (c, samples) = s.preview_import_user_words("wb", &rows).unwrap();

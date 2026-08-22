@@ -11,7 +11,7 @@
 
 use crate::codetable::CodeTableEngine;
 use crate::encoder;
-use crate::engine::{ConvertResult, Engine, EngineType};
+use crate::engine::{BoundaryResolution, ConvertResult, Engine, EngineType};
 use crate::freq_rerank::ProtectPolicy;
 use crate::pinyin::{Config as PinyinConfig, PinyinEngine};
 use std::collections::HashMap;
@@ -2590,6 +2590,36 @@ impl EngineManager {
             .get(schema_id)
             .cloned()?;
         engine.generate_word_pinyin(text)
+    }
+
+    /// 批量求解 `(code, text)` 的音节边界，兼作拼音词条合法性判据（导入闸口用）。
+    ///
+    /// 引擎句柄只取一次——导入动辄上万行，逐行 `ensure_loaded` + 加锁不可接受
+    /// （同 [`Self::generate_words_pinyin`] 的理由）。返回与 `pairs` **同序等长**。
+    ///
+    /// ⚠️ 方案未加载 / 非拼音方案 → 整批 [`BoundaryResolution::NoInfo`]，即
+    /// **「合法但无边界」而非「非法」**。码表词库导入正是走这条路，判成非法会全军覆没。
+    pub fn resolve_boundaries(
+        &self,
+        schema_id: &str,
+        pairs: &[(&str, &str)],
+    ) -> Vec<BoundaryResolution> {
+        if !self.ensure_loaded(schema_id) {
+            return vec![BoundaryResolution::NoInfo; pairs.len()];
+        }
+        let engine = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        let Some(engine) = engine else {
+            return vec![BoundaryResolution::NoInfo; pairs.len()];
+        };
+        pairs
+            .iter()
+            .map(|(code, text)| engine.resolve_boundary(code, text))
+            .collect()
     }
 
     /// 批量版 [`Self::generate_word_pinyin`]：引擎句柄只取一次（`ensure_loaded` +
