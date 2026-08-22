@@ -131,7 +131,42 @@ enum Located {
     Missing,
 }
 
+/// 方案文件里写下的相对路径**安全可用**吗（不逃出 schemas 根）。
+///
+/// # 这道守卫为什么必须在这里
+///
+/// [`crate::bundle::validate_entry_rel`] 此前是全 crate 唯一的穿越守卫，而它只校验
+/// **归档条目名**（zip 的 file name / 信封的 `files[].path`）。方案文件一旦落盘就被当成
+/// 「本机配置」，可它其实是同一个包带进来的**同一份外来数据**——`dictionaries[].path`、
+/// `engine.chaizi.db_path` / `font_path`、`shuangpin.layout`、`engine.mixed.*_schema`
+/// 全是包作者写的字符串，全都会被 `user_dir.join()` 当路径用。
+///
+/// 少了这道守卫的实测后果（2026-08-22，三条腿都跑过真实代码）：一个条目名完全干净、
+/// 只含 `evil.schema.toml` 的包，内容写 `[[dictionaries]] path = "../victim.txt"`，
+/// 装上之后
+/// - **删除该方案** → `../victim.txt` 被 `remove_file` 掉（user_dir 之外的任意文件）；
+/// - **导出该方案** → 该文件内容被打进 .wpkg（而导出的包正是要发给别人的）。
+///
+/// 判据直接复用 `validate_entry_rel`（所有组件必须是 `Component::Normal` 且不含 `:`，
+/// 顺带覆盖 `..`、绝对路径、`C:name` 这类驱动器相对路径）——**不另写一份**：两份谓词
+/// 迟早漂移，而漂移的那一半就是洞。只取它的 Ok/Err，归一化后的返回值刻意丢弃：
+/// 那会改写 `plan.pack` 里的 rel 字符串（`\` → `/`），是与本次修复无关的行为变化。
+fn is_safe_rel(rel: &str) -> bool {
+    crate::bundle::validate_entry_rel(rel, "").is_ok()
+}
+
+/// 定位一个方案资源。**不安全的 rel 一律当 Missing**——调用方据此记进 `plan.missing`
+/// 并告警，既不打包也不删除。
 fn locate(rel: &str, user_dir: &Path, system_dir: Option<&Path>) -> Located {
+    if !is_safe_rel(rel) {
+        // 归到 Missing 而不是静默丢弃：调用方会把它记进 `plan.missing`，那条通道本来
+        // 就是「这个引用没解析到」的出口，且一路上送到设置页的缺失清单——用户看到的是
+        // `../victim.txt` 这么一行，本身已经足够指认问题。
+        //
+        // 刻意**不**在这里打日志：本 crate 至今零日志依赖，为一行 warn 引入 tracing
+        // 不划算，而 `missing` 已经承担了同样的可见性。
+        return Located::Missing;
+    }
     let u = user_dir.join(rel);
     if u.is_file() {
         return Located::User(u);
@@ -217,6 +252,14 @@ fn read_override_value(
     let Some(dir) = override_dir else {
         return Ok(None);
     };
+    // id 同样来自方案文件内容（`engine.mixed.*_schema`），照样要过守卫。
+    //
+    // 当前调用序上这里已经安全了——`collect_into` 先 `locate(&schema_rel)` 且 Missing 即
+    // 早退，而那道守卫已经把 id 校验过一遍。但那是**调用顺序**给的保证，不是本函数的
+    // 契约；顺序一旦被人调整，这里就成了第二个出口。两行的代价换掉这份耦合。
+    if !is_safe_rel(&format!("{id}.toml")) {
+        anyhow::bail!("非法方案 id（越界路径）: {id}");
+    }
     let path = dir.join(format!("{id}.toml"));
     if !path.is_file() {
         return Ok(None);
@@ -722,9 +765,26 @@ pub fn delete_package(
     let mut deleted = Vec::new();
     let mut kept_shared = Vec::new();
     let mut deleted_rels: HashSet<String> = HashSet::new();
+    // ★★ 「在 user_dir 之下吗」必须**规范化之后**再比。
+    //
+    // `Path::starts_with` 是**组件前缀**比较且不做任何规范化：`user_dir/../../x` 的组件
+    // 序列以 user_dir 打头，它恒返回 true，随后 `remove_file` 把 `..` 交给操作系统解析——
+    // 守卫等于不存在。实测（2026-08-22）：方案里写 `path = "../victim.txt"`，删方案时
+    // user_dir 之外的那个文件确实被删掉了。
+    //
+    // 上游 `is_safe_rel` 已经把越界 rel 挡在 plan 之外，这里是**纵深第二道**：删除不可逆，
+    // 值得两道。canonicalize 失败即 bail 而不是继续——拿不准就别删。
+    let user_root = user_dir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("无法规范化用户方案目录 {}: {e}", user_dir.display()))?;
     for (rel, src) in &plan.pack {
-        if !src.starts_with(user_dir) {
-            continue; // 系统目录文件(如内置根方案)永不删
+        // 系统目录文件(如内置根方案)永不删；规范化失败(文件已消失/无权限)同样不删。
+        let inside = src
+            .canonicalize()
+            .map(|c| c.starts_with(&user_root))
+            .unwrap_or(false);
+        if !inside {
+            continue;
         }
         if kept.contains(rel) {
             kept_shared.push(rel.clone());
@@ -1841,5 +1901,110 @@ layout = "old"
         );
         let err = preview_import(&backup, &dest).unwrap_err().to_string();
         assert!(err.contains("备份包"), "误选备份包应有针对性提示: {err}");
+    }
+
+    // ───────── 方案文件**内容**里的越界路径（2026-08-22 实测三条腿）─────────
+    //
+    // 归档条目名的守卫（`import_rejects_path_traversal_and_wrong_kind`）拦不住这一类：
+    // 恶意包的条目名可以完全干净，越界路径藏在 `evil.schema.toml` 的**内容**里。
+    // 方案文件落盘之后容易被当成「本机配置」，可它是同一个包带进来的同一份外来数据。
+
+    /// 造一个条目名干净、内容越界的用户方案；同时在 user_dir 之外放一个受害文件。
+    fn evil_schema_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let user = root.join("schemas");
+        fs::create_dir_all(&user).unwrap();
+        let victim = root.join("victim.txt");
+        fs::write(&victim, "SECRET-CONTENT").unwrap();
+        fs::write(
+            user.join("evil.schema.toml"),
+            "[schema]\nid = \"evil\"\nversion = \"1.0\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\npath = \"../victim.txt\"\n",
+        )
+        .unwrap();
+        (user, victim)
+    }
+
+    /// ★★ 删除方案不得删掉 user_dir 之外的文件。
+    ///
+    /// 修复前实测：`DELETED = ["evil.schema.toml", "../victim.txt"]`，受害文件真没了。
+    /// 两道守卫各挡一层——`is_safe_rel` 让它进不了 plan，`delete_package` 里规范化后的
+    /// `starts_with` 是纵深第二道（原来那道是**词法**比较，对 `..` 恒为 true）。
+    #[test]
+    fn delete_never_escapes_user_dir_via_schema_content() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, victim) = evil_schema_fixture(t.path());
+
+        let r = delete_package("evil", &user, None, &[]).unwrap();
+        assert!(victim.exists(), "越界文件被删了：{:?}", r.deleted);
+        assert_eq!(
+            r.deleted,
+            vec!["evil.schema.toml"],
+            "只该删方案文件本身；越界引用不进删除清单"
+        );
+    }
+
+    /// ★★ 导出不得把 user_dir 之外的文件打进包——导出的包正是要发给别人的。
+    #[test]
+    fn export_never_packs_files_outside_user_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, _victim) = evil_schema_fixture(t.path());
+        let out = t.path().join("evil.wpkg");
+
+        let r = export_package("evil", &user, None, None, &out, "0.0.0", "windows", "t").unwrap();
+        assert_eq!(r.packed, vec!["evil.schema.toml"], "越界文件不得入包");
+        // 直接查 zip：`packed` 是我们自己填的，光看它等于自证。
+        let a = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
+        let names: Vec<String> = a.file_names().map(String::from).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("victim")),
+            "zip 里出现了越界文件: {names:?}"
+        );
+        // 越界引用要能被看见（否则「某个词库莫名其妙不在」无从查起）。
+        assert_eq!(r.missing, vec!["../victim.txt"], "越界引用应记进 missing");
+    }
+
+    /// 子方案 id 走的是同一道守卫：`engine.mixed.*_schema` 也是包作者写的字符串。
+    #[test]
+    fn mixed_subschema_id_cannot_escape() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let user = root.join("schemas");
+        fs::create_dir_all(&user).unwrap();
+        // user_dir 之外放一个「方案文件」，看 mixed 引用能不能把它拽进来
+        fs::write(
+            root.join("outside.schema.toml"),
+            "[schema]\nid = \"outside\"\n[engine]\ntype = \"codetable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            user.join("mix.schema.toml"),
+            "[schema]\nid = \"mix\"\nversion = \"1.0\"\n[engine]\ntype = \"mixed\"\n\
+             [engine.mixed]\nprimary_schema = \"../outside\"\n",
+        )
+        .unwrap();
+
+        let plan = collect_package_files("mix", &user, None, None, true).unwrap();
+        let packed: Vec<&str> = plan.pack.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(packed, vec!["mix.schema.toml"], "越界子方案不得被收集");
+        assert!(
+            plan.missing.iter().any(|m| m.contains("outside")),
+            "越界子方案应记进 missing: {:?}",
+            plan.missing
+        );
+    }
+
+    /// 反向对照：合法的子目录 rel（`my/main.dict.yaml`）必须照常收集。
+    /// 少了这条，把守卫写成「一律拒绝」也能让上面三条全绿。
+    #[test]
+    fn safe_rels_are_still_collected() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let plan = collect_package_files("my", &user, Some(&system), None, false).unwrap();
+        let packed: Vec<&str> = plan.pack.iter().map(|(r, _)| r.as_str()).collect();
+        assert!(
+            packed.contains(&"my/main.dict.yaml") && packed.contains(&"my/chaizi.txt"),
+            "合法子目录资源被误拦: {packed:?}"
+        );
     }
 }
