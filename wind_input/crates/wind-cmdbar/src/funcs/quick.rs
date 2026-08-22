@@ -69,10 +69,27 @@ fn parse_bool(func: &str, key: &str, v: &str) -> Result<bool> {
     }
 }
 
+/// 宽度/位数类参数的上限。
+///
+/// 三个消费者（`pad(pad=)`、`thou(group=)`、`pct(decimals=)`）都是**面向人写的排版常量**，
+/// 超过几百就一定是笔误。而它们各自会按这个数分配：`pad_left` 造 N 个字符，
+/// `format!("{:.*}", N, x)` 造 N 位小数——不设限时 `pct(decimals=99999999999)` 这一条
+/// 模板就能让求值线程卡在分配上。上限本身取多少不敏感（候选窗一行远放不下 512 字符，
+/// f64 超过 17 位有效数字之后全是舍入噪声），有界才是要点。
+const MAX_WIDTH_ARG: usize = 512;
+
 fn parse_width(func: &str, key: &str, v: &str) -> Result<usize> {
-    v.trim()
+    let n = v
+        .trim()
         .parse::<usize>()
-        .map_err(|_| CmdbarError::runtime(func, format!("{} 需要非负整数，得到 {:?}", key, v)))
+        .map_err(|_| CmdbarError::runtime(func, format!("{} 需要非负整数，得到 {:?}", key, v)))?;
+    if n > MAX_WIDTH_ARG {
+        return Err(CmdbarError::runtime(
+            func,
+            format!("{key} 过大（{n}，上限 {MAX_WIDTH_ARG}）"),
+        ));
+    }
+    Ok(n)
 }
 
 /// 左补零到 `width` 个字符（已够长则原样）。按 char 计数——中文数字模式下补零无意义，
@@ -308,13 +325,25 @@ fn fn_pct_named(ctx: &dyn EvalContext, _a: &[String], n: &[(String, String)]) ->
     let v: f64 = raw
         .parse()
         .map_err(|_| CmdbarError::runtime("pct", format!("内部值解析失败: {raw:?}")))?;
-    let mut s = format!("{:.*}", decimals, v * scale);
+    // 溢出成 ±inf / NaN 时不能照 format 出去：`{:.2}` 对它们给的是字面 "inf"/"NaN"，
+    // 拼上后缀就成了 "inf%" 这么一条谁也用不上的候选。$EXACT 本身恒有限
+    // （`render_calc` 用 `is_finite` 过过一道），所以非有限只可能来自 scale 写太大。
+    let scaled = v * scale;
+    if !scaled.is_finite() {
+        return Err(CmdbarError::runtime(
+            "pct",
+            format!("换算结果超出可表示范围（{v} × {scale}）"),
+        ));
+    }
+    let mut s = format!("{:.*}", decimals, scaled);
     if s.contains('.') {
         s = s.trim_end_matches('0').trim_end_matches('.').to_string();
     }
     Ok(format!("{s}{suffix}"))
 }
 
+/// `scale` 只查「是不是数字」，不设上下限：它不按值分配内存（宽度由 `decimals` 定），
+/// 而负数倍率、0 倍率都有正当用法。真正的越界只剩「乘出来不是有限数」，那在上面拦。
 fn parse_scale(func: &str, v: &str) -> Result<f64> {
     v.trim()
         .parse::<f64>()
@@ -594,6 +623,54 @@ mod tests {
         let c = ctx();
         assert!(fn_pct_named(&c, &[], &nm(&[("scale", "abc")])).is_err());
         assert!(fn_pct_named(&c, &[], &nm(&[("decimals", "-1")])).is_err());
+    }
+
+    /// ★ 宽度/位数类参数必须有上界。
+    ///
+    /// 三个消费者都会按这个数分配（`pad_left` 造 N 个字符、`format!("{:.*}")` 造 N 位
+    /// 小数），不设限时**一条模板就能让求值线程卡在分配上**。上限恰好那个值要放行、
+    /// 再多一个要拒——只测一个大数的话，把上限写成 1 也照样绿。
+    #[test]
+    fn width_args_are_bounded() {
+        let c = ctx();
+        for (func, key) in [("pct", "decimals"), ("pad", "pad"), ("thou", "group")] {
+            assert!(
+                parse_width(func, key, &MAX_WIDTH_ARG.to_string()).is_ok(),
+                "{func}({key}) 恰好等于上限应放行"
+            );
+            let over = (MAX_WIDTH_ARG + 1).to_string();
+            let err = parse_width(func, key, &over).expect_err("超上限应报错");
+            assert!(
+                err.to_string().contains(key),
+                "错误信息要点名是哪个参数：{err}"
+            );
+        }
+        // 走一遍真实调用链，证明拦截确实接在函数上而不只是那个 helper 里。
+        assert!(
+            fn_pct_named(&c, &[], &nm(&[("decimals", "99999999999")])).is_err(),
+            "pct 的 decimals 超限必须报错，而不是去分配一个天文数字长的字符串"
+        );
+    }
+
+    /// scale 写得过大时换算会溢出成 inf——不能照着 format 出去。
+    /// `{:.2}` 对 inf 给的是字面 "inf"，拼上后缀就是 "inf%" 这么一条谁也用不上的候选。
+    #[test]
+    fn percent_rejects_non_finite_result() {
+        let mut c = ctx();
+        c.vars.insert("EXACT", "1e300");
+        assert!(fn_pct_named(&c, &[], &nm(&[("scale", "1e300")])).is_err());
+        // 反向对照：同样是大数，只要乘出来仍是有限值就照常出结果——别把上面那条写成
+        // 「大数一律拒」。
+        //
+        // 不断言具体数字：`{:.*}` 打印的是 f64 的**精确**值，而最接近 1e300 的那个 double
+        // 并不是整十次幂，展开出来后半截全是尾数噪声（…5250476025520442…）。这里要钉的是
+        // 「没被拒、按定点展开了」，那就按形状断言。
+        let big = fn_pct_named(&c, &[], &nm(&[("scale", "1")])).unwrap();
+        assert!(
+            big.starts_with('1') && big.ends_with('%') && big.len() > 300,
+            "大但有限 → 照常展开，实得 {} 字符",
+            big.len()
+        );
     }
 
     /// ★ quick 函数名不得与既有内置函数重名。
