@@ -2663,6 +2663,7 @@ dependencies = [
  "wind-coordinator",
  "wind-engine",
  "wind-keys",
+ "wind-quick-input",
  "wind-reverse",
  "wind-store",
  "wind-theme",

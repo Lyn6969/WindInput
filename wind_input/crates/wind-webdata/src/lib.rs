@@ -4024,7 +4024,19 @@ mod tests {
         let (c, p) = quick_coord("list");
         let rows = quick_rows(&c);
         // 出厂表全部条目都在（含各类别）。
-        assert_eq!(rows.len(), 25, "出厂表 25 条，实际 {}", rows.len());
+        //
+        // 条数**对照内置表现取**，不写死数字：headless 无 data 目录 ⇒ 格式表回落
+        // `FormatTable::builtin()`，两边本就是同一份。写死数字的话，每次往出厂表加
+        // 条目这里都会红，而人只会把数字加一——那既没验证「有没有漏」，还平白多一次
+        // 无意义的改动。现在验的是真正该验的：**RPC 转换没吞掉也没重复任何条目**。
+        let builtin_count = wind_quick_input::FormatTable::builtin().entries().len();
+        assert_eq!(
+            rows.len(),
+            builtin_count,
+            "quick.list 应逐条转换出厂表，实际 {} 条对 {} 条",
+            rows.len(),
+            builtin_count
+        );
         for kind in ["date", "month_day", "year_month", "number", "calc"] {
             assert!(
                 rows.iter().any(|r| r["kind"] == json!(kind)),

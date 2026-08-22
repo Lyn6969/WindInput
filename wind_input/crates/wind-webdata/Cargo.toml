@@ -25,6 +25,8 @@ chrono = "0.4"
 fontdb = "0.22"
 
 [dev-dependencies]
+# 只供测试对照内置格式表条数（quick.list 不该漏条目）。
+wind-quick-input = { path = "../wind-quick-input" }
 wind-bridge = { path = "../wind-bridge" }
 # 手工构造 .wpkg 用（export_package 写不出带说明的 package.toml）；
 # 与 wind-transfer 同一版本，不引入新的外部依赖。
