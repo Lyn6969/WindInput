@@ -405,6 +405,9 @@ pub struct Behavior {
     pub always_show_pager: Option<bool>,
     pub show_page_number: Option<bool>,
     pub hide_pager: Option<bool>,
+    /// 竖排候选窗内容宽度上限，单位 **dp**（跟 `min_window_width_*` 等字段一致，渲染时按当前
+    /// 显示器 DPI 换算成设备 px）。0 或未配 = 不限。仅竖排布局生效；跟屏幕边界无关的另一层
+    /// 安全钳制（不越出显示器）由渲染层恒定施加，不受本字段控制。
     pub vertical_max_width: Option<i32>,
     /// 独立翻页栏行的水平对齐：left/center/right（默认 center）。仅竖排独立翻页栏行生效；
     /// 翻页栏并入编码栏时强制右对齐，不受此项影响。

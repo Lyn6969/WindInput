@@ -288,6 +288,35 @@ pub fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
     (x, y)
 }
 
+/// 给定屏幕坐标所在显示器的工作区宽度（设备 px），供候选窗内容宽度的「屏幕安全上限」使用——
+/// 防止异常长候选把窗口撑出屏幕外。与 [`clamp_to_work_area`] 同源（同一套 `MonitorFromPoint` +
+/// `rcWork` 查询），但那两个函数钳的是**窗口位置**，本函数给的是**宽度**上限，用途不同故不合并。
+///
+/// 非 Windows 下无显示器查询能力，返回 `None`——调用方需自行给一个保守的兜底值（当前唯一调用点
+/// [`CandidateWindow::screen_safety_max_width_px`] 已处理）。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn monitor_work_area_width_at(x: i32, y: i32) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT { x, y };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                return Some((wa.right - wa.left).max(0) as u32);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod clamp_rect_tests {
     use super::clamp_rect_in_bounds;

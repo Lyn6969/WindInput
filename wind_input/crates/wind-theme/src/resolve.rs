@@ -23,20 +23,26 @@ pub struct ResolvedBehavior {
     pub always_show_pager: bool,
     pub show_page_number: bool,
     pub hide_pager: bool,
+    /// 竖排候选窗宽度上限，单位 dp。0=不限——渲染层另有一道恒定的屏幕安全钳制兜底，
+    /// 不依赖本字段。
     pub vertical_max_width: i32,
     /// 独立翻页栏行水平对齐：left/center/right（默认 center）。
     pub pager_align: String,
 }
 
 impl Default for ResolvedBehavior {
-    /// 引擎内置基线（与 Go defaultBehavior 一致，零回归）。
+    /// 引擎内置基线。
+    ///
+    /// `vertical_max_width` 出厂值为 0（不限）：固定宽度上限裁切候选文字时不加省略号
+    /// （View 引擎不支持折行），改为不限后交给渲染层恒生效的屏幕安全钳制防越界，用户/主题若
+    /// 仍要美观类宽度上限可显式配置 `behavior.vertical_max_width`（单位 dp）覆盖。
     fn default() -> Self {
         Self {
             font_size: 18,
             always_show_pager: false,
             show_page_number: true,
             hide_pager: false,
-            vertical_max_width: 600,
+            vertical_max_width: 0,
             pager_align: String::from("center"),
         }
     }

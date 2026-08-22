@@ -18,7 +18,7 @@ use crate::sys::{
     SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
-use crate::text::dwrite::TextRenderer;
+use crate::text::dwrite::{TextRenderer, TextStyle};
 use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
 use wind_theme::DEFAULT_ACCENT_BAR_HEIGHT_RATIO;
 
@@ -384,12 +384,135 @@ impl CandidateWindow {
         Self::dp_to_px(dp, self.scale)
     }
 
+    /// 内容宽度的**屏幕安全上限**（设备 px，恒生效，不受排布方向/主题配置影响）。
+    ///
+    /// 与 `behavior.vertical_max_width`（主题的美观类上限，默认 0=不限、仅竖排生效）是两回事：
+    /// 那个可以关，这个不能关——它是最后一道防线，防止异常长候选（比如超长拼音产生的候选）把
+    /// 窗口撑出显示器边界，届时 `place_window`/`clamp_content_to_monitor` 就算把位置钳回屏内，
+    /// 窗口本身也已经宽到放不下、必然探出另一侧。
+    ///
+    /// Windows：查当前候选窗所在显示器的工作区宽度（精确、随屏幕/DPI 动态变化）。取点逻辑与
+    /// DPI 探测一致——固定位置模式按固定点取，否则按光标点取，因为固定位置可能落在与光标
+    /// 不同缩放/不同显示器的另一块屏上。
+    ///
+    /// 非 Windows：本地服务进程查不到系统显示器几何（真正的屏幕钳制在 `.app` 侧用
+    /// `NSScreen.visibleFrame` 做，但那只管窗口**位置**、不管内容**宽度**——见
+    /// [`crate::sys::clamp_content_to_monitor`] 文档），故退化为一个保守的固定安全值兜底：
+    /// 不追求精确，只保证不会出现「宽到完全没法用」的窗口。
+    /// TODO: 后续应通过 IPC 把 `.app` 侧的真实屏幕宽度传回来，替换这个兜底常量。
+    fn screen_safety_max_width_px(&self) -> u32 {
+        #[cfg(windows)]
+        {
+            let (px, py) = match self.fixed_pos {
+                Some(f) if f != (0, 0) => f,
+                _ => (self.x, self.y),
+            };
+            if let Some(w) = crate::sys::monitor_work_area_width_at(px, py) {
+                return w;
+            }
+            tracing::warn!(
+                "screen_safety_max_width_px: monitor query failed at ({px},{py}), 退化到兜底常量"
+            );
+        }
+        const FALLBACK_SAFETY_DP: u32 = 3000;
+        Self::dp_to_px(FALLBACK_SAFETY_DP, self.scale)
+    }
+
     /// dp（逻辑像素）→ 设备像素，0 原样返回（0 是「不限」而非「0 像素」）。
     fn dp_to_px(dp: u32, scale: f32) -> u32 {
         if dp == 0 {
             return 0;
         }
         (dp as f32 * scale).ceil().max(1.0) as u32
+    }
+
+    /// 构造与 [`crate::view::View`] 叶子**完全同构**的测量样式。
+    ///
+    /// ★ 测量与渲染必须用同一套样式，否则宽度不是一个数：`View::text_style()` 取的是叶子上
+    /// 挂的 `font_family`/`font_weight`，主题配了 `[text] font_family`、或候选选中加粗
+    /// （`[item.selected].font_weight`）时，用 `TextStyle::new(size)`（默认字族 + 细体）
+    /// 算出来的预算会系统性偏离实际排版宽度——预算按细体算、排版按粗体走，差值累积成窗口
+    /// 右侧留白或右缘溢出。
+    ///
+    /// 归一化规则照抄 `View::font_weight`（`>0` 才生效）与 `View::font_family`（非空才生效），
+    /// 少一条就还是两套样式。
+    fn measure_style(fs: f32, weight: i32, family: Option<&str>) -> TextStyle<'_> {
+        TextStyle {
+            family: family.filter(|s| !s.trim().is_empty()),
+            size: fs,
+            weight: if weight > 0 { weight } else { 0 },
+        }
+    }
+
+    /// 按目标像素宽度截断文本：超出则截到刚好放得下「前缀+…」的最长前缀，未超出原样返回。
+    ///
+    /// 只用于**显示层**（候选文字/编码栏）——截的是渲染用的显示副本，不改 `self.candidates`/
+    /// `self.preedit` 本身，选中上屏、退格删字等仍走未截断的原文，不受影响。
+    ///
+    /// 按像素二分而非按字符数：汉字宽、字母窄，字符数相同不代表像素宽度相同（`max_chars` 那条
+    /// 按字符数截断的路径是另一回事，见 `wind-config` 的 `truncate_display`）。
+    ///
+    /// `style` 必须由 [`Self::measure_style`] 按目标叶子的字族/字重构造，理由见该函数。
+    ///
+    /// ⚠️ `max_w <= 0`（预算被行内其它成员吃光）语义是**截到最短**（1 字 + …），不是「不截断」：
+    /// 后者与预算耗尽的含义正好相反，会把溢出放大而非收敛。
+    fn truncate_text_for_width(&self, text: &str, style: &TextStyle, max_w: f32) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        if max_w > 0.0 && self.text_renderer.measure(text, style).width <= max_w {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        // 二分找刚好放得下「前 mid 字 + …」的最大 mid（单调：mid 越大越宽，可二分）。
+        // max_w <= 0 时 hi=0，直接落到下面的「至少留一个字」。
+        let (mut lo, mut hi) = (0usize, if max_w > 0.0 { chars.len() } else { 0 });
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let probe: String = chars[..mid].iter().chain(['…'].iter()).collect();
+            if self.text_renderer.measure(&probe, style).width <= max_w {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        // 连一个字符 + 省略号都放不下时至少保留一个字符，不然什么都看不见。
+        let keep = lo.max(1).min(chars.len());
+        chars[..keep].iter().chain(['…'].iter()).collect()
+    }
+
+    /// 最大最小公平分配（water-filling）：把总额 `total` 分给 `demands`，需求低于均分份额的
+    /// **原样满足**、把没用完的份额让给需求大的，需求大的平分剩余。返回与 `demands` 等长同序
+    /// 的分配结果，`floor` 是每项最低保障。
+    ///
+    /// ★ 为什么横排必须用它而不是「先到先得」的贪心：每个候选除文字外还有一份**无条件计入**的
+    /// 固定开销（item 内边距 / 序号 / 注释 / 候选间隙），贪心下第一个候选吃光预算后，后面每个
+    /// 候选仍各自加上「固定开销 + 文字下限」，累加必然突破任何上限——真机实测 9 个候选溢出约
+    /// 1100px。本函数保证：只要 `total >= 0` 且不触发 `floor`，`Σ result ≤ total` 恒成立，
+    /// **与项数无关**，这正是贪心给不了的性质。
+    ///
+    /// `floor` 触发时（固定开销本身已超预算）总和可能超出 `total`——那是无解情形下的取舍：
+    /// 宁可溢出被裁掉，也不能少显示候选（选中键位与协调器下发的候选列表绑定，少一个会让用户
+    /// 按 8 选到错的词）。
+    fn water_fill(demands: &[f32], total: f32, floor: f32) -> Vec<f32> {
+        let n = demands.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        // 按需求升序处理：先满足小需求，余量自然滚给后面的大需求。
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|a, b| demands[*a].total_cmp(&demands[*b]));
+        let mut out = vec![0.0f32; n];
+        let mut remaining = total;
+        for (k, &i) in idx.iter().enumerate() {
+            let share = remaining / (n - k) as f32;
+            let give = demands[i].min(share).max(floor);
+            out[i] = give;
+            // 扣**实际给出**的量（而非未经 floor 的理论份额）：floor 生效时余额要跟着少，
+            // 否则后面各项会按虚高的余额再算份额，超额层层放大。
+            remaining = (remaining - give).max(0.0);
+        }
+        out
     }
 
     /// 设置候选字体族（来自 ui.font.family；空=默认 Microsoft YaHei UI）。
@@ -701,17 +824,26 @@ impl CandidateWindow {
         root.layout(ml as f32, mt as f32, &self.text_renderer);
         let (w_f, h_f) = root.measured_size();
         let mut content_w = (w_f.ceil() as u32).max(40);
-        // 竖排最大宽度（behavior.vertical_max_width 逻辑 px，>0 生效）：钳制窗口宽度上限。
-        // 本 View 引擎不支持文本折行，超宽候选在窗口右缘裁切（draw_text 按缓冲宽度裁剪）。
+        // 竖排最大宽度（behavior.vertical_max_width，单位 dp，默认 0=不限）：仅在用户/主题
+        // 显式配置正值时生效。本 View 引擎不支持文本折行，超宽候选在窗口右缘裁切（draw_text
+        // 按缓冲宽度裁剪，无省略号）——下面 screen_safety_max_width_px 是恒生效的另一道独立
+        // 防线，两者不是同一回事。
         if self.vertical && !self.candidates.is_empty() {
             let vmax = self.theme.behavior.vertical_max_width;
             if vmax > 0 {
-                let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
+                // 单位 dp，换算复用 dp_to_px（与 min_window_width_* 等字段同一套算法）。
+                let vmax_px = Self::dp_to_px(vmax as u32, self.scale).max(40);
                 // 下限优先于上限：用户显式配的抗抖动宽度不该被主题的裁切上限压回去。
                 // 见 [`CandidateWindow::min_window_w_px`]（未配 min 时该值为 0，行为不变）。
                 content_w = content_w.min(vmax_px.max(self.min_window_w_px()));
             }
         }
+        // 屏幕安全上限：横竖排都生效，防止异常长候选（如超长拼音产生的候选）把窗口撑出
+        // 显示器边界。与上面的主题上限是两条独立防线，见 screen_safety_max_width_px 文档。
+        // 钳的对象须是「屏幕能放下的内容宽度」= 屏幕宽度 − 阴影扩边（下方 width 还要再加回
+        // ml+mr），否则加回扩边后窗口仍会探出屏幕（Windows 真机已实测命中此坑）。
+        let safety_max_w = self.screen_safety_max_width_px().saturating_sub(ml + mr);
+        content_w = content_w.min(safety_max_w.max(self.min_window_w_px()));
         let content_h = (h_f.ceil() as u32).max(24);
         let width = content_w + ml + mr;
         let height = content_h + mt + mb;
@@ -866,12 +998,19 @@ impl CandidateWindow {
         if self.vertical && !self.candidates.is_empty() {
             let vmax = self.theme.behavior.vertical_max_width;
             if vmax > 0 {
-                let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
+                // 单位 dp，换算复用 dp_to_px（与 min_window_width_* 等字段同一套算法）。
+                let vmax_px = Self::dp_to_px(vmax as u32, self.scale).max(40);
                 // 下限优先于上限：用户显式配的抗抖动宽度不该被主题的裁切上限压回去。
                 // 见 [`CandidateWindow::min_window_w_px`]（未配 min 时该值为 0，行为不变）。
                 content_w = content_w.min(vmax_px.max(self.min_window_w_px()));
             }
         }
+        // 屏幕安全上限：横竖排都生效，防止异常长候选（如超长拼音产生的候选）把窗口撑出
+        // 显示器边界。与上面的主题上限是两条独立防线，见 screen_safety_max_width_px 文档。
+        // 钳的对象须是「屏幕能放下的内容宽度」= 屏幕宽度 − 阴影扩边（下方 width 还要再加回
+        // ml+mr），否则加回扩边后窗口仍会探出屏幕（Windows 真机已实测命中此坑）。
+        let safety_max_w = self.screen_safety_max_width_px().saturating_sub(ml + mr);
+        content_w = content_w.min(safety_max_w.max(self.min_window_w_px()));
         let content_h = (h_f.ceil() as u32).max(24);
         let width = content_w + ml + mr;
         let height = content_h + mt + mb;
@@ -1034,11 +1173,34 @@ impl CandidateWindow {
         if self.vertical && !self.candidates.is_empty() {
             let vmax = self.theme.behavior.vertical_max_width;
             if vmax > 0 {
-                let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
+                // 单位 dp，换算复用 dp_to_px（与 min_window_width_* 等字段同一套算法）。
+                let vmax_px = Self::dp_to_px(vmax as u32, self.scale).max(40);
                 // 下限优先于上限：用户显式配的抗抖动宽度不该被主题的裁切上限压回去。
                 // 见 [`CandidateWindow::min_window_w_px`]（未配 min 时该值为 0，行为不变）。
                 content_w = content_w.min(vmax_px.max(self.min_window_w_px()));
             }
+        }
+        // 屏幕安全上限：横竖排都生效，防止异常长候选（如超长拼音产生的候选）把窗口撑出
+        // 显示器边界。与上面的主题上限是两条独立防线，见 screen_safety_max_width_px 文档。
+        // 钳的对象须是「屏幕能放下的内容宽度」= 屏幕宽度 − 阴影扩边（下方 width 还要再加回
+        // ml+mr）——直接拿 content_w 跟屏幕整宽比，加回扩边后窗口仍会探出屏幕（已实测命中：
+        // natural=5195 safety_max=3840 clamped=3840，但 width=clamped+ml+mr 已经超了 3840）。
+        let safety_max_w = self.screen_safety_max_width_px().saturating_sub(ml + mr);
+        let content_w_before_safety = content_w;
+        content_w = content_w.min(safety_max_w.max(self.min_window_w_px()));
+        // 正常情况下 `build_tree` 已按同一套预算把文字裁到位，这里量出来的自然宽本就在上限内，
+        // 钳制是恒不生效的兜底。**只在它真的生效时才记日志**——那意味着预算算漏了行内某个成员
+        // （这正是横排内联编码/徽标/翻页栏曾被漏算的形态），是需要看见的异常，不是每帧噪音。
+        if content_w < content_w_before_safety {
+            tracing::debug!(
+                "candidate width safety-clamp 生效（预算漏算？）: natural={} safety_max_content={} clamped={} margin_lr={} scale={:.2} vertical={}",
+                content_w_before_safety,
+                safety_max_w,
+                content_w,
+                ml + mr,
+                self.scale,
+                self.vertical
+            );
         }
         let content_h = (h_f.ceil() as u32).max(24);
         let width = content_w + ml + mr;
@@ -1577,10 +1739,23 @@ impl CandidateWindow {
     /// 故移动光标不会让编码位移。曾把文本拆成「前半 + 竖线 + 后半」三节点，因
     /// `measure(a+b) != measure(a)+measure(b)`（字距在拆分边界丢失 + 每段各自舍入）、
     /// 且拆分点随光标而变，导致整串宽度抖动、字符跟着晃。
-    fn preedit_view(&self, fs: f32) -> View {
+    /// `max_w`：显示层截断预算（设备 px）——超长编码（如超长拼音打字缓冲）按此宽度截断加省略
+    /// 号，不影响 `self.preedit`/`self.preedit_caret` 本身。`caret_at` 自身会把插入符位置钳到
+    /// 截断后字符串的合法边界内（见 `View::caret_at`），故截断字符串后原样传入光标位置即可，
+    /// 不需要额外调整。
+    fn preedit_view(&self, fs: f32, max_w: f32) -> View {
         let v = &self.theme.views;
+        let display = self.truncate_text_for_width(
+            &self.preedit,
+            &Self::measure_style(
+                fs,
+                v.preedit_bar.font_weight,
+                v.preedit_bar.font_family.as_deref(),
+            ),
+            max_w,
+        );
         View::leaf(
-            self.preedit.clone(),
+            display,
             v.preedit_bar.text_color.unwrap_or([100, 100, 100, 255]),
         )
         .font_size(fs)
@@ -1644,6 +1819,38 @@ impl CandidateWindow {
             b: e.bottom.map(|x| x.resolve(s, 0.0)).unwrap_or(d[2] * s),
             l: e.left.map(|x| x.resolve(s, 0.0)).unwrap_or(d[3] * s),
         };
+        let window_pad = edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]);
+        // 内容宽度预算（设备 px）：与渲染入口钳 `content_w` 用的是**同一套算法**（主题
+        // vertical_max_width ⊕ 恒生效的屏幕安全网），提前在这里算出来是为了在下面构建候选/
+        // 编码栏文字节点时就按预算裁字（带省略号）——而不是等测完整棵树的自然宽度再回头夹
+        // 窗口整体尺寸：那样只夹得住窗口 buffer，夹不到文字本身，超宽文字仍会被
+        // `draw_text` 的直角缓冲区裁剪一路画到窗口右缘，把圆角盖掉（见
+        // project_candidate_screen_safety_width 记忆里的真机实测记录）。
+        let content_budget_px: f32 = {
+            let (ml, _, mr, _) = match self.shadow_params() {
+                Some(sh) => sh.margins(),
+                None => (0, 0, 0, 0),
+            };
+            let mut bound = self.screen_safety_max_width_px().saturating_sub(ml + mr);
+            if self.vertical && !self.candidates.is_empty() {
+                let vmax = t.behavior.vertical_max_width;
+                if vmax > 0 {
+                    bound = bound.min(Self::dp_to_px(vmax as u32, s).max(40));
+                }
+            }
+            bound.max(self.min_window_w_px()) as f32
+        };
+        let preedit_pad = edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]);
+        // 文字宽度下限：预算被行内其它成员吃光时每个文字节点仍保底这么宽，避免退化成
+        // 「一个字都不显示」。触发它意味着无解（固定开销已超预算），见 [`Self::water_fill`]。
+        let min_text_w = 20.0 * s;
+        // **独立**编码栏（`!preedit_embedded`）的文字预算：它是 root 这个 Column 的直接子节点、
+        // 自成一行，不与候选抢宽度，故只需扣窗口内边距与自身内边距。
+        // 内联编码（`preedit_embedded`）走的是另一条路——它在候选行里，预算由下方的统一分配
+        // （横排 water-filling）给出。
+        let preedit_bar_text_budget_px =
+            (content_budget_px - window_pad.l - window_pad.r - preedit_pad.l - preedit_pad.r)
+                .max(min_text_w);
         // 状态 patch 取色（selected/hover 的 bg/text，None patch 或缺色→兜底）。
         let patch_bg =
             |p: &Option<Box<RvNode>>, d: [u8; 4]| p.as_ref().and_then(|n| n.bg_color).unwrap_or(d);
@@ -1777,7 +1984,7 @@ impl CandidateWindow {
                 dim(v.window.border_width, 1.0).max(1.0),
             )
             .radius(dim(v.window.border_radius, 8.0))
-            .pad(edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]))
+            .pad(window_pad)
             // band 间距（预编辑条↔候选列表↔翻页）= 主题 candidate_list.band_gap，未配→0（与 Go 一致）。
             .gap(dim(v.window_gap, 0.0))
             // ── 窗口尺寸下限（ui.candidate.min_window_width_* / min_window_height_*）──
@@ -1826,9 +2033,9 @@ impl CandidateWindow {
                     v.preedit_bar.border_radius.or(v.item.border_radius),
                     4.0,
                 ))
-                .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
+                .pad(preedit_pad)
                 .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
-                .child(self.preedit_view(preedit_fs));
+                .child(self.preedit_view(preedit_fs, preedit_bar_text_budget_px));
             if let Some(vi) = self.rv_image(v.preedit_bar.bg_image.as_ref()) {
                 band = band.bg_image(vi);
             }
@@ -1926,6 +2133,7 @@ impl CandidateWindow {
         // 并排成单行，高度 = 一个候选行，与横排一致；否则竖排下徽标行与占位行会纵向
         // 堆叠致提示窗口过高（网址/临拼/临英刚进入时尤甚）。preedit/徽标分隔方向亦随之。
         let list_vertical = self.vertical && !self.candidates.is_empty();
+        let list_pad = edges_or(&v.candidate_list.padding, [0.0; 4]);
         // candidate_list 此前只贡献 gap/row_gap/band_gap 三个间距，背景与边框从不接线，
         // 「候选区与编码栏用不同底色分区」这类设计表达不出来。装饰全 Option，未配零回归。
         let mut list = decorate_box(
@@ -1940,9 +2148,211 @@ impl CandidateWindow {
             }
             // 候选区内边距（默认全 0=零回归）。footer_bar 不加这项——它的 padding
             // 已被翻页箭头消费（fpad），容器再加一层会双重生效。
-            .pad(edges_or(&v.candidate_list.padding, [0.0; 4])),
+            .pad(list_pad),
             &v.candidate_list,
         );
+
+        // ══ 文字宽度预算分配 ══
+        // 竖排：每候选独占一行、互不竞争，各自可用满整行预算。
+        // 横排：内联编码 + 候选们 + 模式徽标 + 翻页栏全挤在同一个 Row 里共享一行宽度，
+        //   必须按最大最小公平（water-filling）分配，理由与「为什么不能贪心」见
+        //   [`Self::water_fill`]。徽标与翻页栏不截断（本就短、且截了没意义），按实际宽度
+        //   从预算里**预留**掉。
+        let text_pad = edges_or(&v.text.padding, [0.0; 4]);
+        // 逆序仅改排列顺序；i 仍是原始索引（tag/标签/选中据此）。提前到此是因为下面的预扫
+        // 要按最终顺序算每个候选的固定开销。
+        let mut order: Vec<(usize, &CandidateItem)> = self.candidates.iter().enumerate().collect();
+        if flip_cands {
+            order.reverse();
+        }
+        // 每候选的「固定开销」（除文字外无条件占用的宽度）与「自然文字宽」。
+        // 一律用 [`Self::measure_style`] 按各节点真实字族/字重量，与渲染同源。
+        let gap_w = if list_vertical { 0.0 } else { box_gap };
+        let cand_metrics: Vec<(f32, f32)> = order
+            .iter()
+            .map(|(i, cand)| {
+                let is_sel = *i == self.selected;
+                let is_hover = self.hover >= 0 && self.hover as usize == *i;
+                let idx_w = if cand.no_index {
+                    0.0
+                } else {
+                    let marker = if cand.label.is_empty() {
+                        (i + 1).to_string()
+                    } else {
+                        cand.label.clone()
+                    };
+                    let ip = edges_or(&v.index.padding, [0.0; 4]);
+                    let im = edges_or(&v.index.margin, [0.0; 4]);
+                    let base = if index_circle {
+                        // 圆圈样式是 fixed_w 方块，与文字宽度无关。
+                        (index_fs * 1.5).round()
+                    } else {
+                        self.text_renderer
+                            .measure(
+                                &marker,
+                                &Self::measure_style(
+                                    index_fs,
+                                    eff_weight(&v.index, &v.item, is_sel, is_hover),
+                                    v.index.font_family.as_deref(),
+                                ),
+                            )
+                            .width
+                    };
+                    base + ip.l + ip.r + im.l + im.r
+                };
+                let comment_w = if cand.comment.is_empty() {
+                    0.0
+                } else {
+                    let cp = edges_or(&v.comment.padding, [0.0; 4]);
+                    let cm = edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]);
+                    self.text_renderer
+                        .measure(
+                            &cand.comment,
+                            &Self::measure_style(
+                                comment_fs,
+                                eff_weight(&v.comment, &v.item, is_sel, is_hover),
+                                v.comment.font_family.as_deref(),
+                            ),
+                        )
+                        .width
+                        + cp.l
+                        + cp.r
+                        + cm.l
+                        + cm.r
+                };
+                let tm = if cand.no_index {
+                    Edges::default()
+                } else {
+                    edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])
+                };
+                let fixed = item_pad.l
+                    + item_pad.r
+                    + idx_w
+                    + comment_w
+                    + text_pad.l
+                    + text_pad.r
+                    + tm.l
+                    + tm.r
+                    + gap_w;
+                let natural = self
+                    .text_renderer
+                    .measure(
+                        &visible_whitespace(&cand.text),
+                        &Self::measure_style(
+                            text_fs,
+                            eff_weight(&v.text, &v.item, is_sel, is_hover),
+                            v.text.font_family.as_deref(),
+                        ),
+                    )
+                    .width;
+                (fixed, natural)
+            })
+            .collect();
+        // 整行可用宽度（已扣窗口与候选区内边距）。
+        let row_budget =
+            (content_budget_px - window_pad.l - window_pad.r - list_pad.l - list_pad.r).max(0.0);
+        // 横排下内联编码也在同一行里跟候选抢宽度，故作为分配参与者一并纳入；竖排它自成一行，
+        // 走独立预算不参与竞争。
+        let preedit_competes = !list_vertical && self.preedit_embedded && !self.preedit.is_empty();
+        let preedit_natural = if self.preedit.is_empty() {
+            0.0
+        } else {
+            self.text_renderer
+                .measure(
+                    &self.preedit,
+                    &Self::measure_style(
+                        preedit_fs,
+                        v.preedit_bar.font_weight,
+                        v.preedit_bar.font_family.as_deref(),
+                    ),
+                )
+                .width
+        };
+        // 横排行内两个**不截断**的成员，按实际宽度预留：
+        //  - 模式徽标：短（拼/双/英…），截了反而认不出
+        //  - 翻页栏：定宽（两个箭头 + 页码），截了就没法点
+        let preedit_bar_shown_pre = !self.preedit.is_empty() && !self.preedit_embedded;
+        let mode_label_row_w =
+            if !list_vertical && !self.mode_label.is_empty() && !preedit_bar_shown_pre {
+                let ml_fs = node_fs(&v.mode_label);
+                let chip_pad = if v.mode_label.bg_color.is_some()
+                    || eff_border(&v.mode_label, false, false).is_some()
+                {
+                    let p = edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]);
+                    p.l + p.r
+                } else {
+                    0.0
+                };
+                self.text_renderer
+                .measure(
+                    &self.mode_label,
+                    &Self::measure_style(
+                        ml_fs,
+                        v.mode_label.font_weight,
+                        v.mode_label.font_family.as_deref(),
+                    ),
+                )
+                .width
+                + chip_pad
+                + 12.0 * s // 装配段给的右留白
+                + box_gap
+            } else {
+                0.0
+            };
+        let pager_row_w = if !list_vertical && !pager_will_inline && self.pager_visible() {
+            let footer_fs = node_fs(&v.footer_bar);
+            let fpad = edges_or(&v.footer_bar.padding, [0.0, 6.0, 0.0, 6.0]);
+            let fmargin = edges_or(&v.footer_bar.margin, [0.0, 0.0, 0.0, 8.0]);
+            let num_w = if self.page_number_visible() {
+                self.text_renderer
+                    .measure(
+                        &format!("{}/{}", self.page, self.total_pages),
+                        &Self::measure_style(
+                            footer_fs,
+                            v.footer_bar.font_weight,
+                            v.footer_bar.font_family.as_deref(),
+                        ),
+                    )
+                    .width
+            } else {
+                0.0
+            };
+            // 两个箭头各 arrow_w = 字号 + 左右 padding（见下方 pager 构造）。
+            2.0 * (footer_fs + fpad.l + fpad.r) + num_w + fmargin.l + fmargin.r + box_gap
+        } else {
+            0.0
+        };
+        // 分配：参与者 = [内联编码(仅横排下与候选同行)] + 候选们。
+        let (inline_preedit_budget_px, cand_text_budgets) = if list_vertical {
+            // 竖排：内联编码与每个候选各占一行、互不竞争，都用满整行预算（保持既有行为）。
+            (
+                (row_budget - preedit_pad.l).max(min_text_w),
+                cand_metrics
+                    .iter()
+                    .map(|(fixed, _)| (row_budget - fixed).max(min_text_w))
+                    .collect::<Vec<f32>>(),
+            )
+        } else {
+            let preedit_fixed = if preedit_competes {
+                preedit_pad.l + 16.0 * s + box_gap // 左缩进 + 装配段右留白 + 间隙
+            } else {
+                0.0
+            };
+            let fixed_sum: f32 = cand_metrics.iter().map(|(f, _)| *f).sum();
+            let avail = row_budget - mode_label_row_w - pager_row_w - fixed_sum - preedit_fixed;
+            let mut demands: Vec<f32> = Vec::with_capacity(cand_metrics.len() + 1);
+            if preedit_competes {
+                demands.push(preedit_natural);
+            }
+            demands.extend(cand_metrics.iter().map(|(_, n)| *n));
+            let alloc = Self::water_fill(&demands, avail, min_text_w);
+            if preedit_competes {
+                (alloc[0], alloc[1..].to_vec())
+            } else {
+                ((row_budget - preedit_pad.l).max(min_text_w), alloc)
+            }
+        };
+
         // 内联编码的"沉底"（swap_preedit_when_above 在首单元内联下的落点）：
         // 内联模式没有独立编码栏可参与末尾那段 band/list 交换装配，编码是 list 的首个子节点。
         // 横排下首单元 = 行首（最左），与上下无关，开关本就无意义 → 不参与；
@@ -1957,7 +2367,7 @@ impl CandidateWindow {
         // 横排右留白、竖排下留白（沉底时翻到上留白，否则会紧贴末个候选）。
         if self.preedit_embedded && !self.preedit.is_empty() {
             // 左缩进与独立条模式一致：取 preedit_bar.padding.left，避免编码贴窗口左缘。
-            let pe_left = edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]).l;
+            let pe_left = preedit_pad.l;
             let sep = if list_vertical {
                 let gap = 6.0 * s;
                 Edges {
@@ -1973,7 +2383,9 @@ impl CandidateWindow {
                     ..Edges::default()
                 }
             };
-            let node = self.preedit_view(preedit_fs).margin(sep);
+            let node = self
+                .preedit_view(preedit_fs, inline_preedit_budget_px)
+                .margin(sep);
             if inline_preedit_bottom {
                 inline_tail.push(node);
             } else {
@@ -2083,12 +2495,8 @@ impl CandidateWindow {
             }
         }
 
-        // 逆序仅改排列顺序；i 仍是原始索引（tag/标签/选中据此）
-        let mut order: Vec<(usize, &CandidateItem)> = self.candidates.iter().enumerate().collect();
-        if flip_cands {
-            order.reverse();
-        }
-        for (i, cand) in order {
+        // `order` 与每候选的文字预算 `cand_text_budgets` 已在上方预扫阶段算好（k 与之同序）。
+        for (k, (i, cand)) in order.into_iter().enumerate() {
             let is_sel = i == self.selected;
             let is_hover = self.hover >= 0 && self.hover as usize == i;
             // 状态文字色（选中/悬停各自的色，回退基态）。
@@ -2114,14 +2522,16 @@ impl CandidateWindow {
                 } else {
                     cand.label.clone()
                 };
+                let idx_pad = edges_or(&v.index.padding, [0.0; 4]);
+                let idx_margin = edges_or(&v.index.margin, [0.0; 4]);
                 let idx_color = eff_text(&v.index, index_color, is_sel, is_hover);
                 // 圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
                 let mut idx_leaf = View::leaf(marker, idx_color)
                     .font_size(index_fs)
                     .font_weight(eff_weight(&v.index, &v.item, is_sel, is_hover))
                     .font_family(v.index.font_family.clone())
-                    .pad(edges_or(&v.index.padding, [0.0; 4]))
-                    .margin(edges_or(&v.index.margin, [0.0; 4]));
+                    .pad(idx_pad)
+                    .margin(idx_margin);
                 if index_circle {
                     let d = (index_fs * 1.5).round();
                     idx_leaf = idx_leaf
@@ -2141,11 +2551,21 @@ impl CandidateWindow {
             } else {
                 edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])
             };
-            let mut tleaf = View::leaf(visible_whitespace(&cand.text).into_owned(), txt_color)
+            // 文字预算来自上方的统一分配（竖排=整行独占，横排=water-filling 公平份额）。
+            let display_text = self.truncate_text_for_width(
+                &visible_whitespace(&cand.text),
+                &Self::measure_style(
+                    text_fs,
+                    eff_weight(&v.text, &v.item, is_sel, is_hover),
+                    v.text.font_family.as_deref(),
+                ),
+                cand_text_budgets.get(k).copied().unwrap_or(min_text_w),
+            );
+            let mut tleaf = View::leaf(display_text, txt_color)
                 .font_size(text_fs)
                 .font_weight(eff_weight(&v.text, &v.item, is_sel, is_hover))
                 .font_family(v.text.font_family.clone())
-                .pad(edges_or(&v.text.padding, [0.0; 4]))
+                .pad(text_pad)
                 .margin(text_margin);
             // 文字叶子的背景（底色/图/渐变）：此前只画边框，配了背景一律不生效，
             // 「文字药丸」这类样式做不出来。圆角由下面的 eff_border 一并给。
@@ -3219,6 +3639,385 @@ mod min_size_tests {
         w.scale = 2.0;
         assert_eq!((w.min_window_w_px(), w.min_window_h_px()), (400, 300));
         assert_eq!(CandidateWindow::dp_to_px(0, 2.0), 0, "0 恒为「不限」");
+    }
+}
+
+/// 宽度上限：**整棵树**都不得超过屏幕安全上限。
+///
+/// ★ 与 [`min_size_tests`] 不同，本组**不 gate 平台**——断言的是不等式（行宽 ≤ 上限）而非
+/// 具体像素值，与文本后端量出多宽无关，故真实 DirectWrite 与 mock 下同样成立。上限也不写死
+/// 常量，直接取 `screen_safety_max_width_px()`，于是 Windows 下用真实屏幕宽、其它平台用兜底
+/// 常量，两边都是有效断言。
+#[cfg(test)]
+mod width_budget_tests {
+    use super::*;
+
+    fn cand(text: &str) -> CandidateItem {
+        CandidateItem {
+            text: text.to_string(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: String::new(),
+            comment: String::new(),
+            no_index: false,
+        }
+    }
+
+    /// 造一个候选窗并布局，返回 (窗口, 内容宽)。scale 钉 1.0 使 dp == 设备像素。
+    fn build(vertical: bool, texts: &[&str]) -> (CandidateWindow, View) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_vertical(vertical);
+        let items: Vec<CandidateItem> = texts.iter().map(|t| cand(t)).collect();
+        w.update("", 0, "", items, 0, -1, 1, 1);
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        (w, root)
+    }
+
+    /// ★★ 横排多候选：**整行**宽度不得超过屏幕安全上限——与候选个数无关。
+    ///
+    /// 这是「先到先得」贪心分配翻车的直接回归：那种做法下第一个候选吃光预算，其后每个候选
+    /// 仍各自加上「固定开销（item 内边距/序号/间隙）+ 文字下限」，累加必然突破上限，真机 9 个
+    /// 候选实测溢出约 1100px。★ 逐个候选看都「没超自己的预算」，**只有按整行断言才测得出来**
+    /// ——所以这里量的是 `build_tree` 产物的总宽，而不是任何单个候选的宽度。
+    #[test]
+    fn horizontal_row_never_exceeds_screen_budget_for_any_candidate_count() {
+        let long = "超长候选".repeat(200); // 800 字，远超任何屏幕宽度
+        for n in 1..=12usize {
+            let texts: Vec<&str> = (0..n).map(|_| long.as_str()).collect();
+            let (w, root) = build(false, &texts);
+            let cap = w.screen_safety_max_width_px() as f32;
+            let got = root.measured_size().0;
+            assert!(
+                got <= cap + 0.5,
+                "{n} 个超长候选横排时整行宽 {got} 超出上限 {cap}"
+            );
+        }
+    }
+
+    /// 横排「一条长整句 + 若干短词」——最常见的形态：短词必须**原样显示不被误截**，长句吃掉
+    /// 剩余空间。一刀切均分会把长句压到 1/n（明明还有大把空间），water-filling 才有这个性质。
+    #[test]
+    fn horizontal_short_candidates_survive_next_to_a_long_one() {
+        let long = "长".repeat(500);
+        let mut texts: Vec<&str> = vec![long.as_str()];
+        texts.extend(["你好", "世界", "输入", "法"]);
+        let (w, root) = build(false, &texts);
+        assert!(
+            root.measured_size().0 <= w.screen_safety_max_width_px() as f32 + 0.5,
+            "整行仍不得超上限"
+        );
+        let mut in_tree = Vec::new();
+        collect_texts(&root, &mut in_tree);
+        for short in ["你好", "世界", "输入", "法"] {
+            assert!(
+                in_tree.iter().any(|t| t == short),
+                "短候选 {short} 不该被截断，树内文本：{in_tree:?}"
+            );
+        }
+    }
+
+    /// 竖排：每候选独占一行、各自用满整行预算，行宽同样不得超上限。
+    #[test]
+    fn vertical_rows_never_exceed_screen_budget() {
+        let long = "超长候选".repeat(200);
+        let texts: Vec<&str> = (0..9).map(|_| long.as_str()).collect();
+        let (w, root) = build(true, &texts);
+        let cap = w.screen_safety_max_width_px() as f32;
+        let got = root.measured_size().0;
+        assert!(got <= cap + 0.5, "竖排宽 {got} 超出上限 {cap}");
+    }
+
+    /// 正常长度的候选完全不受影响：没超预算就不该动它（零回归）。
+    #[test]
+    fn normal_candidates_are_untouched() {
+        for vertical in [false, true] {
+            let (_, root) = build(vertical, &["你好", "世界", "输入法"]);
+            let mut in_tree = Vec::new();
+            collect_texts(&root, &mut in_tree);
+            for t in ["你好", "世界", "输入法"] {
+                assert!(
+                    in_tree.iter().any(|x| x == t),
+                    "vertical={vertical} 下正常候选 {t} 被改动了：{in_tree:?}"
+                );
+            }
+        }
+    }
+
+    /// 递归收集树内所有文本叶子的内容。
+    fn collect_texts(v: &View, out: &mut Vec<String>) {
+        if let Some(t) = &v.text {
+            out.push(t.clone());
+        }
+        for c in &v.children {
+            collect_texts(c, out);
+        }
+    }
+
+    /// 手动基准：量截断带来的 build_tree+layout 开销与测量缓存增长。
+    /// `cargo test -p wind-ui --release --lib bench_truncation_cost -- --ignored --nocapture`
+    ///
+    /// 只在 Windows：要量的是**真实 DirectWrite** 的排版/哈希成本，mock 后端（等宽近似）量出来
+    /// 的数字没有意义；`measure_cache_len` 也只有真实后端才有。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "手动基准，不参与常规测试"]
+    fn bench_truncation_cost() {
+        use std::time::Instant;
+
+        let short: Vec<&str> = vec![
+            "你好",
+            "世界",
+            "输入法",
+            "候选",
+            "测试",
+            "性能",
+            "开销",
+            "评估",
+            "基准",
+        ];
+        let longs = "超长候选词条".repeat(140); // 840 字
+        let long: Vec<&str> = (0..9).map(|_| longs.as_str()).collect();
+
+        for (name, texts) in [("短候选(常态)", &short), ("超长候选(最坏)", &long)] {
+            for vertical in [false, true] {
+                let (tx, _rx) = std::sync::mpsc::channel();
+                let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+                w.scale = 2.0;
+                w.set_vertical(vertical);
+                let items: Vec<CandidateItem> = texts.iter().map(|t| cand(t)).collect();
+                w.update("ceshipinyin", 0, "", items, 0, -1, 1, 1);
+                let cache0 = w.text_renderer.measure_cache_len();
+
+                // 冷：首帧（所有测量都要真打 DirectWrite）
+                let t0 = Instant::now();
+                let mut root = w.build_tree(false);
+                root.layout(0.0, 0.0, &w.text_renderer);
+                let cold = t0.elapsed();
+                let cache1 = w.text_renderer.measure_cache_len();
+
+                // 热：稳态（同样文本，测量走缓存）——真实打字时每帧都是这个路径
+                let n = 50;
+                let t1 = Instant::now();
+                for _ in 0..n {
+                    let mut r = w.build_tree(false);
+                    r.layout(0.0, 0.0, &w.text_renderer);
+                }
+                let warm = t1.elapsed() / n;
+                let cache2 = w.text_renderer.measure_cache_len();
+
+                println!(
+                    "{name} {} | 冷={cold:?} 热={warm:?} | 缓存 {cache0}→{cache1}→{cache2}",
+                    if vertical { "竖排" } else { "横排" }
+                );
+            }
+        }
+
+        // 拆解：新增开销的两个构成——(a) 预扫阶段的「已缓存」测量，(b) 二分探测串的构造+哈希。
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        let st = TextStyle::new(36.0);
+        for (label, text) in [("短串(4字)", "输入法好"), ("长串(840字)", longs.as_str())]
+        {
+            w.text_renderer.measure(text, &st); // 预热入缓存
+            let n = 2000;
+            let t = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(w.text_renderer.measure(std::hint::black_box(text), &st));
+            }
+            println!("  已缓存 measure {label}: {:?}/次", t.elapsed() / n);
+        }
+        // 单次截断（含二分）的成本：预算取自然宽的一半，强制触发。
+        let full = w.text_renderer.measure(longs.as_str(), &st).width;
+        let n = 500;
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(w.truncate_text_for_width(
+                std::hint::black_box(longs.as_str()),
+                &st,
+                full * 0.5,
+            ));
+        }
+        println!(
+            "  truncate_text_for_width(840字, 热): {:?}/次",
+            t.elapsed() / n
+        );
+    }
+}
+
+/// `truncate_text_for_width` 像素级截断——依赖 mock 文本测量（字符数 × 字号 × 0.6），
+/// 同 [`min_size_tests`] 一样 gate 掉真实文本后端。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod truncate_text_tests {
+    use super::*;
+
+    fn win() -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap()
+    }
+
+    /// mock 后端按「字符数 × 字号 × 0.6」估宽，字号 10 → 每字 6.0px。
+    fn st() -> TextStyle<'static> {
+        TextStyle::new(10.0)
+    }
+
+    /// 没超预算：原样返回，不加省略号（没必要动的东西不要动）。
+    #[test]
+    fn fits_within_budget_returns_unchanged() {
+        let w = win();
+        // 5 字 × 6.0 = 30，预算 30 恰好放得下。
+        assert_eq!(w.truncate_text_for_width("abcde", &st(), 30.0), "abcde");
+    }
+
+    /// 超预算：二分裁到刚好放得下「前缀+…」的最长前缀，结果宽度必须 ≤ 预算。
+    /// "abcdefghij" 10 字，每字宽 6.0；预算 25 时 mid=3 是最大可行值
+    /// （(3+1)*6=24≤25，(4+1)*6=30>25），故应得 "abc…"。
+    #[test]
+    fn exceeds_budget_truncates_with_ellipsis() {
+        let w = win();
+        let out = w.truncate_text_for_width("abcdefghij", &st(), 25.0);
+        assert_eq!(out, "abc…");
+        assert!(w.text_renderer.measure(&out, &st()).width <= 25.0);
+    }
+
+    /// 预算小到连 1 字+省略号都放不下：至少保留 1 字，不能返回空串（空串等于什么都没显示）。
+    #[test]
+    fn tiny_budget_keeps_at_least_one_char() {
+        let w = win();
+        assert_eq!(w.truncate_text_for_width("abcdefghij", &st(), 1.0), "a…");
+    }
+
+    /// ★ 预算被行内其它成员吃光（≤0）时语义是**截到最短**，不是「不截断」。
+    ///
+    /// 反向写法（早退返回原文）会让「预算耗尽」变成「完全放开」，把溢出放大而不是收敛——
+    /// 正是它此前被 `.max(20*s)` 地板掩盖着没暴露。
+    #[test]
+    fn non_positive_budget_truncates_to_minimum() {
+        let w = win();
+        assert_eq!(w.truncate_text_for_width("abcdefghij", &st(), 0.0), "a…");
+        assert_eq!(w.truncate_text_for_width("abcdefghij", &st(), -50.0), "a…");
+    }
+
+    /// 空文本：原样返回（不误加省略号）。
+    #[test]
+    fn empty_text_returns_unchanged() {
+        let w = win();
+        assert_eq!(w.truncate_text_for_width("", &st(), 25.0), "");
+        assert_eq!(w.truncate_text_for_width("", &st(), 0.0), "");
+    }
+
+    /// 用中文候选验证二分逻辑本身不依赖字符集，只依赖 measure() 返回的宽度。
+    #[test]
+    fn works_with_cjk_text() {
+        let w = win();
+        // 6 字 × 6.0 = 36；预算 25 时 mid=3（(3+1)*6=24≤25）。
+        assert_eq!(
+            w.truncate_text_for_width("一二三四五六", &st(), 25.0),
+            "一二三…"
+        );
+    }
+
+    /// 恰好等于预算的边界：允许（`<=`，不是 `<`），不该多切一个字符。
+    #[test]
+    fn exact_fit_boundary_is_not_truncated() {
+        let w = win();
+        // 4 字 × 6.0 = 24，预算恰好 24。
+        assert_eq!(w.truncate_text_for_width("abcd", &st(), 24.0), "abcd");
+    }
+
+    /// ★ 测量样式必须与渲染叶子同构：字重/字族归一化规则照抄 `View::font_weight`（>0 才生效）
+    /// 与 `View::font_family`（非空才生效）。少一条就是两套样式，预算按一种字体算、排版按另一
+    /// 种走，差值累积成窗口右侧留白或右缘溢出。
+    #[test]
+    fn measure_style_mirrors_view_leaf_normalization() {
+        // 字重 0/负数 → 继承默认（0），正数才生效
+        assert_eq!(CandidateWindow::measure_style(10.0, 0, None).weight, 0);
+        assert_eq!(CandidateWindow::measure_style(10.0, -1, None).weight, 0);
+        assert_eq!(CandidateWindow::measure_style(10.0, 700, None).weight, 700);
+        // 空/纯空白字族 → None（用渲染器全局字族）
+        assert_eq!(
+            CandidateWindow::measure_style(10.0, 0, Some("")).family,
+            None
+        );
+        assert_eq!(
+            CandidateWindow::measure_style(10.0, 0, Some("   ")).family,
+            None
+        );
+        assert_eq!(
+            CandidateWindow::measure_style(10.0, 0, Some("宋体")).family,
+            Some("宋体")
+        );
+    }
+}
+
+/// 最大最小公平分配（water-filling）——纯算术，不依赖文本后端，故不 gate 平台。
+#[cfg(test)]
+mod water_fill_tests {
+    use super::CandidateWindow as W;
+
+    /// 总额够用：人人原样满足，不做无谓截断。
+    #[test]
+    fn everyone_fits_when_total_is_enough() {
+        let got = W::water_fill(&[100.0, 200.0, 50.0], 1000.0, 0.0);
+        assert_eq!(got, vec![100.0, 200.0, 50.0]);
+    }
+
+    /// ★ 核心性质：短需求原样保留，**把没用完的份额让给长需求**，而不是一刀切均分。
+    ///
+    /// 均分会给长的 600/3=200，water-filling 给到 400——这正是「1 条长整句 + 8 个短词」
+    /// 这个最常见场景里两者的观感差别。
+    #[test]
+    fn spare_share_flows_to_the_long_one() {
+        let got = W::water_fill(&[100.0, 100.0, 1000.0], 600.0, 0.0);
+        assert_eq!(got, vec![100.0, 100.0, 400.0]);
+        assert_eq!(got.iter().sum::<f32>(), 600.0);
+    }
+
+    /// 顺序无关：同一组需求换个排列，各自拿到的份额不变（内部按需求升序处理，结果按原序返回）。
+    #[test]
+    fn allocation_is_order_independent() {
+        let a = W::water_fill(&[1000.0, 100.0, 100.0], 600.0, 0.0);
+        assert_eq!(a, vec![400.0, 100.0, 100.0]);
+    }
+
+    /// ★ 不溢出保证：只要 total ≥ 0 且不触发 floor，`Σ result ≤ total` **与项数无关**。
+    /// 这正是贪心（先到先得 + 下限）给不了的性质——那种做法下第一项吃光预算，
+    /// 后面每项仍各自加上「固定开销 + 文字下限」，累加必然突破上限。
+    #[test]
+    fn sum_never_exceeds_total_regardless_of_count() {
+        for n in 1..=20usize {
+            let demands: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 500.0).collect();
+            let total = 1000.0;
+            let got = W::water_fill(&demands, total, 0.0);
+            let sum: f32 = got.iter().sum();
+            assert!(sum <= total + 0.01, "n={n} 时 Σ={sum} 超出 total={total}");
+        }
+    }
+
+    /// 全员都超份额：平分总额。
+    #[test]
+    fn all_oversized_split_evenly() {
+        let got = W::water_fill(&[900.0, 900.0, 900.0], 300.0, 0.0);
+        assert_eq!(got, vec![100.0, 100.0, 100.0]);
+    }
+
+    /// floor 是「无解时的保底」：固定开销已超预算（total ≤ 0）时每项仍拿到 floor，
+    /// 总和因此可能超出 total——这是刻意取舍，宁可溢出被裁，也不少显示候选
+    /// （选中键位与候选列表绑定，少一个会让用户按 8 选到错的词）。
+    #[test]
+    fn floor_guarantees_minimum_even_when_insolvent() {
+        let got = W::water_fill(&[900.0, 900.0], 0.0, 20.0);
+        assert_eq!(got, vec![20.0, 20.0]);
+        let got = W::water_fill(&[900.0, 900.0], -500.0, 20.0);
+        assert_eq!(got, vec![20.0, 20.0]);
+    }
+
+    /// 空输入不 panic（无候选时的退化情形）。
+    #[test]
+    fn empty_demands_yield_empty_result() {
+        assert!(W::water_fill(&[], 100.0, 0.0).is_empty());
     }
 }
 
