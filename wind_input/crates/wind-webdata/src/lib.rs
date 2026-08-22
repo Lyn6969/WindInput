@@ -94,7 +94,12 @@ fn default_dict_sections(engine_type: &str) -> Vec<wind_store::dict_export::Dict
 }
 
 /// 多段导入结果 → JSON（`{sections:[{key, added/updated/unchanged | imported, skipped}]}`）。
-fn dict_report_json(rep: &wind_store::dict_export::DictImportReport) -> Value {
+/// `contract` 是各段的准入统计（key = 段的 RPC 标识），逐段并进对应的 section 对象——
+/// 与 Rime/TSV 路径的字段名保持一致，UI 两条路径共用同一套渲染。
+fn dict_report_json(
+    rep: &wind_store::dict_export::DictImportReport,
+    contract: &[(&'static str, EntryContractStats)],
+) -> Value {
     let sections: Vec<Value> = rep
         .sections
         .iter()
@@ -108,7 +113,15 @@ fn dict_report_json(rep: &wind_store::dict_export::DictImportReport) -> Value {
             } else {
                 o.insert("imported".into(), json!(s.imported));
             }
+            // store 已把闸口丢掉的行并进 skipped，此处只补「为什么少」的分类。
             o.insert("skipped".into(), json!(s.skipped));
+            if let Some((_, st)) = contract.iter().find(|(k, _)| *k == s.key) {
+                o.insert("rejected".into(), json!(st.rejected));
+                o.insert("rejectedSamples".into(), json!(st.samples));
+                o.insert("boundaryFilled".into(), json!(st.filled));
+                o.insert("boundaryAmbiguous".into(), json!(st.ambiguous));
+                o.insert("noBoundary".into(), json!(st.no_boundary));
+            }
             Value::Object(o)
         })
         .collect();
@@ -782,9 +795,21 @@ pub trait WebDataRpc: WebDataHost {
                 Some(sel) => sel.into_iter().filter(|s| present.contains(s)).collect(),
                 None => present,
             };
-            let rep =
-                store.import_dict_sections_wdict(&data_schema, content, &sections, replace)?;
-            Ok(dict_report_json(&rep))
+            // 准入契约注入闸口：store 拿不到引擎，求解链只能由这一层供给（同 `CodePolicy`）。
+            // 逐段收集统计——两段各报各的，混成一份会把临时词的拒收算到用户词头上。
+            let mut contract: Vec<(&'static str, EntryContractStats)> = Vec::new();
+            let rep = store.import_dict_sections_wdict(
+                &data_schema,
+                content,
+                &sections,
+                replace,
+                &mut |sec, rows| {
+                    let (rows, st) = self.apply_pinyin_entry_contract(schema_id, rows);
+                    contract.push((sec.key(), st));
+                    rows
+                },
+            )?;
+            Ok(dict_report_json(&rep, &contract))
         } else {
             // Rime/TSV：仅用户词库。
             let (_fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(
@@ -834,17 +859,35 @@ pub trait WebDataRpc: WebDataHost {
                     DictSection::UserWords => {
                         let (rows, sk) = wind_store::wdict::parse_words_wdict(content)
                             .map_err(|e| anyhow::anyhow!(e))?;
+                        let total = rows.len();
+                        // 预览必须跑与导入**完全相同**的准入判据，否则「预计入库 N 条」会骗人。
+                        let (rows, ct) = self.apply_pinyin_entry_contract(schema_id, rows);
                         let (c, samples) = store.preview_import_user_words(&data_schema, &rows)?;
                         arr.push(json!({
-                            "key": "userWords", "count": rows.len(),
+                            "key": "userWords", "count": total,
                             "willAdd": c.added, "willUpdate": c.updated, "unchanged": c.unchanged,
-                            "skipped": sk, "samples": samples,
+                            "skipped": sk + ct.rejected, "samples": samples,
+                            "rejected": ct.rejected,
+                            "rejectedSamples": ct.samples,
+                            "boundaryFilled": ct.filled,
+                            "boundaryAmbiguous": ct.ambiguous,
+                            "noBoundary": ct.no_boundary,
                         }));
                     }
                     DictSection::TempWords => {
                         let (rows, sk) = wind_store::wdict::parse_temp_words_wdict(content)
                             .map_err(|e| anyhow::anyhow!(e))?;
-                        arr.push(json!({ "key": "tempWords", "count": rows.len(), "skipped": sk }));
+                        let total = rows.len();
+                        let (_rows, ct) = self.apply_pinyin_entry_contract(schema_id, rows);
+                        arr.push(json!({
+                            "key": "tempWords", "count": total,
+                            "skipped": sk + ct.rejected,
+                            "rejected": ct.rejected,
+                            "rejectedSamples": ct.samples,
+                            "boundaryFilled": ct.filled,
+                            "boundaryAmbiguous": ct.ambiguous,
+                            "noBoundary": ct.no_boundary,
+                        }));
                     }
                     DictSection::Freq => {
                         let (rows, sk) = wind_store::wdict::parse_freq_wdict(content)

@@ -489,7 +489,8 @@ count，若在那条路径上无差别断言 `boundary != 0`，告警会全是�
 3. ~~`normalize_code` 策略参数化（§4.3）。~~ ✅ **已完成**（`CodePolicy`）。
    ⚠️ `is_valid_code` **有意保留**：store 层拿不到引擎，判据② 只能在 webdata 层做。
    分工变成：store 只做**归一化** + 拦乱码，webdata 做**准入**。
-4. ~~导入闸口接求解链 + 预览三档字段（§5）。~~ ✅ **已完成**（仅 Rime/TSV 路径，见 §10）。
+4. ~~导入闸口接求解链 + 预览三档字段（§5）。~~ ✅ **已完成**，Rime/TSV 与
+   **WindDict 多段**两条路径都已接（后者含 `words` 与 `temp_words` 两段）。
 5. wind-setting UI 对话框。⏸ 曾被主仓阻塞（wind-setting 路径依赖 `../WindInput`），
    本特性合入 main 后**已解除阻塞**。
 6. ~~其余写入路径装探测器（§6）。~~ ✅ **已完成**，但落点与原计划不同：
@@ -502,13 +503,30 @@ count，若在那条路径上无差别断言 `boundary != 0`，告警会全是�
   （`generate_word_pinyin` 要枚举 410 音节的笛卡尔积，`MAX_READING_COMBOS` 封顶）。
   第 4 层的 DAG 只在单行的短码上建，**很可能比第 3 层便宜，把 4 提到 3 前面大概率更快**。
   需在 19 万词量级实测后定序。
-- **本次接线只覆盖 Rime/TSV 路径**，WindDict 格式分支（`import_dict_sections_wdict`，
-  多段导入）**未接契约**。理由：自家格式的 code 列本就带空格、边界随之流出，是问题的
-  次要面；而它是多段管线，接线面比 Rime/TSV 大得多。⚠️ 代价是用户手工编辑 wdict 文件
-  写出无空格码时不会被补齐，也不会被拦。
-- `import_temp_words` 与 freq 段是否同款问题**未读代码**。freq 表按设计不带 boundary
-  （「不给词频表扩容加字段」是既定决策），临时词表应与用户词同款。
-- `backup.rs:330 import_user_words_wdict`（整机还原）走 store 直连、**绕过 webdata**。
-  该路径读的是自家导出文件、带空格，理应不需要求解链——但需确认不会因此产生第二套行为。
+- ~~本次接线只覆盖 Rime/TSV 路径~~ ✅ **WindDict 多段路径已接**（2026-08-22）。
+  闸口以 `&mut dyn FnMut(DictSection, Vec<WordIo>) -> Vec<WordIo>` **注入** `wind-store`——
+  求解链要引擎，store 拿不到 `engine_mgr`（同 `CodePolicy` 的理由）。store 只负责
+  「少了几行 → 进 `skipped`」，不关心为什么少；分类计数由 webdata 逐段并进响应。
+  ⚠️ 闸口是注入的 ⇒ **漏接一段不会有任何编译错误或运行时报错**，表现是「导入成功，
+  但那批词悄悄进去了」。`dict_export.rs` 的
+  `contract_gates_both_word_sections_and_is_counted_as_skipped` 专门锁这一点。
+- ~~`import_temp_words` 与 freq 段是否同款问题未读代码~~ ✅ **已查**：
+  - **临时词是同款问题，且更隐蔽**——它会随 `promote_temp_word` **带着 boundary 一起**
+    晋升成用户词，是绕过不变量的一条现成后门。已一并过闸。
+  - ★★ 顺带修掉一个静默失效：`import_temp_word_rows` / `import_temp_words_wdict` 原本
+    **只认 code 里的空格、无视 `WordIo::boundary`**。空格载体表达不了单音节
+    （`join_code_by_boundary("xian", 0b1)` 仍是 `xian`），闸口求解出的边界会被丢掉，
+    而闸口那边照样记成「已补齐」。测试 `temp_word_import_honors_explicit_boundary`
+    用单音节样本 + 对照组锁住，已做变异验证（撤掉修复即红）。
+  - **freq 段有意不过闸**：词频表按既定决策不带 boundary 字段，且它的 code 来自用户
+    既有词条、不是新入库的词。`shadow` 段不是词条。
+- `backup.rs` 的整机还原（`import_user_words_wdict` / `import_temp_words_wdict`）走 store
+  直连、**绕过 webdata 因而绕过闸口——这是正确的**：还原读的是自家导出文件，边界随空格
+  流出，且还原的语义是「恢复原样」而不是「重新裁决一遍」。
+  ⚠️ 上面那条 `WordIo::boundary` 修复**对该路径无影响**：`parse_words_wdict` 产出的行
+  `boundary` 恒为 `None`，`unwrap_or(spaced_b)` 取的仍是空格推断值，逐字节等价于改动前。
+  ⇒ **单音节用户词经「导出→还原」一轮仍会丢掉 `0b1`**（`join_code_by_boundary` 表达不了
+  单音节，`wdict.rs::single_syllable_boundary_is_lossy_by_design` 记着这是既定取舍）。
+  要修得给 wdict 文件格式加一列显式边界，代价远大于收益，**本次不做**。
 - 求解率本身未实测。若「可补」档的实际比例很低（多数词库本就带空格），§5 的 UI
   投入可以相应缩减。

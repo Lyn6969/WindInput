@@ -155,12 +155,23 @@ impl Store {
 
     /// 从多段 wdict 文本导入所选数据段。**只处理文件中实际存在的段**（防 replace 误清空
     /// 文件未携带的段）。replace=先清该段再导入；否则 Merge。
+    ///
+    /// `contract` 是**词条准入闸口**：解析之后、落库之前，对 `words` 与 `temp_words` 两段
+    /// 的行做过滤与补齐（拼音词条的音节边界求解在此发生）。
+    ///
+    /// ★ 为什么是注入而不是在本层实现：准入判据要跑引擎的求解链，而 `wind-store` 拿不到
+    /// `engine_mgr`（同 `CodePolicy` 的理由）。本层只负责「少了几行」，不关心为什么少。
+    /// 被闸口丢掉的行计入该段的 `skipped`，`imported` 取闸口之后的条数。
+    ///
+    /// ⚠️ `freq` 段**有意不过闸**：词频表按既定决策不带 boundary 字段，且它的 code 来自
+    /// 用户既有词条、不是新入库的词。`shadow` 段不是词条。
     pub fn import_dict_sections_wdict(
         &self,
         schema: &str,
         text: &str,
         sections: &[DictSection],
         replace: bool,
+        contract: &mut dyn FnMut(DictSection, Vec<wdict::WordIo>) -> Vec<wdict::WordIo>,
     ) -> anyhow::Result<DictImportReport> {
         let present = wdict::sections_present(text);
         let has = |tag: &str| present.iter().any(|t| t == tag);
@@ -173,6 +184,9 @@ impl Store {
                 DictSection::UserWords => {
                     let (rows, skipped) =
                         wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
+                    let parsed = rows.len();
+                    let rows = contract(*sec, rows);
+                    let rejected = parsed - rows.len();
                     if replace {
                         self.clear_user_words(schema)?;
                     }
@@ -181,12 +195,17 @@ impl Store {
                         key: sec.key(),
                         words: Some(counts),
                         imported: rows.len(),
-                        skipped,
+                        skipped: skipped + rejected,
                     });
                 }
                 DictSection::TempWords => {
                     let (rows, skipped) =
                         wdict::parse_temp_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
+                    let parsed = rows.len();
+                    // 临时词同样过闸：它会随 `promote_temp_word` 晋升成用户词并**带着
+                    // boundary 一起走**，放它进来等于给不变量开一条绕行路。
+                    let rows = contract(*sec, rows);
+                    let rejected = parsed - rows.len();
                     if replace {
                         self.clear_temp_words(schema)?;
                     }
@@ -195,7 +214,7 @@ impl Store {
                         key: sec.key(),
                         words: None,
                         imported: n,
-                        skipped,
+                        skipped: skipped + rejected,
                     });
                 }
                 DictSection::Freq => {
@@ -235,6 +254,67 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 恒等闸口：本模块的用例测的是多段编排（段的存在性、replace 清空、计数），
+    /// 准入判据要引擎、属 `wind-webdata` 的测试范围。
+    fn pass_through(_sec: DictSection, rows: Vec<WordIo>) -> Vec<WordIo> {
+        rows
+    }
+
+    /// 准入闸口作用于 **words 与 temp_words 两段**，被丢掉的行如实进 `skipped`、
+    /// 不进 `imported`。
+    ///
+    /// ★ 为什么这条测试有必要：闸口是**注入**的，接错段或漏接一段都不会有任何编译错误
+    /// 或运行时报错——表现是「导入成功，但那批词悄悄进去了」。临时词那段尤其容易漏：
+    /// 它会随 `promote_temp_word` 晋升成用户词，是绕过不变量的一条现成后门。
+    #[test]
+    fn contract_gates_both_word_sections_and_is_counted_as_skipped() {
+        let path = tmp("wind_dict_contract_gate.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "好", 100, 0).unwrap();
+        s.add_user_word("wb", "b", "坏", 100, 0).unwrap();
+        s.learn_temp_word("wb", "c", "好", 50, 0).unwrap();
+        s.learn_temp_word("wb", "d", "坏", 50, 0).unwrap();
+
+        let all = [DictSection::UserWords, DictSection::TempWords];
+        let text = s
+            .export_dict_sections_wdict("wb", &all, "2026-08-22T00:00:00+08:00", "codetable")
+            .unwrap();
+
+        let path2 = tmp("wind_dict_contract_gate2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        let mut seen: Vec<&'static str> = Vec::new();
+        let rep = s2
+            .import_dict_sections_wdict("wb", &text, &all, false, &mut |sec, rows| {
+                seen.push(sec.key());
+                rows.into_iter().filter(|r| r.text != "坏").collect()
+            })
+            .unwrap();
+
+        assert_eq!(
+            seen,
+            vec!["userWords", "tempWords"],
+            "两段都必须过闸，且闸口要知道自己在处理哪一段"
+        );
+        let uw = rep.sections.iter().find(|s| s.key == "userWords").unwrap();
+        assert_eq!(uw.imported, 1, "imported 取闸口之后的条数");
+        assert_eq!(uw.skipped, 1, "被闸口丢掉的行必须进 skipped");
+        let tw = rep.sections.iter().find(|s| s.key == "tempWords").unwrap();
+        assert_eq!(tw.imported, 1);
+        assert_eq!(tw.skipped, 1);
+
+        // 落库端的真凭据：被丢的词一条都不能在库里。
+        assert!(
+            s2.get_user_words("wb", "b").unwrap().is_empty(),
+            "坏 不该入库"
+        );
+        assert!(s2.get_temp_words("wb", "d").unwrap().is_empty());
+        assert_eq!(
+            s2.get_user_words("wb", "a").unwrap().len(),
+            1,
+            "放行的照常入库"
+        );
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(name);
@@ -276,8 +356,14 @@ mod tests {
         // 导入到新库：key 必须是扁平的，否则这条记录永远匹配不到候选
         let p2 = tmp("wind_dict_freq_spaced2.redb");
         let s2 = Store::open(&p2).unwrap();
-        s2.import_dict_sections_wdict("pinyin", &text, &[DictSection::Freq], false)
-            .unwrap();
+        s2.import_dict_sections_wdict(
+            "pinyin",
+            &text,
+            &[DictSection::Freq],
+            false,
+            &mut pass_through,
+        )
+        .unwrap();
         let (rows, _) = s2.list_freq_paged("pinyin", "", 0, 0).unwrap();
         let mut codes: Vec<String> = rows.into_iter().map(|(c, _, _)| c).collect();
         codes.sort();
@@ -320,7 +406,7 @@ mod tests {
         let path2 = tmp("wind_dict_sections_io2.redb");
         let s2 = Store::open(&path2).unwrap();
         let rep = s2
-            .import_dict_sections_wdict("wb", &text, &all, false)
+            .import_dict_sections_wdict("wb", &text, &all, false, &mut pass_through)
             .unwrap();
         assert_eq!(rep.sections.len(), 4);
 
@@ -367,7 +453,7 @@ mod tests {
         s2.add_user_word("wb", "z", "旧", 9, 0).unwrap();
         let all = [DictSection::UserWords, DictSection::Freq];
         let rep = s2
-            .import_dict_sections_wdict("wb", &text, &all, true)
+            .import_dict_sections_wdict("wb", &text, &all, true, &mut pass_through)
             .unwrap();
         assert_eq!(rep.sections.len(), 1, "只处理文件存在的 freq 段");
         assert_eq!(rep.sections[0].key, "freq");

@@ -257,8 +257,15 @@ impl Store {
         let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         for r in &rows {
             // code 列可能是带空格的音节码 → 拆成扁平码 + 边界；无空格则 boundary=0。
-            let (code, b) = wdict::split_spaced_code(&r.code);
-            self.learn_temp_word(schema, &code, &r.text, r.weight, b)?;
+            // `WordIo::boundary` 优先，理由同 `import_temp_word_rows`。
+            let (code, spaced_b) = wdict::split_spaced_code(&r.code);
+            self.learn_temp_word(
+                schema,
+                &code,
+                &r.text,
+                r.weight,
+                r.boundary.unwrap_or(spaced_b),
+            )?;
         }
         Ok((rows.len(), skipped))
     }
@@ -278,7 +285,11 @@ impl Store {
                 let mut idx = txn.open_table(TEMP_ABBREV)?;
                 for r in rows {
                     // code 列可能是带空格的音节码 → 拆成扁平 key + 边界。
-                    let (code, in_b) = wdict::split_spaced_code(&r.code);
+                    // ★ `WordIo::boundary` 优先于空格载体：导入闸口的求解结果走这个字段送进来，
+                    // 而空格表达不了单音节（`xian` 的 0b1 join 后无空格，split 回来是 0）。
+                    // 只认空格的话，补齐的边界会被静默丢掉——统计上还照样记成「已补齐」。
+                    let (code, spaced_b) = wdict::split_spaced_code(&r.code);
+                    let in_b = r.boundary.unwrap_or(spaced_b);
                     let key = enc_key(schema, &code, &r.text);
                     let cap = r.weight.min(TEMP_WORD_MAX_WEIGHT);
                     // 已存在且旧 boundary 非 0 则沿用（切分不因导入而变），为 0 时用导入行补齐。
@@ -423,6 +434,50 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// 临时词导入必须认 `WordIo::boundary`，而不只认 code 里的空格。
+    ///
+    /// ★★ 样本是**单音节**，这不是随手挑的：`join_code_by_boundary("xian", 0b1)` 产出的
+    /// 仍是无空格的 `xian`，`split_spaced_code` 拿回来就是 0 —— 空格载体从原理上表达不了
+    /// 单音节边界。只认空格的实现会把导入闸口求解出的边界**静默丢掉**，而闸口那边照样
+    /// 把它记成「已补齐」。对照组 `gong` 锁住另一半：不给显式边界时行为逐字节不变。
+    #[test]
+    fn temp_word_import_honors_explicit_boundary() {
+        let path = tmp("wind_tw_explicit_b.redb");
+        let s = Store::open(&path).unwrap();
+        let row = |code: &str, text: &str, b: Option<u64>| wdict::WordIo {
+            code: code.into(),
+            text: text.into(),
+            weight: 50,
+            count: 1,
+            boundary: b,
+        };
+        s.import_temp_word_rows(
+            "pinyin",
+            &[
+                row("xian", "先", Some(0b1)),
+                row("gong", "工", None),
+                row("nihao", "你好", Some(0b101)),
+            ],
+        )
+        .unwrap();
+        let b = |code: &str, text: &str| {
+            s.get_temp_words("pinyin", code)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.text == text)
+                .unwrap()
+                .boundary
+        };
+        assert_eq!(b("xian", "先"), 0b1, "单音节边界必须存活");
+        assert_eq!(
+            b("gong", "工"),
+            0,
+            "不给显式边界 ⇒ 空格载体推不出单音节，退化为 0（旧路径不变）"
+        );
+        assert_eq!(b("nihao", "你好"), 0b101);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// **临时词的每一条写路径都要维护索引。**
