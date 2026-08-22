@@ -178,6 +178,27 @@ pub fn extract_entry(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// 读取单个条目字节，**上限 `max`**（超出即报错）。
+///
+/// ★ 与「先读完再判长度」不是一回事：`Read::take` 让解压在 `max + 1` 字节处停下，
+/// 超额部分根本不进内存。zip 的中央目录里那个「解压后大小」是**归档自己声明的**，
+/// 一个 1 KB 的条目完全可以声明 1 KB 而解压出 10 GB——按声明值预检只挡得住诚实的
+/// 归档，真正的界必须画在读取上。
+pub fn extract_entry_limited(path: &Path, name: &str, max: u64) -> anyhow::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let entry = archive
+        .by_name(name)
+        .map_err(|_| anyhow::anyhow!("归档缺少条目 {}", name))?;
+    let mut buf = Vec::new();
+    // 多读 1 字节即可判定「超了」，且这 1 字节是可承受的越界量。
+    entry.take(max + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        anyhow::bail!("归档条目 {name} 解压后超过上限（{max} 字节）");
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

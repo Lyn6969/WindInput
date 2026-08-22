@@ -25,6 +25,26 @@ pub const PACKAGE_FORMAT_VERSION: u32 = 2;
 /// 在设置端(导入方案文件 → `config.applyPatch`),文件层不复刻片段管线的热重载与镜像回灌。
 pub const CONFIG_PATCH_NAME: &str = "config_patch.toml";
 
+/// 包内条目数上限。
+///
+/// 真实方案包是「一个方案文件 + 几个词库/字体」，几十个条目顶天；两千是给
+/// 「一个包带多套混输子方案」留的余量，同时挡掉「中央目录里几十万个空条目」
+/// 那种只为把导入端拖死的构造。
+pub const MAX_PACKAGE_ENTRIES: usize = 2000;
+
+/// 包内解压后**总**字节上限。
+///
+/// 与文本信封的 2 MB 不是一个量级、也不该是：信封的定位就是「小方案」，而大词库
+/// 走的正是 .wpkg（极点五笔全量词库就是几十 MB）。256 MiB 对任何真实方案包都绰绰
+/// 有余，同时把 zip 炸弹挡在把服务进程撑爆之前。
+pub const MAX_PACKAGE_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// `package.toml` / `config_patch.toml` 这类**文本**条目的单条上限。
+///
+/// 它们是手写 TOML，KB 量级；单独给一个小上限，免得走总额那条时要先把几百 MB
+/// 读进来才发现不对。取值与文本信封的 `MAX_TEXT_BYTES` 对齐。
+const MAX_TEXT_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
+
 /// 缺 format_version 字段的包一律视为 legacy v1(该字段出现之前的产物)。
 fn legacy_format_version() -> u32 {
     1
@@ -512,11 +532,33 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<Str
     // 版本门禁在 read_package_meta 内(先于说明校验),此处不再重复。
     let meta = read_package_meta(package)?;
     let file = std::fs::File::open(package)?;
-    let archive = zip::ZipArchive::new(file)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    // 规模门禁：条目数与声明总大小都只读**中央目录**，不解压任何内容，故排在逐条
+    // 校验之前——限额要挡的正是「先把整个包处理一遍再说它太大」那份开销。
+    //
+    // ⚠️ 这里读的「解压后大小」是归档**自己声明的**，撒谎的包骗得过它。真正的界画在
+    // `import_package` 的逐条有界读取上（`extract_entry_limited`），本段只是廉价前筛。
+    if archive.len() > MAX_PACKAGE_ENTRIES {
+        anyhow::bail!(
+            "方案包条目过多({} 个,上限 {MAX_PACKAGE_ENTRIES})",
+            archive.len()
+        );
+    }
+    let mut declared: u64 = 0;
+    for i in 0..archive.len() {
+        declared = declared.saturating_add(archive.by_index_raw(i)?.size());
+    }
+    if declared > MAX_PACKAGE_UNCOMPRESSED_BYTES {
+        anyhow::bail!(
+            "方案包解压后过大(声明 {declared} 字节,上限 {MAX_PACKAGE_UNCOMPRESSED_BYTES})"
+        );
+    }
     let mut entries: Vec<PayloadEntry> = Vec::new();
     let mut has_root_schema = false;
     let mut config_patch_name: Option<String> = None;
-    for name in archive.file_names() {
+    let names: Vec<String> = archive.file_names().map(String::from).collect();
+    for name in &names {
+        let name = name.as_str();
         if name == PACKAGE_META_NAME || name.ends_with('/') {
             continue;
         }
@@ -564,7 +606,12 @@ fn scan_package(package: &Path) -> anyhow::Result<(Vec<PayloadEntry>, Option<Str
 /// 这与 [`scan_package`] 文档里「门禁先于布局校验」是同一条原则,信封路径
 /// (`envelope::parse`)也是同一顺序——两条路必须同判据。
 pub fn read_package_meta(package: &Path) -> anyhow::Result<PackageMeta> {
-    let Ok(bytes) = crate::bundle::extract_entry(package, PACKAGE_META_NAME) else {
+    // 有界读取：package.toml 是手写 TOML，KB 量级。读不出来（不存在 / 超上限）一律
+    // 回落默认值——超大的 package.toml 只可能是构造出来的，而 legacy 宽容语义本就是
+    // 「读不到元信息就当没有」，在这里区分两种读不到没有意义。
+    let Ok(bytes) =
+        crate::bundle::extract_entry_limited(package, PACKAGE_META_NAME, MAX_TEXT_ENTRY_BYTES)
+    else {
         return Ok(PackageMeta::default());
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -629,7 +676,9 @@ fn read_config_patch(package: &Path, name: Option<&str>) -> anyhow::Result<Optio
     let Some(name) = name else {
         return Ok(None);
     };
-    let bytes = crate::bundle::extract_entry(package, name)?;
+    // 有界读取：配置片段是手写 TOML。这一条在 `preview_import`（只读预览）里就会被读，
+    // 不设界的话「只是看一眼这个包」都能被撑爆。
+    let bytes = crate::bundle::extract_entry_limited(package, name, MAX_TEXT_ENTRY_BYTES)?;
     Ok(Some(String::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!("{CONFIG_PATCH_NAME} 不是 UTF-8 文本")
     })?))
@@ -682,8 +731,12 @@ pub fn import_package(
     // 读取阶段:全部载荷入内存,任何缺条目/坏条目在写盘前失败。
     // 取字节按 zip 原名,落盘按归一化 rel——见 [`PayloadEntry`]。
     let mut staged: Vec<(String, Vec<u8>)> = Vec::new();
+    // 逐条**有界**读取，且预算是整包共享的余额——这才是真正的界：`scan_package` 那道
+    // 前筛读的是归档自己声明的大小，撒谎的包骗得过它（声明 1 KB、解压 10 GB）。
+    let mut remaining = MAX_PACKAGE_UNCOMPRESSED_BYTES;
     for e in &entries {
-        let bytes = crate::bundle::extract_entry(package, &e.name)?;
+        let bytes = crate::bundle::extract_entry_limited(package, &e.name, remaining)?;
+        remaining -= bytes.len() as u64;
         staged.push((e.rel.clone(), bytes));
     }
     let rels: Vec<String> = entries.into_iter().map(|e| e.rel).collect();
@@ -1991,6 +2044,92 @@ layout = "old"
             "越界子方案应记进 missing: {:?}",
             plan.missing
         );
+    }
+
+    // ───────── 导入规模限额 ─────────
+
+    /// 条目数上限。中央目录里塞满空条目就能把逐条校验拖死，而这一步在解压之前。
+    #[test]
+    fn import_rejects_too_many_entries() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let pkg = t.path().join("many.zip");
+        let mut w = zip::ZipWriter::new(fs::File::create(&pkg).unwrap());
+        for i in 0..=MAX_PACKAGE_ENTRIES {
+            w.start_file(
+                format!("f{i}.txt"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+        let err = preview_import(&pkg, &dest).unwrap_err().to_string();
+        assert!(err.contains("条目过多"), "{err}");
+    }
+
+    /// 高压缩比条目（zip 炸弹）超上限即报错。
+    #[test]
+    fn limited_read_rejects_oversized_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let pkg = t.path().join("bomb.zip");
+        let mut w = zip::ZipWriter::new(fs::File::create(&pkg).unwrap());
+        w.start_file("big.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..200 {
+            w.write_all(&chunk).unwrap();
+        }
+        w.finish().unwrap();
+        let err = crate::bundle::extract_entry_limited(&pkg, "big.bin", 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超过上限"), "{err}");
+    }
+
+    /// ★★ 上一条**测不出**「有没有把超额部分读进内存」——先 `read_to_end` 再判长度同样
+    /// 会报错、同样绿。而这正是本次修复的要点：不设界的害处是内存被撑爆，不是没报错。
+    ///
+    /// 试过用耗时当判据，**实测不成立**：200 MB 全零解压只要 0.5 秒，任何不假红的阈值
+    /// 都区分不开两种实现（去掉 `take()` 后那条测试照样通过）。要做出可区分的时间差，
+    /// 得把炸弹造到 GB 级，那反过来会让正常路径也变慢、还挑机器。
+    ///
+    /// 「读了多少」是资源性质，运行时观察不到，故改用本仓既有的**源码扫描守卫**
+    /// （同 `handle_mode.rs` 的 `schema_switch_finish_guard`）：钉住 `Read::take` 还在。
+    /// 判据弱，但它诚实——比一条永远绿的计时断言强。
+    #[test]
+    fn limited_read_bounds_the_read_itself() {
+        const SRC: &str = include_str!("bundle.rs");
+        let body = SRC
+            .split("pub fn extract_entry_limited")
+            .nth(1)
+            .expect("extract_entry_limited 应存在")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains(".take(max + 1)"),
+            "extract_entry_limited 必须用 Read::take 把解压停在上限处，\
+             而不是读完再判长度——后者一样报错，但内存已经被撑爆了"
+        );
+    }
+
+    /// 反向对照：没超限的包照常导入。少了它，把上限写成 0 也能让上面两条全绿。
+    #[test]
+    fn normal_sized_package_still_imports() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let pkg = t.path().join("ok.zip");
+        write_zip(
+            &pkg,
+            &[
+                ("my.schema.toml", b"[schema]\nid=\"my\"\n".as_slice()),
+                ("my/main.dict.yaml", b"a\t\xe5\xb7\xa5\n".as_slice()),
+            ],
+        );
+        let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.imported.len(), 2);
     }
 
     /// 反向对照：合法的子目录 rel（`my/main.dict.yaml`）必须照常收集。
