@@ -107,8 +107,64 @@ impl KeyInjector for SysKeys {
         send_key_events(&events)
     }
     fn type_text(&self, text: &str) -> anyhow::Result<()> {
-        type_unicode(text)
+        for chunk in split_type_text(text) {
+            match chunk {
+                TypeChunk::Text(s) => type_unicode(s)?,
+                TypeChunk::Key(vk) => tap_combo(&[], vk)?,
+            }
+        }
+        Ok(())
     }
+}
+
+/// [`split_type_text`] 的一段：可直接注入的文本，或必须走虚拟键的控制字符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeChunk<'a> {
+    Text(&'a str),
+    /// 虚拟键码（Win32 VK；macOS 侧由 `vk_to_cgkeycode` 换算）。
+    Key(u32),
+}
+
+/// 把 `key.type` 的文本切成「文本段」与「按键段」。
+///
+/// **换行与制表符必须走按键，不能走字符注入**：两个平台的 `type_unicode` 都是把码点
+/// 当字符投递（Windows `KEYEVENTF_UNICODE` + `wScan`、macOS `set_string`），而目标控件
+/// 要的是 VK_RETURN / VK_TAB 这两个**按键**。作为字符投出去，多数控件既不换行也不
+/// 插制表符，用户写的 `\n` 就这么无声无息地消失了——不报错，只是没反应。
+///
+/// `\r\n` 合成一次回车：CRLF 是一个换行的两种写法，逐个转按键会敲出两行。
+///
+/// 其余控制字符原样留在文本段：它们既没有直观对应的按键，作为字符注入也是现状行为，
+/// 这里不顺手改变它。
+pub(crate) fn split_type_text(text: &str) -> Vec<TypeChunk<'_>> {
+    const VK_RETURN: u32 = 0x0D;
+    const VK_TAB: u32 = 0x09;
+
+    let mut out = Vec::new();
+    let mut seg_start = 0usize;
+    let mut it = text.char_indices().peekable();
+    while let Some((i, ch)) = it.next() {
+        let vk = match ch {
+            '\n' | '\r' => VK_RETURN,
+            '\t' => VK_TAB,
+            _ => continue,
+        };
+        if seg_start < i {
+            out.push(TypeChunk::Text(&text[seg_start..i]));
+        }
+        out.push(TypeChunk::Key(vk));
+        // CRLF：吃掉紧跟的 \n，只算一次回车。
+        if ch == '\r' && it.peek().is_some_and(|(_, c)| *c == '\n') {
+            it.next();
+            seg_start = i + 2;
+        } else {
+            seg_start = i + ch.len_utf8();
+        }
+    }
+    if seg_start < text.len() {
+        out.push(TypeChunk::Text(&text[seg_start..]));
+    }
+    out
 }
 
 /// 敲击 CapsLock（VK_CAPITAL 0x14，down+up）以取消系统大写锁定。
@@ -437,6 +493,116 @@ fn type_unicode(_text: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// key.type 的换行必须变成**按键**。作为字符投递时多数控件不换行，
+    /// 用户写的换行就无声无息消失了。
+    #[test]
+    fn type_text_splits_newline_into_key() {
+        let nl = char::from_u32(10).unwrap();
+        let text = format!("第一行{nl}第二行");
+        assert_eq!(
+            split_type_text(&text),
+            vec![
+                TypeChunk::Text("第一行"),
+                TypeChunk::Key(0x0D),
+                TypeChunk::Text("第二行"),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_text_splits_tab_into_key() {
+        let tab = char::from_u32(9).unwrap();
+        let text = format!("a{tab}b");
+        assert_eq!(
+            split_type_text(&text),
+            vec![
+                TypeChunk::Text("a"),
+                TypeChunk::Key(0x09),
+                TypeChunk::Text("b")
+            ]
+        );
+    }
+
+    /// CRLF 是一个换行的两种写法，逐个转按键会敲出两行。
+    #[test]
+    fn crlf_is_one_return() {
+        let cr = char::from_u32(13).unwrap();
+        let nl = char::from_u32(10).unwrap();
+        let text = format!("a{cr}{nl}b");
+        assert_eq!(
+            split_type_text(&text),
+            vec![
+                TypeChunk::Text("a"),
+                TypeChunk::Key(0x0D),
+                TypeChunk::Text("b")
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_cr_is_also_return() {
+        let cr = char::from_u32(13).unwrap();
+        let text = format!("a{cr}b");
+        assert_eq!(
+            split_type_text(&text),
+            vec![
+                TypeChunk::Text("a"),
+                TypeChunk::Key(0x0D),
+                TypeChunk::Text("b")
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_text_is_one_chunk() {
+        assert_eq!(
+            split_type_text("Hello, 世界"),
+            vec![TypeChunk::Text("Hello, 世界")]
+        );
+        assert_eq!(split_type_text(""), vec![]);
+    }
+
+    /// 连续换行不合并（两个空行就是两次回车），且首尾不产出空文本段。
+    #[test]
+    fn consecutive_and_edge_newlines() {
+        let nl = char::from_u32(10).unwrap();
+        let text = format!("{nl}a{nl}{nl}b{nl}");
+        assert_eq!(
+            split_type_text(&text),
+            vec![
+                TypeChunk::Key(0x0D),
+                TypeChunk::Text("a"),
+                TypeChunk::Key(0x0D),
+                TypeChunk::Key(0x0D),
+                TypeChunk::Text("b"),
+                TypeChunk::Key(0x0D),
+            ]
+        );
+    }
+
+    /// 多字节字符紧贴控制字符：切片边界必须落在字符边界上，否则 panic。
+    #[test]
+    fn multibyte_next_to_control_char_does_not_panic() {
+        let nl = char::from_u32(10).unwrap();
+        let text = format!("知典{nl}超精");
+        assert_eq!(
+            split_type_text(&text),
+            vec![
+                TypeChunk::Text("知典"),
+                TypeChunk::Key(0x0D),
+                TypeChunk::Text("超精"),
+            ]
+        );
+    }
+
+    /// 其余控制字符不动（维持现状，不顺手改变）。
+    #[test]
+    fn other_control_chars_stay_in_text() {
+        let bell = char::from_u32(7).unwrap();
+        let text = format!("a{bell}b");
+        assert_eq!(split_type_text(&text), vec![TypeChunk::Text(text.as_str())]);
+    }
 
     #[test]
     fn parse_simple_keys() {
