@@ -44,6 +44,11 @@ pub enum QuickValues {
     Calc {
         expr: String,
         result: String,
+        /// 结果的原始精度（未按 `decimal_places` 截断/去尾零）。供 `{pct()}` 这类
+        /// 需要自行选倍数/小数位/后缀的函数在此基础上二次换算——若只能拿到已按
+        /// `decimal_places` 舍入过的 `$RESULT`，`decimal_places=2` 时 1/3 的 `$RESULT`
+        /// 已经是 "0.33"，`×100` 只能得到 "33" 而非用户想要的 "33.33"。
+        exact: String,
     },
 }
 
@@ -56,7 +61,11 @@ impl QuickValues {
             Self::Date { y, m, d } | Self::MonthDay { y, m, d } => date_var(name, *y, *m, *d),
             Self::YearMonth { y, m } => year_month_var(name, *y, *m),
             Self::Number { subject } => number_var(name, subject),
-            Self::Calc { expr, result } => calc_var(name, expr, result),
+            Self::Calc {
+                expr,
+                result,
+                exact,
+            } => calc_var(name, expr, result, exact),
         }
     }
 
@@ -153,11 +162,13 @@ pub(crate) fn number_var(name: &str, subject: &str) -> Option<String> {
     })
 }
 
-/// `kind = "calc"`：`expr` 为裁剪后的算式（不含 `=` 及其右侧），`result` 为格式化后的结果。
-pub(crate) fn calc_var(name: &str, expr: &str, result: &str) -> Option<String> {
+/// `kind = "calc"`：`expr` 为裁剪后的算式（不含 `=` 及其右侧），`result` 为格式化后的结果，
+/// `exact` 为未截断的原始精度结果。
+pub(crate) fn calc_var(name: &str, expr: &str, result: &str, exact: &str) -> Option<String> {
     Some(match name {
         "EXPR" => expr.to_string(),
         "RESULT" => result.to_string(),
+        "EXACT" => exact.to_string(),
         _ => return None,
     })
 }
@@ -176,8 +187,8 @@ mod tests {
         // 覆盖全部四类可能出现的变量名（并集），逐个比对两侧口径
         let all = [
             "Y", "YYYY", "YY", "YC", "M", "MM", "MC", "D", "DD", "DC", "N", "THOU", "CNL", "CNU",
-            "DIG", "AMT", "EXPR", "RESULT", "NOPE", "WC", "LY", "LYN", "LZ", "LM", "LD", "LMD",
-            "LF",
+            "DIG", "AMT", "EXPR", "RESULT", "EXACT", "NOPE", "WC", "LY", "LYN", "LZ", "LM", "LD",
+            "LMD", "LF",
         ];
         for name in all {
             let cases = [
@@ -195,7 +206,7 @@ mod tests {
                     year_month_var(name, 2026, 6).is_some(),
                 ),
                 (FormatKind::Number, number_var(name, "123").is_some()),
-                (FormatKind::Calc, calc_var(name, "1+1", "2").is_some()),
+                (FormatKind::Calc, calc_var(name, "1+1", "2", "2").is_some()),
             ];
             for (kind, has_value) in cases {
                 assert_eq!(

@@ -123,6 +123,7 @@ pub(crate) fn precheck(table: &FormatTable) {
         QuickValues::Calc {
             expr: "1+1".to_string(),
             result: "2".to_string(),
+            exact: "2".to_string(),
         },
     ];
     for entry in table.entries().iter().filter(|e| e.is_expression()) {
@@ -152,6 +153,22 @@ mod tests {
             m: 6,
             d: 5,
         }
+    }
+
+    /// ★ 端到端回归：打 `1/3` 出厂候选须含百分比档，且不是从已截断的 `$RESULT`
+    /// 二次舍入出来的——`decimal_places=2` 时 `$RESULT` 是 "0.33"，若 `pct()` 从它
+    /// 再算，`×100` 只会得到 "33%" 而非 "33.33%"。走真实出厂表 + 真实 eval，
+    /// 而不是像 `funcs::quick` 单测那样手填 `$EXACT`，才盖得住整条接线。
+    #[test]
+    fn calc_percent_uses_exact_not_rounded_result() {
+        let got = wind_quick_input::generate_with_eval(
+            wind_quick_input::QuickSource::Calc,
+            "1/3",
+            2,
+            &wind_quick_input::FormatTable::builtin(),
+            Some(&eval_expr),
+        );
+        assert_eq!(got, vec!["0.33", "1/3=0.33", "33.33%"]);
     }
 
     /// ★ 表达式路径与变量路径必须同源：无参函数 == 对应的 `$` 变量。

@@ -96,7 +96,7 @@ impl FormatKind {
             }
             Self::YearMonth => common_year || matches!(name, "M" | "MM" | "MC"),
             Self::Number => matches!(name, "N" | "THOU" | "CNL" | "CNU" | "DIG" | "AMT"),
-            Self::Calc => matches!(name, "EXPR" | "RESULT"),
+            Self::Calc => matches!(name, "EXPR" | "RESULT" | "EXACT"),
         }
     }
 
@@ -149,7 +149,14 @@ impl FormatKind {
                 ("DIG", "逐位读，一二三四点五"),
                 ("AMT", "金额大写，壹仟贰佰叁拾肆元伍角（超两位小数为空）"),
             ],
-            Self::Calc => &[("EXPR", "算式原文，1+2*3"), ("RESULT", "计算结果，7")],
+            Self::Calc => &[
+                ("EXPR", "算式原文，1+2*3"),
+                ("RESULT", "计算结果，7"),
+                (
+                    "EXACT",
+                    "结果原始精度（未按小数位截断），供 {pct()} 等函数二次换算，如 1/3 → 0.3333333333333333",
+                ),
+            ],
         }
     }
 }
@@ -223,9 +230,10 @@ const BUILTIN: &[(&str, FormatKind, &str)] = &[
     ("number.cn_upper", FormatKind::Number, "$CNU"),
     ("number.digits", FormatKind::Number, "$DIG"),
     ("number.thousands", FormatKind::Number, "$THOU"),
-    // 计算：结果作首选，等式次之
+    // 计算：结果作首选，等式次之，百分比殿后（默认 ×100 保两位小数、去尾零）
     ("calc.result", FormatKind::Calc, "$RESULT"),
     ("calc.equation", FormatKind::Calc, "$EXPR=$RESULT"),
+    ("calc.percent", FormatKind::Calc, "{pct()}"),
 ];
 
 /// 用户对某一类格式的调整（右键菜单产生，存在 userdata.redb，**不写回格式表文件**）。
@@ -1491,7 +1499,7 @@ text = "$RESULT"
         assert_eq!(n(FormatKind::MonthDay), 17, "与 date 同一套");
         assert_eq!(n(FormatKind::YearMonth), 7, "无 $D 系列、无农历");
         assert_eq!(n(FormatKind::Number), 6);
-        assert_eq!(n(FormatKind::Calc), 2);
+        assert_eq!(n(FormatKind::Calc), 3);
     }
 
     /// 农历变量给 date/month_day 而**不给 year_month**：这条分工在提示清单里也要成立，

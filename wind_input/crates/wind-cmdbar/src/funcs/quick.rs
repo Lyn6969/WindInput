@@ -41,6 +41,8 @@ pub fn specs() -> Vec<FuncSpec> {
             named(fn_amt_named, "unit" = "货币单位, 默认 '元'", "zheng" = "false 去掉末尾的 '整'");
         "expr"  : Value (0, 0) pure => fn_expr,   "快捷输入: 所输算式", "expr()";
         "result": Value (0, 0) pure => fn_result, "快捷输入: 算式结果", "result()";
+        "pct"   : Value (0, 0) pure => fn_pct,    "快捷输入: 结果按比例转百分比/千分位等 (1/3→33.33%)", "pct(scale=1000, decimals=1, suffix='‰')"
+            named(fn_pct_named, "scale" = "乘的倍数, 默认 100", "decimals" = "小数位数上限(去尾零), 默认 2", "suffix" = "结果后缀, 默认 '%'");
     }
 }
 
@@ -276,6 +278,49 @@ fn fn_result(ctx: &dyn EvalContext, _a: &[String]) -> Result<String> {
     Ok(var(ctx, "RESULT"))
 }
 
+/// 按比例换算结果并加后缀：默认 `scale=100, decimals=2, suffix='%'`，即百分比。
+/// 换 `scale=1000, suffix='‰'` 是千分比，`scale=10000, suffix='bp'` 是基点——
+/// 一个函数覆盖这一族「结果 × 倍数 + 单位」的写法，不必逐个再开新函数。
+///
+/// 换算基于 `$EXACT`（原始未截断精度）而非 `$RESULT`：若从已按 `decimal_places`
+/// 舍入过的 `$RESULT` 再乘 `scale`，`decimal_places=2` 时 1/3 的 `$RESULT` 已是
+/// `"0.33"`，`×100` 只能得到 `"33"` 而非 `"33.33"`——二次舍入会丢精度。
+fn fn_pct(ctx: &dyn EvalContext, a: &[String]) -> Result<String> {
+    fn_pct_named(ctx, a, &[])
+}
+
+fn fn_pct_named(ctx: &dyn EvalContext, _a: &[String], n: &[(String, String)]) -> Result<String> {
+    let scale = match named(n, "scale") {
+        Some(v) => parse_scale("pct", v)?,
+        None => 100.0,
+    };
+    let decimals = match named(n, "decimals") {
+        Some(v) => parse_width("pct", "decimals", v)?,
+        None => 2,
+    };
+    let suffix = named(n, "suffix").unwrap_or("%");
+    // 跨类调用（不在计算上下文）：与 fn_amt/fn_raw 等既有函数同一约定，给空串
+    // 而非报错——报错会让「有的模板碰巧含 pct()」在非计算类别整条候选消失。
+    let raw = var(ctx, "EXACT");
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    let v: f64 = raw
+        .parse()
+        .map_err(|_| CmdbarError::runtime("pct", format!("内部值解析失败: {raw:?}")))?;
+    let mut s = format!("{:.*}", decimals, v * scale);
+    if s.contains('.') {
+        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    Ok(format!("{s}{suffix}"))
+}
+
+fn parse_scale(func: &str, v: &str) -> Result<f64> {
+    v.trim()
+        .parse::<f64>()
+        .map_err(|_| CmdbarError::runtime(func, format!("scale 需要数字，得到 {v:?}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +387,7 @@ mod tests {
                 ("AMT", "壹佰贰拾叁元整"),
                 ("EXPR", "1+2*3"),
                 ("RESULT", "7"),
+                ("EXACT", "7"),
                 // 农历（2026-06-19 端午当天的取值）
                 ("LMD", "五月初五"),
                 ("LM", "五月"),
@@ -511,6 +557,43 @@ mod tests {
         assert_eq!(fn_year(&c, &[]).unwrap(), "");
         assert_eq!(fn_amt(&c, &[]).unwrap(), "");
         assert_eq!(fn_raw(&c, &[]).unwrap(), "");
+        assert_eq!(fn_pct(&c, &[]).unwrap(), "");
+    }
+
+    /// `pct()` 默认 ×100 保两位小数并去尾零；具名参数可换成千分比/基点等任意倍数与后缀。
+    ///
+    /// ★ 换算基于 `$EXACT`（未截断精度），不是 `$RESULT`：`ctx()` 的 `RESULT`/`EXACT`
+    /// 均固定为 "7"，这里换上 1/3 的真实精度值才能验出「不会二次舍入」。
+    #[test]
+    fn percent_default_and_custom() {
+        let mut c = ctx();
+        c.vars.insert("EXACT", "0.3333333333333333");
+        assert_eq!(
+            fn_pct(&c, &[]).unwrap(),
+            "33.33%",
+            "默认 scale=100 decimals=2"
+        );
+        assert_eq!(
+            fn_pct_named(
+                &c,
+                &[],
+                &nm(&[("scale", "1000"), ("decimals", "1"), ("suffix", "‰")])
+            )
+            .unwrap(),
+            "333.3‰",
+            "换个倍数与后缀即千分比，不必另开函数"
+        );
+        // decimals 是上限，整除的结果要去尾零，不能定死两位
+        c.vars.insert("EXACT", "0.5");
+        assert_eq!(fn_pct(&c, &[]).unwrap(), "50%");
+    }
+
+    /// 写错的 scale/decimals 必须报错，不能静默当默认值——否则用户以为参数生效了。
+    #[test]
+    fn percent_rejects_bad_named_args() {
+        let c = ctx();
+        assert!(fn_pct_named(&c, &[], &nm(&[("scale", "abc")])).is_err());
+        assert!(fn_pct_named(&c, &[], &nm(&[("decimals", "-1")])).is_err());
     }
 
     /// ★ quick 函数名不得与既有内置函数重名。

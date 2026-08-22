@@ -506,6 +506,9 @@ fn render_calc(
         &QuickValues::Calc {
             expr: clean.to_string(),
             result,
+            // `{}` 是 f64 的最短可回读表示，不受 decimal_places 影响——
+            // `{pct()}` 等函数据此自行换算，避免对已截断的 result 二次舍入。
+            exact: format!("{val}"),
         },
         eval,
     )

@@ -31,6 +31,8 @@
 #     $CNL 一百二十三      $CNU 壹佰贰拾叁     $AMT 壹佰贰拾叁元肆角伍分
 #   calc        输入 1+2*3
 #     $EXPR 1+2*3         $RESULT 7
+#     $EXACT 结果原始精度（未按小数位截断），只给 {pct()} 这类函数二次换算用，
+#     一般模板用不上，直接写 $RESULT 即可。
 #
 # 函数写法（变量表达不了时用；一条模板内不能与 $变量 混用）
 #   text = "{amt(unit='圆', zheng='false')}"   → 壹佰贰拾叁圆
@@ -39,6 +41,9 @@
 #   thou(sep=' ', group=4)     amt(unit='元', zheng='true')
 #   lunar(part=...)  part 取 md(默认)/month/day/ganzhi/zodiac/year/festival/full
 #   expr()  result()
+#   pct(scale=100, decimals=2, suffix='%')   结果按比例转百分比/千分比/基点等；
+#     不带参数即百分比（1/3 → 33.33%），换 scale=1000, suffix='‰' 即千分比，
+#     decimals 是小数位数上限，整除时去尾零（1/2 在默认参数下是 50% 不是 50.00%）。
 #   不带参数时与对应的 $变量 完全相同；开关类参数要加引号（cn='true'）。
 #
 # 渲染结果为空的条目不出现在候选中。
@@ -200,3 +205,9 @@ id = 'calc.equation'
 kind = 'calc'
 text = '$EXPR=$RESULT'
 position = 2
+
+[[formats]]
+id = 'calc.percent'
+kind = 'calc'
+text = '{pct()}'
+position = 3
