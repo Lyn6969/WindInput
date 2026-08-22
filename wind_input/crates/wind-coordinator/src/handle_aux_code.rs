@@ -305,6 +305,15 @@ impl Coordinator {
     /// 会话态那侧取 `include_printable = false`，与 `handle_candidate_nav` 在辅助码态下
     /// 的取值一致：辅助码态里字母是码元输入，不能被当成会话键抢走。
     fn is_aux_code_trigger(&self, data: &KeyEventData) -> bool {
+        // ★ 字母恒是码元，绝不当触发键。区间与下方那条累积臂（`VK_A..=VK_Z`）**取同一个**，
+        // 两处不会漂。
+        //
+        // 会话态那侧本已天然排除（`z` 在 `session_key_name_to_vk` 里标 `printable: true`，
+        // 而这里取 `include_printable = false`）；`key_actions` 压根没有 printable 这个维度，
+        // 得在此显式排。少了它，配过 `z = "aux_code"` 的用户在辅助码里再也打不出 `z`。
+        if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
+            return false;
+        }
         let shift = data.modifiers & MOD_SHIFT != 0;
         if self.session_action_for(data.key_code, shift, false)
             == Some(wind_config::SessionAction::AuxCode)
@@ -896,6 +905,40 @@ mod tests {
         assert_eq!(st.candidates.len(), 3, "退出不得吃掉候选（那意味着上屏了）");
         assert_eq!(st.input_buffer, "li", "退出不得消费编码缓冲");
         assert!(st.committed_text.is_empty(), "不该有待上屏文本");
+    }
+
+    /// ★ 辅助码态里**字母恒是码元**，即便它在 `key_actions` 里绑了 `aux_code`。
+    ///
+    /// 两张表在这一点上必须同规格。会话态那侧是天然的：`z` 在 `session_key_name_to_vk`
+    /// 里标着 `printable: true`，而辅助码态取 `include_printable = false` ⇒ 自动排除。
+    /// `key_actions` 那侧压根没有 `printable` 这个维度，得显式排。
+    ///
+    /// 少了这一排的后果：配了 `z = "aux_code"` 的用户在辅助码里再也打不出 `z`——
+    /// 而 `z` 是笔画码的「折」、也是形码方案的常用码元。
+    ///
+    /// ⚠️ 这条绑定对**进入**本就无效（`bound_action_yield_reason`：字母键仅码表引擎
+    /// 生效，而辅助码只服务拼音）。退出侧比进入侧更宽松，正是不对称的形态。
+    #[test]
+    fn letter_stays_code_input_even_when_bound_as_trigger() {
+        let c = coord_with_data_cfg("sess_zletter", data_dir_with_aux("sess_zletter"), |cfg| {
+            cfg.keys
+                .key_actions
+                .insert("z".to_string(), "aux_code".to_string());
+        });
+        let mut st = seed_composition(&c);
+        c.enter_aux_code(&mut st, keymap::VK_BACKTICK)
+            .expect("反引号应进得去");
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('Z'), 0));
+        assert_eq!(
+            st.active,
+            Some(ModeKind::AuxCode),
+            "z 是码元，不得当成退出键"
+        );
+        assert_eq!(
+            st.aux_code.as_ref().map(|o| o.session.buffer()),
+            Some("z"),
+            "z 应累积进辅助码缓冲"
+        );
     }
 
     /// ★ 别的 overlay 模式里，触发键也不得把辅助码套进来。
