@@ -460,7 +460,10 @@ impl CandidateWindow {
         if text.is_empty() {
             return String::new();
         }
-        if max_w > 0.0 && self.text_renderer.measure(text, style).width <= max_w {
+        // 半像素容差：不同后端的浮点连乘可能让「恰好等宽」冒出几个 ulp 的误差，
+        // 卡在预算边界上的文字不该只因这点误差被多裁一个字——差半像素肉眼分不出来。
+        const WIDTH_EPS: f32 = 0.5;
+        if max_w > 0.0 && self.text_renderer.measure(text, style).width <= max_w + WIDTH_EPS {
             return text.to_string();
         }
         let chars: Vec<char> = text.chars().collect();
@@ -470,7 +473,7 @@ impl CandidateWindow {
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
             let probe: String = chars[..mid].iter().chain(['…'].iter()).collect();
-            if self.text_renderer.measure(&probe, style).width <= max_w {
+            if self.text_renderer.measure(&probe, style).width <= max_w + WIDTH_EPS {
                 lo = mid;
             } else {
                 hi = mid - 1;
