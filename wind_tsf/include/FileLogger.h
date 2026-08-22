@@ -39,6 +39,8 @@
 //   level=debug
 //
 // Multi-process safety: 每进程一个日志文件，本进程独占 → 无需任何跨进程同步
+// Thread safety:  进程**内**仍需同步（_fileLock）——至少两个线程会写日志：TSF 输入线程
+//                 与 CIPCClient 的异步读线程。见 _fileLock 的注释。
 // Auto-rotation: 5MB max, rotates to <前缀>.<宿主名>.<pid>.old.log
 //
 // 外部改动日志文件是**受支持**的（每秒自检一次，见 _ResyncFile）：
@@ -118,12 +120,12 @@ private:
     // Build log directory and file paths
     void _BuildPaths();
 
-    // Rotate log file if needed (caller must hold mutex)
-
-    // Write to file (caller must hold mutex)
+    // 写文件。持 _fileLock，真正的实现在 _WriteToFileLocked。
     void _WriteToFile(const char* utf8Line, int utf8Len);
+    // 写文件的实现体。**调用方须持 _fileLock**（下面三个同）。
+    void _WriteToFileLocked(const char* utf8Line, int utf8Len);
 
-    // Write to OutputDebugStringW
+    // Write to OutputDebugStringW（不碰 _hFile/_written，无需持锁）
     void _WriteToDebugString(LogLevel level, const wchar_t* message);
     // 打开常开的追加句柄；失败返回 nullptr。顺带把已有文件大小计入 _written。
     HANDLE _OpenLogFile();
@@ -146,6 +148,18 @@ private:
     // 成分表见 FileLogger.cpp 的 _WriteToFile）。大头是每行开关文件被 Defender 逐次扫描，
     // 不是那把锁；锁只是把这段临界区跨进程串行化，让多宿主同时写时雪上加霜。
     HANDLE  _hFile;
+    // 文件段的进程内锁，保护 _hFile / _written / _lastCheckTick 三者。
+    //
+    // ★ 「每进程一个文件」消掉的是**跨进程**同步，不是跨线程的：至少两个线程会走
+    // Write() —— TSF 输入线程（每次按键）与 CIPCClient::_AsyncReaderThread（每收一条
+    // 推送就 _LogDebug）。此前那把命名互斥量同时兼着这两个职责，删它时只论证了跨进程
+    // 那半边，跨线程这半边就此裸奔：_ResyncFile/_RotateNow 会 CloseHandle(_hFile)，
+    // 而另一个线程可能正停在 WriteFile(_hFile, ...) 上——Windows 的句柄值会被激进复用，
+    // 最坏情形是日志字节写进另一个刚被打开的内核对象。
+    //
+    // 与 _ringLock 分开：环形缓冲恒开（mode=none 也写），不该被文件 I/O 挡住。
+    // 无竞争的 EnterCriticalSection 是 20-50ns 量级，对照现在 3.6μs/行可以忽略。
+    CRITICAL_SECTION _fileLock;
     // 已写入字节数，用于轮转判定。**精确而非估算**：本进程独占该文件，没有别人往里写。
     // 此前每行都要 GetFileAttributesExW 查一次真实大小，现在一次系统调用都不需要。
     DWORD   _written;

@@ -24,11 +24,15 @@ CFileLogger::CFileLogger()
     _configPath[0] = L'\0';
     memset(_ringBuffer, 0, sizeof(_ringBuffer));
     InitializeCriticalSection(&_ringLock);
+    // 必须在 Init 之前就绪：Init 末尾会 Write 一条启动标记，那条已经要持锁。
+    // InitializeCriticalSection 只分配内核对象、不加载 DLL，loader lock 下可用。
+    InitializeCriticalSection(&_fileLock);
 }
 
 CFileLogger::~CFileLogger()
 {
     Shutdown();
+    DeleteCriticalSection(&_fileLock);
     DeleteCriticalSection(&_ringLock);
 }
 
@@ -76,7 +80,12 @@ void CFileLogger::Init()
     // 它的害处是把上面那 246μs 的临界区跨进程串行化了。
     if (_mode == LogMode::File || _mode == LogMode::All)
     {
+        // 此刻本 DLL 还没有第二个线程（异步读线程要等 CIPCClient 起来才建），
+        // 持锁纯粹是为了让「碰 _hFile 必持 _fileLock」没有例外——例外正是日后
+        // 被人照抄的那一条。
+        EnterCriticalSection(&_fileLock);
         _hFile = _OpenLogFile();
+        LeaveCriticalSection(&_fileLock);
         if (_hFile == nullptr)
         {
             OutputDebugStringW(L"[WindInput][FileLogger] Failed to open log file, file logging disabled\n");
@@ -106,11 +115,14 @@ void CFileLogger::Shutdown()
         Write(LogLevel::Info, L"FileLogger shutdown");
     }
 
+    // 关句柄同样持锁：宿主退出时异步读线程未必已经停稳，它那边可能还在 WriteFile。
+    EnterCriticalSection(&_fileLock);
     if (_hFile != nullptr)
     {
         CloseHandle(_hFile);
         _hFile = nullptr;
     }
+    LeaveCriticalSection(&_fileLock);
 
     _mode = LogMode::None;
     _initialized = false;
@@ -160,7 +172,16 @@ void CFileLogger::_WriteToDebugString(LogLevel level, const wchar_t* message)
     OutputDebugStringW(buf);
 }
 
+// 文件段的进程内串行化。实现体拆成 _WriteToFileLocked 而不是在原函数里 Enter/Leave：
+// 那里面有四处提前 return，逐个配 Leave 迟早漏一个，而漏掉的表现是整个日志子系统死锁。
 void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
+{
+    EnterCriticalSection(&_fileLock);
+    _WriteToFileLocked(utf8Line, utf8Len);
+    LeaveCriticalSection(&_fileLock);
+}
+
+void CFileLogger::_WriteToFileLocked(const char* utf8Line, int utf8Len)
 {
     if (_hFile == nullptr)
         return;
@@ -193,9 +214,13 @@ void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
     //     合计                     230,695   →  现在 3,579
     //
     // ⚠ 别把账算在锁上：无竞争时它只占 0.1%。真正的开销是**每行开一次文件**——
-    // Defender 会在每次文件打开时插一次扫描，200μs 由此而来。锁的作用是放大：
-    // 那 246μs 的临界区被它串行化，N 个宿主同时写日志就是 N×246μs 的排队。
-    // 所以「拆文件」才是主要收益，「去锁」只是拆文件之后顺带不再需要。
+    // Defender 会在每次文件打开时插一次扫描，200μs 由此而来。那把**跨进程**互斥量的
+    // 害处是放大：246μs 的临界区被它跨进程串行化，N 个宿主同时写就是 N×246μs 的排队。
+    // 所以「拆文件」才是主要收益。
+    //
+    // ⚠⚠ 但「不需要跨进程锁」≠「不需要锁」：进程内仍有两个线程走这条路（见
+    // _fileLock 的注释）。现在这把 CRITICAL_SECTION 只在本进程内串行化 3.6μs 的
+    // 临界区，与被删掉的那把不是同一回事，别再顺手把它也当成历史包袱删掉。
     DWORD written = 0;
     if (!WriteFile(_hFile, utf8Line, (DWORD)utf8Len, &written, nullptr))
         return;
@@ -213,7 +238,7 @@ void CFileLogger::_WriteToFile(const char* utf8Line, int utf8Len)
 }
 
 // 打开常开的追加句柄。失败返回 nullptr（而非 INVALID_HANDLE_VALUE，省得每个调用点
-// 各判一次哨兵值）。
+// 各判一次哨兵值）。**调用方须持 _fileLock**（会写 _written / _lastCheckTick）。
 //
 // FILE_APPEND_DATA 而非 GENERIC_WRITE：追加语义由内核保证，不必自己维护写指针。
 // FILE_SHARE_READ 让排查时能一边跑一边 tail 日志；FILE_SHARE_DELETE 让文件在被打开
@@ -249,7 +274,10 @@ HANDLE CFileLogger::_OpenLogFile()
     return h;
 }
 
-// 与磁盘上的真实状态对一次表。一次 GetFileInformationByHandleEx 同时办三件事：
+// 与磁盘上的真实状态对一次表。**调用方须持 _fileLock**——本函数会 CloseHandle(_hFile)
+// 并重开，与别的线程的 WriteFile 撞上就是往已关闭（且可能已被复用）的句柄里写。
+//
+// 一次 GetFileInformationByHandleEx 同时办三件事：
 // 认出文件被删（重开）、认出文件被外部清空（校正累计字节数）、拿到真实大小。
 //
 // 判据实测（Win11/NTFS，见提交说明）：外部删除后 `NumberOfLinks` 归零 **且**
@@ -281,8 +309,10 @@ void CFileLogger::_ResyncFile()
 
 // 立即轮转：关句柄 → 覆盖式改名到 .old → 重开。
 //
-// 只有本进程持有这个文件，所以不需要与任何人协调——这正是「每进程一个文件」换来的
-// 简化。此前的 _RotateIfNeeded 要在共享文件上做，还得先靠互斥锁排他。
+// 只有本进程持有这个文件，所以不需要与**别的进程**协调——这正是「每进程一个文件」
+// 换来的简化。此前的 _RotateIfNeeded 要在共享文件上做，还得先靠跨进程互斥量排他。
+//
+// **调用方须持 _fileLock**：进程内的另一个日志线程仍要挡住，理由同 _ResyncFile。
 void CFileLogger::_RotateNow()
 {
     if (_hFile != nullptr)
@@ -314,12 +344,13 @@ void CFileLogger::_BuildPaths()
     // 日志文件**每进程一个**：`wind_tsf.<宿主名>.<pid>.log`。
     //
     // TSF DLL 被每个宿主进程各加载一份，此前它们共写一个文件，于是既要靠一把跨进程互斥锁
-    // 串行化，也没法常开句柄（别人要写同一个文件）。拆开之后没有共享资源，句柄可以常开，
-    // 锁也一并不再需要——真正省下的是「每行开关文件」那 246μs，见 _WriteToFile 的实测表。
+    // 串行化，也没法常开句柄（别人要写同一个文件）。拆开之后进程间没有共享资源，句柄可以
+    // 常开，**跨进程**那把锁不再需要——真正省下的是「每行开关文件」那 246μs，见
+    // _WriteToFile 的实测表。进程**内**的线程同步是另一回事，仍由 _fileLock 承担。
     //
     // 带宿主名是为了排查时一眼认出是谁（wind_tsf.feishu.12345.log）；**还要带 pid**，
     // 因为同一个程序可以多开，Chrome 那类多进程宿主更是一开就是一串——只带名字会撞回
-    // 共享，锁也就白去了。
+    // 共享，跨进程那把锁也就白去了。
     wchar_t hostExe[MAX_PATH] = {};
     wchar_t hostName[HOST_NAME_MAX + 1];
     wcscpy_s(hostName, L"host");
