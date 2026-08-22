@@ -354,7 +354,18 @@ impl Coordinator {
     /// **连续组句**：候选只消费缓冲前缀（`commit_selected` 走逐步转换分支、缓冲还有剩余）
     /// 时**不退出**辅助码模式——重建会话快照继续筛选下一段（如「没时间」：先 `n` 筛出 没
     /// 选中，再 `ss` 筛出 时间 选中，全程留在辅助码模式）；完整消费（整串上屏）才退出。
-    fn aux_code_committed(&self, state: &mut State, cand: Candidate, offset: i32) -> KeyAction {
+    ///
+    /// ★ **辅助码的三条选词路径必须全部走这里**：键盘（数字/空格/回车/二三候选键，见
+    /// [`Self::handle_aux_code_key`]）、鼠标点选（`handle_candidate_click`）、修饰键作
+    /// 二三候选键的 keyup（`select_page_candidate`）。少接一条的表现不是报错，而是
+    /// 「按 `2` 能继续组句、轻敲 Shift 选同一个候选却退出了模式」——同一个动作换个键
+    /// 换套语义，是最难被复现出来的那类缺陷。三条都收口在此，就不存在「只改对两条」。
+    pub(crate) fn aux_code_committed(
+        &self,
+        state: &mut State,
+        cand: Candidate,
+        offset: i32,
+    ) -> KeyAction {
         let act = self.commit_selected(state, &cand, offset);
         // 部分消费 → 缓冲还有剩余编码，处于逐步转换态 → 重建会话、留在辅助码模式。
         if !state.input_buffer.is_empty() {
@@ -757,6 +768,56 @@ mod tests {
             "组合区 = 已转换前缀 + 剩余拼音 + 分隔符前缀"
         );
         assert!(matches!(act, KeyAction::UpdateComposition { .. }));
+    }
+
+    /// ★★ 第三条选词路径（`select_page_candidate`）也要留在模式内。
+    ///
+    /// 它是「修饰键作二三候选键」的 keyup 落点（`handle_select_key_up` →
+    /// `select_page_candidate`）。此前那一臂是 `commit_selected` + **无条件**
+    /// `finish_aux_code_after_commit`，于是配了 `select_key_groups = lrshift` 的用户
+    /// 打「没时间」时：按 `2` 能继续组句，轻敲 Shift 选同一个候选却直接退出辅助码——
+    /// 同一个动作换个键换套语义。
+    ///
+    /// 判据取「`active` 仍是 AuxCode 且缓冲已裁剪」，不是看返回的 `KeyAction` 变体：
+    /// 留在模式内与退出模式都返回 `UpdateComposition`，按变体断言测不出任何东西。
+    #[test]
+    fn select_page_candidate_partial_commit_stays_in_aux_mode() {
+        let c = coord_with("continuous_selectkey");
+        let mut st = seed_composition(&c);
+        st.candidates[0].consumed_length = 1; // 李 只消费 li 的前 1 码
+        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('M'), 0)); // 筛 m → 李/樱
+        assert_eq!(st.active, Some(ModeKind::AuxCode));
+
+        // offset 0 = 首选（李）。走的是与键盘数字键**不同**的那条路径。
+        let act = c
+            .select_page_candidate(&mut st, 0)
+            .expect("页内有候选，不应越界");
+        assert_eq!(
+            st.active,
+            Some(ModeKind::AuxCode),
+            "部分消费后不得退出辅助码——否则与按 `2` 选同一个候选结果不同"
+        );
+        assert!(st.aux_code.is_some(), "overlay 三件套应已重建");
+        assert_eq!(st.committed_text, "李");
+        assert_eq!(st.input_buffer, "i", "缓冲应裁剪为剩余编码");
+        assert!(
+            st.aux_code.as_ref().unwrap().session.is_empty(),
+            "重建会话的辅助码缓冲应清空"
+        );
+        assert!(matches!(act, KeyAction::UpdateComposition { .. }));
+    }
+
+    /// 同一条路径的反向对照：完整消费仍须退出，别把「不退出」写成无条件的。
+    #[test]
+    fn select_page_candidate_full_commit_exits_aux_mode() {
+        let c = coord_with("continuous_selectkey_exit");
+        let mut st = seed_composition(&c);
+        // consumed_length 全 0 = 整串消费。
+        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        let _ = c.select_page_candidate(&mut st, 0).expect("页内有候选");
+        assert_eq!(st.active, None, "整串消费仍退出辅助码");
+        assert!(st.aux_code.is_none(), "overlay 三件套应整体销毁");
     }
 
     /// 完整消费（候选消费整串）→ 照常退出辅助码：连续组句只在逐步转换态续命，

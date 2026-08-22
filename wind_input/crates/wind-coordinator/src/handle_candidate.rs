@@ -1531,11 +1531,13 @@ impl Coordinator {
             Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
             // 网址模式无候选列表（不出候选窗），没有可选中的东西。
             Some(ModeKind::Url) => return None,
+            // 走 `aux_code_committed` 而**不是** `commit_selected` + 无条件收尾：
+            // 部分消费（候选只吃掉缓冲前缀）时辅助码要留在模式内重建会话继续筛，
+            // 否则「没时间」这类分步组句在按 `2` 时能继续、轻敲 Shift 选同一个候选
+            // 却直接退出模式——正是本函数文档里那条「两条路径分叉」的实例。
             Some(ModeKind::AuxCode) => {
                 let cand = state.candidates[gi].clone();
-                let act = self.commit_selected(state, &cand, offset as i32);
-                self.finish_aux_code_after_commit(state);
-                act
+                self.aux_code_committed(state, cand, offset as i32)
             }
             None => {
                 let cand = state.candidates[gi].clone();
@@ -3279,17 +3281,15 @@ impl Coordinator {
             let cand = state.candidates[idx].clone();
             let chinese_mode = state.chinese_mode;
             // 鼠标页内位置 = page_local（候选首选率统计，与数字键的 num-1 同义）。
-            let act = self.commit_selected(&mut state, &cand, page_local as i32);
-            // 辅助码收尾：与键盘 `aux_code_committed` 同源——部分消费（缓冲还有剩余）
-            // 留在模式内重建会话继续筛，完整消费才退出。少了这一步 `state.aux_code`
-            // 会连同候选快照残留（overlay 三件套「同生共死」的约定在此被打破）。
-            if state.active == Some(ModeKind::AuxCode) {
-                if state.input_buffer.is_empty() {
-                    self.finish_aux_code_after_commit(&mut state);
-                } else {
-                    self.rearm_aux_code_session(&mut state);
-                }
-            }
+            //
+            // 辅助码走 `aux_code_committed`（三条选词路径的唯一收尾，见该函数）：部分消费
+            // 时留在模式内重建会话继续筛，完整消费才退出。此前这里是就地抄的一份，抄漏了
+            // 重建之后的 `notify_ui_update` —— 鼠标点掉「没」之后候选窗还停在旧那一屏。
+            let act = if state.active == Some(ModeKind::AuxCode) {
+                self.aux_code_committed(&mut state, cand, page_local as i32)
+            } else {
+                self.commit_selected(&mut state, &cand, page_local as i32)
+            };
             drop(state);
             // commit_selected 已按分支自行 notify_ui_update / notify_ui_hide，此处不再重复。
             self.push_mouse_action(&act, chinese_mode);
