@@ -1162,6 +1162,29 @@ impl MessageHandler for Coordinator {
                 self.handle_number_key_select(&mut state, 10)
             }
             keymap::VK_A..=keymap::VK_Z => {
+                // ★ 会话态选词键里的**字母**（当前值域只有 z）：有候选时先选词，再谈组码。
+                //
+                // 为什么必须拦在这里、而不是像符号键那样交给下方的选词消费点：那一段在
+                // `decideBufferedTrigger` 分支里（本 match 的符号/数字臂之后），而字母走
+                // 本臂、当场进缓冲，**永远流不到那里**。`apply_session_action` 也接不住——
+                // 它对 `SelectCandidate` 刻意返回 `None`（选词带 overflow 语义，执行路径另在别处）。
+                //
+                // ⚠️ 候选不足时**落回本臂的正常组码**，不套 `keys.overflow.select_key`：
+                // 那三档是为符号键设计的（符号本身不是编码，越界了才要决定它怎么办），
+                // 而字母键的「输出该键字符」恰恰就是当编码打。套过来的话，`commit` 档会
+                // 在候选不足时吞掉字母并上屏高亮候选，用户按 z 想接着打码却上了别的字。
+                // 判据与 `handle_select_key_up` 同源、结论相反：那里修饰键**没有**字符可
+                // 输出所以吞键，这里字母的字符就是编码所以落回。
+                if !state.candidates.is_empty()
+                    && let Some(offset) = self.select_key_offset(data.key_code)
+                {
+                    let (start, end) = self.page_range(&state);
+                    let idx = start + offset;
+                    if idx < end {
+                        let cand = state.candidates[idx].clone();
+                        return self.commit_selected(&mut state, &cand, offset as i32);
+                    }
+                }
                 // A-Z 字母累积。缓冲恒存小写：z-fallback 探针、顶码判定、引擎查询、词频记账
                 // 全部只看它，大小写对匹配零影响。
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;

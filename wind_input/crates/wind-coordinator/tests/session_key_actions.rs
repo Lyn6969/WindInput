@@ -24,6 +24,7 @@ fn has_schemas() -> bool {
 const VK_TAB: u32 = 0x09;
 const VK_CAPITAL: u32 = 0x14;
 const VK_A: u32 = 0x41;
+const VK_Z: u32 = 0x5A;
 
 fn key(vk: u32, modifiers: u32, event_type: u8) -> KeyEventData {
     KeyEventData {
@@ -104,6 +105,10 @@ fn session_key_tables_agree_across_crates() {
         "slash",
         "backtick",
         "backslash",
+        // 唯一收进会话态表的字母（见 `session_key_to_vk` 里那段「只收 z」的理由）。
+        // 它在两处表里走的分支不同（wind-config 是 match 臂、wind-keys 是显式 if），
+        // 正是最容易只改一边的形态。
+        "z",
         // 纯修饰键：`select_key_groups = ["lrctrl"]` 折算后的形态。
         // ⚠️ 一期这几个只有 hotkey.rs 认得、wind-keys 漏了，而当时的键名列表恰好没覆盖
         // 到它们——**这条测试的覆盖面就是它的全部价值**，漏一个名字等于那个名字没被守。
@@ -553,6 +558,53 @@ fn modifier_select_key_picks_second_candidate_on_key_up() {
         }
         other => panic!("修饰键选词应上屏次选，实际: {other:?}"),
     }
+}
+
+/// z 是会话态表里唯一收进来的字母：**有候选时**按下即执行动作。
+#[test]
+fn z_selects_third_candidate_when_candidates_shown() {
+    if !has_schemas() {
+        return;
+    }
+    let coord =
+        Coordinator::new_headless(cfg_with(&[("z", "select_candidate:3")]), Some(&data_dir()));
+    type_until_multipage(&coord);
+    let page = coord.debug_page_texts();
+    assert!(page.len() >= 3, "前置条件：当前页应有至少三个候选");
+    let third = page[2].clone();
+
+    let act = coord.handle_key_event(&key(VK_Z, 0, EVENT_KEY_DOWN));
+    match act {
+        wind_bridge::handler::KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, third, "有候选时按 z 应选中第 3 个候选")
+        }
+        other => panic!("z 应上屏第三候选，实际: {other:?}"),
+    }
+}
+
+/// ★★ **空缓冲按 z 必须照常起头组码**，不能被会话态绑定夺走。
+///
+/// 这是「只加 z」这个决定能成立的**唯一前提**：导航/选词类动词带
+/// `requires_candidates` 守卫，无候选时 `apply_session_action` 返回 `None`，z 落回大
+/// match 的字母臂。这条一旦破了，配过 z 的用户在该方案里再也起不了以 z 开头的码，
+/// 而症状是「按 z 什么都没发生」——与键盘坏了同形。
+///
+/// 对照组不可省：若 `type_until_multipage` 之外 z 本来就打不出候选，上面那个用例
+/// 也会「绿」，因为它只断言了按下之后的事。
+#[test]
+fn z_still_starts_composition_when_buffer_empty() {
+    if !has_schemas() {
+        return;
+    }
+    let coord =
+        Coordinator::new_headless(cfg_with(&[("z", "select_candidate:3")]), Some(&data_dir()));
+    // 空缓冲直接按 z：应进组码（有编码 ⇒ 出候选），而不是被当成选词键吞掉。
+    coord.handle_key_event(&key(VK_Z, 0, EVENT_KEY_DOWN));
+    let (_, _, total) = coord.debug_page_info();
+    assert!(
+        total > 0,
+        "空缓冲按 z 应照常起头组码并出候选，实际候选数 {total}"
+    );
 }
 
 /// 以词定字折算后仍认 `brackets`——该组**不在**选词键组的值域里。

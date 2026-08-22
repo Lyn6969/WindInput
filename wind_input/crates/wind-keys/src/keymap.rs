@@ -116,6 +116,17 @@ pub fn session_key_name_to_vk(name: &str) -> Option<SessionKey> {
             printable: false,
         });
     }
+    // ★ 字母里**只收 z**，且 `printable: true`（它确实产出字符，文本模式下要让位）。
+    // 键名表另一半在 `wind_config::hotkey::session_key_to_vk`，那里写着为什么只收 z。
+    // 两处漂移的表现是「进了 TSF 转发白名单却查不到动作」，靠
+    // `session_key_tables_agree_across_crates` 守门。
+    if base == "z" {
+        return Some(SessionKey {
+            vk: VK_Z,
+            shift,
+            printable: true,
+        });
+    }
     key_name_to_vk(base).map(|vk| SessionKey {
         vk,
         shift,

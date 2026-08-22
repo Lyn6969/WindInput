@@ -200,6 +200,18 @@ pub fn session_key_to_vk(name: &str) -> Option<(u32, bool)> {
         "slash" | "/" => VK_OEM_2,
         "backtick" | "grave" | "`" => VK_OEM_3,
         "backslash" | "\\" => VK_OEM_5,
+        // ★ 字母里**只收 z**。会话态查表（`apply_session_action`）排在大 match 的字母臂
+        // 之前，故收进来的字母在**有候选时**会被夺走、打不出以它接续的编码。z 是唯一
+        // 值得付这个代价的：它在多数码表里是最边缘的码元，且用户对「z 兼职功能键」已有
+        // 习惯（`z_key_action` 那条路早就这么用）。
+        //
+        // ⛔ 别顺手放开成全部字母：其余字母在任何码表里几乎都是活码前缀，配了等于把那个
+        // 字母在该方案里废掉，且没有任何提示。这与 `schema_key_actions` 的键名下拉「字母
+        // 只留 z」是同一条判据。
+        //
+        // ⚠️ 无会话时不受影响：导航类动词带 `requires_candidates` 守卫，空缓冲按 z 照常
+        // 起头组码。被夺走的只有「已出候选后再按 z」那一下（五笔的 zz 类短语）。
+        "z" => 0x5A,
         _ => return None,
     };
     Some((vk, shift))
