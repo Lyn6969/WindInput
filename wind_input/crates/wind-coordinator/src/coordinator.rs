@@ -1786,6 +1786,23 @@ impl Coordinator {
         self.rt().config.input.enter_behavior == "clear"
     }
 
+    /// 空码时按标点/符号键是否丢弃这串废码（`input.punct_on_empty_behavior = "clear"`）。
+    ///
+    /// 「空码」= 缓冲非空但一个候选都没有（多为码表打错字根）。此时既有行为是把废码连同
+    /// 标点一起送上屏，用户要的往往是「这串码作废、句号照打」。
+    ///
+    /// ⚠️ 只管**无候选**那一支。有候选时按标点仍顶屏首选——那是「就选高亮那条吧」的既有
+    /// 语义，与本开关无关。
+    ///
+    /// ⚠️ 与 `schema.codetable.punct_commit` 正交：那一项关掉是吞键、连标点都不输出。
+    ///
+    /// 判据收口在此而非内联比较字符串：标点有两个彼此独立的上屏出口（普通标点、智能符号
+    /// `CommitAndHoldComposition`），内联必漏其一，而漏掉的那个是「只在开了智能符号的宿主
+    /// 上复现」的间歇性不一致。参见 [`Self::enter_clears_composition`] 的同款教训。
+    pub(crate) fn punct_clears_on_empty(&self) -> bool {
+        self.rt().config.input.punct_on_empty_behavior == "clear"
+    }
+
     /// 焦点/IME 激活时按 client_token 高 32 位的 PID 解析焦点进程名，缓存其 caret 兼容态
     /// （对齐 Go `HandleFocusGained` 设置 activeCompatRule）。按 pid 缓存：同进程命中直接返回，
     /// 避免每次焦点事件重复 OpenProcess。仅在重型/异步段调用，不在 DLL 同步阻塞路径上。

@@ -1972,6 +1972,14 @@ pub struct InputConfig {
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
     pub space_on_empty_behavior: String,
+    /// 空码（缓冲非空但无候选）时按标点/符号键的处理方式。
+    /// `commit`（默认）上屏原码再接标点；`clear` 丢弃原码，标点照常上屏。
+    ///
+    /// 与 [`Self::enter_behavior`] / [`Self::space_on_empty_behavior`] 同族，值域同为两态。
+    /// **不要与 `schema.codetable.punct_commit` 混淆**：那一项关掉是「吞键、保留编码」，
+    /// 连标点本身都不输出，语义完全不同。
+    #[serde(default = "default_punct_on_empty_behavior")]
+    pub punct_on_empty_behavior: String,
     #[serde(default = "default_numpad_behavior")]
     pub numpad_behavior: String,
     /// 启动默认状态（记住上次状态 / 默认中文 / 全角 / 中文标点；原 general 域）。
@@ -2024,6 +2032,7 @@ impl Default for InputConfig {
             scope_relax: ScopeRelaxConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
+            punct_on_empty_behavior: default_punct_on_empty_behavior(),
             numpad_behavior: default_numpad_behavior(),
             default: InputDefaultConfig::default(),
             punct: PunctConfig::default(),
@@ -3732,6 +3741,10 @@ fn default_space_behavior() -> String {
     "commit".to_string()
 }
 
+fn default_punct_on_empty_behavior() -> String {
+    "commit".to_string()
+}
+
 fn default_pinyin_separator() -> String {
     "auto".to_string()
 }
@@ -3815,6 +3828,7 @@ impl Config {
         Self::migrate_enable_english_value(&mut merged);
         Self::migrate_force_vertical_value(&mut merged);
         Self::migrate_index_labels_value(&mut merged);
+        Self::migrate_empty_code_behavior_value(&mut merged);
         let mut config: Config = merged.try_into()?;
         config.normalize();
         Ok(config)
@@ -3827,6 +3841,36 @@ impl Config {
     /// 该键与 members 曾是双真相源；语义合并到 members 后，关掉过英文候选的存量用户
     /// 必须在这里落成成员删除，否则升级后英文候选会自己冒回来。只认 false——true 是默认值，
     /// 无需动作。
+    /// 存量迁移（**须在反序列化前**跑）：空码三键（`input.enter_behavior` /
+    /// `space_on_empty_behavior` / `punct_on_empty_behavior`）的值域收窄为 `commit | clear`，
+    /// 把设置端曾经误列的 `ignore` / `commit_and_input` 归一到 `commit`。
+    ///
+    /// 那两个值**从未被实现过**：消费点只判 `== "clear"`，其余一律走 commit 分支。所以这条
+    /// 迁移是**零行为变更**，纯粹让存量配置落回合法值域——不做的话，设置页下拉「按当前值
+    /// 恢复选中项」匹配不到，会静默弹回首项，用户看到的是自己的配置被悄悄改了。
+    fn migrate_empty_code_behavior_value(merged: &mut toml::Value) {
+        const KEYS: [&str; 3] = [
+            "enter_behavior",
+            "space_on_empty_behavior",
+            "punct_on_empty_behavior",
+        ];
+        let Some(input) = merged.get_mut("input").and_then(|i| i.as_table_mut()) else {
+            return;
+        };
+        // 先收集再改写：`get` 的不可变借用不能与 `insert` 的可变借用同时活着。
+        let illegal: Vec<(String, String)> = KEYS
+            .iter()
+            .filter_map(|k| {
+                let v = input.get(*k)?.as_str()?;
+                (v != "commit" && v != "clear").then(|| ((*k).to_string(), v.to_string()))
+            })
+            .collect();
+        for (key, old) in illegal {
+            info!("Migrated input.{key} = {old:?} → \"commit\"（该值从未被实现，行为不变）");
+            input.insert(key, toml::Value::String("commit".to_string()));
+        }
+    }
+
     fn migrate_enable_english_value(merged: &mut toml::Value) {
         let disabled = merged
             .get("schema")
@@ -6215,6 +6259,55 @@ active = "x"
             Some("f".to_string()),
             "空槽之后仍生效"
         );
+    }
+
+    #[test]
+    fn test_migrate_empty_code_behavior_normalizes_illegal_values() {
+        // 设置端 manifest 曾把 keys.overflow 的四个选项抄给了这三个键，而消费点只认
+        // commit/clear。归一是零行为变更（那两个值本就走 commit 分支），目的是让存量配置
+        // 落回合法值域，设置页下拉才能「按当前值恢复选中项」而不是静默弹回首项。
+        let mut v: toml::Value = toml::from_str(
+            "[input]\nenter_behavior = \"ignore\"\nspace_on_empty_behavior = \"commit_and_input\"\npunct_on_empty_behavior = \"clear\"\n",
+        )
+        .unwrap();
+        Config::migrate_empty_code_behavior_value(&mut v);
+        assert_eq!(v["input"]["enter_behavior"].as_str(), Some("commit"));
+        assert_eq!(
+            v["input"]["space_on_empty_behavior"].as_str(),
+            Some("commit")
+        );
+        assert_eq!(
+            v["input"]["punct_on_empty_behavior"].as_str(),
+            Some("clear"),
+            "合法值不得被动——否则这条迁移会把用户设的 clear 抹成 commit"
+        );
+        // 幂等：每次启动都会跑一遍。
+        let before = v.clone();
+        Config::migrate_empty_code_behavior_value(&mut v);
+        assert_eq!(v, before, "对已归一的值二次迁移须无变化");
+    }
+
+    #[test]
+    fn test_empty_code_behavior_registry_values_match_impl() {
+        // ★ 守门：注册表的值域必须与消费点实际认得的值一致。这三个键此前登记为 Str，
+        // 值域不受任何约束，设置端才得以抄进两个从未被实现的选项且无一层拦得住。
+        for key in [
+            "input.enter_behavior",
+            "input.space_on_empty_behavior",
+            "input.punct_on_empty_behavior",
+        ] {
+            let f = crate::config_schema::field(key).expect("键须已登记");
+            match f.ty {
+                crate::config_schema::FieldType::Enum(vals) => {
+                    assert_eq!(
+                        vals,
+                        ["commit", "clear"],
+                        "{key} 的值域须恰为 commit/clear——加值前先确认消费点真的分了那一支"
+                    );
+                }
+                other => panic!("{key} 须登记为 Enum 而非 {other:?}"),
+            }
+        }
     }
 
     #[test]

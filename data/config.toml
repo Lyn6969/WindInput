@@ -336,8 +336,16 @@ decimal_places = 6
 
 [input]
 filter_mode = "smart"
+# 空码（打了码但一个候选都没有，多半是打错了）时，终结键怎么处置这串废码。
+# 三键同族，值域同为两态：commit = 上屏原码，clear = 丢弃原码。
+#   enter_behavior           回车
+#   space_on_empty_behavior  空格
+#   punct_on_empty_behavior  标点/符号键（clear 时废码丢掉，标点本身照常上屏）
+# 注意 punct_on_empty_behavior 与 schema.codetable.punct_commit 是两回事：后者关掉是
+# 「吞键、保留编码」，连标点都不输出。
 enter_behavior = "commit"
 space_on_empty_behavior = "commit"
+punct_on_empty_behavior = "commit"
 numpad_behavior = "direct"
 # 顶码上屏时「已确认文字」如何落到宿主（内部/实验项，设置页不暴露）：
 #   direct_commit（默认）= 顶码时真提交，余码的新组合延到触发键 keyup 才开，靠隔一拍

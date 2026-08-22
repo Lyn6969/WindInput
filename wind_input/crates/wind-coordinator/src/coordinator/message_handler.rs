@@ -1470,8 +1470,18 @@ impl MessageHandler for Coordinator {
                             if let Some(act) = self.top_commit_command_guard(&mut state) {
                                 return act;
                             }
+                            // 空码丢弃（`punct_on_empty_behavior = "clear"`）：与下方普通标点
+                            // 出口同判据、同语义。本分支是智能符号专属的**独立**上屏通路，
+                            // 只改那边会得到「开了智能符号的宿主上开关不生效」的间歇性不一致。
+                            let discard_empty_code = state.candidates.is_empty()
+                                && !state.input_buffer.is_empty()
+                                && self.punct_clears_on_empty();
                             let committed = self.take_committed(&mut state);
-                            let mut commit_text = self.maybe_s2t(&state, &committed);
+                            let mut commit_text = if discard_empty_code {
+                                String::new()
+                            } else {
+                                self.maybe_s2t(&state, &committed)
+                            };
                             if !state.candidates.is_empty() {
                                 let (start, _) = self.page_range(&state);
                                 let idx =
@@ -1487,7 +1497,7 @@ impl MessageHandler for Coordinator {
                                     CommitSource::Candidate,
                                 );
                                 commit_text.push_str(&self.cand_s2t_text(&state, &cand));
-                            } else if !state.input_buffer.is_empty() {
+                            } else if !state.input_buffer.is_empty() && !discard_empty_code {
                                 // 无候选顶屏的是原码 → 同回车，用用户所打的大小写形态。
                                 commit_text.push_str(preedit_cursor::cased_or_buffer(
                                     &state.input_buffer,
@@ -1516,8 +1526,24 @@ impl MessageHandler for Coordinator {
                         return act;
                     }
                     // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
+                    //
+                    // 空码（缓冲非空但一个候选都没有）+ `punct_on_empty_behavior = "clear"`：
+                    // 废码与已转换前缀都不上屏，只出标点本身。丢 `committed_text` 是与
+                    // `enter_behavior` 的 clear 对齐的既定决策——「清空编码」就是清空全部，
+                    // 不让用户记忆「哪部分会保留」（见 enter-behavior-clear-semantics.md）。
+                    // 码表下 `committed_text` 恒为空串，实际影响面只在拼音逐步转换。
+                    //
+                    // ⚠️ 判据必须算在 `take_committed` **之前**：那一步会把 committed_text 取空，
+                    // 之后再问就恒为假。
+                    let discard_empty_code = state.candidates.is_empty()
+                        && !state.input_buffer.is_empty()
+                        && self.punct_clears_on_empty();
                     let committed = self.take_committed(&mut state);
-                    let mut out = self.maybe_s2t(&state, &committed);
+                    let mut out = if discard_empty_code {
+                        String::new()
+                    } else {
+                        self.maybe_s2t(&state, &committed)
+                    };
                     // 若此前有 HoldComposition 残留（非参与集合标点令 arm 解除武装），
                     // 将旧符号纳入 out 首部：CommitText 原子替换 TSF 组合态，timer 被 CancelHoldTimer
                     // 取消，旧符号不会二次提交，也不会因组合态被覆盖而丢失。
@@ -1549,7 +1575,7 @@ impl MessageHandler for Coordinator {
                             CommitSource::Candidate,
                         );
                         out.push_str(&self.cand_s2t_text(&state, &cand));
-                    } else if !state.input_buffer.is_empty() {
+                    } else if !state.input_buffer.is_empty() && !discard_empty_code {
                         // 无候选顶屏的是原码 → 同回车，用用户所打的大小写形态。
                         out.push_str(preedit_cursor::cased_or_buffer(
                             &state.input_buffer,
@@ -2543,6 +2569,12 @@ impl MessageHandler for Coordinator {
                     (t, s, f, ap)
                 }
                 // 空格退回原码：无候选可依，方案口径（与 VK_SPACE 空码分支同）。
+                //
+                // ⚠️ 这一支**没有接空码丢弃开关**（`input.space_on_empty_behavior`），按键路径
+                // 那边接了。眼下不是缺陷——整条 barrier 通路是**死代码**：C++ 侧
+                // `_SendCommitRequest` 只有定义没有调用点（见 wind_tsf/src/AGENTS.md「Barrier
+                // mechanism 预留，尚未激活」）。哪天真把它接上，这里连同下方 VK_RETURN 分支
+                // （`enter_behavior`）都得补判据，否则表现为「开关只在部分宿主/部分时机生效」。
                 None => {
                     let (t, s, f) = raw();
                     (t, s, f, self.english_space_enabled())

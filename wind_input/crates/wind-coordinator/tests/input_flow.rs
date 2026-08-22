@@ -8896,3 +8896,156 @@ fn top_code_overlong_phrase_in_mixed_schema() {
     }
     let _ = std::fs::remove_file(&store_path);
 }
+
+// ───── punct_on_empty_behavior：空码时标点键是否丢弃废码 ─────
+//
+// 「空码」= 打了码但一个候选都没有（多为码表打错字根）。既有行为是把废码连同标点一起
+// 送上屏；`clear` 让废码作废、标点照常出。
+//
+// 标点有**两个彼此独立的上屏出口**，各写一对测试：普通标点，以及智能符号
+// `hold_composition` 的 `CommitAndHoldComposition`。只接一个的后果是「开了智能符号的
+// 宿主上开关不生效」——这种间歇性不一致没有对照测试根本发现不了。
+//
+// ⚠️ 每个测试都必须先断言「候选确实为空」：`bbqq` 若哪天进了词库，测试会退化成在验
+// 「有候选时按标点顶屏首选」，那条路与本开关无关，断言却照样能过。
+//
+// ⚠️ 必须显式开 `punct_commit`：结构体零值是 `false`（出厂 toml 是 `true`），关着时标点
+// 分支在 `has_input` 守卫处就 `return Consumed` 吞键，压根走不到被测代码。
+
+/// 构造 wubi86 + 标点顶屏已开的配置。`clear` 决定空码时是否丢弃废码。
+fn config_punct_on_empty(clear: bool) -> Config {
+    let mut cfg = config_with("wubi86");
+    // 出厂即开，测试须显式打开——零值 false 会让标点在 has_input 分支被吞掉。
+    cfg.schema.codetable.punct_commit = true;
+    if clear {
+        cfg.input.punct_on_empty_behavior = "clear".into();
+    }
+    cfg
+}
+
+/// 打出一串空码，返回协调器。先验候选确实为空，避免测试悄悄换了被测路径。
+fn type_empty_code(coord: &Coordinator) {
+    for c in "bbqq".chars() {
+        press_letter(coord, c);
+    }
+    assert!(
+        coord.debug_page_texts().is_empty(),
+        "前提失守：bbqq 应当无候选（空码），实际: {:?}",
+        coord.debug_page_texts()
+    );
+}
+
+/// clear：空码时按句号，废码不上屏，只出中文句号。
+#[test]
+fn test_punct_on_empty_clear_discards_raw_code() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_punct_on_empty(true), Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "。", "clear 应丢弃废码 bbqq，只上屏句号");
+        }
+        other => panic!("空码按句号应上屏标点，实际: {:?}", other),
+    }
+}
+
+/// 对照组：默认 commit 下同样操作仍把废码顶上屏。
+///
+/// 没有它，上面那条测试无法区分「配置生效」与「这条路本来就不上屏原码」。
+#[test]
+fn test_punct_on_empty_commit_still_outputs_raw_code() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_punct_on_empty(false), Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "bbqq。", "commit（默认）应把废码连同句号一起上屏");
+        }
+        other => panic!("空码按句号应上屏原码+标点，实际: {:?}", other),
+    }
+}
+
+/// clear：智能符号 `hold_composition` 出口同样丢弃废码，符号仍进 held。
+#[test]
+fn test_punct_on_empty_clear_discards_in_hold_composition() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_punct_on_empty(true);
+    cfg.input.symbol.smart_mode = true;
+    cfg.input.symbol.smart_method = wind_config::config::SmartMethod::HoldComposition;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::CommitAndHoldComposition {
+            commit_text,
+            hold_text,
+            ..
+        } => {
+            assert_eq!(commit_text, "", "clear 应丢弃废码，commit_text 为空");
+            assert_eq!(hold_text, "。", "符号本身仍照常进 held");
+        }
+        other => panic!(
+            "智能符号 hold 下空码按句号应走 CommitAndHold，实际: {:?}",
+            other
+        ),
+    }
+}
+
+/// 对照组：智能符号 hold 出口在默认 commit 下仍顶废码上屏。
+#[test]
+fn test_punct_on_empty_commit_outputs_raw_code_in_hold_composition() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_punct_on_empty(false);
+    cfg.input.symbol.smart_mode = true;
+    cfg.input.symbol.smart_method = wind_config::config::SmartMethod::HoldComposition;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::CommitAndHoldComposition {
+            commit_text,
+            hold_text,
+            ..
+        } => {
+            assert_eq!(commit_text, "bbqq", "commit（默认）应把废码顶上屏");
+            assert_eq!(hold_text, "。", "符号本身进 held");
+        }
+        other => panic!(
+            "智能符号 hold 下空码按句号应走 CommitAndHold，实际: {:?}",
+            other
+        ),
+    }
+}
+
+/// 有候选时按标点仍顶屏首选——`clear` 只管空码那一支，不得误伤正常顶屏。
+#[test]
+fn test_punct_on_empty_clear_does_not_affect_nonempty_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_punct_on_empty(true), Some(&data_dir()));
+    for c in "ffff".chars() {
+        press_letter(&coord, c);
+    }
+    let first = coord
+        .debug_page_texts()
+        .first()
+        .cloned()
+        .expect("前提失守：ffff 应当有候选");
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text,
+                format!("{first}。"),
+                "有候选时 clear 不得改变「按标点顶屏首选」的既有语义"
+            );
+        }
+        other => panic!("有候选按句号应顶屏首选+标点，实际: {:?}", other),
+    }
+}

@@ -48,6 +48,15 @@ use FieldType::{Bool, Enum, Float, Int, Map, Str, StrList, StructList};
 /// 候选无效按键三策（number_key/select_key/select_char_key 共用）。
 const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 
+/// 空码（缓冲非空但无候选）时终结键怎么处置这串废码，回车/空格/标点三键共用。
+/// **只有两态**：`commit` 上屏原码 / `clear` 丢弃。语义与实现见
+/// `docs/design/enter-behavior-clear-semantics.md`。
+///
+/// ⚠️ 登记成 `Enum` 而非 `Str` 是刻意的：这三键曾因值域不受约束，让设置端 manifest 抄来了
+/// [`OVERFLOW_VALUES`] 的四个选项，用户选「忽略」被静默当成「上屏编码」，界面与行为不一致
+/// 且无任何测试拦得住。值域进注册表后，设置端的守门测试即可比对。
+const EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear"];
+
 /// 码表词频应用策略。
 const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step", "position"];
 
@@ -201,8 +210,15 @@ static REGISTRY: &[ConfigField] = &[
     // 检索范围放宽（智能档增强，见 docs/design/smart-filter-scope-relax.md）
     f("input.scope_relax.page_end_key", Bool),
     f("input.scope_relax.prefix", Str),
-    f("input.enter_behavior", Str),
-    f("input.space_on_empty_behavior", Str),
+    f("input.enter_behavior", Enum(EMPTY_CODE_BEHAVIOR_VALUES)),
+    f(
+        "input.space_on_empty_behavior",
+        Enum(EMPTY_CODE_BEHAVIOR_VALUES),
+    ),
+    f(
+        "input.punct_on_empty_behavior",
+        Enum(EMPTY_CODE_BEHAVIOR_VALUES),
+    ),
     f("input.numpad_behavior", Str),
     // 启动默认状态（原 general 域）
     f("input.default.remember_last_state", Bool),
