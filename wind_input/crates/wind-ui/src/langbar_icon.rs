@@ -772,7 +772,7 @@ impl IconRenderer {
         let n = size_px as usize;
         // 黑色不透明底：GDI 需要不透明背景才能正确抗锯齿混合
         let mut buf = vec![0u8; n * n * 4];
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
         let _ = self.text.draw(

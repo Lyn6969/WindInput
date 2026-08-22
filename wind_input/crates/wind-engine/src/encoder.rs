@@ -80,7 +80,7 @@ fn parse_formula(formula: &str) -> Option<Vec<FormulaStep>> {
         return None;
     }
     let mut steps = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let (upper, lower) = (pair[0], pair[1]);
         if !upper.is_ascii_uppercase() || !lower.is_ascii_lowercase() {
             return None;

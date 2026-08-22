@@ -439,9 +439,7 @@ impl PopupMenu {
     /// 作废全部渲染基线：下一次 reconcile 会全量重绘并重新摆位。
     /// 用于「像素会变但 items/selected 不变」的场合（主题切换、DPI 变化、菜单重新弹出）。
     fn invalidate_rendered(&mut self) {
-        for slot in &mut self.rendered {
-            *slot = None;
-        }
+        self.rendered.fill(None);
     }
 
     /// DPI 动态化：按显示点所在显示器实时取缩放，变化则更新字号并按新缩放重解析主题几何。

@@ -111,7 +111,7 @@ pub fn save_bgra_to_png(buffer: &[u8], width: u32, height: u32, path: &Path) -> 
     let (trimmed, w, h) = trim_transparent(buffer, width, height);
     // BGRA（预乘）→ RGBA（直通）：Win32 DIB 以 B-G-R-A 顺序存储
     let mut rgba = trimmed;
-    for chunk in rgba.chunks_exact_mut(4) {
+    for chunk in rgba.as_chunks_mut::<4>().0 {
         chunk.swap(0, 2); // B ↔ R
         unpremultiply(chunk);
     }
@@ -148,7 +148,9 @@ pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<
 
     // 预乘 BGRA 合成到白色背景：f = premult + (255 - alpha)
     let composited: Vec<u8> = trimmed
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| {
             let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
             let inv = 255u8.saturating_sub(a);

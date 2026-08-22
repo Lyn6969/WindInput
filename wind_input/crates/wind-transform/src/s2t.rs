@@ -100,7 +100,7 @@ impl Dict {
         let mut buf = vec![0u8; entries_len];
         f.read_exact(&mut buf).ok()?;
         let mut entries = Vec::with_capacity(count);
-        for chunk in buf.chunks_exact(ENTRY_SIZE) {
+        for chunk in buf.as_chunks::<ENTRY_SIZE>().0 {
             entries.push(Entry {
                 key_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
                 key_len: u16::from_le_bytes(chunk[4..6].try_into().ok()?),

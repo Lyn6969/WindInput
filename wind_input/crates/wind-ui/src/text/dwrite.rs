@@ -1071,7 +1071,12 @@ mod alpha_text_tests {
     /// 缓冲中最暗的 R 通道值。取最暗而非固定坐标——字形的确切落点随字体/hinting 变，
     /// 但"块体最暗处"这个判据与位置无关。
     fn darkest_r(buf: &[u8]) -> u8 {
-        buf.chunks_exact(4).map(|p| p[2]).min().unwrap_or(255)
+        buf.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[2])
+            .min()
+            .unwrap_or(255)
     }
 
     /// 在白底画一个全块字符（█ U+2588，覆盖率≈1），返回缓冲。
