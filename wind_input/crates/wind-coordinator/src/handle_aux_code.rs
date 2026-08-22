@@ -96,6 +96,20 @@ impl Coordinator {
     /// - 方案未配 `[engine.aux_code].files` 或码表文件全部缺失
     /// - 当前无候选（没有可筛的东西；空缓冲下触发键落普通标点流程）
     pub(crate) fn enter_aux_code(&self, state: &mut State, key_code: u32) -> Option<KeyAction> {
+        // ★★ 只能从**主输入路**进入：本模式筛的是主路候选，而各 overlay 模式有自己的
+        // 候选面与生命周期。
+        //
+        // ⚠️ 这道守卫在 `apply_session_action` 收下 `SessionAction::AuxCode` 之后才成为
+        // 必需：`handle_candidate_nav` 被**五个** overlay 共用（辅助码自身、特殊模式、
+        // 临拼、临英、URL），它们都会把按键送回 `apply_session_action`，而它现在认得
+        // AuxCode ⇒ 触发键在这些模式里会重入。
+        //
+        // 少了它的实际症状（2026-08-22 真机）：辅助码态再按一次 Tab → 重入 →
+        // `preedit_prefix` 每次在旧 preedit 上再拼 4 个空格，组合区里长出一段越来越宽的
+        // 空白，看起来像插进了一个宽制表符。
+        if state.active.is_some() {
+            return None;
+        }
         let settings = self.engine_mgr.aux_code_settings();
         if !settings.enabled {
             return None;
@@ -206,6 +220,13 @@ impl Coordinator {
         {
             return act;
         }
+        // 触发键再按一次 = 退出。**必须排在 `handle_candidate_nav` 之前**：那个函数把键送回
+        // `apply_session_action`，而它认得 AuxCode——虽然 `enter_aux_code` 的守卫已挡住重入，
+        // 但挡住之后返回 None，键会继续落到下方兜底臂**上屏高亮候选**，那是个破坏性动作。
+        // 按同一个键返回也正是用户对自选触发键的预期。
+        if self.is_aux_code_trigger(data) {
+            return self.aux_code_exited(state);
+        }
         // 候选导航（翻页 / 高亮）：辅助码只收字母，`-`/`=`/`[`/`]` 等按普通导航处理。
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
@@ -276,6 +297,24 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// 这个键是不是「进辅助码」的触发键。**两张表都问**——`aux_code` 在
+    /// `keys.key_actions` 与 `keys.session_actions` 里各有一份，用户配在哪张都算数。
+    ///
+    /// 会话态那侧取 `include_printable = false`，与 `handle_candidate_nav` 在辅助码态下
+    /// 的取值一致：辅助码态里字母是码元输入，不能被当成会话键抢走。
+    fn is_aux_code_trigger(&self, data: &KeyEventData) -> bool {
+        let shift = data.modifiers & MOD_SHIFT != 0;
+        if self.session_action_for(data.key_code, shift, false)
+            == Some(wind_config::SessionAction::AuxCode)
+        {
+            return true;
+        }
+        matches!(
+            self.bound_action_for(data.key_code),
+            Some(wind_config::BoundAction::AuxCode)
+        )
     }
 
     /// 组合区随辅助码更新：通知 UI 并回组合更新（光标在辅助码串尾）。
@@ -806,6 +845,82 @@ mod tests {
         let act = c.apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true);
         assert!(act.is_none(), "无候选时不得吞键——Tab 要还给宿主");
         assert_eq!(st.active, None);
+    }
+
+    /// ★★ 触发键在辅助码态里再按一次 = **退出**，绝不重入。
+    ///
+    /// 真机症状（2026-08-22）：重入时 `preedit_prefix = format!("{旧 preedit}    ")`，
+    /// 每按一次组合区就多 4 个空格，看起来像插进了一个越来越宽的制表符。
+    /// 判据取「组合区长度不增长」而非只看 `active`——`active` 在重入后**仍是** AuxCode，
+    /// 只看它这条测不出任何东西。
+    #[test]
+    fn trigger_key_exits_instead_of_reentering() {
+        let c = coord_with_data_cfg("sess_reenter", data_dir_with_aux("sess_reenter"), |cfg| {
+            cfg.keys
+                .session_actions
+                .insert("tab".to_string(), "aux_code".to_string());
+        });
+        let mut st = seed_composition(&c);
+        let tab = key(keymap::VK_TAB, 0);
+        c.apply_session_action(&mut st, &tab, true).expect("应进入");
+        assert_eq!(st.active, Some(ModeKind::AuxCode));
+        let after_enter = st.preedit.clone();
+        assert_eq!(after_enter, "li    ", "进入后 = 拼音 + 4 空格");
+
+        // 再按一次：退出并还原拼音组合，而不是把前缀又拼一遍。
+        let act = c.handle_aux_code_key(&mut st, &tab);
+        assert!(matches!(act, KeyAction::UpdateComposition { .. }));
+        assert_eq!(st.active, None, "触发键再按一次应退出辅助码");
+        assert!(st.aux_code.is_none(), "overlay 三件套应整体销毁");
+        assert_eq!(st.preedit, "li", "组合区应还原成拼音，不带任何残留空格");
+        assert_eq!(st.candidates.len(), 3, "候选应还原");
+    }
+
+    /// 再按触发键**不能上屏**。
+    ///
+    /// 少了「触发键退出」这一支，键会落到兜底臂「其余键：有候选则上屏高亮候选并退出」——
+    /// 用户只是想退出，却把首选打了出去，是个破坏性动作。
+    #[test]
+    fn trigger_key_does_not_commit_on_exit() {
+        let c = coord_with_data_cfg("sess_nocommit", data_dir_with_aux("sess_nocommit"), |cfg| {
+            cfg.keys
+                .session_actions
+                .insert("tab".to_string(), "aux_code".to_string());
+        });
+        let mut st = seed_composition(&c);
+        let tab = key(keymap::VK_TAB, 0);
+        c.apply_session_action(&mut st, &tab, true).expect("应进入");
+        let _ = c.handle_aux_code_key(&mut st, &tab);
+        // 判据取「候选还在、缓冲还在」而不是看返回的 KeyAction 变体：兜底臂走
+        // `commit_selected`，它在部分消费时同样返回 `UpdateComposition`，按变体断言测不出来。
+        assert_eq!(st.candidates.len(), 3, "退出不得吃掉候选（那意味着上屏了）");
+        assert_eq!(st.input_buffer, "li", "退出不得消费编码缓冲");
+        assert!(st.committed_text.is_empty(), "不该有待上屏文本");
+    }
+
+    /// ★ 别的 overlay 模式里，触发键也不得把辅助码套进来。
+    ///
+    /// `handle_candidate_nav` 被五个 overlay 共用，全都会把键送回 `apply_session_action`。
+    /// 少了 `enter_aux_code` 的 `state.active.is_some()` 守卫，Tab 在特殊模式/临拼/临英/URL
+    /// 里都会夺走那个模式的候选、改写 preedit。
+    #[test]
+    fn enter_is_refused_from_any_overlay_mode() {
+        let c = coord_with("overlay_guard");
+        let mut st = seed_composition(&c);
+        for mode in [
+            ModeKind::TempPinyin,
+            ModeKind::TempEnglish,
+            ModeKind::AuxCode,
+        ] {
+            st.active = Some(mode);
+            assert!(
+                c.enter_aux_code(&mut st, keymap::VK_TAB).is_none(),
+                "{mode:?} 态下不得进入辅助码"
+            );
+            assert_eq!(st.active, Some(mode), "被拒时不得改动 active");
+            assert_eq!(st.candidates.len(), 3, "被拒时候选必须原封不动");
+            assert_eq!(st.preedit, "li", "被拒时组合区必须原封不动");
+        }
     }
 
     /// 两张表的动词写法必须逐字一致：同一个功能在两处写法不同的话，用户把配置从一张表
