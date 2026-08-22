@@ -8917,9 +8917,10 @@ fn config_punct_on_empty(clear: bool) -> Config {
     let mut cfg = config_with("wubi86");
     // 出厂即开，测试须显式打开——零值 false 会让标点在 has_input 分支被吞掉。
     cfg.schema.codetable.punct_commit = true;
-    if clear {
-        cfg.input.punct_on_empty_behavior = "clear".into();
-    }
+    // ⚠️ 两个分支都**显式写**，不靠「不设＝commit」：出厂默认已经是 clear，靠缺省表达
+    // commit 的话，对照组会跟着默认值漂移——那正是它要防的东西。出厂默认本身由
+    // `punct_on_empty_default_discards_without_any_config` 单独守。
+    cfg.input.punct_on_empty_behavior = if clear { "clear" } else { "commit" }.into();
     cfg
 }
 
@@ -9020,6 +9021,60 @@ fn test_punct_on_empty_commit_outputs_raw_code_in_hold_composition() {
             "智能符号 hold 下空码按句号应走 CommitAndHold，实际: {:?}",
             other
         ),
+    }
+}
+
+/// 行为层守门：**一个相关开关都不设**，只靠出厂默认，空码按标点就应丢弃废码。
+///
+/// 上面那一族测试全都显式写了 `punct_on_empty_behavior`，所以把出厂默认改回 `commit`
+/// 它们一条都不会红——本仓实测过「只翻一个默认值，全量两千多条无一失败」。这条补的正是
+/// 那个缺口：它不写该键，读到什么就是真实用户装完就用的行为。
+///
+/// ⚠️ `punct_commit` 仍要显式对齐 L2（结构体零值 false、出厂 toml true）。不对齐的话标点
+/// 在 `has_input` 守卫处就被吞掉，断言会以「没上屏废码」的形态通过——测的却是一个标点功能
+/// 整个关闭的系统，是彻底的假绿。
+#[test]
+fn punct_on_empty_default_discards_without_any_config() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.punct_commit = true; // 对齐 L2，非本测试的被测项
+    assert_eq!(
+        cfg.input.punct_on_empty_behavior, "clear",
+        "出厂默认应为 clear；这行读的就是 L1，改它等于改产品决策"
+    );
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "。", "装完就用的默认行为：废码丢弃，只上屏句号");
+        }
+        other => panic!("空码按句号应上屏标点，实际: {:?}", other),
+    }
+}
+
+/// 反向对照：同一条路径下，回车与空格的出厂默认**仍然上屏原码**。
+///
+/// 这组不一致是产品决策，不是漏改。没有这条对照，将来有人「顺手把三个统一成 clear」时，
+/// 上面那条测试照样绿——它只看标点。
+#[test]
+fn enter_and_space_on_empty_still_commit_by_default() {
+    if !has_schemas() {
+        return;
+    }
+    for (vk, name) in [(0x0D_u32, "回车"), (0x20, "空格")] {
+        let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+        type_empty_code(&coord);
+        match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => {
+                assert!(
+                    text.starts_with("bbqq"),
+                    "{name}的出厂默认仍应上屏原码（保住「我就要这串原码」的出口），实际: {text:?}"
+                );
+            }
+            other => panic!("{name}空码应上屏原码，实际: {other:?}"),
+        }
     }
 }
 

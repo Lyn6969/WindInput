@@ -341,11 +341,17 @@ filter_mode = "smart"
 #   enter_behavior           回车
 #   space_on_empty_behavior  空格
 #   punct_on_empty_behavior  标点/符号键（clear 时废码丢掉，标点本身照常上屏）
+#
+# ⚠️ 只有标点那项出厂是 clear，另两项是 commit——**刻意不一致，不是漏改**。
+# 标点判错的代价不对称：一串没对应任何字的码被插进正文，往往发出去才发现、要退格删
+# 好几次。回车留 commit 是为了保住一个「我就要这串原码」的出口，不至于想拿原码只能
+# 去改配置。空格暂随回车（改它会命中「曾把它设成当时默认值的用户被静默改写」）。
+#
 # 注意 punct_on_empty_behavior 与 schema.codetable.punct_commit 是两回事：后者关掉是
 # 「吞键、保留编码」，连标点都不输出。
 enter_behavior = "commit"
 space_on_empty_behavior = "commit"
-punct_on_empty_behavior = "commit"
+punct_on_empty_behavior = "clear"
 numpad_behavior = "direct"
 # 顶码上屏时「已确认文字」如何落到宿主（内部/实验项，设置页不暴露）：
 #   direct_commit（默认）= 顶码时真提交，余码的新组合延到触发键 keyup 才开，靠隔一拍

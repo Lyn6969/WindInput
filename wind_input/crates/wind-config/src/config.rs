@@ -3741,8 +3741,14 @@ fn default_space_behavior() -> String {
     "commit".to_string()
 }
 
+/// 空码时按标点**出厂即丢弃废码**（与同族的 `enter_behavior` / `space_on_empty_behavior`
+/// 刻意不同，那两项仍是 `commit`——这不是漏改）。
+///
+/// 判据是代价不对称：判错成 `commit` 会把一串没对应任何字的码插进正文，用户往往发出去才
+/// 发现、要退格删好几次；判错成 `clear` 只是少上屏了原码，而回车那条路仍旧给原码，一次
+/// 按键就能拿到。留着回车不改，是为了不把「获取原码」这个能力面整个封掉。
 fn default_punct_on_empty_behavior() -> String {
-    "commit".to_string()
+    "clear".to_string()
 }
 
 fn default_pinyin_separator() -> String {
@@ -6532,6 +6538,67 @@ smart_method = "delete_replace"
             MixGlobal::default().enable_pinyin_abbrev,
             "L1 与 L2 的简拼默认值漂移了"
         );
+    }
+
+    /// 取值守门：空码时按标点**出厂即丢弃废码**，而同族的回车/空格仍是 `commit`。
+    ///
+    /// 三个值一起断言是刻意的：这组不一致是产品决策（判据见
+    /// `default_punct_on_empty_behavior` 的注释），最可能的破坏方式不是有人把 clear 改回
+    /// commit，而是有人「顺手把三个统一了」。分开写三条测试拦不住那种改动——它会让被改的
+    /// 那条红、另两条绿，看起来像是只动了一个值。
+    #[test]
+    fn empty_code_behavior_defaults_are_intentionally_asymmetric() {
+        let c = InputConfig::default();
+        assert_eq!(
+            c.punct_on_empty_behavior, "clear",
+            "标点出厂应丢弃废码；要改先读 default_punct_on_empty_behavior 的注释"
+        );
+        assert_eq!(
+            c.enter_behavior, "commit",
+            "回车须保留上屏原码——它是「我就要这串原码」的唯一出口，别为了统一把它一起改了"
+        );
+        assert_eq!(
+            c.space_on_empty_behavior, "commit",
+            "空格暂随回车；改它会静默改写「曾把它设成当时默认值」的用户，须先写 changelog"
+        );
+    }
+
+    /// 同源守门：L1（`InputConfig::default()`）与 L2（`data/config.toml`）必须给出同一个值。
+    /// 漂移的后果有两层：单测跑在**现实中不存在的配置**下（全绿但保护是反的），以及
+    /// `preset_for_pruning` 拿 L1⊕L2 判「用户值是否等于默认」时开始吃用户配置。
+    /// 缺 `data/` 时静默跳过（全仓惯例）。
+    #[test]
+    fn empty_code_behavior_l1_and_l2_agree() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data")
+            .join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "跳过 empty_code_behavior_l1_and_l2_agree：{} 不存在",
+                path.display()
+            );
+            return;
+        };
+        let v: toml::Value = toml::from_str(&text).expect("data/config.toml 应能解析");
+        let l1 = InputConfig::default();
+        for (key, expected) in [
+            ("enter_behavior", l1.enter_behavior.as_str()),
+            (
+                "space_on_empty_behavior",
+                l1.space_on_empty_behavior.as_str(),
+            ),
+            (
+                "punct_on_empty_behavior",
+                l1.punct_on_empty_behavior.as_str(),
+            ),
+        ] {
+            let l2 = v
+                .get("input")
+                .and_then(|i| i.get(key))
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("data/config.toml 应显式写出 input.{key}"));
+            assert_eq!(l2, expected, "input.{key} 的 L1 与 L2 默认值漂移了");
+        }
     }
 
     #[test]
