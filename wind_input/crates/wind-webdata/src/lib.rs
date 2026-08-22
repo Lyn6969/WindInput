@@ -27,8 +27,63 @@ pub struct EntryContractStats {
     pub ambiguous: usize,
     /// 入库了但仍无边界的行数（码超 64 字节等）。
     pub no_boundary: usize,
+    /// 用户选了「不补充」⇒ 本可补齐、但按其意愿**跳过未入库**的行数。
+    ///
+    /// 与 [`Self::rejected`] 分开计：那是「程序判定不合法」，这是「用户选择不要」。
+    /// 合并成一个数会让 UI 只能说「少了 N 条」而讲不出是谁的决定。
+    pub unfilled_skipped: usize,
     /// 被拒行的样例（至多 5 条）——UI 要能让用户看出「是不是选错了文件」。
     pub samples: Vec<String>,
+}
+
+/// 按求解裁决处置每一行：留下哪些、丢弃哪些、各自计几笔。
+///
+/// `verdicts` 与 `rows` **同序等长**；`None` = 层 1（文件自带空格，不进求解），一律放行。
+///
+/// ★ 从 [`WebData::apply_pinyin_entry_contract`] 里抽出来是为了**可测**：那个方法要拿
+/// `engine_mgr` 求解，而 webdata 的测试夹具没有数据目录、引擎压根加载不起来，整段判据
+/// 在测试里是空转的。分支全在这里，纯函数，喂裁决就能验。
+fn dispose_contract_rows(
+    rows: Vec<wind_store::wdict::WordIo>,
+    verdicts: &[Option<wind_engine::BoundaryResolution>],
+    fill: bool,
+) -> (Vec<wind_store::wdict::WordIo>, EntryContractStats) {
+    let mut st = EntryContractStats::default();
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, mut r) in rows.into_iter().enumerate() {
+        let Some(v) = verdicts.get(i).copied().flatten() else {
+            out.push(r); // 层 1：切分是词库作者写下的真值，直接采信
+            continue;
+        };
+        if v == wind_engine::BoundaryResolution::Unresolvable {
+            st.rejected += 1;
+            if st.samples.len() < 5 {
+                st.samples.push(format!("{} {}", r.code, r.text));
+            }
+            continue;
+        }
+        let b = v.boundary();
+        if b != 0 {
+            if !fill {
+                // 用户选了「不补充」：这些行整条跳过。**不能原样入库**——
+                // boundary=0 的拼音词条正是本契约要消灭的东西，那等于开正门。
+                st.unfilled_skipped += 1;
+                continue;
+            }
+            // ★ 走 `WordIo::boundary` 而不是把 code 改写成带空格形态：空格载体表达不了
+            // 单音节（`xian` 的 0b1 经 join→split 退化为 0），单字词的补齐会静默失效、
+            // 而这里还会把它算进 filled。
+            r.boundary = Some(b);
+            st.filled += 1;
+        } else {
+            st.no_boundary += 1;
+        }
+        if matches!(v, wind_engine::BoundaryResolution::Ambiguous(_)) {
+            st.ambiguous += 1;
+        }
+        out.push(r);
+    }
+    (out, st)
 }
 use wind_coordinator::web_host::WebDataHost;
 
@@ -121,6 +176,7 @@ fn dict_report_json(
                 o.insert("boundaryFilled".into(), json!(st.filled));
                 o.insert("boundaryAmbiguous".into(), json!(st.ambiguous));
                 o.insert("noBoundary".into(), json!(st.no_boundary));
+                o.insert("boundarySkipped".into(), json!(st.unfilled_skipped));
             }
             Value::Object(o)
         })
@@ -693,14 +749,18 @@ pub trait WebDataRpc: WebDataHost {
     /// ★ 求解出的边界通过**把 code 写回带空格形态**传给落库端，而不是给
     /// `import_user_words` 加参数：空格本就是本仓的边界载体，`split_spaced_code` 在
     /// 落库时会把它拆回 `flat key + boundary`。既有管线一行都不用改。
+    ///
+    /// `fill` = 用户在导入对话框里的二选一（见 §5）：`true` 由程序补充边界；`false` 则
+    /// **跳过**这些行、不入库，把处置权交回用户。⚠️ `false` 不等于「照原样导入」——
+    /// 那是给不变量开正门，设计上有意不提供第三个选项。
     fn apply_pinyin_entry_contract(
         &self,
         schema_id: &str,
         rows: Vec<wind_store::wdict::WordIo>,
+        fill: bool,
     ) -> (Vec<wind_store::wdict::WordIo>, EntryContractStats) {
-        let mut st = EntryContractStats::default();
         if !self.target_is_pinyin(schema_id) {
-            return (rows, st);
+            return (rows, EntryContractStats::default());
         }
         // 层 1：文件自带空格的行，切分是词库作者写下的真值 —— 直接采信，不进求解。
         let mut flats: Vec<String> = Vec::with_capacity(rows.len());
@@ -722,35 +782,7 @@ pub trait WebDataRpc: WebDataHost {
         for (k, &i) in pending.iter().enumerate() {
             verdicts[i] = solved.get(k).copied();
         }
-        let mut out = Vec::with_capacity(rows.len());
-        for (i, mut r) in rows.into_iter().enumerate() {
-            let Some(v) = verdicts[i] else {
-                out.push(r); // 层 1
-                continue;
-            };
-            if v == wind_engine::BoundaryResolution::Unresolvable {
-                st.rejected += 1;
-                if st.samples.len() < 5 {
-                    st.samples.push(format!("{} {}", r.code, r.text));
-                }
-                continue;
-            }
-            let b = v.boundary();
-            if b != 0 {
-                // ★ 走 `WordIo::boundary` 而不是把 code 改写成带空格形态：空格载体
-                // 表达不了单音节（`xian` 的 0b1 经 join→split 退化为 0），单字词的
-                // 补齐会静默失效、而这里还会把它算进 filled。
-                r.boundary = Some(b);
-                st.filled += 1;
-            } else {
-                st.no_boundary += 1;
-            }
-            if matches!(v, wind_engine::BoundaryResolution::Ambiguous(_)) {
-                st.ambiguous += 1;
-            }
-            out.push(r);
-        }
-        (out, st)
+        dispose_contract_rows(rows, &verdicts, fill)
     }
 
     fn web_dict_import(&self, params: &Value) -> anyhow::Result<Value> {
@@ -765,6 +797,12 @@ pub trait WebDataRpc: WebDataHost {
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
         ) == Strategy::Replace;
+        // 导入对话框的二选一（§5）。**缺省 true**：旧客户端与命令行不传这个参数，
+        // 行为必须与本参数出现之前完全一致。
+        let fill_boundary = params
+            .get("fillBoundary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
@@ -804,7 +842,8 @@ pub trait WebDataRpc: WebDataHost {
                 &sections,
                 replace,
                 &mut |sec, rows| {
-                    let (rows, st) = self.apply_pinyin_entry_contract(schema_id, rows);
+                    let (rows, st) =
+                        self.apply_pinyin_entry_contract(schema_id, rows, fill_boundary);
                     contract.push((sec.key(), st));
                     rows
                 },
@@ -817,7 +856,7 @@ pub trait WebDataRpc: WebDataHost {
                 self.code_policy_for(schema_id),
             )
             .map_err(|e| anyhow::anyhow!(e))?;
-            let (rows, contract) = self.apply_pinyin_entry_contract(schema_id, rows);
+            let (rows, contract) = self.apply_pinyin_entry_contract(schema_id, rows, fill_boundary);
             if replace {
                 store.clear_user_words(&data_schema)?;
             }
@@ -827,13 +866,16 @@ pub trait WebDataRpc: WebDataHost {
                 "added": c.added,
                 "updated": c.updated,
                 "unchanged": c.unchanged,
-                // 解析期跳过的（列数不足/乱码）与准入判据拒收的合并计入 skipped，
-                // 另按类别分列——UI 要能告诉用户「少了的词是为什么少的」。
-                "skipped": skipped + contract.rejected,
+                // 解析期跳过的（列数不足/乱码）、准入判据拒收的、以及用户选「不补充」
+                // 而跳过的，三者合计进 skipped，另按类别分列——UI 要能告诉用户
+                // 「少了的词是为什么少的」，三个原因对用户意味着三种不同的下一步。
+                "skipped": skipped + contract.rejected + contract.unfilled_skipped,
                 "rejected": contract.rejected,
                 "boundaryFilled": contract.filled,
                 "boundaryAmbiguous": contract.ambiguous,
                 "noBoundary": contract.no_boundary,
+                // 用户选「不补充」时跳过的行数（与 rejected 分开：那是程序判非法，这是用户的选择）。
+                "boundarySkipped": contract.unfilled_skipped,
             } ] }))
         }
     }
@@ -861,7 +903,7 @@ pub trait WebDataRpc: WebDataHost {
                             .map_err(|e| anyhow::anyhow!(e))?;
                         let total = rows.len();
                         // 预览必须跑与导入**完全相同**的准入判据，否则「预计入库 N 条」会骗人。
-                        let (rows, ct) = self.apply_pinyin_entry_contract(schema_id, rows);
+                        let (rows, ct) = self.apply_pinyin_entry_contract(schema_id, rows, true);
                         let (c, samples) = store.preview_import_user_words(&data_schema, &rows)?;
                         arr.push(json!({
                             "key": "userWords", "count": total,
@@ -878,7 +920,7 @@ pub trait WebDataRpc: WebDataHost {
                         let (rows, sk) = wind_store::wdict::parse_temp_words_wdict(content)
                             .map_err(|e| anyhow::anyhow!(e))?;
                         let total = rows.len();
-                        let (_rows, ct) = self.apply_pinyin_entry_contract(schema_id, rows);
+                        let (_rows, ct) = self.apply_pinyin_entry_contract(schema_id, rows, true);
                         arr.push(json!({
                             "key": "tempWords", "count": total,
                             "skipped": sk + ct.rejected,
@@ -925,7 +967,7 @@ pub trait WebDataRpc: WebDataHost {
             .map_err(|e| anyhow::anyhow!(e))?;
             let total = rows.len();
             // 预览必须跑与导入**完全相同**的准入判据，否则「预计入库 N 条」会骗人。
-            let (rows, contract) = self.apply_pinyin_entry_contract(schema_id, rows);
+            let (rows, contract) = self.apply_pinyin_entry_contract(schema_id, rows, true);
             let (c, samples) = store.preview_import_user_words(&data_schema, &rows)?;
             // Rime/TSV 无来源引擎元信息，兼容性交由用户判断（不拦截）。
             Ok(json!({
@@ -941,6 +983,9 @@ pub trait WebDataRpc: WebDataHost {
                     "boundaryFilled": contract.filled,
                     "boundaryAmbiguous": contract.ambiguous,
                     "noBoundary": contract.no_boundary,
+                    // ⚠️ 预览恒按「补充」求解（`fill = true`），故这里没有 boundarySkipped：
+                    // 那个选择在预览之后、由用户在对话框里做。预览的职责是告诉他
+                    // **有多少条要做这个选择**（= boundaryFilled），不是替他先选一个。
                 } ],
                 "compatible": true,
             }))
@@ -2967,6 +3012,65 @@ mod tests {
     use wind_config::Config;
     use wind_coordinator::Coordinator;
     use wind_store::Store;
+
+    /// 拼音词条准入契约的**处置表**：五种裁决 × 两种 fill 选择，各落到哪一档。
+    ///
+    /// ⚠️ 这条测试之所以直接喂 `dispose_contract_rows` 而不走 `dict.import`：本模块的
+    /// `coord()` 用 `Config::default()`、没有数据目录 ⇒ 引擎加载不起来 ⇒
+    /// `target_is_pinyin` 恒 false ⇒ 契约整段空转。走 RPC 写出来的用例会**永远绿着
+    /// 却一个分支都没进**，是本仓最典型的假绿形态。
+    #[test]
+    fn contract_disposition_table_covers_both_fill_choices() {
+        use wind_engine::BoundaryResolution as B;
+        let row = |code: &str, text: &str| wind_store::wdict::WordIo {
+            code: code.into(),
+            text: text.into(),
+            weight: 100,
+            count: 0,
+            boundary: None,
+        };
+        let rows = vec![
+            row("ni hao", "你好"),   // 层 1：自带空格
+            row("nihao", "你好"),    // Derived
+            row("angan", "安甘"),    // Ambiguous
+            row("wgkq", "工"),       // Unresolvable
+            row("verylong", "超长"), // NoInfo（码超 64 字节等）
+        ];
+        let verdicts = [
+            None,
+            Some(B::Derived(0b101)),
+            Some(B::Ambiguous(0b101)),
+            Some(B::Unresolvable),
+            Some(B::NoInfo),
+        ];
+
+        // ① 补充（默认）
+        let (kept, st) = dispose_contract_rows(rows.clone(), &verdicts, true);
+        assert_eq!(kept.len(), 4, "只有 Unresolvable 不入库");
+        assert_eq!(st.rejected, 1);
+        assert_eq!(st.filled, 2, "Derived 与 Ambiguous 都算补齐");
+        assert_eq!(st.ambiguous, 1, "Ambiguous 是 filled 的子集");
+        assert_eq!(st.no_boundary, 1);
+        assert_eq!(st.unfilled_skipped, 0);
+        assert_eq!(kept[0].boundary, None, "层 1 不该被改写");
+        assert_eq!(
+            kept[1].boundary,
+            Some(0b101),
+            "求解结果必须落到 boundary 字段"
+        );
+        assert_eq!(st.samples, vec!["wgkq 工".to_string()], "拒收要留样例");
+
+        // ② 不补充：可补的那两条**跳过**，而不是原样入库
+        let (kept, st) = dispose_contract_rows(rows.clone(), &verdicts, false);
+        assert_eq!(kept.len(), 2, "层 1 与 NoInfo 仍入库，可补的两条被跳过");
+        assert_eq!(st.unfilled_skipped, 2);
+        assert_eq!(st.filled, 0);
+        assert_eq!(st.rejected, 1, "拒收与用户的选择无关");
+        assert!(
+            kept.iter().all(|r| r.text != "安甘"),
+            "★ 不补充 ≠ 照原样导入：boundary=0 的拼音词条正是契约要消灭的东西"
+        );
+    }
 
     /// 构造一个带临时 store 的无头 Coordinator。
     fn coord(tag: &str) -> Arc<Coordinator> {
