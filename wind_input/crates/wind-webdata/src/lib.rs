@@ -277,6 +277,8 @@ pub trait WebDataRpc: WebDataHost {
             "phrase.listUser" => self.web_phrase_list_user(params),
             "phrase.export" => self.web_phrase_export(),
             "phrase.import" => self.web_phrase_import(params),
+            "phrase.previewImportText" => self.web_phrase_preview_import_text(params),
+            "phrase.importText" => self.web_phrase_import_text(params),
             "phrase.resetSystem" => self.web_phrase_reset_system(),
 
             // ── quick.*（快捷输入格式表的用户调整，全局，redb 持久化）──
@@ -1705,17 +1707,13 @@ pub trait WebDataRpc: WebDataHost {
     fn web_phrase_add(&self, params: &Value) -> anyhow::Result<Value> {
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let position = i32_param(params, "position");
-        // 缺省 1800：短语与码表精确候选**按权重竞争**（`PHRASE_WEIGHT_BASE`(40M) 类别硬顶
-        // 已删除，见 candidate-sorting-rules.md §5.1），所以这个默认值直接决定「新建的短语
-        // 打不打得出」。此处曾是 1 —— 那会输给几乎每一条码表词条（五笔主库 min=120），
-        // 在 40M 时代无所谓，现在是让新短语默认沉底。
-        //
-        // 取 1800 的依据：五笔主库 median=941、p99=9000，1800 越过约 90% 的条目，
-        // 又留足余量给用户手动上调（约定值域 0~10000）。与系统短语常用档 800~2000 同轴。
+        // 缺省值与取值依据见 `wind_store::phrases::DEFAULT_USER_PHRASE_WEIGHT`
+        // （分发导入走同一个常量）。
         let weight = params
             .get("weight")
             .and_then(|v| v.as_i64())
-            .unwrap_or(1800) as i32;
+            .unwrap_or(wind_store::phrases::DEFAULT_USER_PHRASE_WEIGHT as i64)
+            as i32;
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
@@ -1873,6 +1871,142 @@ pub trait WebDataRpc: WebDataHost {
         let (imported, skipped) = store.import_user_phrases_wdict(content)?;
         self.rebuild_phrases();
         Ok(json!({ "imported": imported, "skipped": skipped }))
+    }
+
+    /// 逐行短语文本（`wind:p1` 分发格式）的导入预览。
+    ///
+    /// 与 `phrase.import`（wdict，备份还原语义）分开是刻意的：那条是整表 upsert、原样写回
+    /// position；本条只新增、位置本地重算，且预览要回答「会不会动到我已有的短语」。
+    fn web_phrase_preview_import_text(&self, params: &Value) -> anyhow::Result<Value> {
+        let content = str_param(params, "content")?;
+        let (doc, items, checks, plan) = self.phrase_text_plan(content)?;
+
+        let mut counts = (0usize, 0usize, 0usize);
+        let entries: Vec<Value> = doc
+            .entries
+            .iter()
+            .zip(&items)
+            .zip(&checks)
+            .zip(&plan)
+            .map(|(((e, (_, stored)), ck), st)| {
+                use wind_store::phrases::PhraseImportStatus as S;
+                match st {
+                    S::New => counts.0 += 1,
+                    S::ExistsUser => counts.1 += 1,
+                    S::ShadowsSystem => counts.2 += 1,
+                }
+                json!({
+                    "line": e.line,
+                    "code": e.code,
+                    // 回显分发原文：分发域与设置页显示域同形，用户在预览里看到的
+                    // 与他在群里读到的、在短语列表里看到的是同一串。
+                    "text": e.text,
+                    "status": match st {
+                        S::New => "new",
+                        S::ExistsUser => "existsUser",
+                        S::ShadowsSystem => "shadowsSystem",
+                    },
+                    "hints": ck.hints.iter().map(hint_json).collect::<Vec<_>>(),
+                    "error": ck.error,
+                    // 存储域与分发域不同（普通文本的 `\\`）时给 UI 一个对照位；相同则省略。
+                    "storedText": (stored != &e.text).then(|| stored.clone()),
+                })
+            })
+            .collect();
+
+        let problems: Vec<Value> = doc
+            .problems
+            .iter()
+            .map(|p| json!({ "line": p.line, "raw": p.raw, "message": p.reason.message() }))
+            .collect();
+
+        Ok(json!({
+            "title": doc.title,
+            "entries": entries,
+            "problems": problems,
+            "counts": {
+                "new": counts.0,
+                "existsUser": counts.1,
+                "shadowsSystem": counts.2,
+                "skippedLines": doc.problems.len(),
+            },
+        }))
+    }
+
+    /// 应用逐行短语文本。
+    ///
+    /// `accept` = 要导入的**源行号**数组（来自预览的 `line`）；**缺省导入全部可导入条目**。
+    ///
+    /// 语法错的条目无论是否被 `accept` 列出都不装——它们装进去只会在触发时失败，
+    /// 而失败点离导入很远。
+    fn web_phrase_import_text(&self, params: &Value) -> anyhow::Result<Value> {
+        let content = str_param(params, "content")?;
+        let (doc, items, checks, _) = self.phrase_text_plan(content)?;
+        let accept: Option<std::collections::HashSet<u64>> = params
+            .get("accept")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect());
+
+        let mut selected: Vec<(String, String)> = Vec::new();
+        let (mut skipped_invalid, mut skipped_unselected) = (0, 0);
+        for ((e, item), ck) in doc.entries.iter().zip(&items).zip(&checks) {
+            if !ck.is_importable() {
+                skipped_invalid += 1;
+                continue;
+            }
+            if accept
+                .as_ref()
+                .is_some_and(|set| !set.contains(&(e.line as u64)))
+            {
+                skipped_unselected += 1;
+                continue;
+            }
+            selected.push(item.clone());
+        }
+
+        let store = self
+            .user_store()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let rep = store
+            .import_phrases_appending(&selected, wind_store::phrases::DEFAULT_USER_PHRASE_WEIGHT)?;
+        self.rebuild_phrases();
+        Ok(json!({
+            "added": rep.added,
+            "skippedExisting": rep.skipped_existing,
+            "shadowedSystem": rep.shadowed_system,
+            "skippedInvalid": skipped_invalid,
+            "skippedUnselected": skipped_unselected,
+        }))
+    }
+
+    /// 解析 + 存储域投影 + 静态检查 + 落点判定。预览与应用共用，保证两次看到的是
+    /// 同一份判定——各算各的会让「预览一个样、应用装了另一个」成为可能。
+    #[allow(clippy::type_complexity)]
+    fn phrase_text_plan(
+        &self,
+        content: &str,
+    ) -> anyhow::Result<(
+        wind_store::phrase_text::PhraseTextDoc,
+        Vec<(String, String)>,
+        Vec<wind_store::phrase_text::EntryCheck>,
+        Vec<wind_store::phrases::PhraseImportStatus>,
+    )> {
+        let doc =
+            wind_store::phrase_text::parse_phrase_text(content).map_err(|e| anyhow::anyhow!(e))?;
+        let store = self
+            .user_store()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        // 存储域投影与手动新增（`web_phrase_add`）走同一个 `store_text`——新增一条入口
+        // 就得配一对转换，否则同一条短语经不同入口进库会变成两个字符串。
+        let items: Vec<(String, String)> = doc
+            .entries
+            .iter()
+            .map(|e| (e.code.clone(), store_text(&e.text)))
+            .collect();
+        let plan = store.plan_phrase_import(&items)?;
+        let texts: Vec<String> = items.iter().map(|(_, t)| t.clone()).collect();
+        let checks = wind_store::phrase_text::check_entries(&texts);
+        Ok((doc, items, checks, plan))
     }
 
     fn web_phrase_reset_system(&self) -> anyhow::Result<Value> {
@@ -2446,6 +2580,18 @@ fn ui_text(s: &str) -> String {
     wind_store::wdict::escape_text_field(s)
 }
 
+/// 疑似笔误 → JSON。`kind` 供 UI 判定，`message` 是给人看的一句话。
+fn hint_json(h: &wind_cmdbar::Hint) -> Value {
+    use wind_cmdbar::Hint as H;
+    match h {
+        H::ControlCharInPath(f) => json!({
+            "kind": "controlCharInPath",
+            "func": f,
+            "message": format!("{f} 的路径里出现了换行或制表符，通常是反斜杠只写了一个"),
+        }),
+    }
+}
+
 /// 设置页显示域 → 存储域：[`ui_text`] 的逆。
 ///
 /// **凡是从设置页收 text 的 RPC 都必须先过它**，不只是写入类：`dict.remove`/`update`、
@@ -2929,6 +3075,272 @@ mod tests {
         assert!(
             hits("hao ya").contains(&"好呀".to_string()),
             "带空格的搜索词须先拆再匹配"
+        );
+    }
+
+    /// 逐行短语文本（`wind:p1`）导入契约：预览落点 → 缺省全部导入 → 重导跳过。
+    ///
+    /// 命令短语不再受任何额外门控——它本就是短语的主要用途，且不会自行执行。
+    #[test]
+    fn phrase_text_import_contract() {
+        let q = char::from_u32(34).unwrap();
+        let nl = char::from_u32(10).unwrap();
+        let c = coord("phrasetext");
+        let text = format!(
+            "wind:p1 我的直通车{nl}kx (＾▽＾){nl}             zd $CC({q}记事本{q}, proc.run({q}notepad.exe{q})){nl}             sh $CC({q}跑{q}, proc.shell({q}echo hi{q})){nl}             编码 缺少合法编码的一行{nl}"
+        );
+
+        let prev = c
+            .web_data_rpc("phrase.previewImportText", &json!({ "content": text }))
+            .unwrap();
+        assert_eq!(
+            prev.get("title").and_then(|v| v.as_str()),
+            Some("我的直通车")
+        );
+        let entries = prev.get("entries").unwrap().as_array().unwrap();
+        assert_eq!(entries.len(), 3, "非法行不进 entries");
+        assert_eq!(entries[0].get("line").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            entries[0].get("status").and_then(|v| v.as_str()),
+            Some("new")
+        );
+
+        // 能力分级已移除：预览不再携带这三个字段。
+        for e in entries {
+            assert!(e.get("capability").is_none(), "不应再有 capability");
+            assert!(e.get("highRisk").is_none(), "不应再有 highRisk");
+            assert!(e.get("effects").is_none(), "不应再有 effects");
+        }
+
+        assert_eq!(
+            prev.get("problems").unwrap().as_array().unwrap().len(),
+            1,
+            "非法编码的行进 problems"
+        );
+        assert_eq!(
+            prev.get("counts")
+                .unwrap()
+                .get("new")
+                .and_then(|v| v.as_u64()),
+            Some(3)
+        );
+
+        // ★ 缺省全导：含 proc.shell 的那条也直接装进去。
+        let out = c
+            .web_data_rpc("phrase.importText", &json!({ "content": text }))
+            .unwrap();
+        assert_eq!(
+            out.get("added").and_then(|v| v.as_u64()),
+            Some(3),
+            "不传 accept 就全部导入，命令短语不再需要额外确认"
+        );
+
+        // 再来一次：已存在的原样跳过。
+        let again = c
+            .web_data_rpc("phrase.importText", &json!({ "content": text }))
+            .unwrap();
+        assert_eq!(again.get("added").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            again.get("skippedExisting").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+
+        // accept 仍可用于选择性导入。
+        let c2 = coord("phrasetextsel");
+        let sel = c2
+            .web_data_rpc(
+                "phrase.importText",
+                &json!({ "content": text, "accept": [2] }),
+            )
+            .unwrap();
+        assert_eq!(sel.get("added").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            sel.get("skippedUnselected").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+
+        // position 依次追加。
+        let list = c.web_data_rpc("phrase.listUser", &json!({})).unwrap();
+        let mut got: Vec<(&str, i64)> = list
+            .get("items")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                (
+                    x.get("code").and_then(|v| v.as_str()).unwrap(),
+                    x.get("position").and_then(|v| v.as_i64()).unwrap(),
+                )
+            })
+            .collect();
+        got.sort_by_key(|(_, p)| *p);
+        let codes: Vec<&str> = got.iter().map(|(c, _)| *c).collect();
+        assert_eq!(codes, vec!["kx", "zd", "sh"], "position 按导入顺序递增");
+    }
+
+    /// 语法坏掉的条目一律不装——无论有没有被 accept 选中。
+    #[test]
+    fn phrase_text_rejects_broken_syntax() {
+        let c = coord("phrasetextbad");
+        let text = "wind:p1\nbad $CC(\"未闭合\nok 好\n";
+        let out = c
+            .web_data_rpc(
+                "phrase.importText",
+                &json!({ "content": text, "accept": [2, 3] }),
+            )
+            .unwrap();
+        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            out.get("skippedInvalid").and_then(|v| v.as_u64()),
+            Some(1),
+            "显式 accept 也不能让语法错误的条目进库"
+        );
+    }
+
+    /// ★ 分发文本 / 设置页手动新增 / wdict 文件导入，三条路径对同一段文本必须落到
+    /// **同一形态**。分发格式没有、也不该有自己的一套反斜杠规则——用户在任一处学到的
+    /// 写法要能照搬，这条断言就是那个承诺。
+    #[test]
+    fn phrase_text_escape_domain_matches_manual_add() {
+        let bs = char::from_u32(92).unwrap();
+        let q = char::from_u32(34).unwrap();
+        let tab = char::from_u32(9).unwrap();
+        let nl = char::from_u32(10).unwrap();
+        let c = coord("phraseesc");
+
+        // 按约定写法：一个字面反斜杠写两个。目录名刻意取 `notes`——单写时反斜杠
+        // 紧跟 n 会变成换行，是最典型的静默损坏。
+        let plain = format!("D:{bs}{bs}notes");
+        let cmd = format!("$CC({q}x{q}, proc.run({q}D:{bs}{bs}notes{bs}{bs}a.exe{q}))");
+
+        c.web_data_rpc("phrase.add", &json!({ "code": "m1", "text": plain }))
+            .unwrap();
+        c.web_data_rpc("phrase.add", &json!({ "code": "m2", "text": cmd }))
+            .unwrap();
+        c.web_data_rpc(
+            "phrase.importText",
+            &json!({ "content": format!("wind:p1{nl}d1 {plain}{nl}d2 {cmd}{nl}") }),
+        )
+        .unwrap();
+        let hdr = format!(
+            "wind_dict:{nl}  version: 1{nl}  sections:{nl}    phrases:{nl}      columns: [code, text, weight, position, enabled]{nl}{nl}--- !phrases{nl}"
+        );
+        c.web_data_rpc(
+            "phrase.import",
+            &json!({ "content": format!("{hdr}w1{tab}{plain}{tab}1800{tab}9{tab}1{nl}w2{tab}{cmd}{tab}1800{tab}10{tab}1{nl}") }),
+        )
+        .unwrap();
+
+        let list = c.web_data_rpc("phrase.listUser", &json!({})).unwrap();
+        let text_of = |src: &Value, code: &str| -> String {
+            src.get("items")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|it| it.get("code").and_then(|v| v.as_str()) == Some(code))
+                .and_then(|it| it.get("text").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        assert_eq!(
+            text_of(&list, "m1"),
+            text_of(&list, "d1"),
+            "普通短语：手动新增与分发导入须同形"
+        );
+        assert_eq!(
+            text_of(&list, "m1"),
+            text_of(&list, "w1"),
+            "普通短语：手动新增与 wdict 导入须同形"
+        );
+        assert_eq!(
+            text_of(&list, "m2"),
+            text_of(&list, "d2"),
+            "命令短语：手动新增与分发导入须同形"
+        );
+        assert_eq!(
+            text_of(&list, "m2"),
+            text_of(&list, "w2"),
+            "命令短语：手动新增与 wdict 导入须同形"
+        );
+
+        // 双写确实得到**字面反斜杠**：回显是 escape 后的形态，字面反斜杠会再次双写。
+        // 若存进去的是换行（单写的后果），回显只会有一个反斜杠。
+        assert_eq!(
+            text_of(&list, "d1"),
+            plain,
+            "双写往返后仍是双写 ⇒ 存的是字面反斜杠"
+        );
+        assert_eq!(
+            text_of(&list, "d1").matches(bs).count(),
+            2,
+            "期望两个反斜杠，实得 {:?}",
+            text_of(&list, "d1")
+        );
+
+        // 对照：单写一个反斜杠时它紧跟 n 会变成换行，回显与双写**不同**。
+        // 这正是文档要求一律写两个的原因，也保证上面的断言不是恒真。
+        c.web_data_rpc(
+            "phrase.importText",
+            &json!({ "content": format!("wind:p1{nl}s1 D:{bs}notes{nl}") }),
+        )
+        .unwrap();
+        let list2 = c.web_data_rpc("phrase.listUser", &json!({})).unwrap();
+        assert_ne!(
+            text_of(&list2, "s1"),
+            plain,
+            "单写与双写必须落到不同内容，否则上面的断言证明不了什么"
+        );
+    }
+
+    /// 路径里反斜杠写少了 ⇒ 预览里给一句提示，但**不阻止导入**（轻微提示）。
+    #[test]
+    fn phrase_text_hints_single_backslash_path() {
+        let bs = char::from_u32(92).unwrap();
+        let q = char::from_u32(34).unwrap();
+        let nl = char::from_u32(10).unwrap();
+        let c = coord("phrasehint");
+
+        let bad = format!("$CC({q}x{q}, proc.run({q}D:{bs}notes{bs}a.exe{q}))");
+        let good = format!("$CC({q}x{q}, proc.run({q}D:{bs}{bs}notes{bs}{bs}a.exe{q}))");
+        let text = format!("wind:p1{nl}b1 {bad}{nl}g1 {good}{nl}");
+
+        let prev = c
+            .web_data_rpc("phrase.previewImportText", &json!({ "content": text }))
+            .unwrap();
+        let entries = prev.get("entries").unwrap().as_array().unwrap();
+        let hints_of = |i: usize| entries[i].get("hints").unwrap().as_array().unwrap();
+
+        assert_eq!(hints_of(0).len(), 1, "单写路径应有提示");
+        assert_eq!(
+            hints_of(0)[0].get("kind").and_then(|v| v.as_str()),
+            Some("controlCharInPath")
+        );
+        assert!(hints_of(1).is_empty(), "双写路径不该有提示");
+
+        // 轻微提示：不抦导入。
+        let out = c
+            .web_data_rpc(
+                "phrase.importText",
+                &json!({ "content": text, "accept": [2, 3] }),
+            )
+            .unwrap();
+        assert_eq!(
+            out.get("added").and_then(|v| v.as_u64()),
+            Some(2),
+            "带提示的条目照样可以导入"
+        );
+    }
+
+    /// 没有格式标记 ⇒ 整段拒绝。侦测「不猜」，报错优于误装。
+    #[test]
+    fn phrase_text_requires_marker() {
+        let c = coord("phrasetextmark");
+        assert!(
+            c.web_data_rpc("phrase.previewImportText", &json!({ "content": "kx 好\n" }))
+                .is_err()
         );
     }
 

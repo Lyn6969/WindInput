@@ -12,6 +12,18 @@ use crate::context::EvalContext;
 use crate::error::Result;
 use crate::registry::Registry;
 
+/// 由 [`crate::eval`] 特例拦截、**不经 registry 查找**的动作名。
+///
+/// 单一真相源：eval 的拦截分支与 [`crate::capability`] 的能力分级都读这里。
+/// 各写各的名单会让新增的拦截名在分级侧变成「registry 查不到」，进而被从危规则
+/// 判成高危——正常短语一旦被泛滥的警示淹没，警示本身就失效了。
+pub const EVAL_INTERCEPTED: &[&str] = &["type"];
+
+/// 名字是否由 eval 特例拦截。见 [`EVAL_INTERCEPTED`]。
+pub fn is_eval_intercepted(name: &str) -> bool {
+    EVAL_INTERCEPTED.contains(&name)
+}
+
 /// 动作类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {

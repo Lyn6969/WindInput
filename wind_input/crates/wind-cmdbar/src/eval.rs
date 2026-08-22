@@ -58,9 +58,9 @@ fn eval_command(cp: &CommandPhrase, ctx: &dyn EvalContext, reg: &Registry) -> Re
     let display = eval_expr(&cp.display, ctx, reg)?;
     let mut actions = Vec::with_capacity(cp.actions.len());
     for act in &cp.actions {
-        // type(arg)：拦截为文本上屏（不经 registry 查找）。
+        // type(arg)：拦截为文本上屏（不经 registry 查找）。名单见 `action::EVAL_INTERCEPTED`。
         if let Expr::Call { name, args, named } = act
-            && name == "type"
+            && crate::action::is_eval_intercepted(name)
         {
             if !named.is_empty() {
                 return Err(CmdbarError::runtime(

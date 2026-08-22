@@ -8,6 +8,7 @@ pub mod dict_export;
 pub mod freq;
 pub mod import_formats;
 pub mod migration;
+pub mod phrase_text;
 pub mod phrases;
 pub mod quick_format;
 pub mod shadow;

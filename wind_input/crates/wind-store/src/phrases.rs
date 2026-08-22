@@ -66,6 +66,38 @@ struct PhraseValue {
     overrides_system: bool,
 }
 
+/// 分发导入时一条短语相对本地库的落点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhraseImportStatus {
+    /// 库里没有，会新增。
+    New,
+    /// 已有同款**用户**短语，导入是空操作。
+    ExistsUser,
+    /// 撞上同款**系统**短语——导入会把它转成用户行并遮蔽系统条目
+    /// （见 [`PhraseRecord::overrides_system`]）。这是接收者最需要被告知的一种。
+    ShadowsSystem,
+}
+
+/// 分发导入结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhraseImportReport {
+    pub added: usize,
+    pub skipped_existing: usize,
+    /// `added` 中遮蔽了系统条目的条数（是 `added` 的子集，不另计）。
+    pub shadowed_system: usize,
+}
+
+/// 新建用户短语的默认权重（手动新增与分发导入共用，两处各写一份必然漂移）。
+///
+/// 短语与码表精确候选**按权重竞争**（`PHRASE_WEIGHT_BASE`(40M) 类别硬顶已删除，
+/// 见 candidate-sorting-rules.md §5.1），所以这个默认值直接决定「新建的短语打不打得出」。
+/// 此处曾是 1 —— 那会输给几乎每一条码表词条（五笔主库 min=120），在 40M 时代无所谓，
+/// 现在是让新短语默认沉底。
+///
+/// 取 1800 的依据：五笔主库 median=941、p99=9000，1800 越过约 90% 的条目，
+/// 又留足余量给用户手动上调（约定值域 0~10000）。与系统短语常用档 800~2000 同轴。
+pub const DEFAULT_USER_PHRASE_WEIGHT: i32 = 1800;
+
 fn default_true() -> bool {
     true
 }
@@ -423,6 +455,65 @@ impl Store {
             )?;
         }
         Ok((imported, skipped))
+    }
+
+    /// 分发导入时一条短语的落点。
+    ///
+    /// 与 wdict 导入（备份语义、整表 upsert）不同，分发导入**只新增、不改动既有条目**：
+    /// 别人的包无权改写接收者已有短语的权重与位置。
+    pub fn plan_phrase_import(
+        &self,
+        items: &[(String, String)],
+    ) -> anyhow::Result<Vec<PhraseImportStatus>> {
+        items
+            .iter()
+            .map(|(code, text)| {
+                Ok(match self.get_phrase(code, text)? {
+                    None => PhraseImportStatus::New,
+                    Some(cur) if cur.is_system => PhraseImportStatus::ShadowsSystem,
+                    Some(_) => PhraseImportStatus::ExistsUser,
+                })
+            })
+            .collect()
+    }
+
+    /// 分发导入：新条目**追加到末尾**，已存在的用户短语原样跳过。
+    ///
+    /// ★ position 由本地重新分配，不取分发文本里的值——分发格式压根不带 position，
+    /// 正是因为照抄分发者的位置会打乱接收者既有短语的顺序。这与 wdict 导入
+    /// （[`Self::import_user_phrases_wdict`] 原样写入 position，备份还原要求逐字还原）
+    /// 是**刻意相反**的两种语义，别把其中一处「顺手统一」掉。
+    ///
+    /// `text` 必须已是**存储域**文本（调用方过 `unescape_text_field`），与手动新增
+    /// 走同一个转换——出入口必须成对。
+    pub fn import_phrases_appending(
+        &self,
+        items: &[(String, String)],
+        weight: i32,
+    ) -> anyhow::Result<PhraseImportReport> {
+        let mut next_pos = self
+            .list_phrases()?
+            .iter()
+            .map(|p| p.position)
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1);
+        let mut rep = PhraseImportReport::default();
+        for (code, text) in items {
+            match self.get_phrase(code, text)? {
+                // 已有用户行：连 enabled 也不动——用户停用过的条目不该被一次导入悄悄启用。
+                Some(cur) if !cur.is_system => {
+                    rep.skipped_existing += 1;
+                    continue;
+                }
+                Some(_) => rep.shadowed_system += 1,
+                None => {}
+            }
+            self.add_phrase(code, text, next_pos, weight)?;
+            next_pos = next_pos.saturating_add(1);
+            rep.added += 1;
+        }
+        Ok(rep)
     }
 
     /// 只把**缺失**的系统条目补回库里，已存在的行一律不动。返回补回条数。
