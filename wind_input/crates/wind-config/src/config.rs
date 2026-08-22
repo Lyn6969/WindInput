@@ -830,6 +830,22 @@ pub enum SessionAction {
     SelectCandidate(u8),
     /// 以词定字：取当前高亮候选词的第 N 个字（**N 从 1 起**）。收编自 `keys.select_char_keys`。
     SelectChar(u8),
+    /// 进辅助码筛选：对已出的候选按字形码二次过滤。
+    ///
+    /// # 为什么它在**这张**表而不是 `key_actions`
+    ///
+    /// 辅助码是**对已有候选的操作**——`enter_aux_code` 第一件事就是查
+    /// `state.candidates.is_empty()`，空了直接拒。这正是本表的定义性质
+    /// （见 [`Self::requires_candidates`]），而 `key_actions` 那张表管的是「给这个键指定
+    /// 一个功能」，不以有会话为前提。
+    ///
+    /// 实际后果：`key_actions` 只认符号键、字母 z 与四个修饰键
+    /// （`key_action_name_to_vk` 的值域），Tab / PageDown / 方向键那一批**根本解析不出来**，
+    /// 写进去会被静默丢弃。本表认得它们，于是「Tab 进辅助码」才表达得出来。
+    ///
+    /// ⚠️ `key_actions` 里的 `aux_code` 仍然有效且保留（双拼出厂就是 `backtick = "aux_code"`）。
+    /// 两条路都通向同一个 `enter_aux_code`，差别只在**哪些键名解析得出来**。
+    AuxCode,
 }
 
 impl SessionAction {
@@ -859,6 +875,9 @@ impl SessionAction {
             "page_next" => Self::PageNext,
             "highlight_up" => Self::HighlightUp,
             "highlight_down" => Self::HighlightDown,
+            // 与 `BoundAction::parse` 的同名动词逐字一致：同一个功能在两张表里写法不同的话，
+            // 用户把配置从一张表挪到另一张就会静默失效。
+            "aux_code" => Self::AuxCode,
             // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
             "cancel" | "clear" => Self::Cancel,
             _ => Self::None,
@@ -933,6 +952,7 @@ impl std::fmt::Display for SessionAction {
             Self::Cancel => f.write_str("cancel"),
             Self::SelectCandidate(n) => write!(f, "select_candidate:{n}"),
             Self::SelectChar(n) => write!(f, "select_char:{n}"),
+            Self::AuxCode => f.write_str("aux_code"),
         }
     }
 }

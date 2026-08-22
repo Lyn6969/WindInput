@@ -769,6 +769,56 @@ mod tests {
         assert_eq!(st.preedit, "li", "组合区原封不动");
     }
 
+    /// ★ Tab 这类非符号键靠 `[session_actions]` 进辅助码。
+    ///
+    /// `key_actions` 那张表**解析不出 `tab`**（`key_action_name_to_vk` 只认符号键、字母 z
+    /// 与四个修饰键），写进去会被静默丢弃——这正是把 `aux_code` 也收进 `SessionAction`
+    /// 的理由。两条路通向同一个 `enter_aux_code`，差别只在哪些键名解析得出来。
+    #[test]
+    fn session_action_tab_enters_aux_code() {
+        let c = coord_with_data_cfg("sess_tab", data_dir_with_aux("sess_tab"), |cfg| {
+            cfg.keys
+                .session_actions
+                .insert("tab".to_string(), "aux_code".to_string());
+        });
+        let mut st = seed_composition(&c);
+        let act = c.apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true);
+        assert!(act.is_some(), "有候选时 Tab 应进辅助码");
+        assert_eq!(st.active, Some(ModeKind::AuxCode));
+        assert!(st.aux_code.is_some(), "overlay 三件套应已建立");
+    }
+
+    /// ★★ 无候选时**必须放行**，否则空闲按 Tab 就再也打不出制表符了。
+    ///
+    /// 守的是 `requires_candidates()` 那道通用闸门：`AuxCode` 落在
+    /// `!matches!(self, None | Cancel)` 的 true 侧是自动的，一旦有人给它加特例
+    /// （比如照 `Cancel` 的样子放宽到「有会话即可」），这条就红。
+    #[test]
+    fn session_action_tab_passes_through_without_candidates() {
+        let c = coord_with_data_cfg("sess_tab_idle", data_dir_with_aux("sess_tab_idle"), |cfg| {
+            cfg.keys
+                .session_actions
+                .insert("tab".to_string(), "aux_code".to_string());
+        });
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        // 空闲态：无缓冲、无候选。
+        let act = c.apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true);
+        assert!(act.is_none(), "无候选时不得吞键——Tab 要还给宿主");
+        assert_eq!(st.active, None);
+    }
+
+    /// 两张表的动词写法必须逐字一致：同一个功能在两处写法不同的话，用户把配置从一张表
+    /// 挪到另一张就会静默失效。
+    #[test]
+    fn aux_code_verb_spelling_matches_across_both_tables() {
+        use wind_config::{BoundAction, SessionAction};
+        assert_eq!(BoundAction::parse("aux_code"), BoundAction::AuxCode);
+        assert_eq!(SessionAction::parse("aux_code"), SessionAction::AuxCode);
+        // 写回也要能读回来（Display 与 parse 互逆）。
+        assert_eq!(SessionAction::AuxCode.to_string(), "aux_code");
+    }
+
     /// tri-state 覆盖方向一：全局关 + 方案显式开 → 进得去。
     /// 这正是「只在双拼开、全拼不动」的落地形态。
     #[test]
