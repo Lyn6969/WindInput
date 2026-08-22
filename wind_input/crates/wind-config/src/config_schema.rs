@@ -319,8 +319,10 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.take_screenshot", Str),
     f("keys.global_hotkeys", StrList),
     // `keys.schema_hotkeys` 已废弃并**从登记表移除**（与当年 `schema.special_modes` 同样
-    // 的处置）：它已并入下面的 key_actions，由 `Config::migrate_schema_hotkeys_into_key_actions`
-    // 在加载期折算。serde 字段仍保留，故旧配置照常读得进来；移出登记表则让 `config.setItems`
+    // 的处置）：改写进下面的 key_actions（动词 `switch_schema:<id>`），**没有兼容折算**
+    // ——加载期只由 `Config::warn_legacy_schema_hotkeys` 告警一次随后清空，残留的老配置
+    // 不生效。serde 字段仍保留（`legacy_schema_hotkeys`），是为了**读得出残留值以便告警**，
+    // 不是为了让它继续工作；移出登记表则让 `config.setItems`
     // 不再接受对它的写入——写旧键的客户端会收到 skipped 而不是静默成功，这正是我们想要的
     // 可见性（本仓最忌讳「写进去了、没人读」）。
     f("keys.key_actions", Map),

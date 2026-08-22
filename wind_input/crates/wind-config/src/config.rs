@@ -4159,7 +4159,10 @@ impl Config {
         // 否则日志比对时会以为配置变过。
         pairs.sort();
         warn!(
-            "keys.schema_hotkeys 已废弃且不再生效（残留 {} 条：{}）。             改法：写进 keys.key_actions，如 \"ctrl+shift+r\" = \"switch_schema:<方案id>\"             （单向切换；要「再按一次回到来源」则用 toggle_schema:<方案id>）。             也可在设置页「方案 → 选中方案 → 设置 → 进入方式」重配一次。",
+            "keys.schema_hotkeys 已废弃且不再生效（残留 {} 条：{}）。\r
+             改法：写进 keys.key_actions，如 \"ctrl+shift+r\" = \"switch_schema:<方案id>\"\r
+             （单向切换；要「再按一次回到来源」则用 toggle_schema:<方案id>）。\r
+             也可在设置页「方案 → 选中方案 → 设置 → 进入方式」重配一次。",
             pairs.len(),
             pairs.join(", ")
         );

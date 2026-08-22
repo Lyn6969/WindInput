@@ -422,10 +422,12 @@ impl Compiler {
         }
 
         // ── 方案直达热键在这里**没有**独立编译段 ──
-        // `keys.schema_hotkeys` 已并入下方的 `keys.key_actions`（动词 `switch_schema:<id>`），
-        // 由 `Config::migrate_schema_hotkeys_into_key_actions` 在加载期折算。
+        // `keys.schema_hotkeys` 已废弃，改写进下方的 `keys.key_actions`（动词
+        // `switch_schema:<id>`）。**没有兼容折算**：加载期只由
+        // `Config::warn_legacy_schema_hotkeys` 告警一次随后清空，残留的老配置不生效
+        // （用户拍板不做向后兼容，见 044a2a1a）。
         //
-        // 合表的理由见那个函数，其中一条正是本段自己造成的：它与 key_actions 编译进**同一张**
+        // 合表的理由之一正是本段自己造成的：它与 key_actions 编译进**同一张**
         // key_down 表，而 `match_key_down` 是 `.find()` 先注册者赢——本段排在前面，于是同一个
         // 键两处都配时 key_actions 那条静默失效。另一条是本段**不问键形态**地把解析结果塞进
         // key_down 表（下方 key_actions 走 `route_of_key_action` 三分），单字符键进表会被 TSF

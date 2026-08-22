@@ -746,9 +746,12 @@ pub trait WebDataRpc: WebDataHost {
     ///
     /// 非拼音方案原样放行——码表词组码没有音节语义，`boundary = 0` 是**正确语义**。
     ///
-    /// ★ 求解出的边界通过**把 code 写回带空格形态**传给落库端，而不是给
-    /// `import_user_words` 加参数：空格本就是本仓的边界载体，`split_spaced_code` 在
-    /// 落库时会把它拆回 `flat key + boundary`。既有管线一行都不用改。
+    /// ★ 求解出的边界写进 **`WordIo::boundary`**，不走「把 code 改写成带空格形态」那条。
+    ///
+    /// ⚠️ 本段曾经写反过（说的是走空格载体）。空格确实是本仓别处的边界载体，但它
+    /// **表达不了单音节**——`xian` 的 `0b1` 经 join→split 会退化成 0，于是单字词的补齐
+    /// 静默失效、而统计那边还照样记进 `filled`。判据见 `dispose_contract_rows` 里的
+    /// 同名 ★ 注释，那里是真正落笔的地方。
     ///
     /// `fill` = 用户在导入对话框里的二选一（见 §5）：`true` 由程序补充边界；`false` 则
     /// **跳过**这些行、不入库，把处置权交回用户。⚠️ `false` 不等于「照原样导入」——
@@ -3366,7 +3369,10 @@ mod tests {
         let nl = char::from_u32(10).unwrap();
         let c = coord("phrasetext");
         let text = format!(
-            "wind:p1 我的直通车{nl}kx (＾▽＾){nl}             zd $CC({q}记事本{q}, proc.run({q}notepad.exe{q})){nl}             sh $CC({q}跑{q}, proc.shell({q}echo hi{q})){nl}             编码 缺少合法编码的一行{nl}"
+            "wind:p1 我的直通车{nl}kx (＾▽＾){nl}\
+             zd $CC({q}记事本{q}, proc.run({q}notepad.exe{q})){nl}\
+             sh $CC({q}跑{q}, proc.shell({q}echo hi{q})){nl}\
+             编码 缺少合法编码的一行{nl}"
         );
 
         let prev = c

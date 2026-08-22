@@ -265,7 +265,9 @@ impl Coordinator {
         // 「切方案」却切了中英文，比没反应更难排查。
         if from_schema && matches!(action, BoundAction::SwitchSchema(_)) {
             warn!(
-                "key_actions: 方案级绑定不支持 switch_schema（单向切走就回不来了），                 键 0x{key_code:02X} 上忽略。改用 toggle_schema:<id>（往返），                 或把这条写进全局 keys.key_actions"
+                "key_actions: 方案级绑定不支持 switch_schema（单向切走就回不来了），\
+                 键 0x{key_code:02X} 上忽略。改用 toggle_schema:<id>（往返），\
+                 或把这条写进全局 keys.key_actions"
             );
             return BoundKeyDecision::Yield;
         }

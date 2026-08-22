@@ -2186,7 +2186,8 @@ mod schema_switch_finish_guard {
                 || body.contains("active_schema_id() == id || self.engine_mgr.switch_schema(&id)");
             assert!(
                 idempotent_handled,
-                "{name}: 「已是该方案」时既没归位也没走收尾 ⇒ 英文态/大写态下按方案热键                 毫无反应。要么调 restore_state_for_same_schema，要么与切换尝试共用条件"
+                "{name}: 「已是该方案」时既没归位也没走收尾 ⇒ 英文态/大写态下按方案热键\
+                 毫无反应。要么调 restore_state_for_same_schema，要么与切换尝试共用条件"
             );
         }
     }
