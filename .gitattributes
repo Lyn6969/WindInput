@@ -1,0 +1,14 @@
+# Git hooks 必须保持 LF。
+#
+# 本仓 core.autocrlf=true：不显式声明的文本文件在 checkout 时一律转成 CRLF。而 Git Bash
+# 执行 shell 脚本时，CRLF 会让首行变成 `#!/usr/bin/env bash\r`，报
+# "bad interpreter: No such file or directory" —— hook 在新 clone 的机器上直接失效，
+# 且失效方式是静默的（git 只在 stderr 抱怨一句，提交照常进行，格式检查等于没跑）。
+#
+# 2026-08-22 实测：删掉工作区的 .githooks/pre-commit 再 checkout，行尾确实变成 CRLF。
+# 这个隐患在改 hook 之前就存在，只是原脚本恰好没在本机暴露。
+#
+# ⚠️ 这里**只声明 .githooks**，不放宽到 `*.sh`：本仓 C++/Swift/toml/部分 rs 是 CRLF，
+# 行尾规则牵一发动全身（见 memory 里那一串 CRLF 教训）。要给别的路径加规则时，先确认
+# 那批文件在仓库里存的就是 LF，否则会给所有人制造一次全文件 diff。
+.githooks/** text eol=lf
