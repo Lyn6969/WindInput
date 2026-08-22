@@ -1,11 +1,23 @@
 //! 通用候选词筛选容器：封装「原始候选 + 可选筛选视图」。
 //!
-//! - 原始数据始终保留在 [`CandidateStore::original`] 中，筛选构建独立的显示列表
+//! - 原始数据始终保留在 `original` 字段中，筛选构建独立的显示列表
 //! - 清除筛选即复制原始数据恢复全量显示
-//! - [`CandidateStore::filtered_out`] 按需计算被滤集（用于翻页放宽），不存储副本
 //!
 //! 使用场景：
 //! - 辅助码：`set_candidates`（快照）+ `set_filter`（重筛）+ `clear_filter`（还原）
+//!
+//! # ⛔ 曾有一个 `filtered_out()`（被滤集迭代器），已删除
+//!
+//! 它写来预备「翻页放宽」用，但那条路一直没接过来——而辅助码是**明确不做**翻页放宽的
+//! （见 `aux_code_does_not_relax_scope_on_page_end`），所以既没有消费者也没有在途的
+//! 消费者。留着的害处不是占地方，是它**按 `text` 建 HashSet 做差集**：同一段文本在
+//! `original` 里出现两次而只有一条通过筛选时，两条都会被当成「已显示」，被滤的那条
+//! 就此漏出结果。这个错在没有消费者时完全看不出来，等哪天有人把它接上翻页放宽，
+//! 收到的是一个静默漏项的列表。
+//!
+//! 真要重做：按**下标**记录哪些进了 `displayed`（`set_filter` 时顺手存一份
+//! `Vec<usize>`），别再按文本比对。同理删掉的还有 `is_filtered` / `original` /
+//! `into_original`——都是没有消费者的推测式接口。
 
 use crate::Candidate;
 
@@ -29,8 +41,6 @@ pub struct CandidateStore {
     original: Vec<Candidate>,
     /// 当前显示的候选（筛选后的子集或原始的克隆）。
     displayed: Vec<Candidate>,
-    /// 是否处于筛选状态（精确追踪，不依赖长度启发）。
-    filtered: bool,
 }
 
 impl Default for CandidateStore {
@@ -45,7 +55,6 @@ impl CandidateStore {
         Self {
             original: Vec::new(),
             displayed: Vec::new(),
-            filtered: false,
         }
     }
 
@@ -55,7 +64,6 @@ impl CandidateStore {
     pub fn set_candidates(&mut self, candidates: Vec<Candidate>) {
         self.original = candidates;
         self.displayed = self.original.clone();
-        self.filtered = false;
     }
 
     /// 应用筛选谓词，构建筛选视图。
@@ -69,23 +77,16 @@ impl CandidateStore {
             .filter(|c| predicate(c))
             .cloned()
             .collect();
-        self.filtered = true;
     }
 
     /// 清除筛选视图，恢复全量显示。
     pub fn clear_filter(&mut self) {
         self.displayed = self.original.clone();
-        self.filtered = false;
     }
 
     /// 当前显示的候选（筛选后的子集或全量）。
     pub fn displayed(&self) -> &[Candidate] {
         &self.displayed
-    }
-
-    /// 原始全量候选（不受筛选影响）。
-    pub fn original(&self) -> &[Candidate] {
-        &self.original
     }
 
     /// 当前显示的候选数量。
@@ -96,56 +97,6 @@ impl CandidateStore {
     /// 当前是否为空。
     pub fn is_empty(&self) -> bool {
         self.displayed.is_empty()
-    }
-
-    /// 是否处于筛选状态（调用过 `set_filter` 且未 `clear_filter`）。
-    pub fn is_filtered(&self) -> bool {
-        self.filtered
-    }
-
-    /// 被筛掉的候选迭代器（保持原序）。
-    ///
-    /// 用于翻页放宽：把被滤候选追加到末尾并标记 `is_scope_filtered`。
-    /// 内部构建 `HashSet` 用于 O(1) 查找，候选列表通常 < 300 条，开销可忽略。
-    pub fn filtered_out(&self) -> FilteredOut<'_> {
-        let displayed_set: std::collections::HashSet<&str> =
-            self.displayed.iter().map(|c| c.text.as_str()).collect();
-        FilteredOut {
-            original: &self.original,
-            displayed_set,
-            index: 0,
-        }
-    }
-
-    /// 消费容器，返回原始候选列表。
-    pub fn into_original(self) -> Vec<Candidate> {
-        self.original
-    }
-}
-
-/// 被筛候选的惰性迭代器。
-///
-/// 由 [`CandidateStore::filtered_out`] 返回，按原序遍历所有不在显示列表中的候选。
-pub struct FilteredOut<'a> {
-    original: &'a [Candidate],
-    displayed_set: std::collections::HashSet<&'a str>,
-    index: usize,
-}
-
-impl<'a> Iterator for FilteredOut<'a> {
-    type Item = &'a Candidate;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.index >= self.original.len() {
-                return None;
-            }
-            let i = self.index;
-            self.index += 1;
-            if !self.displayed_set.contains(self.original[i].text.as_str()) {
-                return Some(&self.original[i]);
-            }
-        }
     }
 }
 
@@ -168,16 +119,13 @@ mod tests {
         let store = CandidateStore::new();
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
-        assert!(!store.is_filtered());
     }
 
     #[test]
-    fn set_candidates_populates_original() {
+    fn set_candidates_shows_all() {
         let mut store = CandidateStore::new();
         store.set_candidates(vec![cand("a", true), cand("b", false)]);
-        assert_eq!(store.len(), 2);
-        assert_eq!(store.original().len(), 2);
-        assert!(!store.is_filtered());
+        assert_eq!(store.len(), 2, "新数据到来即全量显示");
     }
 
     #[test]
@@ -185,12 +133,13 @@ mod tests {
         let mut store = CandidateStore::new();
         store.set_candidates(vec![cand("王", true), cand("尪", false), cand("往", true)]);
         store.set_filter(|c| c.is_common);
-        assert!(store.is_filtered());
         assert_eq!(store.len(), 2);
         let texts: Vec<_> = store.displayed().iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["王", "往"]);
     }
 
+    /// 快照不受筛选影响：清除筛选能原样拿回全量，且顺序不变。
+    /// （辅助码的退格还原与退出还原全靠这一条。）
     #[test]
     fn clear_filter_restores_full() {
         let mut store = CandidateStore::new();
@@ -198,59 +147,21 @@ mod tests {
         store.set_filter(|c| c.is_common);
         assert_eq!(store.len(), 1);
         store.clear_filter();
-        assert!(!store.is_filtered());
-        assert_eq!(store.len(), 2);
+        let texts: Vec<_> = store.displayed().iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b"], "原始快照与原序都要拿得回来");
     }
 
+    /// 新数据到来即丢弃旧筛选。
+    ///
+    /// 判据取「新数据全都显示出来」而非查一个状态位：新装的 `c` 是 `is_common=false`，
+    /// 旧筛选若还挂着就会把它滤掉、len 为 0。状态位断言反而测不出真实显示面。
     #[test]
     fn set_candidates_clears_filter() {
         let mut store = CandidateStore::new();
         store.set_candidates(vec![cand("a", true), cand("b", false)]);
         store.set_filter(|c| c.is_common);
-        assert!(store.is_filtered());
         store.set_candidates(vec![cand("c", false)]);
-        assert!(!store.is_filtered());
-        assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn filtered_out_yields_removed() {
-        let mut store = CandidateStore::new();
-        store.set_candidates(vec![cand("王", true), cand("尪", false), cand("往", true)]);
-        store.set_filter(|c| c.is_common);
-        let filtered: Vec<_> = store.filtered_out().map(|c| c.text.as_str()).collect();
-        assert_eq!(filtered, vec!["尪"]);
-    }
-
-    #[test]
-    fn filtered_out_empty_when_no_filter() {
-        let mut store = CandidateStore::new();
-        store.set_candidates(vec![cand("a", true)]);
-        assert!(store.filtered_out().next().is_none());
-    }
-
-    #[test]
-    fn filtered_out_empty_when_all_pass() {
-        let mut store = CandidateStore::new();
-        store.set_candidates(vec![cand("a", true), cand("b", true)]);
-        store.set_filter(|_| true);
-        assert!(store.is_filtered(), "set_filter(|true) 仍标记为筛选态");
-        assert!(store.filtered_out().next().is_none());
-    }
-
-    #[test]
-    fn filtered_out_preserves_order() {
-        let mut store = CandidateStore::new();
-        store.set_candidates(vec![
-            cand("a", true),
-            cand("b", false),
-            cand("c", true),
-            cand("d", false),
-            cand("e", true),
-        ]);
-        store.set_filter(|c| c.is_common);
-        let filtered: Vec<_> = store.filtered_out().map(|c| c.text.as_str()).collect();
-        assert_eq!(filtered, vec!["b", "d"]);
+        assert_eq!(store.len(), 1, "旧筛选必须随新数据一起丢弃");
     }
 
     #[test]
@@ -269,14 +180,6 @@ mod tests {
     }
 
     #[test]
-    fn into_original_consumes() {
-        let mut store = CandidateStore::new();
-        store.set_candidates(vec![cand("x", true)]);
-        let original = store.into_original();
-        assert_eq!(original.len(), 1);
-    }
-
-    #[test]
     fn reapply_filter_overwrites() {
         let mut store = CandidateStore::new();
         store.set_candidates(vec![cand("a", true), cand("b", false), cand("c", true)]);
@@ -288,11 +191,18 @@ mod tests {
         assert_eq!(store.displayed()[0].text, "a");
     }
 
+    /// 反复筛选恒从**快照**重筛，不是在上一次的结果上再筛。
+    ///
+    /// 辅助码的退格还原全靠这条：`m` → `mz` → 退回 `m` 时，第二次的 `m` 必须能把
+    /// 上一步被 `mz` 滤掉的候选拿回来。在已筛结果上叠筛的话它们再也回不来。
     #[test]
-    fn original_unaffected_by_filter() {
+    fn filter_always_reruns_from_snapshot() {
         let mut store = CandidateStore::new();
-        store.set_candidates(vec![cand("a", true), cand("b", false)]);
+        store.set_candidates(vec![cand("a", true), cand("b", false), cand("c", true)]);
+        store.set_filter(|c| c.text == "a");
+        assert_eq!(store.len(), 1);
         store.set_filter(|c| c.is_common);
-        assert_eq!(store.original().len(), 2, "original 不受筛选影响");
+        let texts: Vec<_> = store.displayed().iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "c"], "被上一次筛掉的 c 必须能回来");
     }
 }
