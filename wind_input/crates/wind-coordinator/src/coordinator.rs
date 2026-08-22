@@ -3153,7 +3153,20 @@ impl Coordinator {
             Some(ModeKind::Url) => self.exit_url_mode(state),
             Some(ModeKind::Special(_)) => self.exit_special_mode(state),
             Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
-            Some(ModeKind::AuxCode) => self.exit_aux_code(state),
+            // ★ 辅助码要**两步**：`exit_aux_code` 是本仓唯一一个「退出后主组合仍存活」的
+            // 退出函数——它按设计还原拼音候选与 preedit（辅助码只是筛选，Esc 的语义是
+            // 「放弃筛选、继续拼音」，见该函数注释）。而本函数末尾无条件
+            // `notify_ui_hide` + `ClearComposition`，两者拼在一起就自相矛盾：协调器认为
+            // 组合区里还有 `li`、候选窗里还有三条，宿主那边却收到了「清掉组合」。下一次
+            // 敲 `a` 会让屏幕上凭空冒出 `lia`。
+            //
+            // 所以取消键在辅助码态要连主组合一起放弃 —— 用户按的是「放弃」，不是「退出
+            // 筛选」；后者由 Esc 那一臂与触发键复按承担（都走 `aux_code_exited`，返回
+            // UpdateComposition 而非 ClearComposition），两个动作从此语义分明。
+            Some(ModeKind::AuxCode) => {
+                self.exit_aux_code(state);
+                self.reset_pinyin_composition(state);
+            }
             // 普通输入：取消整个组合，含已转换前缀（拼音分步上屏的那部分）一并丢弃。
             None => self.reset_pinyin_composition(state),
         }

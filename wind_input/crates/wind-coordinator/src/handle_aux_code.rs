@@ -594,6 +594,47 @@ mod tests {
         assert!(matches!(act, KeyAction::UpdateComposition { .. }));
     }
 
+    /// ★★ 自定义取消键（`session_actions` 里的 `cancel`）在辅助码态必须**连主组合一起
+    /// 放弃**，不能只退筛选。
+    ///
+    /// `cancel_session` 末尾无条件 `notify_ui_hide` + `ClearComposition`，而
+    /// `exit_aux_code` 是本仓唯一一个「退出后主组合仍存活」的退出函数（它按设计还原
+    /// 拼音候选与 preedit）。两者直接拼在一起就自相矛盾：宿主收到「清掉组合」，协调器
+    /// 这边 `input_buffer` 还是 `li`、候选还有三条——下一次敲 `a` 会让屏幕上凭空冒出
+    /// `lia`。
+    ///
+    /// 判据取「协调器状态与 ClearComposition 相符」，**不是**看返回的 KeyAction：
+    /// 那个变体修不修都是 ClearComposition，按它断言测不出任何东西。
+    ///
+    /// 与上面 `esc_exits_and_restores_pinyin_composition` 恰成对照：Esc 走
+    /// `aux_code_exited`（还原拼音、返回 UpdateComposition），取消键走这里（整体放弃、
+    /// 返回 ClearComposition）。两个动作语义不同，各走各的路。
+    #[test]
+    fn cancel_session_in_aux_mode_clears_whole_composition() {
+        let c = coord_with("cancel_whole");
+        let mut st = seed_composition(&c);
+        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('M'), 0));
+        assert_eq!(st.active, Some(ModeKind::AuxCode));
+
+        let act = c.cancel_session(&mut st);
+        assert!(matches!(act, KeyAction::ClearComposition));
+        assert_eq!(st.active, None, "取消键应退出辅助码");
+        assert!(st.aux_code.is_none(), "overlay 三件套应整体销毁");
+        assert!(
+            st.input_buffer.is_empty(),
+            "编码缓冲必须清空——残留会让下一次按键在屏幕上补出旧内容"
+        );
+        assert!(
+            st.preedit.is_empty(),
+            "组合区必须清空，与 ClearComposition 相符"
+        );
+        assert!(
+            st.candidates.is_empty(),
+            "候选必须清空，UI 已被 notify_ui_hide 隐藏"
+        );
+    }
+
     #[test]
     fn backspace_to_empty_stays_for_reinput() {
         let c = coord_with("back");
