@@ -51,6 +51,20 @@ pub(crate) struct AuxCodeOverlay {
     pub(crate) filter_options: wind_aux_code::AuxCodeFilterOptions,
 }
 
+/// 辅助码态里一个按键相对**辅助码绑定**的角色，见 [`Coordinator::aux_code_key_role`]。
+///
+/// 做成三态而不是 `bool`：共键（`aux_code:page_next`）与专用触发键在模式内的处置相反
+/// （翻页 vs 退出），而两者都必须在 `handle_candidate_nav` **之前**裁决——用 bool 表达
+/// 只能表达其中一件事，另一件就会漏到兜底臂上把首选打出去。
+enum AuxKeyRole {
+    /// 专用触发键（`aux_code`）：再按一次 = 退出辅助码。
+    Exit,
+    /// 共键（`aux_code:page_next`）：模式内当下翻页，**不退出**。
+    PageNext,
+    /// 与辅助码绑定无关，交给后面的臂（导航 / 选词 / 码元累积 / 兜底）。
+    Other,
+}
+
 /// 辅助码会话（快照/缓冲/重筛）已移入 `wind-aux-code::session`，见
 /// [`wind_aux_code::AuxCodeSession`]；显示态（组合区 preedit/光标）与筛选会话打包在
 /// [`AuxCodeOverlay`]，经 `State.aux_code` 整体持有、整体销毁。
@@ -220,12 +234,24 @@ impl Coordinator {
         {
             return act;
         }
-        // 触发键再按一次 = 退出。**必须排在 `handle_candidate_nav` 之前**：那个函数把键送回
+        // 辅助码绑定键的角色裁决。**必须排在 `handle_candidate_nav` 之前**：那个函数把键送回
         // `apply_session_action`，而它认得 AuxCode——虽然 `enter_aux_code` 的守卫已挡住重入，
         // 但挡住之后返回 None，键会继续落到下方兜底臂**上屏高亮候选**，那是个破坏性动作。
-        // 按同一个键返回也正是用户对自选触发键的预期。
-        if self.is_aux_code_trigger(data) {
-            return self.aux_code_exited(state);
+        match self.aux_code_key_role(data) {
+            // 专用触发键再按一次 = 退出。按同一个键返回正是用户对自选触发键的预期。
+            AuxKeyRole::Exit => return self.aux_code_exited(state),
+            // 共键（`aux_code:page_next`）在模式内 = 下翻页。
+            //
+            // ⚠️ 这里不能改走下面的 `handle_candidate_nav`：它取 `include_printable = false`，
+            // 而符号键（`backtick` 等）一律 `printable = true` ⇒ 配在符号键上的绑定在那儿
+            // **查不到**，键会一路落到兜底臂把首选打出去。见 `aux_code_key_role` 的说明。
+            AuxKeyRole::PageNext => {
+                if self.page_next(state) {
+                    self.notify_ui_update(state);
+                }
+                return KeyAction::Consumed;
+            }
+            AuxKeyRole::Other => {}
         }
         // 候选导航（翻页 / 高亮）：辅助码只收字母，`-`/`=`/`[`/`]` 等按普通导航处理。
         if let Some(act) = self.handle_candidate_nav(state, data) {
@@ -299,38 +325,57 @@ impl Coordinator {
         }
     }
 
-    /// 这个键是不是「进辅助码」的**专用**触发键（再按一次 = 退出）。**两张表都问**
-    /// ——`aux_code` 在 `keys.key_actions` 与 `keys.session_actions` 里各有一份，
-    /// 用户配在哪张都算数。
+    /// 辅助码态里这个键的角色。**两张表都问**——`aux_code` 在 `keys.key_actions` 与
+    /// `keys.session_actions` 里各有一份，用户配在哪张都算数。
     ///
-    /// 会话态那侧取 `include_printable = false`，与 `handle_candidate_nav` 在辅助码态下
-    /// 的取值一致：辅助码态里字母是码元输入，不能被当成会话键抢走。
+    /// # ★★★ 为什么这里取 `include_printable = true`，与 `handle_candidate_nav` 相反
     ///
-    /// ★ **共键（`aux_code:page_next`）刻意不算**：它在辅助码态里的身份是翻页键，
-    /// 要落到下面的 `handle_candidate_nav` 去翻页。若在此认成退出键，共键用户就永远
-    /// 翻不了第二页——按一次进、再按一次就出来了。
-    fn is_aux_code_trigger(&self, data: &KeyEventData) -> bool {
-        // ★ 字母恒是码元，绝不当触发键。区间与下方那条累积臂（`VK_A..=VK_Z`）**取同一个**，
-        // 两处不会漂。
-        //
-        // 会话态那侧本已天然排除（`z` 在 `session_key_name_to_vk` 里标 `printable: true`，
-        // 而这里取 `include_printable = false`）；`key_actions` 压根没有 printable 这个维度，
-        // 得在此显式排。少了它，配过 `z = "aux_code"` 的用户在辅助码里再也打不出 `z`。
+    /// 那个取值（false）是为了保护**码元**——文本/码元语境里 `-`/`=`/`z` 这类键要出字符，
+    /// 不能被夺为动作。而**辅助码的码元只有字母**（下方累积臂 `VK_A..=VK_Z`，已在本函数
+    /// 开头排除），符号键在辅助码态不产出任何东西。
+    ///
+    /// 若这里沿用 false，所有**符号键**（`session_key_name_to_vk` 里一律 `printable = true`）
+    /// 上的 `aux_code` / `aux_code:page_next` 在模式内都查不到，键一路落到兜底臂
+    /// 「有候选则上屏高亮候选并退出」——**把首选打了出去**，而用户只是想退出或翻页。
+    /// ⚠️ 这是既有缺陷（不是共键引入的）：把 `backtick = "aux_code"` 只写在 `session_actions`
+    /// 里就能复现，此前一直被双拼出厂那份 `[key_actions] backtick = "aux_code"` 兜住。
+    ///
+    /// 📌 同源的缺口仍在：符号键上的 `cancel` 等**其它**会话动词在辅助码态同样不可达
+    /// （走 `handle_candidate_nav` 的 false）。要一并解决得让整个辅助码态改用
+    /// `include_printable = true`，那就必须先把字母累积臂提到导航之前——是另一件事。
+    fn aux_code_key_role(&self, data: &KeyEventData) -> AuxKeyRole {
+        // ★ 字母恒是码元，任何绑定都不算数。区间与下方那条累积臂（`VK_A..=VK_Z`）
+        // **取同一个**，两处不会漂。少了它，配过 `z = "aux_code"` 的用户在辅助码里再也
+        // 打不出 `z`——而 `z` 是笔画码的「折」、也是形码方案的常用码元。
         if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
-            return false;
+            return AuxKeyRole::Other;
         }
         let shift = data.modifiers & MOD_SHIFT != 0;
-        if self.session_action_for(data.key_code, shift, false)
-            == Some(wind_config::SessionAction::AuxCode(
-                wind_config::AuxCodeShare::Solo,
-            ))
+        // ★★ 两张表都问，但**必须按分派优先级短路**，不能写成「任一表命中即算」：
+        // 会话表在按键分派里先裁决（`apply_session_action` 位于 message_handler 的兜底臂 D0
+        // 之前），所以它一旦对这个键表了态，`key_actions` 那份就没有发言权了。
+        //
+        // 少了这个短路的实际后果：**双拼出厂就带着 `[key_actions] backtick = "aux_code"`**，
+        // 用户若把反引号在 `session_actions` 里改配成共键，进入走会话表（共键生效）、退出却
+        // 被 `key_actions` 那份认成触发键 ⇒ 按一次进、再按一次出，永远翻不到第二页，
+        // 而两处配置各自看上去都没错。
+        if let Some(wind_config::SessionAction::AuxCode(share)) =
+            self.session_action_for(data.key_code, shift, true)
         {
-            return true;
+            return match share {
+                wind_config::AuxCodeShare::Solo => AuxKeyRole::Exit,
+                wind_config::AuxCodeShare::PageNext => AuxKeyRole::PageNext,
+            };
         }
-        matches!(
+        // `key_actions` 那张表没有共键形态（它解析不出翻页键，见 `SessionAction::AuxCode`
+        // 的文档），命中即专用触发键。
+        if matches!(
             self.bound_action_for(data.key_code),
             Some(wind_config::BoundAction::AuxCode)
-        )
+        ) {
+            return AuxKeyRole::Exit;
+        }
+        AuxKeyRole::Other
     }
 
     /// 组合区随辅助码更新：通知 UI 并回组合更新（光标在辅助码串尾）。
@@ -1380,6 +1425,90 @@ mod tests {
         assert_eq!(st.active, Some(ModeKind::TempPinyin), "不得改动所在模式");
         assert!(st.aux_code.is_none());
         assert_eq!(st.current_page, 1);
+        assert!(matches!(act, KeyAction::Consumed));
+    }
+
+    /// ★★★ 专用触发键**只配在 `session_actions` 的符号键上**时，模式内再按必须正常退出，
+    /// 且**绝不上屏**。
+    ///
+    /// 符号键一律 `printable = true`，而辅助码态下 `handle_candidate_nav` 取
+    /// `include_printable = false` ⇒ 用同样取值去查这条绑定会**查不到**，键一路落到兜底臂
+    /// 「有候选则上屏高亮候选并退出」——用户只是想退出，却把首选打了出去。
+    /// 修法是 `aux_code_key_role` 改取 `include_printable = true`（辅助码的码元只有字母，
+    /// 已在那里单独排除）。
+    ///
+    /// ⚠️ 这是**既有缺陷**，不是共键引入的：此前一直被双拼出厂那份
+    /// `[key_actions] backtick = "aux_code"` 兜住，所以本用例刻意换一个 fixture 方案
+    /// **没有**在 `key_actions` 里绑过的符号键（`/`），否则测的就是 key_actions 那条路。
+    ///
+    /// 判据取「候选与缓冲原封不动」而非 `KeyAction` 变体：兜底臂走 `commit_selected`，
+    /// 它在部分消费时同样返回 `UpdateComposition`，按变体断言测不出来。
+    #[test]
+    fn solo_trigger_on_symbol_key_exits_without_commit() {
+        let c = coord_with_data_cfg("solo_symbol", data_dir_with_aux("solo_symbol"), |cfg| {
+            cfg.keys
+                .session_actions
+                .insert("slash".to_string(), "aux_code".to_string());
+        });
+        let mut st = seed_composition(&c);
+        let slash = key(keymap::VK_SLASH, 0);
+        assert_ne!(
+            c.bound_action_for(keymap::VK_SLASH),
+            Some(wind_config::BoundAction::AuxCode),
+            "前提：这个键在 key_actions 里没有绑定，本用例才测得到会话表那条路"
+        );
+        c.apply_session_action(&mut st, &slash, true)
+            .expect("应进入辅助码");
+
+        let act = c.handle_aux_code_key(&mut st, &slash);
+
+        assert_eq!(st.active, None, "专用触发键再按一次应退出");
+        assert_eq!(st.candidates.len(), 3, "退出不得吃掉候选（那意味着上屏了）");
+        assert_eq!(st.input_buffer, "li", "退出不得消费编码缓冲");
+        assert!(st.committed_text.is_empty(), "不该有待上屏文本");
+        assert!(matches!(act, KeyAction::UpdateComposition { .. }));
+    }
+
+    /// ★★ 同一个键两张表各有一份、且形态不同时，**退出判定必须跟随分派优先级**（会话表先）。
+    ///
+    /// 这不是构造出来的边角：**双拼出厂就带着 `[key_actions] backtick = "aux_code"`**
+    /// （本用例的 fixture 方案同样带），用户只要在 `session_actions` 里把反引号改配成共键
+    /// 就会撞上。若 `is_aux_code_trigger` 写成「任一表命中即算触发键」，进入走会话表
+    /// （共键生效）、退出却被 `key_actions` 那份认走 ⇒ 按一次进、再按一次出，第二页永远
+    /// 到不了，而两处配置各自看上去都没错。
+    #[test]
+    fn share_key_wins_over_key_actions_binding_on_same_key() {
+        let c = coord_with_data_cfg(
+            "share_bothtables",
+            data_dir_with_aux("share_bothtables"),
+            |cfg| {
+                cfg.keys
+                    .session_actions
+                    .insert("backtick".to_string(), "aux_code:page_next".to_string());
+            },
+        );
+        let mut st = seed_multi_page(&c);
+        let bt = key(keymap::VK_BACKTICK, 0);
+        // 前提断言：fixture 方案的 [key_actions] 里确实还绑着 backtick = "aux_code"。
+        // 少了它本用例就退化成普通共键测试，测不到「两张表打架」这件事。
+        assert_eq!(
+            c.bound_action_for(keymap::VK_BACKTICK),
+            Some(wind_config::BoundAction::AuxCode),
+            "前提：key_actions 那份绑定仍在"
+        );
+
+        c.apply_session_action(&mut st, &bt, true)
+            .expect("共键应进辅助码");
+        assert_eq!(st.active, Some(ModeKind::AuxCode));
+
+        let act = c.handle_aux_code_key(&mut st, &bt);
+
+        assert_eq!(
+            st.active,
+            Some(ModeKind::AuxCode),
+            "会话表配的是共键 ⇒ key_actions 那份不得把它认成退出键"
+        );
+        assert_eq!(st.current_page, 1, "应当翻页");
         assert!(matches!(act, KeyAction::Consumed));
     }
 

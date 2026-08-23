@@ -147,7 +147,8 @@ capslock = "page_prev"
 1. **组合动词** `page_next_aux_code`：语义是「两个都做」——先翻页再进入，于是首按就越过了
    第一屏候选，还得在进入路径上另存 / 另恢复 `current_page` 去补救。且组合动词的名字随
    组合数相乘。
-2. **通用降级链** `aux_code|page_next`：见 key-resolver-unification.md 的否决清单第 ① 条。
+2. **通用降级链** `aux_code|page_next`：已在 key-resolver-unification.md §5「不做通用降级链」
+   否决。
    具体到这里：它要求给每个动词定义「不适用」，而那些条件多是实现细节——`page_next` 的
    「失败」是已在末页，于是语法允许的 `page_next|cancel` 会在**末页取消整段输入**。
    可表达的组合远多于有意义的组合。
@@ -168,8 +169,32 @@ capslock = "page_prev"
 | 功能未开 / 方案无码表 | 退化成纯翻页键 | `enabled` / `files` |
 | 无候选（空闲） | 放行，Tab 还给宿主 | `requires_candidates` |
 
+⚠️ **共键与专用触发键在「门卫拒绝」时的归宿不同**：专用键**放行**（键落回原语义），共键
+**降级并吞键**（它的第二身份就是翻页键）。实际差异看得见的一处：全拼下反引号是音节分隔符，
+`backtick = "aux_code"` 被门卫拒绝后仍能当分隔符用，`backtick = "aux_code:page_next"` 则会
+把这个键夺成翻页键（会话表的裁决排在分隔符臂之前）。
+
 ⚠️ 辅助码态里「再按触发键 = 退出」那条**只认专用触发键**（`aux_code`）。共键若也被认成退出键，
-用户就永远翻不到第二页——判据写在 `is_aux_code_trigger` 上。
+用户就永远翻不到第二页。模式内的键角色因此由 `aux_code_key_role` 三态裁决
+（`Exit` / `PageNext` / `Other`）——用 bool 表达只能表达其中一件事，另一件会漏到兜底臂。
+
+#### ★★★ 那个裁决取 `include_printable = true`，与同模式下的 `handle_candidate_nav` 相反
+
+实施时才暴露的一条。符号键（`backtick` / `slash` / `-` / `=` …）在 `session_key_name_to_vk`
+里**一律 `printable = true`**，而辅助码态的 `handle_candidate_nav` 取 `include_printable = false`
+（那个取值是为了保护码元）。于是配在符号键上的 `aux_code` 绑定在模式内**查不到**，键一路落到
+兜底臂「有候选则上屏高亮候选并退出」——用户只是想退出，却**把首选打了出去**。
+
+取 true 之所以安全：**辅助码的码元只有字母**（`VK_A..=VK_Z` 累积臂），而字母在
+`aux_code_key_role` 开头就被单独排除了；符号键在辅助码态不产出任何东西。
+
+⚠️ 这是**既有缺陷**，不是共键引入的：把 `backtick = "aux_code"` 只写进 `session_actions`
+即可复现，此前一直被双拼出厂那份 `[key_actions] backtick = "aux_code"` 兜住
+（`key_actions` 没有 `printable` 维度）。★ 又一次印证「两张表维度不同 ⇒ 两张表都问不能对称写」。
+
+📌 **同源缺口仍在**：符号键上的 `cancel` 等**其它**会话动词在辅助码态同样不可达。要一并解决，
+得让整个辅助码态改用 `include_printable = true`，那就必须先把字母累积臂提到导航裁决之前
+——是另一件事，不在本次范围。
 
 ### ★ 处置类只做 `cancel`，`clear` 收作别名（二期实施时定案）
 

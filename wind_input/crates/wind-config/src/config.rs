@@ -864,7 +864,7 @@ pub enum SessionAction {
 /// 2. **通用降级链**（`aux_code|page_next`）：要给每个动词定义「不适用」，而那些条件多是
 ///    实现细节（`page_next` 的「失败」是已在末页 ⇒ 语法允许的 `page_next|cancel` 会在末页
 ///    取消整段输入）。可表达的组合远多于有意义的组合，终点是 DSL。**已在
-///    `docs/design/key-resolver-unification.md` 的否决清单里**。
+///    `docs/design/key-resolver-unification.md` §5「不做通用降级链」否决过**。
 /// 3. **动词参数**（本形态）：值域封闭在 `aux_code` 上，配不出无意义的组合，
 ///    与 `select_candidate:N` / `mix:id` / `special:id` 同一套 `verb:arg` 写法。
 ///
