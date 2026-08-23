@@ -689,7 +689,7 @@ impl MessageHandler for Coordinator {
                 // 与 switch_schema 同样**不判 chinese_mode**——回程尤其要在英文态按得动。
                 //
                 // trigger_vk 传 0：全局热键在所有方案里都生效，不需要「回程键临时授权」
-                // 那套（那是方案级绑定专有的问题，见 `schema_return_key_action`）。
+                // 那套（那是方案级绑定专有的问题，见 `schema_toggle_key_authorized`）。
                 self.toggle_schema_by_id(id, 0);
                 return KeyAction::StatusUpdate(self.build_status());
             } else if let Some(id) = action.strip_prefix("switch_schema:") {

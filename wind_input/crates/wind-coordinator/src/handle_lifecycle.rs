@@ -655,11 +655,18 @@ impl Coordinator {
     /// 返回 `None` 表示本函数不接管，调用方继续走 `is_toggle_mode_keycode`。
     pub(crate) fn handle_bound_modifier_key_up(&self, key_code: u32) -> Option<KeyAction> {
         match self.bound_key_decision(key_code) {
-            // 活跃方案没绑这个键，但它可能是**回程键**——刚才正是用它把用户带到当前方案的。
-            // 少了这一条，「五笔按 RShift 去英文方案」就要求英文方案自己也配一遍才回得来。
-            // 见 `schema_return_key_action`。
+            // 活跃方案没绑这个键，但它可能**携带往返语义**——刚才正是用它把用户带到当前
+            // 方案的。少了这一条，「五笔按 RShift 去英文方案」就要求英文方案自己也配一遍
+            // 才回得来。见 `schema_toggle_key_authorized`。
+            //
+            // ★ 授权成立后一律转交 `toggle_schema_by_id`，不在这里自己判「回程还是去程」：
+            //   授权只保证代际未变（⇒ 必然仍在目标方案），至于该回来源还是该重新落地，由
+            //   它按完整落点裁决——**与全局 `keys.key_actions` 配置走的是同一条路**。曾经
+            //   这里有一份只看代际的独立回程实现（`run_schema_return`），判据一分叉，
+            //   同一个 bug 就只在其中一种配置下复现，报障时表现为「换个配法就不灵」。
             BoundKeyDecision::NotBound => {
-                if self.schema_return_key_action(key_code) && self.run_schema_return() {
+                if self.schema_toggle_key_authorized(key_code) {
+                    self.toggle_schema_by_id(&self.engine_mgr.active_schema_id(), key_code);
                     return Some(KeyAction::StatusUpdate(self.build_status()));
                 }
                 None

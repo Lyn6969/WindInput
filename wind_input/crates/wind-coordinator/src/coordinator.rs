@@ -778,7 +778,6 @@ pub(crate) fn should_reapply_initial(
     !out_of_scope && crossed && (per_app || old_has_rule || new_has_rule)
 }
 
-/// 中央协调器
 /// 上一次推给 UI 的工具栏指令（供 `notify_toolbar` 去重）。
 ///
 /// 区分「隐藏」与「显示某状态」两种，而不是只存 `Option<ToolbarState>`：后者无法表达
@@ -792,6 +791,41 @@ pub(crate) enum ToolbarPush {
     Shown(Box<ToolbarState>),
 }
 
+/// `toggle_schema` 去程的**落点快照**：上次这把键把用户送到的那个输入状态。
+///
+/// # 字段为什么恰好是这三项
+///
+/// 判据不是「我能想到哪些状态」，而是**去程自己断言了哪些状态**。
+/// `Coordinator::finish_user_schema_switch` 断言的正是：活跃方案 = 目标、中文态、
+/// CapsLock 关（后两者的理由写在那个函数里——它们开着时按键根本不进引擎）。
+///
+/// 回程是去程的撤销；**去程断言过的东西不再成立时，就没有可撤销的东西了**，此时该做的
+/// 是重新落地而不是回程。
+///
+/// ⚠ 将来给 `finish_user_schema_switch` 加新断言时，这里必须同步加一项，否则那项被扰动
+/// 后回程会静默失准——漏项没有任何编译期或测试期信号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToggleLanding {
+    /// 活跃方案变更代际（`EngineManager::schema_generation`）。
+    pub(crate) generation: u64,
+    /// 中英模式。
+    pub(crate) chinese_mode: bool,
+    /// CapsLock 镜像态。
+    pub(crate) caps_lock: bool,
+}
+
+/// `toggle_schema:<id>` 的去程记录。字段语义见 `Coordinator::schema_toggle_origin`。
+#[derive(Debug, Clone)]
+pub(crate) struct SchemaToggleOrigin {
+    /// 从哪个方案按进来的。
+    pub(crate) origin: String,
+    /// 送达时的落点快照。
+    pub(crate) landing: ToggleLanding,
+    /// 触发本次去程的键 VK（0 = 非方案级绑定触发，如全局组合热键）。
+    pub(crate) trigger_vk: u32,
+}
+
+/// 中央协调器
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
     pub(crate) push_server: Arc<PushServer>,
@@ -1066,13 +1100,26 @@ pub struct Coordinator {
     /// 全部挤在 UI 线程上，表现就是「切换时占用高、语言栏图标迟钝」——图标更新排在
     /// 这些重复消息后面。内容没变就不必再推。
     pub(crate) last_toolbar_push: Mutex<Option<ToolbarPush>>,
-    /// `toggle_schema:<id>` 的**来源**：`(从哪个方案按进来, 写入时的方案变更代际)`。
+    /// `toggle_schema:<id>` 的**去程记录**：从哪个方案按进来、送达时的落点、用的哪个键。
     ///
     /// 刻意只存运行时、不落配置：它描述的是「用户此刻的往返意图」，不是偏好。持久化会让
     /// 重启后第一次按跳到一个用户早忘了的方案——那正是「回到来源」这个语义最容易失信的
-    /// 时刻。无有效来源时按 `toggle_schema` 到已在的方案是 no-op（不切走）。
+    /// 时刻。无有效记录时按 `toggle_schema` 到已在的方案是 no-op（不切走）。
     ///
-    /// # 为什么带代际，而不是在切方案时清空
+    /// # 判据分两层：代际决定「来源还算不算数」，落点决定「这次是回程还是重新落地」
+    ///
+    /// ★ 早期只有代际一层，于是**去程之后在目标方案里切中英、开大写时代际不动、记录照旧
+    /// 有效**，再按就把用户送回来源。真机报障原话：「从五笔一键切到英文方案，又用别的方式
+    /// 切了英文状态，再按却切回了五笔」。根因是「来源还算不算数」与「这次该回程还是该去
+    /// 程」两个问题压在同一个判据上，必错一个。现按三分支裁决（见 `toggle_schema_by_id`）：
+    ///
+    /// - 代际不等 ⇒ 期间用别的方式切过方案，来源已是几步之前的地方，**作废且不动作**
+    ///   （此时没有任何依据说明用户想去哪，随便挑一个会把往返键变成随机跳转键）。
+    /// - 代际相等、落点整体不等 ⇒ 用户没离开过目标方案，只是中英态/大写被扰动了。来源
+    ///   仍然成立，本次按键退回本义「去目标」——重新落地一次，**来源保留**，再按仍回得去。
+    /// - 落点整体相等 ⇒ 回程。
+    ///
+    /// # 代际为什么是代际，而不是在切方案时清空
     ///
     /// 切 active 方案在协调器侧有**五条路径**（循环键 / 直达热键 / 命令栏 / 菜单
     /// `select_schema` / 设置页 RPC），其中只有两条走 `finish_user_schema_switch`——
@@ -1084,14 +1131,14 @@ pub struct Coordinator {
     ///
     /// 只比对方案 id 是不够的——「切走又切回来」与「从未变过」在 id 上完全同形。
     ///
-    /// 第三项是**触发键 VK**（0 = 非方案级绑定触发，如全局热键）。有它，回程才真正
-    /// 「不依赖目标方案的配置」：去程后该键在目标方案里临时获得回程语义，哪怕目标方案
-    /// 的 `[key_actions]` 是空的。
+    /// [`SchemaToggleOrigin::trigger_vk`] 是**触发键 VK**（0 = 非方案级绑定触发，如全局
+    /// 组合热键）。有它，往返才真正「不依赖目标方案的配置」：去程后该键在目标方案里临时
+    /// 获得往返语义，哪怕目标方案的 `[key_actions]` 是空的。
     ///
     /// ★ 没有这一项时，「五笔按 RShift 去英文方案」要求英文方案**自己也配一遍** RShift
     /// 才回得来——设计文档 §5 原本断言 `toggle_schema` 对锁死「从结构上免疫」，那只覆盖了
     /// 「回到哪」，没覆盖「怎么按得动」。测试里复现过。
-    pub(crate) schema_toggle_origin: Mutex<Option<(String, u64, u32)>>,
+    pub(crate) schema_toggle_origin: Mutex<Option<SchemaToggleOrigin>>,
     /// 当前主题定义的序号槽位字符（views.index.labels）；push_theme 载入时刷新。
     /// 序号优先级：用户配置 index_labels > 本字段 > 默认数字。
     pub(crate) theme_index_labels: Mutex<Vec<String>>,

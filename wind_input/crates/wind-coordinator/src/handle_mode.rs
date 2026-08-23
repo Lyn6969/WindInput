@@ -3,7 +3,7 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 //! 简繁、方案切换、主题切换、mix 融合模式、引擎方案叠加。
 
-use crate::coordinator::{Coordinator, State};
+use crate::coordinator::{Coordinator, SchemaToggleOrigin, State, ToggleLanding};
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;
@@ -1089,45 +1089,95 @@ impl Coordinator {
     /// docs/design/schema-key-actions.md §5）。
     ///
     /// `trigger_vk` = 触发本次切换的键（0 = 全局热键等非方案级绑定）。记下它，回程才
-    /// **真正**不依赖目标方案的配置——见 [`Self::schema_return_key_action`]。
+    /// **真正**不依赖目标方案的配置——见 [`Self::schema_toggle_key_authorized`]。
+    ///
+    /// # 三分支裁决
+    ///
+    /// 「已在目标方案」时**不是**一律回程，而是先问「此刻还完好停在上次送达的落点上吗」：
+    /// 代际不等 ⇒ 来源作废、不动作；落点整体不等 ⇒ 重新落地（来源保留）；相等 ⇒ 回程。
+    /// 判据为什么这么分，见 [`Coordinator::schema_toggle_origin`] 的字段说明。
     pub(crate) fn toggle_schema_by_id(&self, schema_id: &str, trigger_vk: u32) {
         let current = self.engine_mgr.active_schema_id();
+        // take 而非 clone：无论走哪个分支，这条记录都到此为止——要么用掉（回程），要么按
+        // 新落点重写（去程/重新落地），要么作废。连按第三次不该又拿陈旧记录弹回去。
+        let record = self
+            .schema_toggle_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+
         if current == schema_id {
-            // 已在目标方案：回来源。take 而非 clone——回程用掉这一次记录，
-            // 连按第三次不该又弹回去（那时来源已由下面的切换重新写入）。
-            let origin = self
-                .schema_toggle_origin
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            match origin {
-                // 代际相等 = 自记录以来无人动过活跃方案，这条来源仍代表用户的往返意图。
-                Some((origin, generation, _))
-                    if generation == self.engine_mgr.schema_generation() =>
-                {
-                    self.switch_schema_by_id(&origin)
-                }
-                // 无来源（刚启动）或来源已失效（期间用别的方式切过方案）：**no-op**。
-                // 不切走是刻意的——此时没有任何依据说明用户想去哪，随便挑一个（如循环到
-                // 下一个方案）会把「往返键」变成「随机跳转键」。
-                _ => debug!("toggle_schema: 已在 {schema_id} 且无有效来源，不动作"),
+            let Some(rec) = record else {
+                // 无记录（刚启动）：**no-op**。不切走是刻意的——此时没有任何依据说明用户
+                // 想去哪，随便挑一个（如循环到下一个方案）会把「往返键」变成「随机跳转键」。
+                debug!("toggle_schema: 已在 {schema_id} 且无来源记录，不动作");
+                return;
+            };
+            // 代际不等 = 期间用别的方式切过方案。来源已是几步之前的地方，作废且**不动作**
+            // （记录已 take 掉、不写回）。理由同上：宁可这一按没反应，也不要把人随机送走。
+            if rec.landing.generation != self.engine_mgr.schema_generation() {
+                debug!("toggle_schema: 来源已失效（期间切过方案），不动作");
+                return;
             }
+            // 落点完好 ⇒ 回程。
+            if rec.landing == self.toggle_landing() {
+                debug!("toggle_schema: 回程 -> {}", rec.origin);
+                self.switch_schema_by_id(&rec.origin);
+                return;
+            }
+            // 方案没动过，但中英态或 CapsLock 被别的途径改了 ⇒ 落点被扰动：这把键退回本义
+            // 「去目标」，重新落地一次；**来源保留**，再按一次仍回得去。
+            //
+            // ★ 这一支恒有可见动作，不会静默：走得到这里说明 chinese_mode / caps_lock 至少
+            //   一项偏离了快照，而快照里这两项恒是 `(true, false)`——去程
+            //   `finish_user_schema_switch` 的断言。故 `restore_state_for_same_schema` 必定
+            //   真的翻转了什么，不会命中它那条「没有实际变化时完全静默」的早退。
+            debug!("toggle_schema: 落点被扰动，重新落地 -> {schema_id}");
+            self.switch_schema_by_id(schema_id);
+            self.record_schema_toggle_origin(rec.origin, trigger_vk);
             return;
         }
+
         self.switch_schema_by_id(schema_id);
         // 切换失败（方案加载不了）时 active 未变，不该记来源——否则下次按会把用户
         // 送去一个他从未离开过的地方。
         if self.engine_mgr.active_schema_id() == schema_id {
-            // 代际取**切换之后**的值：这条记录的有效期从现在开始。
-            let generation = self.engine_mgr.schema_generation();
-            *self
-                .schema_toggle_origin
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some((current, generation, trigger_vk));
+            self.record_schema_toggle_origin(current, trigger_vk);
         }
     }
 
-    /// 该键此刻是否是「回程键」——即刚才正是用它把用户带到当前方案的。
+    /// 取当前的落点快照。
+    ///
+    /// ★ **写入侧与比对侧共用本函数**——「落点」的定义只有这一处，两侧不可能取到不一致的
+    /// 值。同类漂移在候选去重的分组键上翻过一次（两条路径各自取值，表现为「打得越全候选
+    /// 越少」）。
+    ///
+    /// ⚠ 取 `State` 锁，必须在**不持锁**时调用（与 `toggle_schema_by_id` 的既有契约一致）。
+    fn toggle_landing(&self) -> ToggleLanding {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        ToggleLanding {
+            generation: self.engine_mgr.schema_generation(),
+            chinese_mode: state.chinese_mode,
+            caps_lock: state.caps_lock,
+        }
+    }
+
+    /// 记下去程记录。落点取**此刻**（切换收尾之后）的值：这条记录的有效期从现在开始。
+    fn record_schema_toggle_origin(&self, origin: String, trigger_vk: u32) {
+        // 先算落点再取记录锁：`toggle_landing` 自己要 `State` 锁，嵌在赋值表达式里就成了
+        // 两把锁的固定嵌套序，给将来留死锁面。
+        let landing = self.toggle_landing();
+        *self
+            .schema_toggle_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(SchemaToggleOrigin {
+            origin,
+            landing,
+            trigger_vk,
+        });
+    }
+
+    /// 该键此刻是否**携带往返语义**——即刚才正是用它把用户带到当前方案的。
     ///
     /// # 为什么需要它
     ///
@@ -1136,11 +1186,23 @@ impl Coordinator {
     /// 变成要求英文方案自己也配一遍 RShift——那正是 §5 想消除的对称配置负担，只是从
     /// 「N² 个定向绑定」降到了「每个方案配同一个键」，并没有消除。
     ///
-    /// 有了触发键记录，去程后该键在目标方案里**临时**获得回程语义，有效期与来源记录
-    /// 同寿（代际一变即失效）。这才兑现「回程不依赖目标方案的配置」。
+    /// 有了触发键记录，去程后该键在目标方案里**临时**获得往返语义。作用域仅限「方案级
+    /// 绑定 + 目标方案没配同键」这一种组合：全局 `keys.key_actions` 的条目在所有方案下
+    /// 都查得到（见 `bound_action_with_source` 的三个来源），走不到这里。
     ///
-    /// `vk == 0` 的记录（全局热键触发）不参与：那类键本来就在所有方案里都生效。
-    pub(crate) fn schema_return_key_action(&self, key_code: u32) -> bool {
+    /// # ★ 判据只看方案代际，不看完整落点
+    ///
+    /// 这里回答的是「**这把键归不归我管**」，而不是「该回程还是该去程」——后者由
+    /// [`Self::toggle_schema_by_id`] 按完整落点裁决。两个问题合成一个判据的话，中英态一被
+    /// 扰动这把键就漏回全局链、多半撞上 `toggle_mode` 去切中英文——用户配的是「切方案」
+    /// 却切了中英文，比送错方案更难排查。
+    ///
+    /// 代际未变 ⇒ 活跃方案自去程以来没动过 ⇒ **此刻必然仍在目标方案**。故授权一旦成立，
+    /// `toggle_schema_by_id` 恒可动作，不存在「接管了却没事做」的情况——调用方可以无条件
+    /// 返回 Consumed。
+    ///
+    /// `vk == 0` 的记录（全局组合热键触发）不参与：那类键本来就在所有方案里都生效。
+    pub(crate) fn schema_toggle_key_authorized(&self, key_code: u32) -> bool {
         if key_code == 0 {
             return false;
         }
@@ -1150,27 +1212,10 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner());
         matches!(
             guard.as_ref(),
-            Some((_, generation, vk))
-                if *vk == key_code && *generation == self.engine_mgr.schema_generation()
+            Some(rec)
+                if rec.trigger_vk == key_code
+                    && rec.landing.generation == self.engine_mgr.schema_generation()
         )
-    }
-
-    /// 执行回程：回到来源方案并用掉记录。调用方须先用
-    /// [`Self::schema_return_key_action`] 确认，且**不得持 `State` 锁**。
-    pub(crate) fn run_schema_return(&self) -> bool {
-        let origin = self
-            .schema_toggle_origin
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        match origin {
-            Some((origin, generation, _)) if generation == self.engine_mgr.schema_generation() => {
-                debug!("toggle_schema: 回程 -> {origin}");
-                self.switch_schema_by_id(&origin);
-                true
-            }
-            _ => false,
-        }
     }
 
     /// 用户主动切换方案后的统一收尾（引擎已切好，此处只处理状态与副作用）。

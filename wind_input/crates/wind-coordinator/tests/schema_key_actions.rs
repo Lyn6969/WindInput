@@ -308,6 +308,9 @@ fn schema_table_overrides_global_z_key_action() {
 // ──────────────── 四期：修饰键 keyup 通路 + C 类 toggle_schema ────────────────
 
 const VK_RSHIFT: u32 = 0xA1;
+const VK_LSHIFT: u32 = 0xA0;
+const VK_LCONTROL: u32 = 0xA2;
+const VK_RCONTROL: u32 = 0xA3;
 
 /// 修饰键的 keyup 事件（TSF 只在「干净单击」后转发这类事件，见 KeyEventSink.cpp）。
 fn key_up(vk: u32) -> KeyEventData {
@@ -461,6 +464,105 @@ fn return_authorization_is_consumed_once() {
         "第三次应是新的去程，而非拿用掉的记录再回一次"
     );
     let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// ★ 用户报障场景：**去程之后用别的方式切了英文状态，再按不该弹回来源**。
+///
+/// 原实现的回程判据只有 `schema_generation`，而切中英文不动代际 ⇒ 记录照旧"有效" ⇒
+/// 「从五笔一键切到英文方案，又切了英文状态，再按却切回五笔」。现在落点快照把
+/// `chinese_mode` 也算进去：落点被扰动 ⇒ 这把键退回本义「去目标」，重新落地一次；
+/// **来源保留**，所以第四次按仍然回得去。
+///
+/// 本例同时压在 `BoundKeyDecision::NotBound` 那条路上（pinyin 没配 rshift），即
+/// 「方案级绑定 + 目标方案没配同键」的临时授权路径——它曾有一份只看代际的独立回程
+/// 实现，判据分叉后同一个 bug 只在这种配法下复现。
+///
+/// 扰动用左 Shift：`default_toggle_mode_keys` 出厂即 `["lshift", "rshift"]`，故它落回
+/// 全局链就是中英切换，不需要额外配置。
+#[test]
+fn disturbed_landing_relands_instead_of_returning() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("tgl_dist", "wubi86", "rshift = \"toggle_schema:pinyin\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(coord.active_schema_id(), "pinyin", "去程");
+    assert!(coord.is_chinese_mode(), "去程收尾会归位中文态");
+
+    // 用别的方式切英文状态 —— 落点被扰动，但活跃方案没动，代际不变。
+    coord.handle_key_event(&key_up(VK_LSHIFT));
+    assert!(!coord.is_chinese_mode(), "左 Shift 应切到英文态");
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "落点被扰动后再按应重新落地，而不是弹回 wubi86"
+    );
+    assert!(coord.is_chinese_mode(), "重新落地必须把中文态归位回来");
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(
+        coord.active_schema_id(),
+        "wubi86",
+        "重新落地保留来源，落点复原后再按仍应回得去"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 期间用别的方式切过方案（代际已变）⇒ 来源作废，按键**完全无操作**，且不复活。
+///
+/// 不顺手做「归位」是用户拍板的取舍：此时没有任何依据说明用户想去哪，随便挑一个会把
+/// 往返键变成随机跳转键。第二次按验的是记录确实被 take 掉了——留着的话，下一次代际
+/// 恰好对上时会把人送回几步之前的方案。
+///
+/// 这里用**全局** `keys.key_actions`（而非方案级 override）：全局条目在所有方案下都
+/// 查得到（`bound_action_with_source` 的三个来源），两次按都走 `Act` 分支，能干净地
+/// 断言"无操作"。方案级配法下授权本身就不成立，键会落回全局链另作它用，那是另一回事。
+#[test]
+fn origin_dropped_after_schema_changed_by_other_means() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let mut cfg = cfg_for("wubi86");
+    for (k, v) in [
+        ("rshift", "toggle_schema:pinyin"),
+        ("lctrl", "switch_schema:wubi86"),
+        ("rctrl", "switch_schema:pinyin"),
+    ] {
+        cfg.keys.key_actions.insert(k.to_string(), v.to_string());
+    }
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), None);
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(coord.active_schema_id(), "pinyin", "去程");
+
+    // 用方案直达热键（不经 toggle_schema_by_id）来回切一遍：代际 +2，活跃方案又是 pinyin。
+    coord.handle_key_event(&key_up(VK_LCONTROL));
+    assert_eq!(coord.active_schema_id(), "wubi86");
+    coord.handle_key_event(&key_up(VK_RCONTROL));
+    assert_eq!(coord.active_schema_id(), "pinyin");
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "来源已随代际失效，这一按应完全无操作"
+    );
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "失效的记录必须已被丢弃，不能在下一按复活"
+    );
 }
 
 // ──────────────── 五期：A 类状态切换 ────────────────
