@@ -2632,7 +2632,7 @@ impl MessageHandler for Coordinator {
                 Some(c) => {
                     let (t, s, f) = cand_meta(c);
                     // 与按键路径同口径：头部候选（输入原文）不带 source，只认 source 会漏补。
-                    let ap = self.english_appends_space_for(s, &t, &state.input_buffer);
+                    let ap = self.english_appends_space(s, &t, &state.input_buffer);
                     (t, s, f, ap)
                 }
                 // 空格退回原码：无候选可依，方案口径（与 VK_SPACE 空码分支同）。
@@ -2657,7 +2657,7 @@ impl MessageHandler for Coordinator {
                 Some(c) => {
                     let (t, s, f) = cand_meta(c);
                     // 与按键路径同口径：头部候选（输入原文）不带 source，只认 source 会漏补。
-                    let ap = self.english_appends_space_for(s, &t, &state.input_buffer);
+                    let ap = self.english_appends_space(s, &t, &state.input_buffer);
                     (t, s, f, ap)
                 }
                 // 数字键越界退回原码：**不补**。按键路径下此情形走

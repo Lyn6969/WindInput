@@ -2042,7 +2042,7 @@ impl Coordinator {
             Some(t) => t.to_string(),
             None => self.maybe_s2t(state, text),
         };
-        if self.english_appends_space_for(source, text, &state.input_buffer) {
+        if self.english_appends_space(source, text, &state.input_buffer) {
             out.push(' ');
         }
         state.input_buffer.clear();
@@ -2198,26 +2198,22 @@ impl Coordinator {
             && (self.engine_mgr.active_is_english() || in_temp_english)
     }
 
-    /// 英文**候选**上屏后是否补一个空格：方案口径之上再要求候选来源是英文。
+    /// 英文**候选**上屏后是否补一个空格：方案口径之上，再要求「这条候选算英文内容」。
     ///
-    /// 多出来的 `source == English` 是给「英文方案下的非英文候选」用的——英文方案里同样会
-    /// 出现短语等其它来源的候选，那些不该补空格。
-    pub(crate) fn english_appends_space(&self, source: CandidateSource) -> bool {
-        source == CandidateSource::English && self.english_space_enabled()
-    }
-
-    /// 同 [`Self::english_appends_space`]，但把「上屏的就是所打原码」一并算进去。
+    /// # 两个来源，两条理由
     ///
-    /// ★ 判据落在**上屏文本是否等于当前输入串**，而不是「这条候选有没有 `source`」——
-    /// 后者是实现细节，前者才是「这是不是原码」的定义。
+    /// - `source == English`——英文方案里同样会出现短语等其它来源的候选，那些不该补空格；
+    /// - `text == input`（上屏的就是**所打原码**）——`commit_space` 的生效范围里本就写着
+    ///   「**空格上屏原码**（打了词库里没有的词）」。头部候选（见 `crate::english_candidates`）
+    ///   刻意不带 `source`（带了就会往词频表里写读端永远查不中的孤儿键），于是它把「上屏
+    ///   原码」这条路从「无候选兜底分支」变成了「选中首候选」——只认 `source` 的话，这条
+    ///   既有契约就静默漏补了（`english_commit_space.rs` 六条一起红）。
     ///
-    /// 为什么需要这一条：`commit_space` 的生效范围里本就写着「**空格上屏原码**（打了词库
-    /// 里没有的词）」。头部候选（见 `crate::english_candidates`）刻意不带 `source`（带了
-    /// 就会往词频表里写读端永远查不中的孤儿键），于是它把「上屏原码」这条路从「兜底分支」
-    /// 变成了「选中首候选」——只认 `source == English` 的话，这条既有契约就静默漏补了。
+    /// ★ 第二个判据落在**上屏文本是否等于当前输入串**，而不是「这条候选有没有 `source`」
+    /// ——后者是实现细节，前者才是「这是不是原码」的定义。
     ///
     /// ⚠️ 非英文方案不会误中：`english_space_enabled` 已经要求 `active_is_english()`。
-    pub(crate) fn english_appends_space_for(
+    pub(crate) fn english_appends_space(
         &self,
         source: CandidateSource,
         text: &str,
@@ -2466,7 +2462,7 @@ impl Coordinator {
             //
             // 补在 s2t 之后：空格不参与简繁转换，且提前补会让 STPhrases 的词级最长匹配断在
             // 空格上。
-            if self.english_appends_space_for(cand.source, &cand.text, &state.input_buffer) {
+            if self.english_appends_space(cand.source, &cand.text, &state.input_buffer) {
                 out.push(' ');
             }
             // 下一轮联想的**上文**：取简体域的完整文本，而不是上屏的 `out`。
