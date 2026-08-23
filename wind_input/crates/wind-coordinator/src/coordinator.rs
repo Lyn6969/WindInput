@@ -597,6 +597,33 @@ pub(crate) struct State {
     pub(crate) add_word_boundary: u64,
 }
 
+/// 空码时按标点/符号键怎么处置这串废码（`input.punct_on_empty_behavior` 的解释结果）。
+///
+/// ★ 这一族配置描述的行为有**两根轴**——「废码上不上屏」与「按键字符本身出不出」——而配置
+/// 值域只有一维，是两轴的合法组合枚举：
+///
+/// | | 键字符输出 | 键字符吞掉 |
+/// |---|---|---|
+/// | 废码上屏 | [`Self::Commit`] | （无意义，不设值） |
+/// | 废码丢弃 | [`Self::Clear`] | [`Self::ClearNoInput`] |
+///
+/// 回车/空格的 `clear` 落在**吞键**那一格，标点的 `clear` 落在**出键**那一格——同一字面值在
+/// 第二根轴上取值相反，刻意如此：标点是用户真正想输入的可见字符，吞掉等于吞掉用户意图。
+///
+/// 唯一解释器是 [`Coordinator::punct_empty_code_policy`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PunctEmptyCodePolicy {
+    /// 上屏原码，标点跟在其后照常上屏。非空码时也是这一态（本开关不管有候选的情形）。
+    Commit,
+    /// 丢弃废码（连同已转换前缀），标点照常上屏。出厂值。
+    Clear,
+    /// 丢弃废码，标点本身也不上屏——整个按键当没按过。
+    ///
+    /// ⚠️ 标点不上屏 ⇒ **没有可 hold 的对象**。这一态必须在智能符号 `hold_info` 之前短路，
+    /// 否则会挂一个屏幕上并不存在的 hold 态，下一次同键 press2 会去删一个从未上屏的符号。
+    ClearNoInput,
+}
+
 /// 智能符号模式待命态：press1 提交一个参与集合内的标点后武装，等待时限内同键 press2
 /// 触发替换。对齐 Go `smartSymbol*` 字段。
 #[derive(Default)]
@@ -1833,21 +1860,36 @@ impl Coordinator {
         self.rt().config.input.enter_behavior == "clear"
     }
 
-    /// 空码时按标点/符号键是否丢弃这串废码（`input.punct_on_empty_behavior = "clear"`）。
+    /// 空码时按标点/符号键怎么处置这串废码（`input.punct_on_empty_behavior`）。
     ///
-    /// 「空码」= 缓冲非空但一个候选都没有（多为码表打错字根）。此时既有行为是把废码连同
-    /// 标点一起送上屏，用户要的往往是「这串码作废、句号照打」。
+    /// 「空码」= 缓冲非空但一个候选都没有（多为码表打错字根）。既有行为是把废码连同标点
+    /// 一起送上屏，用户要的往往是「这串码作废、句号照打」，也有人要「连句号一起当没按过」。
+    ///
+    /// **非空码时恒返回 [`PunctEmptyCodePolicy::Commit`]**——空码判定折在函数内部，调用方
+    /// 不必也不该自己再拼一遍 `candidates.is_empty() && !input_buffer.is_empty()`：那个条件
+    /// 曾在两个出口各写一份，两份哪天走岔了没有任何东西拦得住。
     ///
     /// ⚠️ 只管**无候选**那一支。有候选时按标点仍顶屏首选——那是「就选高亮那条吧」的既有
     /// 语义，与本开关无关。
     ///
-    /// ⚠️ 与 `schema.codetable.punct_commit` 正交：那一项关掉是吞键、连标点都不输出。
+    /// ⚠️ 与 `schema.codetable.punct_commit` 正交：那一项关掉是「吞键、**保留**编码」，编码
+    /// 留在组合区继续输入；本开关的 `clear_no_input` 是「吞键、**丢弃**编码」。
     ///
-    /// 判据收口在此而非内联比较字符串：标点有两个彼此独立的上屏出口（普通标点、智能符号
-    /// `CommitAndHoldComposition`），内联必漏其一，而漏掉的那个是「只在开了智能符号的宿主
-    /// 上复现」的间歇性不一致。参见 [`Self::enter_clears_composition`] 的同款教训。
-    pub(crate) fn punct_clears_on_empty(&self) -> bool {
-        self.rt().config.input.punct_on_empty_behavior == "clear"
+    /// ★ 返回枚举而非 bool 是刻意的：标点有**两个彼此独立的上屏出口**（普通标点、智能符号
+    /// `CommitAndHoldComposition`），第三态加进来时，bool 判据的漏接会静默落进 else 分支，
+    /// 而 `match` 的漏接是编译错误。参见 [`Self::enter_clears_composition`] 的同款教训。
+    pub(crate) fn punct_empty_code_policy(&self, state: &State) -> PunctEmptyCodePolicy {
+        // 有候选 / 没编码 ⇒ 不是空码，本开关不管。
+        if !state.candidates.is_empty() || state.input_buffer.is_empty() {
+            return PunctEmptyCodePolicy::Commit;
+        }
+        match self.rt().config.input.punct_on_empty_behavior.as_str() {
+            "clear" => PunctEmptyCodePolicy::Clear,
+            "clear_no_input" => PunctEmptyCodePolicy::ClearNoInput,
+            // 未知值落回 commit（＝历史行为）。存量非法值本已由
+            // `Config::migrate_empty_code_behavior_value` 归一，此处只是防御。
+            _ => PunctEmptyCodePolicy::Commit,
+        }
     }
 
     /// 焦点/IME 激活时按 client_token 高 32 位的 PID 解析焦点进程名，缓存其 caret 兼容态

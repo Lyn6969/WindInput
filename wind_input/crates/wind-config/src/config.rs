@@ -1972,12 +1972,22 @@ pub struct InputConfig {
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
     pub space_on_empty_behavior: String,
-    /// 空码（缓冲非空但无候选）时按标点/符号键的处理方式。
-    /// `commit`（默认）上屏原码再接标点；`clear` 丢弃原码，标点照常上屏。
+    /// 空码（缓冲非空但无候选）时按标点/符号键的处理方式。**三态**：
     ///
-    /// 与 [`Self::enter_behavior`] / [`Self::space_on_empty_behavior`] 同族，值域同为两态。
-    /// **不要与 `schema.codetable.punct_commit` 混淆**：那一项关掉是「吞键、保留编码」，
-    /// 连标点本身都不输出，语义完全不同。
+    /// - `commit` 上屏原码再接标点；
+    /// - `clear`（出厂）丢弃原码，标点照常上屏；
+    /// - `clear_no_input` 丢弃原码，标点本身也不上屏——整个按键当没按过。
+    ///
+    /// ★ 与 [`Self::enter_behavior`] / [`Self::space_on_empty_behavior`] 同族但**值域多一态**。
+    /// 这一族描述的行为其实有两根轴：「废码上不上屏」与「键字符本身出不出」。回车/空格的
+    /// `clear` 落在**吞键**那一格（返回 `ClearComposition`），标点的 `clear` 落在**出键**那一
+    /// 格——同一字面值在第二根轴上取值相反，是刻意的（标点是用户真想输入的可见字符）。
+    /// `clear_no_input` 补的是标点缺的那一格。值域清单在
+    /// `config_schema::PUNCT_EMPTY_CODE_BEHAVIOR_VALUES`，唯一解释器是
+    /// `Coordinator::punct_empty_code_policy`。
+    ///
+    /// **不要与 `schema.codetable.punct_commit` 混淆**：那一项关掉是「吞键、**保留**编码」，
+    /// 编码留在组合区继续输入；`clear_no_input` 是「吞键、**丢弃**编码」。
     #[serde(default = "default_punct_on_empty_behavior")]
     pub punct_on_empty_behavior: String,
     #[serde(default = "default_numpad_behavior")]
@@ -3863,12 +3873,22 @@ impl Config {
         let Some(input) = merged.get_mut("input").and_then(|i| i.as_table_mut()) else {
             return;
         };
+        // ★ 合法值域**取自注册表**，不在此处另抄一份。三键的值域并不相同（标点多一个
+        // `clear_no_input`），且日后还会加值；抄一份的后果是「新值加了，但迁移把存量配置里
+        // 的它抹回 commit」——只在升级过的机器上复现，本地怎么测都是绿的。
+        let allowed = |key: &str| -> &'static [&'static str] {
+            match crate::config_schema::field(&format!("input.{key}")).map(|f| &f.ty) {
+                Some(crate::config_schema::FieldType::Enum(vals)) => vals,
+                // 注册表里没登记或不是 Enum：宁可不迁移也不要按猜测的值域改写用户配置。
+                _ => &["commit", "clear"],
+            }
+        };
         // 先收集再改写：`get` 的不可变借用不能与 `insert` 的可变借用同时活着。
         let illegal: Vec<(String, String)> = KEYS
             .iter()
             .filter_map(|k| {
                 let v = input.get(*k)?.as_str()?;
-                (v != "commit" && v != "clear").then(|| ((*k).to_string(), v.to_string()))
+                (!allowed(k).contains(&v)).then(|| ((*k).to_string(), v.to_string()))
             })
             .collect();
         for (key, old) in illegal {
@@ -6290,6 +6310,27 @@ active = "x"
             Some("clear"),
             "合法值不得被动——否则这条迁移会把用户设的 clear 抹成 commit"
         );
+        // ★ 标点独有的第三态必须活着穿过迁移。这条断言的存在意义：迁移一旦把合法值域
+        // 内联抄成 ["commit","clear"]（最自然的写法），存量配置里的 clear_no_input 会被
+        // 静默抹回 commit——只在升过级的机器上复现，新装机器怎么测都是绿的。
+        let mut v3: toml::Value =
+            toml::from_str("[input]\npunct_on_empty_behavior = \"clear_no_input\"\n").unwrap();
+        Config::migrate_empty_code_behavior_value(&mut v3);
+        assert_eq!(
+            v3["input"]["punct_on_empty_behavior"].as_str(),
+            Some("clear_no_input"),
+            "标点第三态被迁移抹掉了——合法值域须取自注册表，不能在迁移里另抄一份"
+        );
+        // 反向夹逼：同一个值在回车上**不合法**，须归一为 commit。两条一起才拦得住
+        // 「图省事让三键共用一份值域」。
+        let mut v4: toml::Value =
+            toml::from_str("[input]\nenter_behavior = \"clear_no_input\"\n").unwrap();
+        Config::migrate_empty_code_behavior_value(&mut v4);
+        assert_eq!(
+            v4["input"]["enter_behavior"].as_str(),
+            Some("commit"),
+            "回车没有 clear_no_input 这一态，须被归一"
+        );
         // 幂等：每次启动都会跑一遍。
         let before = v.clone();
         Config::migrate_empty_code_behavior_value(&mut v);
@@ -6300,23 +6341,30 @@ active = "x"
     fn test_empty_code_behavior_registry_values_match_impl() {
         // ★ 守门：注册表的值域必须与消费点实际认得的值一致。这三个键此前登记为 Str，
         // 值域不受任何约束，设置端才得以抄进两个从未被实现的选项且无一层拦得住。
-        for key in [
-            "input.enter_behavior",
-            "input.space_on_empty_behavior",
-            "input.punct_on_empty_behavior",
-        ] {
+        //
+        // ⚠️ 三键**不同值域**：标点多一个 `clear_no_input`（丢废码且吞标点），回车/空格的
+        // `clear` 本就是吞键态，给它们加同名值只会得到两个行为相同、用户无从分辨的选项。
+        // 分开断言正是为了拦「顺手统一成一样」——共用一个期望值的话，把标点的值域抄回
+        // 两态、或把新值扩散给另两键，测试都照样绿。
+        let values_of = |key: &str| -> &'static [&'static str] {
             let f = crate::config_schema::field(key).expect("键须已登记");
             match f.ty {
-                crate::config_schema::FieldType::Enum(vals) => {
-                    assert_eq!(
-                        vals,
-                        ["commit", "clear"],
-                        "{key} 的值域须恰为 commit/clear——加值前先确认消费点真的分了那一支"
-                    );
-                }
+                crate::config_schema::FieldType::Enum(vals) => vals,
                 other => panic!("{key} 须登记为 Enum 而非 {other:?}"),
             }
+        };
+        for key in ["input.enter_behavior", "input.space_on_empty_behavior"] {
+            assert_eq!(
+                values_of(key),
+                ["commit", "clear"],
+                "{key} 的值域须恰为 commit/clear——它的 clear 已是吞键态，别把标点那个新值扩散过来"
+            );
         }
+        assert_eq!(
+            values_of("input.punct_on_empty_behavior"),
+            ["commit", "clear", "clear_no_input"],
+            "标点值域须为三态——加值前先确认 Coordinator::punct_empty_code_policy 真的分了那一支"
+        );
     }
 
     #[test]

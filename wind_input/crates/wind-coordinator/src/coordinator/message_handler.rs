@@ -886,9 +886,24 @@ impl MessageHandler for Coordinator {
         // handleEngineDefault——select_char 优先于翻页键，故置于 apply_session_action 之前）。默认
         // `select_char_keys` 为空 → select_char_index 恒 None → 跳过（零回归）。仅在缓冲非空或
         // 有候选时拦截；空缓冲且无候选时放行，让 `,`/`.` 作普通标点（对齐 Go 空缓冲回退标点）。
+        //
+        // ★★ 这是标点键的**第三条**通路，且它在标点臂**之前**就 return——空码时
+        // `handle_select_char` 拿不到字源、退到 `keys.overflow.select_char_key`（出厂 `ignore`
+        // ＝吞键并**保留**编码），`input.punct_on_empty_behavior` 根本够不着。症状是「开了以词
+        // 定字之后，空码丢废码只在没配成以词定字的那几个标点上生效」——出厂 `select_char_keys`
+        // 为空所以默认不暴露，正因如此更不容易被发现。
+        //
+        // 修法是**放行**而不是在 overflow 那边复制一份判据：放行后这几个键落回标点臂，与其余
+        // 标点走同一段代码，日后标点臂再改也不会漏掉它们。空码 + `commit` 仍按原路拦截（那一
+        // 态本就是「上屏编码」，与 overflow 的 commit 语义不冲突），零回归。
+        //
+        // 放行安全的依据（改这一段前请重新核一遍）：本行到标点臂之间还有三道拦截，空码下
+        // 都够不着——`apply_session_action` 只在**有候选**时生效；`numpad_char` 不认这几个
+        // 键；`try_z_fallback` 要求缓冲以 z 开头且破活码前缀。
         if data.modifiers & MOD_SHIFT == 0
             && (!state.input_buffer.is_empty() || !state.candidates.is_empty())
             && let Some(char_index) = self.select_char_index(data.key_code)
+            && self.punct_empty_code_policy(&state) == PunctEmptyCodePolicy::Commit
         {
             return self.handle_select_char_with_overflow(
                 &mut state,
@@ -1452,6 +1467,35 @@ impl MessageHandler for Coordinator {
                         if !punct_commit {
                             return KeyAction::Consumed;
                         }
+                        // 空码 + `punct_on_empty_behavior = "clear_no_input"`：废码丢弃，标点
+                        // 本身也不产出——整个按键当没按过。
+                        //
+                        // ★ 短路点刻意放在 `hold_info` **之前**、两个上屏出口之上。标点有两条
+                        // 彼此独立的上屏通路（下面的智能符号 `CommitAndHoldComposition`、再往下
+                        // 的普通标点出口），在任一条里判都必漏另一条，而漏掉的那条是「只在开了
+                        // 智能符号的宿主上复现」的间歇性不一致。放这里一处覆盖两条。
+                        //
+                        // ⚠️ 也必须早于标点流水线（`convert_punct` / `record_commit` / 配对栈）：
+                        // 走到那里再丢弃，会记一次从未上屏的标点、并把它压进配对栈，表现为
+                        // 后续的跳出键行为错乱。
+                        if self.punct_empty_code_policy(&state)
+                            == PunctEmptyCodePolicy::ClearNoInput
+                        {
+                            self.reset_pinyin_composition(&mut state);
+                            // 标点不上屏 ⇒ 没有可 hold 的对象，且本次按键**可能已被
+                            // `try_smart_symbol_replace` 武装成新的 press1**。不解除的话，下次按
+                            // 同键会以 press2 的身份去删一个从未出现在屏幕上的符号。
+                            self.disarm_smart_symbol();
+                            self.notify_ui_hide();
+                            // 上一个智能符号若还挂在组合态里（`pre_held_text`），它此刻**只存在于
+                            // 组合态**——直接 ClearComposition 会连它一起收掉，表现为「按标点丢
+                            // 废码时，上一个符号跟着不见了」。用一次原子提交把它落实。
+                            if let Some(held) = pre_held_text {
+                                self.record_commit(&held, 0, -1, CommitSource::Punctuation);
+                                return Self::commit_action(held, true);
+                            }
+                            return KeyAction::ClearComposition;
+                        }
                         // HoldComposition + has_input：arm 已设 hold_pending_commit，
                         // 顶屏上屏候选后开 HoldComposition 放入中文标点。
                         let hold_info = {
@@ -1473,9 +1517,11 @@ impl MessageHandler for Coordinator {
                             // 空码丢弃（`punct_on_empty_behavior = "clear"`）：与下方普通标点
                             // 出口同判据、同语义。本分支是智能符号专属的**独立**上屏通路，
                             // 只改那边会得到「开了智能符号的宿主上开关不生效」的间歇性不一致。
-                            let discard_empty_code = state.candidates.is_empty()
-                                && !state.input_buffer.is_empty()
-                                && self.punct_clears_on_empty();
+                            //
+                            // `clear_no_input` 已在上方单点短路，走不到这里；此处只区分
+                            // 「丢废码但出标点」与「照常上屏」。
+                            let discard_empty_code =
+                                self.punct_empty_code_policy(&state) == PunctEmptyCodePolicy::Clear;
                             let committed = self.take_committed(&mut state);
                             let mut commit_text = if discard_empty_code {
                                 String::new()
@@ -1535,9 +1581,11 @@ impl MessageHandler for Coordinator {
                     //
                     // ⚠️ 判据必须算在 `take_committed` **之前**：那一步会把 committed_text 取空，
                     // 之后再问就恒为假。
-                    let discard_empty_code = state.candidates.is_empty()
-                        && !state.input_buffer.is_empty()
-                        && self.punct_clears_on_empty();
+                    //
+                    // `clear_no_input`（丢废码且标点也不出）已在上方 `has_input` 块内单点短路，
+                    // 走不到这里——那一态必须早于标点流水线返回，见该处注释。
+                    let discard_empty_code =
+                        self.punct_empty_code_policy(&state) == PunctEmptyCodePolicy::Clear;
                     let committed = self.take_committed(&mut state);
                     let mut out = if discard_empty_code {
                         String::new()

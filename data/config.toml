@@ -337,10 +337,18 @@ decimal_places = 6
 [input]
 filter_mode = "smart"
 # 空码（打了码但一个候选都没有，多半是打错了）时，终结键怎么处置这串废码。
-# 三键同族，值域同为两态：commit = 上屏原码，clear = 丢弃原码。
-#   enter_behavior           回车
-#   space_on_empty_behavior  空格
-#   punct_on_empty_behavior  标点/符号键（clear 时废码丢掉，标点本身照常上屏）
+#   enter_behavior           回车          commit | clear
+#   space_on_empty_behavior  空格          commit | clear
+#   punct_on_empty_behavior  标点/符号键   commit | clear | clear_no_input
+#
+# 这一族其实有两根轴：「废码上不上屏」与「按下的这个键本身出不出字符」。
+#   commit          废码上屏，键照常出（标点跟在废码后面）
+#   clear           废码丢弃，键照常出
+#   clear_no_input  废码丢弃，键也不出——整个按键当没按过（**仅标点有这一态**）
+# 回车/空格的 clear 本就落在「键也不出」那一格（回车不换行、空格不插空格），所以它们
+# 不需要、也不该有 clear_no_input——加了只会得到两个行为一样、用户无从分辨的选项。
+# 标点的 clear 之所以照常出标点：标点是用户真正想输入的可见字符，吞掉等于吞掉用户意图。
+# 想让标点也一起吞掉（拿标点当「取消这串废码」的键）就选 clear_no_input。
 #
 # ⚠️ 只有标点那项出厂是 clear，另两项是 commit——**刻意不一致，不是漏改**。
 # 标点判错的代价不对称：一串没对应任何字的码被插进正文，往往发出去才发现、要退格删
@@ -348,7 +356,7 @@ filter_mode = "smart"
 # 去改配置。空格暂随回车（改它会命中「曾把它设成当时默认值的用户被静默改写」）。
 #
 # 注意 punct_on_empty_behavior 与 schema.codetable.punct_commit 是两回事：后者关掉是
-# 「吞键、保留编码」，连标点都不输出。
+# 「吞键、**保留**编码」，编码留在组合区继续输入；clear_no_input 是「吞键、**丢弃**编码」。
 enter_behavior = "commit"
 space_on_empty_behavior = "commit"
 punct_on_empty_behavior = "clear"

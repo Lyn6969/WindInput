@@ -8914,13 +8914,18 @@ fn top_code_overlong_phrase_in_mixed_schema() {
 
 /// 构造 wubi86 + 标点顶屏已开的配置。`clear` 决定空码时是否丢弃废码。
 fn config_punct_on_empty(clear: bool) -> Config {
+    config_punct_on_empty_value(if clear { "clear" } else { "commit" })
+}
+
+/// 同上，但直取三态之一（`commit` / `clear` / `clear_no_input`）。
+fn config_punct_on_empty_value(value: &str) -> Config {
     let mut cfg = config_with("wubi86");
     // 出厂即开，测试须显式打开——零值 false 会让标点在 has_input 分支被吞掉。
     cfg.schema.codetable.punct_commit = true;
-    // ⚠️ 两个分支都**显式写**，不靠「不设＝commit」：出厂默认已经是 clear，靠缺省表达
+    // ⚠️ 每个分支都**显式写**，不靠「不设＝commit」：出厂默认已经是 clear，靠缺省表达
     // commit 的话，对照组会跟着默认值漂移——那正是它要防的东西。出厂默认本身由
     // `punct_on_empty_default_discards_without_any_config` 单独守。
-    cfg.input.punct_on_empty_behavior = if clear { "clear" } else { "commit" }.into();
+    cfg.input.punct_on_empty_behavior = value.into();
     cfg
 }
 
@@ -9076,6 +9081,167 @@ fn enter_and_space_on_empty_still_commit_by_default() {
             other => panic!("{name}空码应上屏原码，实际: {other:?}"),
         }
     }
+}
+
+// ───── clear_no_input：废码丢弃，标点本身也不上屏 ─────
+//
+// ★ 这一族配置的行为其实是**两根轴**：「废码上不上屏」与「按键字符本身出不出」。
+// `clear` 是「丢废码、出标点」，`clear_no_input` 是「丢废码、也不出标点」——后者与回车/
+// 空格的 `clear` 才是同一格（那两个键的 clear 本就返回 `ClearComposition`，键本身不产出）。
+//
+// ⚠️ 每条都必须断言**具体的 KeyAction 变体**，不能只看「文本为空」：`InsertText("")` 与
+// `ClearComposition` 在「屏幕上没多出字」这个层面无法区分，而前者是错的——它会把一次空
+// 提交推给宿主，组合态的收尾时机随宿主而异。
+
+/// clear_no_input：普通标点出口——废码丢弃，句号也不上屏，整个按键当没按过。
+#[test]
+fn test_punct_on_empty_clear_no_input_swallows_punct() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_punct_on_empty_value("clear_no_input"),
+        Some(&data_dir()),
+    );
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("clear_no_input 应收组合且不产出任何字符，实际: {:?}", other),
+    }
+}
+
+/// clear_no_input：智能符号 hold 出口——**不得**走 CommitAndHoldComposition。
+///
+/// ★ 这条是本族最容易漏的一条。上一版的 `clear` 只把 `commit_text` 置空却仍走 hold 分支，
+/// 照搬到 `clear_no_input` 就会挂一个屏幕上并不存在的 hold 态：下一次按同键的 press2 会去
+/// 删一个从未上屏的符号，表现为「开了智能符号后，丢废码会顺手吃掉前面一个字」。
+#[test]
+fn test_punct_on_empty_clear_no_input_skips_hold_composition() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_punct_on_empty_value("clear_no_input");
+    cfg.input.symbol.smart_mode = true;
+    cfg.input.symbol.smart_method = wind_config::config::SmartMethod::HoldComposition;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "标点不上屏就没有可 hold 的对象，不该走 CommitAndHold，实际: {:?}",
+            other
+        ),
+    }
+}
+
+/// clear_no_input 同样只管空码那一支：有候选时仍顶屏首选 + 标点。
+///
+/// 没有这条，把短路点提到 `has_input` 守卫之上（一个很自然的「简化」）不会红任何测试，
+/// 而那会让**所有**按标点顶屏的场景都变成吞键。
+#[test]
+fn test_punct_on_empty_clear_no_input_does_not_affect_nonempty_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_punct_on_empty_value("clear_no_input"),
+        Some(&data_dir()),
+    );
+    for c in "ffff".chars() {
+        press_letter(&coord, c);
+    }
+    let first = coord
+        .debug_page_texts()
+        .first()
+        .cloned()
+        .expect("前提失守：ffff 应当有候选");
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text,
+                format!("{first}。"),
+                "有候选时 clear_no_input 不得改变「按标点顶屏首选」的既有语义"
+            );
+        }
+        other => panic!("有候选按句号应顶屏首选+标点，实际: {:?}", other),
+    }
+}
+
+/// ★★ 第三条通路：以词定字（`select_char_keys`）会在标点臂**之前**劫走这几个键。
+///
+/// 空码时 `handle_select_char` 拿不到字源，退到 `keys.overflow.select_char_key`（出厂
+/// `ignore` ＝吞键并**保留**编码），`punct_on_empty_behavior` 根本够不着。修法是空码且本
+/// 开关非 `commit` 时放行到标点臂。
+///
+/// 断言取 `clear`（而非 `clear_no_input`）：`ignore` 与 `clear_no_input` 都不产出字符，拿
+/// 后者断言的话，修不修都是 `Consumed`/`ClearComposition` 二选一，区分度太低；`clear` 会
+/// 实实在在出一个句号，漏修必红。
+#[test]
+fn test_punct_on_empty_reaches_select_char_keys() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_punct_on_empty_value("clear");
+    cfg.keys.select_char_keys = vec!["comma_period".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    type_empty_code(&coord);
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text, "。",
+                "开了以词定字后，空码丢废码仍须生效——这几个键被 select_char 提前劫走了"
+            );
+        }
+        other => panic!(
+            "空码 + 以词定字：应放行到标点臂并按 clear 处理，实际: {:?}",
+            other
+        ),
+    }
+}
+
+/// 反向夹逼：**有候选**时以词定字照常生效，放行判据不得把它一起放跑。
+///
+/// 与上一条成对。只有上一条时，把拦截条件整个删掉也能过。
+#[test]
+fn test_select_char_still_works_with_punct_on_empty_clear() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_punct_on_empty_value("clear");
+    cfg.keys.select_char_keys = vec!["comma_period".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "ffff".chars() {
+        press_letter(&coord, c);
+    }
+    let Some(first) = coord.debug_page_texts().first().cloned() else {
+        return;
+    };
+    let Some(first_char) = first.chars().next() else {
+        return;
+    };
+    match coord.handle_key_event(&key_event(0xBC, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text,
+                first_char.to_string(),
+                "有候选时 `,` 仍应以词定字取第 1 字，而不是被当成普通标点"
+            );
+        }
+        other => panic!("有候选时 `,` 应以词定字，实际: {:?}", other),
+    }
+}
+
+/// 出厂零回归：`clear_no_input` 不得成为默认。
+///
+/// 出厂仍是 `clear`（标点照常上屏）——`clear_no_input` 是给「拿标点当取消键」的人准备的，
+/// 让它变成默认等于让所有人的标点在空码时凭空消失。
+#[test]
+fn punct_on_empty_clear_no_input_is_not_the_default() {
+    let cfg = Config::default();
+    assert_eq!(
+        cfg.input.punct_on_empty_behavior, "clear",
+        "出厂须为 clear；clear_no_input 只能是用户显式选择"
+    );
 }
 
 /// 有候选时按标点仍顶屏首选——`clear` 只管空码那一支，不得误伤正常顶屏。

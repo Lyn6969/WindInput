@@ -48,7 +48,7 @@ use FieldType::{Bool, Enum, Float, Int, Map, Str, StrList, StructList};
 /// 候选无效按键三策（number_key/select_key/select_char_key 共用）。
 const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 
-/// 空码（缓冲非空但无候选）时终结键怎么处置这串废码，回车/空格/标点三键共用。
+/// 空码（缓冲非空但无候选）时终结键怎么处置这串废码——**回车/空格两键**。
 /// **只有两态**：`commit` 上屏原码 / `clear` 丢弃。语义与实现见
 /// `docs/design/enter-behavior-clear-semantics.md`。
 ///
@@ -56,6 +56,27 @@ const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 /// [`OVERFLOW_VALUES`] 的四个选项，用户选「忽略」被静默当成「上屏编码」，界面与行为不一致
 /// 且无任何测试拦得住。值域进注册表后，设置端的守门测试即可比对。
 const EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear"];
+
+/// 标点键的空码处置——比回车/空格**多一态**，故不能与 [`EMPTY_CODE_BEHAVIOR_VALUES`] 共用。
+///
+/// ★ 这一族配置描述的行为其实是**两根轴**，而值域只有一维：
+///
+/// | | 键字符输出 | 键字符吞掉 |
+/// |---|---|---|
+/// | 废码上屏 | `commit` | （无意义，不设值） |
+/// | 废码丢弃 | `clear` | `clear_no_input` |
+///
+/// 回车/空格的 `clear` 落在**吞键**那一格（返回 `ClearComposition`，键本身不产出任何字符），
+/// 标点的 `clear` 落在**出键**那一格（标点照常上屏）——同一个字面值在第二根轴上取值相反。
+/// 这不是笔误：标点是用户真正想输入的可见字符，吞掉等于吞掉用户的意图，故出键是对的默认。
+/// `clear_no_input` 补的正是这一族缺的第四格：「这串码作废，这个键也当没按过」。
+///
+/// ⚠️ **不要**为了「三键同族」把 `clear_no_input` 也加给回车/空格：它们的 `clear` 本就是
+/// 吞键态，加了会得到两个行为完全相同的值，设置页出现两个无法区分的选项。
+///
+/// ⚠️ 加值前先确认消费点真的分了那一支——`Coordinator::punct_empty_code_policy` 的 `match`
+/// 是唯一解释器，未知值一律落到 `commit`。
+const PUNCT_EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear", "clear_no_input"];
 
 /// 码表词频应用策略。
 const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step", "position"];
@@ -217,7 +238,7 @@ static REGISTRY: &[ConfigField] = &[
     ),
     f(
         "input.punct_on_empty_behavior",
-        Enum(EMPTY_CODE_BEHAVIOR_VALUES),
+        Enum(PUNCT_EMPTY_CODE_BEHAVIOR_VALUES),
     ),
     f("input.numpad_behavior", Str),
     // 启动默认状态（原 general 域）
