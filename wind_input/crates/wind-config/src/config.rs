@@ -803,6 +803,7 @@ impl BoundAction {
 /// - `"cancel"`（别名 `"clear"`）：放弃当前输入，等同 Esc
 /// - `"select_candidate:N"`：选中当前页第 N 个候选（N 从 1 起，`2` 即次选键）
 /// - `"select_char:N"`：以词定字，取当前高亮候选词的第 N 个字（N 从 1 起）
+/// - `"aux_code"` / `"aux_code:page_next"`：进辅助码筛选（后者与下翻页共键）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     /// 未启用 / 显式禁用。
@@ -845,7 +846,50 @@ pub enum SessionAction {
     ///
     /// ⚠️ `key_actions` 里的 `aux_code` 仍然有效且保留（双拼出厂就是 `backtick = "aux_code"`）。
     /// 两条路都通向同一个 `enter_aux_code`，差别只在**哪些键名解析得出来**。
-    AuxCode,
+    ///
+    /// 载荷 [`AuxCodeShare`] 是**这个动词的参数**（共键降级目标），不是第二条绑定，
+    /// 理由见那里。
+    AuxCode(AuxCodeShare),
+}
+
+/// 辅助码触发键的「共键」参数：**进不去辅助码时，这个键改做什么**。
+///
+/// # 为什么是参数，而不是 `page_next_aux_code` 这种组合动词或 `a|b` 通用链
+///
+/// 需求是「Tab 既翻页又进辅助码」。三种表达形态里：
+///
+/// 1. **组合动词**（`page_next_aux_code`）：语义是「两个都做」——先翻页再进入，于是进入
+///    瞬间停在第 2 页、首选被翻走，还得在进入路径上保存/恢复 `current_page` 去补救。
+///    且每多一个组合就多一个动词，名字随组合数相乘。
+/// 2. **通用降级链**（`aux_code|page_next`）：要给每个动词定义「不适用」，而那些条件多是
+///    实现细节（`page_next` 的「失败」是已在末页 ⇒ 语法允许的 `page_next|cancel` 会在末页
+///    取消整段输入）。可表达的组合远多于有意义的组合，终点是 DSL。**已在
+///    `docs/design/key-resolver-unification.md` 的否决清单里**。
+/// 3. **动词参数**（本形态）：值域封闭在 `aux_code` 上，配不出无意义的组合，
+///    与 `select_candidate:N` / `mix:id` / `special:id` 同一套 `verb:arg` 写法。
+///
+/// 判据是本仓已用过三次的那条：**一组取值只对一个动词有意义 ⇒ 它是那个动词的参数**。
+/// 「与翻页共键」只对 `aux_code` 成立（没有别的动词需要它），故取第 3 种。
+///
+/// # 语义：顺序即优先级
+///
+/// `aux_code:page_next` = **先试辅助码，进不去才翻页**。「进不去」不需要新定义——
+/// `enter_aux_code` 本就是「门卫没过返回 `None` 不吞键」的契约，四道门卫
+/// （已在别的 overlay / 未启用 / 无码表 / 无候选）直接复用。于是这几种情形全部天然成立：
+///
+/// - 主输入路 + 辅助码可用 → 进辅助码，**不翻页**（首选不会被翻走）；
+/// - 已在辅助码态内 → `active.is_some()` 拒 ⇒ 降级翻页（模式内继续翻页）；
+/// - 辅助码未开启 / 方案无码表 → 拒 ⇒ 退化成纯翻页键；
+/// - 无候选 → 两个成员都 `requires_candidates` ⇒ 按键放行，Tab 仍是宿主的制表符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxCodeShare {
+    /// 专用触发键（`aux_code`）：进不去就不吞键，落该键原本的语义。
+    Solo,
+    /// 与下翻页共键（`aux_code:page_next`）：进不去时翻下一页。
+    ///
+    /// **只收下翻页**：`page_prev` 共键没有对应的心智（「翻回上一页」与「进筛选」不构成
+    /// 同一个递进动作），放开只是让值域变大。要加成员先问它有没有真实用例。
+    PageNext,
 }
 
 impl SessionAction {
@@ -870,6 +914,15 @@ impl SessionAction {
                 _ => Self::None,
             };
         }
+        // 辅助码的共键参数（`aux_code:page_next`）。未知参数落 `None` 而不是退回专用触发键
+        // ——静默降级会让 `aux_code:page_prev` 这种写错的配置表现成「共键没生效」，
+        // 而那与「功能坏了」同形；落 `None` 则由 `parse_checked` 在加载期告警。
+        if let Some(rest) = t.strip_prefix("aux_code:") {
+            return match rest.trim() {
+                "page_next" => Self::AuxCode(AuxCodeShare::PageNext),
+                _ => Self::None,
+            };
+        }
         match t.as_str() {
             "page_prev" => Self::PagePrev,
             "page_next" => Self::PageNext,
@@ -877,7 +930,8 @@ impl SessionAction {
             "highlight_down" => Self::HighlightDown,
             // 与 `BoundAction::parse` 的同名动词逐字一致：同一个功能在两张表里写法不同的话，
             // 用户把配置从一张表挪到另一张就会静默失效。
-            "aux_code" => Self::AuxCode,
+            // （`key_actions` 那张表没有共键形态：它只认符号键与字母 z，翻页键压根解析不出来。）
+            "aux_code" => Self::AuxCode(AuxCodeShare::Solo),
             // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
             "cancel" | "clear" => Self::Cancel,
             _ => Self::None,
@@ -952,7 +1006,8 @@ impl std::fmt::Display for SessionAction {
             Self::Cancel => f.write_str("cancel"),
             Self::SelectCandidate(n) => write!(f, "select_candidate:{n}"),
             Self::SelectChar(n) => write!(f, "select_char:{n}"),
-            Self::AuxCode => f.write_str("aux_code"),
+            Self::AuxCode(AuxCodeShare::Solo) => f.write_str("aux_code"),
+            Self::AuxCode(AuxCodeShare::PageNext) => f.write_str("aux_code:page_next"),
         }
     }
 }

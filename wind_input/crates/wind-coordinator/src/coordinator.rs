@@ -3167,8 +3167,21 @@ impl Coordinator {
             //
             // 无候选时走不到这里：上面的 `requires_candidates()` 已经放行了按键，
             // 于是空闲按 Tab 仍是宿主的制表符。
-            wind_config::SessionAction::AuxCode => {
-                return self.enter_aux_code(state, data.key_code);
+            wind_config::SessionAction::AuxCode(share) => {
+                if let Some(act) = self.enter_aux_code(state, data.key_code) {
+                    return Some(act);
+                }
+                // 门卫没过。**顺序即优先级**：专用触发键到此为止（不吞键，落该键原语义）；
+                // 共键（`aux_code:page_next`）降级为下翻页，落到下面那段统一的 nav 执行
+                // ——不在这里自己写一份 `page_next` + `notify_ui_update`，那是第二份要跟着
+                // `flipped` / 混输 preedit 同步一起维护的翻页逻辑。
+                //
+                // ★ 这条降级同时覆盖三种情形，无需各写一个特判：辅助码态内继续翻页
+                // （`active.is_some()` 被拒）、功能未开启 / 方案无码表时退化成纯翻页键。
+                match share {
+                    wind_config::AuxCodeShare::Solo => return None,
+                    wind_config::AuxCodeShare::PageNext => keymap::NavAction::PageNext,
+                }
             }
             // 表里只存启用项（`ConfigBundle::build` 过滤过），None 到不了这里。
             wind_config::SessionAction::None => return None,
@@ -3573,7 +3586,13 @@ impl Coordinator {
             if let Some(a) = self.session_action_for(vk, false, true) {
                 owners.push(match a {
                     wind_config::SessionAction::Cancel => "取消键",
-                    wind_config::SessionAction::AuxCode => "辅助码键",
+                    wind_config::SessionAction::AuxCode(wind_config::AuxCodeShare::Solo) => {
+                        "辅助码键"
+                    }
+                    // 共键两个身份都要点名：只写「辅助码键」会让用户以为把辅助码关掉就不冲突了。
+                    wind_config::SessionAction::AuxCode(wind_config::AuxCodeShare::PageNext) => {
+                        "辅助码/翻页键"
+                    }
                     _ => "翻页/高亮键",
                 });
             }

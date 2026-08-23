@@ -299,11 +299,16 @@ impl Coordinator {
         }
     }
 
-    /// 这个键是不是「进辅助码」的触发键。**两张表都问**——`aux_code` 在
-    /// `keys.key_actions` 与 `keys.session_actions` 里各有一份，用户配在哪张都算数。
+    /// 这个键是不是「进辅助码」的**专用**触发键（再按一次 = 退出）。**两张表都问**
+    /// ——`aux_code` 在 `keys.key_actions` 与 `keys.session_actions` 里各有一份，
+    /// 用户配在哪张都算数。
     ///
     /// 会话态那侧取 `include_printable = false`，与 `handle_candidate_nav` 在辅助码态下
     /// 的取值一致：辅助码态里字母是码元输入，不能被当成会话键抢走。
+    ///
+    /// ★ **共键（`aux_code:page_next`）刻意不算**：它在辅助码态里的身份是翻页键，
+    /// 要落到下面的 `handle_candidate_nav` 去翻页。若在此认成退出键，共键用户就永远
+    /// 翻不了第二页——按一次进、再按一次就出来了。
     fn is_aux_code_trigger(&self, data: &KeyEventData) -> bool {
         // ★ 字母恒是码元，绝不当触发键。区间与下方那条累积臂（`VK_A..=VK_Z`）**取同一个**，
         // 两处不会漂。
@@ -316,7 +321,9 @@ impl Coordinator {
         }
         let shift = data.modifiers & MOD_SHIFT != 0;
         if self.session_action_for(data.key_code, shift, false)
-            == Some(wind_config::SessionAction::AuxCode)
+            == Some(wind_config::SessionAction::AuxCode(
+                wind_config::AuxCodeShare::Solo,
+            ))
         {
             return true;
         }
@@ -1070,13 +1077,22 @@ mod tests {
 
     /// 两张表的动词写法必须逐字一致：同一个功能在两处写法不同的话，用户把配置从一张表
     /// 挪到另一张就会静默失效。
+    ///
+    /// ⚠️ 共键形态（`aux_code:page_next`）**只有 `session_actions` 有**，这不算写法分叉：
+    /// `key_actions` 压根解析不出翻页键，那张表里也就不存在「与翻页共键」这回事。
     #[test]
     fn aux_code_verb_spelling_matches_across_both_tables() {
-        use wind_config::{BoundAction, SessionAction};
+        use wind_config::{AuxCodeShare, BoundAction, SessionAction};
         assert_eq!(BoundAction::parse("aux_code"), BoundAction::AuxCode);
-        assert_eq!(SessionAction::parse("aux_code"), SessionAction::AuxCode);
+        assert_eq!(
+            SessionAction::parse("aux_code"),
+            SessionAction::AuxCode(AuxCodeShare::Solo)
+        );
         // 写回也要能读回来（Display 与 parse 互逆）。
-        assert_eq!(SessionAction::AuxCode.to_string(), "aux_code");
+        assert_eq!(
+            SessionAction::AuxCode(AuxCodeShare::Solo).to_string(),
+            "aux_code"
+        );
     }
 
     /// tri-state 覆盖方向一：全局关 + 方案显式开 → 进得去。
@@ -1249,5 +1265,152 @@ mod tests {
         assert!(!st.scope_relaxed, "更不得留下一个影响后续按键的放宽态");
         let kept: Vec<&str> = st.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(kept, vec!["李", "樱"], "辅助码的筛选结果必须原样保留");
+    }
+
+    // ─────────────── 与翻页共键（`aux_code:page_next`） ────────────────
+
+    /// 装填「多页候选」的初始状态：12 条 > 出厂每页 9 条 ⇒ 2 页，翻页才有可观测效果。
+    fn seed_multi_page(
+        c: &Arc<Coordinator>,
+    ) -> std::sync::MutexGuard<'_, crate::coordinator::State> {
+        let mut st = seed_composition(c);
+        st.candidates = (0..12).map(|i| cand(&format!("候选{i}"))).collect();
+        st
+    }
+
+    fn coord_with_share_key(tag: &str, enabled: Option<bool>) -> Arc<Coordinator> {
+        coord_with_data_cfg(tag, data_dir_with_aux_enabled(tag, enabled), |cfg| {
+            cfg.keys
+                .session_actions
+                .insert("tab".to_string(), "aux_code:page_next".to_string());
+        })
+    }
+
+    /// ★★ 共键**先试辅助码、不先翻页**：首按 Tab 停在第一页，首选不会被翻走。
+    ///
+    /// 这正是「顺序即优先级」与「两个都做」的分野。若实现成「先翻页再进入」
+    /// （社区 PR #74 的 `page_next_aux_code` 形态），用户按一下键就越过了最常用的那一屏。
+    ///
+    /// ⚠️ 本用例盯的是**进入后停在第几页**这个契约，不是「有没有调用过 `page_next`」：
+    /// 进入必经 `refresh_aux_code_candidates` → `reset_candidate_view`，页码在那里归零，
+    /// 所以「先翻页但不保留页码」与「不翻页」在这里本就不可区分（实测过：只加 `page_next`
+    /// 探针，本用例照绿）。反过来说，「先翻页」这个形态**必须**再补一道保存/恢复
+    /// `current_page` 才成立——而那道补丁一加，本用例立刻变红（也实测过）。
+    #[test]
+    fn share_key_enters_aux_without_paging() {
+        let c = coord_with_share_key("share_enter", Some(true));
+        let mut st = seed_multi_page(&c);
+        let act = c
+            .apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true)
+            .expect("有候选且辅助码可用 ⇒ 进辅助码");
+        assert_eq!(st.active, Some(ModeKind::AuxCode));
+        assert_eq!(st.current_page, 0, "进入时不得先翻页");
+        assert_eq!(st.selected_index, 0, "高亮仍在首选");
+        assert_eq!(st.preedit, "li    ", "组合区 = 拼音 + 4 空格");
+        assert!(matches!(act, KeyAction::UpdateComposition { .. }));
+    }
+
+    /// 辅助码态内再按共键 = 翻页，**不退出**（专用触发键那条「再按一次退出」不适用于它）。
+    ///
+    /// 走 `handle_aux_code_key` 而非直接调 `apply_session_action`：要连 `is_aux_code_trigger`
+    /// 一起测——它若把共键也认成退出键，用户就永远翻不到第二页。
+    #[test]
+    fn share_key_pages_inside_aux_mode() {
+        let c = coord_with_share_key("share_page", Some(true));
+        let mut st = seed_multi_page(&c);
+        c.apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true)
+            .expect("应进入辅助码");
+        assert_eq!(st.current_page, 0);
+
+        let act = c.handle_aux_code_key(&mut st, &key(keymap::VK_TAB, 0));
+
+        assert_eq!(st.active, Some(ModeKind::AuxCode), "模式内按共键不得退出");
+        assert_eq!(st.current_page, 1, "应翻到第二页");
+        assert!(st.aux_code.is_some(), "overlay 三件套仍在");
+        assert_eq!(st.candidates.len(), 12, "翻页不得动候选");
+        assert!(matches!(act, KeyAction::Consumed));
+    }
+
+    /// 辅助码未启用 ⇒ 门卫拒 ⇒ 共键退化成**纯翻页键**（而不是哑键）。
+    ///
+    /// 出厂 `enabled = false`，所以这是绝大多数用户绑上这个动词后的第一手体验：
+    /// 功能没开时它必须仍是个能用的翻页键。
+    #[test]
+    fn share_key_degrades_to_paging_when_aux_disabled() {
+        let c = coord_with_share_key("share_off", Some(false));
+        let mut st = seed_multi_page(&c);
+        let act = c
+            .apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true)
+            .expect("降级为翻页 ⇒ 仍然消费按键");
+        assert_eq!(st.active, None, "未启用不得进辅助码");
+        assert!(st.aux_code.is_none(), "更不得建 overlay");
+        assert_eq!(st.current_page, 1, "应当作纯翻页键");
+        assert!(matches!(act, KeyAction::Consumed));
+    }
+
+    /// 无候选（空闲）⇒ 两个成员都 `requires_candidates` ⇒ 整个动词放行，Tab 还给宿主。
+    ///
+    /// 判据取「返回 None」：这是本仓「不吞键」的唯一表达，返回 `Consumed` 就意味着用户
+    /// 在空闲时按 Tab 什么也不会发生。
+    #[test]
+    fn share_key_yields_when_no_candidates() {
+        let c = coord_with_share_key("share_idle", Some(true));
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        assert!(
+            c.apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true)
+                .is_none(),
+            "无候选时共键必须放行（空闲按 Tab 仍是宿主的制表符）"
+        );
+        assert_eq!(st.active, None);
+    }
+
+    /// 已在别的 overlay 模式里 ⇒ `enter_aux_code` 的 `active.is_some()` 守卫拒 ⇒ 只翻页。
+    ///
+    /// `apply_session_action` 被五个 overlay 共用（`handle_candidate_nav` 转调），共键
+    /// 在那些模式里必须是个安分的翻页键，不能把主候选夺过来筛。
+    #[test]
+    fn share_key_only_pages_in_other_overlay_modes() {
+        let c = coord_with_share_key("share_overlay", Some(true));
+        let mut st = seed_multi_page(&c);
+        st.active = Some(ModeKind::TempPinyin);
+        let act = c
+            .apply_session_action(&mut st, &key(keymap::VK_TAB, 0), true)
+            .expect("翻页 ⇒ 消费");
+        assert_eq!(st.active, Some(ModeKind::TempPinyin), "不得改动所在模式");
+        assert!(st.aux_code.is_none());
+        assert_eq!(st.current_page, 1);
+        assert!(matches!(act, KeyAction::Consumed));
+    }
+
+    /// 动词写法：`aux_code` / `aux_code:page_next` 与 `Display` 互逆；写错的参数落 `None`。
+    ///
+    /// 参数写错**不静默降级成专用触发键**：`aux_code:page_prev` 若退回 `aux_code`，
+    /// 用户看到的是「共键没生效」，与「功能坏了」同形；落 `None` 才会被
+    /// `parse_checked` 在加载期告警。
+    #[test]
+    fn share_verb_parse_and_display_roundtrip() {
+        use wind_config::{AuxCodeShare, SessionAction};
+        assert_eq!(
+            SessionAction::parse("aux_code"),
+            SessionAction::AuxCode(AuxCodeShare::Solo)
+        );
+        assert_eq!(
+            SessionAction::parse(" AUX_CODE:PAGE_NEXT "),
+            SessionAction::AuxCode(AuxCodeShare::PageNext)
+        );
+        assert_eq!(
+            SessionAction::AuxCode(AuxCodeShare::PageNext).to_string(),
+            "aux_code:page_next"
+        );
+        assert_eq!(
+            SessionAction::AuxCode(AuxCodeShare::Solo).to_string(),
+            "aux_code"
+        );
+        assert_eq!(
+            SessionAction::parse("aux_code:page_prev"),
+            SessionAction::None
+        );
+        assert_eq!(SessionAction::parse_checked("aux_code:page_prev"), None);
     }
 }

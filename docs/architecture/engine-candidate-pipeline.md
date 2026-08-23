@@ -671,10 +671,17 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   分隔符**。且按键 match 里分隔符臂（`message_handler.rs` 的 `VK_QUOTE|VK_BACKTICK`）位于
   `[key_actions]` 裁决（兜底臂里的 D0）**之前**，所以全拼下哪怕绑了 `backtick = "aux_code"`
   也永远走不到辅助码。于是「双拼开、全拼关」是常态需求，一个全局开关表达不了。
-- **触发**：`[key_actions]` 绑 `"aux_code"`；双拼出厂绑反引号（绑定本身不激活功能，
-  `enabled = false` 时门卫拒绝、该键照常落普通标点），全拼出厂不绑（理由见上）。
-  门卫四道：未启用 / 触发键被音节分隔符占用（`warn_aux_code_key_taken` 每方案告警一次，
-  不再静默失效）/ 方案未配 `files` 或文件全缺 / 当前无候选 → 一律不吞键。
+- **触发**：绑 `"aux_code"`——`[key_actions]`（双拼出厂 `backtick`）与 `[session_actions]`
+  两张表都认，差别只在**哪些键名解析得出来**：后者认得 `tab` / `pagedown` / 方向键那一批，
+  于是「Tab 进辅助码」只表达得在它里面。`[session_actions]` 另有共键写法
+  `"aux_code:page_next"`：**能进就进辅助码、进不去就翻下一页**（顺序即优先级），
+  见 `docs/design/session-key-actions.md` §5。
+  绑定本身不激活功能：`enabled = false` 时门卫拒绝、该键照常落普通标点；全拼出厂不绑
+  （理由见上）。
+  门卫五道：已在别的 overlay 模式（只能从主输入路进）/ 未启用 / 触发键被音节分隔符占用
+  （`warn_aux_code_key_taken` 每方案告警一次，不再静默失效）/ 方案未配 `files` 或文件全缺 /
+  当前无候选 → 一律不吞键。共键正是靠这五道复用出「模式内翻页 / 未开启时退化成纯翻页键」，
+  不另写特判。
   组码中进入，**只筛选不改排序**。
 - **加载**：`EngineManager::aux_code_settings` 一次 `read_schema` 出齐 `enabled` /
   `max_phrase_len` / 已解析的 `files`（用户目录同名优先；**关闭时不解析路径**）；首进时

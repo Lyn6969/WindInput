@@ -14,7 +14,8 @@
 | 1 | 全局基线 `enabled` / `max_phrase_len` | `config.toml` `[schema.pinyin.aux_code]` | 键已登记 REGISTRY，无控件 |
 | 2 | 方案级覆盖（tri-state，`None` = 跟随全局） | `.schema.toml` `[engine.aux_code]` / `schema_overrides/{id}.toml` | 无控件 |
 | 3 | 码表 `files`（这个方案用哪张字形表） | 同上（方案属性） | 无控件 |
-| 4 | **触发键** | **方案文件 `[key_actions]`**（如 `backtick = "aux_code"`） | UI 已有（`dialogs/schema_key_actions.rs`），**但动词列表里没有 `aux_code`** |
+| 4 | **触发键** | **方案文件 `[key_actions]`**（如 `backtick = "aux_code"`）或 `[session_actions]`（功能键那一批只在这张表里绑得上） | UI 已有（`dialogs/schema_key_actions.rs`），**但动词列表里没有 `aux_code`** |
+| 4b | **与翻页共键** | `[session_actions]` 的 `"aux_code:page_next"`（能进就进辅助码、进不去就翻下一页） | 动词列表待加一项（标签建议「辅助码筛选（兼下翻页）」） |
 
 第 4 项是「开了能不能进去」的决定因素，却最容易被漏——它不在 `[schema.pinyin.aux_code]` 段里，
 按配置键去找根本找不到它。

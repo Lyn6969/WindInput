@@ -137,7 +137,39 @@ capslock = "page_prev"
 | 导航 | `page_prev` `page_next` `highlight_up` `highlight_down` | 收编 `NavAction` |
 | 选择 | `select_candidate:2` `select_candidate:3` `select_char:1` `select_char:2` | 收编 `select_key_groups` / `select_char_keys` |
 | 处置 | `cancel`（别名 `clear`） | 收编六处 Esc |
+| 筛选 | `aux_code` `aux_code:page_next` | 辅助码（拼音候选的字形二次筛选） |
 | — | `none` | 禁用该键在本态的绑定 |
+
+### ★ 与翻页共键做成 `aux_code` 的**参数**，不是新动词、更不是通用降级链
+
+需求是「Tab 既翻页又进辅助码」（社区 issue #68 / PR #74）。三种表达形态：
+
+1. **组合动词** `page_next_aux_code`：语义是「两个都做」——先翻页再进入，于是首按就越过了
+   第一屏候选，还得在进入路径上另存 / 另恢复 `current_page` 去补救。且组合动词的名字随
+   组合数相乘。
+2. **通用降级链** `aux_code|page_next`：见 key-resolver-unification.md 的否决清单第 ① 条。
+   具体到这里：它要求给每个动词定义「不适用」，而那些条件多是实现细节——`page_next` 的
+   「失败」是已在末页，于是语法允许的 `page_next|cancel` 会在**末页取消整段输入**。
+   可表达的组合远多于有意义的组合。
+3. **动词参数** `aux_code:page_next`（采用）：值域封闭在 `aux_code` 上，配不出无意义的组合，
+   与 `select_candidate:N` 同一套 `verb:arg` 写法。
+
+判据就是本节 §5 那条的同构版本：**一组取值只对一个动词有意义 ⇒ 它是那个动词的参数**。
+「与翻页共键」只对 `aux_code` 成立（`page_prev` 共键没有对应心智，别的动词没有这个需求）。
+
+**语义：顺序即优先级**——先试辅助码，进不去才翻页。「进不去」不必新定义，`enter_aux_code`
+本来就是「门卫没过返回 `None` 不吞键」的契约，四道门卫直接复用。于是这几件事全部天然成立，
+无需各写一个特判：
+
+| 情形 | 结果 | 靠哪道门卫 |
+|---|---|---|
+| 主输入路 + 辅助码可用 | 进辅助码，**不翻页** | — |
+| 已在辅助码态内 | 翻页（模式内继续翻） | `active.is_some()` |
+| 功能未开 / 方案无码表 | 退化成纯翻页键 | `enabled` / `files` |
+| 无候选（空闲） | 放行，Tab 还给宿主 | `requires_candidates` |
+
+⚠️ 辅助码态里「再按触发键 = 退出」那条**只认专用触发键**（`aux_code`）。共键若也被认成退出键，
+用户就永远翻不到第二页——判据写在 `is_aux_code_trigger` 上。
 
 ### ★ 处置类只做 `cancel`，`clear` 收作别名（二期实施时定案）
 
