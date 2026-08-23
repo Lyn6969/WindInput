@@ -130,6 +130,13 @@ fn prune_redundant(root: &mut toml::Value, preset: &toml::Value) -> usize {
 /// **只能用显式名单**，不能改成「凡未登记键一律删」——`input.punct.custom_mappings.<字符>`
 /// 这类 `Map` 子路径同样不在注册表里，一刀切会把用户的自定义标点映射删光。这也正是
 /// [`prune_redundant`] 用 `is_known_key` 把未登记键整体排除在外的原因。
+/// 引导键物化迁移的当前版本，落在 `keys.key_actions_materialized`。
+///
+/// 递增即让 [`Config::materialize_key_actions`] 对所有用户再跑一次。只有在「出厂绑定
+/// 本身要变、且必须送达存量用户」时才递增——那会**覆盖用户对这批键的修改**，属于
+/// 破坏性操作，不是加个新绑定就该做的事。
+const KEY_ACTIONS_MATERIALIZE_VERSION: u32 = 1;
+
 const RETIRED_KEYS: &[&[&str]] = &[
     // 与 `mix_modes.members` 构成双真相源，已废弃：英文候选的开关只看 members 里有没有
     // `english`。⚠️ **不是** `schema.mix.enable_english` —— 那个还活着，是混输引擎
@@ -157,6 +164,75 @@ fn prune_retired(root: &mut toml::Value) -> usize {
         .iter()
         .filter(|path| remove_nested(t, path))
         .count()
+}
+
+/// 用户层是否已完成引导键物化（版本号 >= [`KEY_ACTIONS_MATERIALIZE_VERSION`]）。
+///
+/// 判据只认这一个显式版本号，**不做「看起来像迁移过了」的推断**（如「key_actions 非空
+/// 就算迁过」）——那种推断在用户手工配过 key_actions 但从没迁移过时会直接猜错，
+/// 导致出厂绑定永久丢失。
+fn already_materialized(root: &toml::Value) -> bool {
+    get_nested(root, &["keys", "key_actions_materialized"])
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(0)
+        >= i64::from(KEY_ACTIONS_MATERIALIZE_VERSION)
+}
+
+/// 把 `bindings` 写进用户层 `keys.key_actions`、摘掉五处旧 `trigger_keys`、打上版本标记。
+/// 返回摘掉的旧字段数。
+///
+/// 纯函数、不碰文件系统：[`Config::materialize_key_actions`] 负责 IO 与两道安全闸，本函数
+/// 负责改写。拆开的理由与 [`prune_redundant`] 相同——`materialize_key_actions` 依赖
+/// `user_config_dir()`，直接测就会写用户真实的 `%APPDATA%\WindInput\config.toml`
+/// （本仓已有前科：`cargo test -p wind-coordinator` 曾真写 `schema.active`）。
+/// **本函数会删键，直接测的代价比那次更大。**
+///
+/// 调用方须先用 [`already_materialized`] 判幂等：本函数每次都会照写，不自带幂等。
+fn materialize_into(
+    root: &mut toml::Value,
+    bindings: &BTreeMap<String, String>,
+) -> anyhow::Result<usize> {
+    let toml::Value::Table(t) = root else {
+        anyhow::bail!("materialize_into: root 不是 table");
+    };
+    set_nested(
+        t,
+        &["keys", "key_actions"],
+        toml::Value::try_from(bindings)?,
+    );
+    // 用户层里的旧字段一并清掉：它们已被物化进 key_actions，留着就是第二真相源，
+    // 日后排查会再次踩「改了哪个都不对」的坑。L2 的那份不动（出厂声明处）。
+    let mut dropped = 0usize;
+    for path in [
+        ["input", "temp_pinyin", "trigger_keys"].as_slice(),
+        ["input", "temp_english", "trigger_keys"].as_slice(),
+    ] {
+        if remove_nested(t, path) {
+            dropped += 1;
+        }
+    }
+    // `schema.mix_modes` 是结构体数组，逐元素摘掉 trigger_keys（不删元素本身：
+    // id/name/members 还活着）。
+    if let Some(arr) = t
+        .get_mut("schema")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|s| s.get_mut("mix_modes"))
+        .and_then(toml::Value::as_array_mut)
+    {
+        for m in arr.iter_mut() {
+            if let Some(mt) = m.as_table_mut()
+                && mt.remove("trigger_keys").is_some()
+            {
+                dropped += 1;
+            }
+        }
+    }
+    set_nested(
+        t,
+        &["keys", "key_actions_materialized"],
+        toml::Value::Integer(i64::from(KEY_ACTIONS_MATERIALIZE_VERSION)),
+    );
+    Ok(dropped)
 }
 
 /// 收集 TOML 值里所有叶子路径（表递归；数组/标量视为叶子，不下钻）。
@@ -2663,6 +2739,22 @@ pub struct KeysConfig {
     /// `HashMap` 会让同一份配置在不同进程里表现不同（`schema_hotkeys` 为此要显式排序）。
     #[serde(default)]
     pub key_actions: BTreeMap<String, String>,
+    /// 引导键**物化**迁移的版本号（0 = 未物化）。见 [`Config::materialize_key_actions`]。
+    ///
+    /// 置位后 [`Config::migrate_trigger_keys_into_key_actions`] 不再折算——五处
+    /// `trigger_keys` 从「每次加载都灌一遍的真相源」降级为**出厂声明处**（只供设置页
+    /// 「恢复默认」读），[`Self::key_actions`] 成为唯一真相源。
+    ///
+    /// ⚠️ **必须住在用户层 config.toml 里，不能改成独立标记文件**：标记要能跟着
+    /// 备份/还原走。否则 A 机删掉的绑定，在 B 机还原后会因「看起来没迁移过」被重新
+    /// 折算灌回去——那正是本次要修的报障现场。
+    ///
+    /// 用版本号而非 bool：日后若要再物化一批键，递增即可重跑，bool 没有第二次机会。
+    /// `skip_serializing_if` 让它默认时不出现在序列化产物里，于是自动退出
+    /// `config_schema` 的登记表对应关系（同 [`Self::legacy_schema_hotkeys`] 的处置）——
+    /// 它是迁移账本，不是用户可配项。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub key_actions_materialized: u32,
     /// **会话态按键功能表**：键名 → 动词（如 `{ tab = "page_next", capslock = "page_prev" }`）。
     ///
     /// 与 [`Self::key_actions`] 同构的姊妹表，分野是触发态：那张管无会话态，本表管
@@ -2695,6 +2787,11 @@ pub struct KeysConfig {
     /// 候选无效按键策略（数字键/次选三选键/以词定字键超出候选范围时的处理）。
     #[serde(default)]
     pub overflow: OverflowConfig,
+}
+
+/// `KeysConfig::key_actions_materialized` 的 `skip_serializing_if`。
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 // 热键默认值对齐 Go 版 DefaultConfig.Hotkeys（wind_input/pkg/config/config.go）。
@@ -2916,6 +3013,8 @@ impl Default for KeysConfig {
             global_hotkeys: Vec::new(),
             legacy_schema_hotkeys: HashMap::new(),
             key_actions: BTreeMap::new(),
+            // 0 = 未物化：新装机器由 `materialize_key_actions` 在服务启动时置位。
+            key_actions_materialized: 0,
             session_actions: BTreeMap::new(),
             select_key_groups: default_select_key_groups(),
             page_keys: default_page_keys(),
@@ -4176,6 +4275,93 @@ impl Config {
         Ok(removed)
     }
 
+    /// **一次性物化**：把折算后的引导键绑定写进用户层 `keys.key_actions`，此后停止折算。
+    /// 返回物化的绑定条数（0 = 已做过 / 条件不满足）。
+    ///
+    /// # 为什么必须落盘，而不能继续「每次加载折算一次」
+    ///
+    /// 五处 `trigger_keys` 的出厂值住在 L2（`data/config.toml`），
+    /// [`Self::migrate_trigger_keys_into_key_actions`] 每次 `load()` 都把它们折算进
+    /// `keys.key_actions`。而设置页在「五c 全局层收编」之后**只写 `key_actions`、从不写
+    /// `trigger_keys`**——于是用户层根本没有一个能压制 L2 出厂值的键：
+    ///
+    /// 1. 用户在设置页取消勾选 `` ` `` → 用户层 `key_actions` 里那条被删掉（真的删了）；
+    /// 2. 下次 `load()`：用户层没写过 `trigger_keys` ⇒ 深合并回落 L2 的 `["backtick"]`
+    ///    ⇒ 折算发现 `key_actions` 里没有 `backtick` ⇒ **重新插回去**；
+    /// 3. 折算唯一的守卫是 `contains_key`，它区分不了「用户配过别的」与「用户删掉了它」。
+    ///
+    /// 表现是「取消勾选保存后毫无效果，反引号照样触发，再点应用设置却说『没有变更』」
+    /// （最后那句来自设置页保存成功后 `base_config = current_config` 的乐观更新）。
+    /// 覆盖安装、备份还原都无法带走「我删过它」——**那个意图从来没有被写进任何地方**。
+    ///
+    /// 物化之后，`key_actions` 成为唯一真相源，删除就是普通的删除；L2 的 `trigger_keys`
+    /// 降级为出厂声明处，只供设置页「恢复默认」按 capability 读取。
+    ///
+    /// # 对新用户也必须跑
+    ///
+    /// 只迁移「已有 config.toml 的老用户」会让方案退化成没修：新装机器的用户层里永远没有
+    /// 实体条目，删除依然会被 L2 折算复活。故用户层文件不存在时按空表处理，照常物化。
+    ///
+    /// # 两道安全闸（缺一不可，且都退化为「什么都不做」）
+    ///
+    /// 1. **用户配置目录不可用**（漫游未挂载）→ 不动。此时用户层「看起来是空的」，
+    ///    照做会把出厂绑定物化成用户的全部绑定，抹掉他真实的自定义。同
+    ///    [`Self::prune_user_config`] 必须排在 `wait_user_config_ready` 之后的理由。
+    /// 2. **L2 `data/config.toml` 不在场** → 不动。折算结果依赖 L2 声明的出厂绑定，
+    ///    L2 缺席时折算出的是一张**残缺**的表，物化下去 = 用户永久丢失出厂绑定，
+    ///    而且标记一置位就再也不会补回来。这是本函数最危险的一条路径。
+    ///
+    /// 幂等：靠 `keys.key_actions_materialized` 版本号，不靠「看起来像迁移过了」的推断。
+    pub fn materialize_key_actions() -> anyhow::Result<usize> {
+        // 闸一：用户配置目录不可用。
+        let Some(dir) = Self::user_config_dir() else {
+            return Ok(0);
+        };
+        // 闸二：L2 必须在场（判据与 `preset_for_pruning` 同源——出厂值只在 L2 看得见）。
+        let data_dir = Self::data_dir();
+        if !data_dir
+            .as_deref()
+            .is_some_and(|d| d.join("config.toml").is_file())
+        {
+            debug!("Skip key_actions materialization: data/config.toml absent");
+            return Ok(0);
+        }
+        let file = dir.join("config.toml");
+        // 文件不存在 = 新用户，按空表继续（见上文「对新用户也必须跑」）。
+        // 解析失败也按空表：那种情况下用户层本就不生效，物化不会额外丢失什么。
+        let mut root = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        if !root.is_table() {
+            root = toml::Value::Table(Default::default());
+        }
+
+        // 幂等闸：版本号已达标就退出（不必读 L2、不必 load）。
+        if already_materialized(&root) {
+            return Ok(0);
+        }
+
+        // 权威来源 = 一次完整 `load()`：它已跑完 normalize，`key_actions` 就是当前**生效**
+        // 的那张表（三层合并 ⊕ 折算 ⊕ 「用户显式配过的不被覆盖」）。这里绝不能自己再抄
+        // 一遍折算规则——抄一份就是第二个真相源，本次修的正是这类问题。
+        let cfg = Self::load(data_dir.as_deref())?;
+        let bindings = cfg.keys.key_actions;
+        let count = bindings.len();
+        let dropped = materialize_into(&mut root, &bindings)?;
+
+        let out = toml::to_string_pretty(&root)?;
+        std::fs::create_dir_all(&dir)?;
+        let tmp = file.with_extension("toml.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &file)?;
+        info!(
+            "Materialized {} key_action binding(s) into user config (v{}), dropped {} legacy trigger_keys field(s)",
+            count, KEY_ACTIONS_MATERIALIZE_VERSION, dropped
+        );
+        Ok(count)
+    }
+
     /// 读取 TOML 文件为 Value（不存在/解析失败返回 None 并告警，不中断加载）
     fn read_toml_value(path: &Path) -> Option<toml::Value> {
         if !path.exists() {
@@ -4316,6 +4502,19 @@ impl Config {
     ///
     /// 已在 `keys.key_actions` 里显式配过的键**不覆盖**：用户的新配置优先于存量迁移。
     fn migrate_trigger_keys_into_key_actions(&mut self) {
+        // ★ 已物化：`key_actions` 是唯一真相源，本折算必须彻底让位。
+        //
+        // 折算在这里多跑一次的代价不是「白做功」而是「复活用户删掉的绑定」：折算的守卫
+        // 只有 `key_actions.contains_key(k)`，它区分不了「用户配过别的」与「用户删掉了它」，
+        // 于是每次加载都把出厂绑定重新灌回去（见 `materialize_key_actions` 的文档）。
+        //
+        // 仍要清空 `trigger_keys`：`normalize()` 之后「trigger_keys 恒为空」是既有的
+        // 后置条件，消费端一律读 `key_actions`（handle_temp.rs / handle_mode.rs 等处的
+        // 注释均已声明不再读它）。留着非空值会让日后有人误以为它还是活的。
+        if self.keys.key_actions_materialized >= KEY_ACTIONS_MATERIALIZE_VERSION {
+            self.clear_all_trigger_keys();
+            return;
+        }
         // (键名 → 动词)，按优先级先到先得。
         let mut claimed: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
@@ -4377,6 +4576,19 @@ impl Config {
             // 一次，本就如此）。真正异常的两种情况（键名解析不了 / 多处争用同一键）仍是 warn。
             debug!("配置迁移：引导键 {key:?} → keys.key_actions = {action:?}");
             self.keys.key_actions.insert(key, action);
+        }
+    }
+
+    /// 清空五处 `trigger_keys`（内存态）。
+    ///
+    /// 维持 `normalize()` 的后置条件「折算之后 trigger_keys 恒为空」——已物化的用户走的是
+    /// 屏蔽分支，不再有 `drain` 把它们取走，须在此显式清掉。**只动内存**：磁盘上 L2 的
+    /// `trigger_keys` 是出厂声明处（设置页「恢复默认」按 capability 读它），必须留着。
+    fn clear_all_trigger_keys(&mut self) {
+        self.input.temp_english.trigger_keys.clear();
+        self.input.temp_pinyin.trigger_keys.clear();
+        for m in self.schema.mix_modes.iter_mut() {
+            m.trigger_keys.clear();
         }
     }
 
@@ -6014,6 +6226,130 @@ auto_commit_at_full = false
         assert!(
             get_nested(&user, &["input", "code_commit", "auto_commit_at_full"]).is_some(),
             "未登记键必须原样保留"
+        );
+    }
+
+    // ── 引导键物化（`Config::materialize_key_actions`）──
+
+    #[test]
+    fn materialize_into_writes_bindings_and_drops_legacy_fields() {
+        let mut root = tv(r#"
+[input.temp_pinyin]
+enabled = true
+trigger_keys = ["backtick"]
+
+[input.temp_english]
+trigger_keys = ["semicolon"]
+
+[[schema.mix_modes]]
+id = "quick_mix"
+members = ["date"]
+trigger_keys = ["backslash"]
+"#);
+        let bindings = BTreeMap::from([
+            ("backtick".to_string(), "temp_pinyin".to_string()),
+            ("semicolon".to_string(), "temp_english".to_string()),
+        ]);
+        let dropped = materialize_into(&mut root, &bindings).unwrap();
+
+        assert_eq!(dropped, 3, "三处 trigger_keys 都应被摘掉");
+        assert_eq!(
+            get_nested(&root, &["keys", "key_actions", "backtick"]).and_then(toml::Value::as_str),
+            Some("temp_pinyin")
+        );
+        assert!(already_materialized(&root), "版本标记应已写入");
+        assert!(
+            get_nested(&root, &["input", "temp_pinyin", "trigger_keys"]).is_none(),
+            "旧字段必须删除，否则仍是第二真相源"
+        );
+        assert!(
+            get_nested(&root, &["input", "temp_pinyin", "enabled"]).is_some(),
+            "同段内的其它键不得受牵连"
+        );
+        assert!(
+            get_nested(&root, &["input", "temp_english"]).is_none(),
+            "该段只剩 trigger_keys 时应被 remove_nested 整段回收"
+        );
+        // mix_modes 只摘 trigger_keys，元素本身（id/members）必须留着。
+        let modes = get_nested(&root, &["schema", "mix_modes"])
+            .and_then(toml::Value::as_array)
+            .expect("mix_modes 应仍在");
+        assert_eq!(modes.len(), 1);
+        assert!(modes[0].get("id").is_some(), "元素本身不可删");
+        assert!(modes[0].get("trigger_keys").is_none());
+    }
+
+    #[test]
+    fn already_materialized_only_trusts_explicit_version() {
+        // 「key_actions 非空」不等于「迁移过」——用户手工配过但从没迁移时会猜错，
+        // 一猜错就是出厂绑定永久丢失，故判据只认显式版本号。
+        let hand_written = tv("[keys.key_actions]\nbacktick = \"temp_pinyin\"\n");
+        assert!(!already_materialized(&hand_written));
+        assert!(!already_materialized(&tv("")));
+        assert!(already_materialized(&tv(
+            "[keys]\nkey_actions_materialized = 1\n"
+        )));
+    }
+
+    /// ★ 回归闸：物化标记绝不能被 `prune_user_config` 清掉。
+    ///
+    /// 标记一旦丢失，下次加载就会重新折算，把用户删掉的出厂绑定灌回去——本次修复
+    /// 整个失效，且现象与修复前一模一样（"删了又回来"）。
+    #[test]
+    fn prune_keeps_materialize_marker() {
+        let preset = toml::Value::try_from(Config::default()).unwrap();
+        assert!(
+            get_nested(&preset, &["keys", "key_actions_materialized"]).is_none(),
+            "标记不得出现在序列化产物里——否则 registry_covers_every_config_key 会红，\
+             且它会被当成用户可配项参与 prune 比对"
+        );
+        assert!(
+            !crate::config_schema::is_known_key("keys.key_actions_materialized"),
+            "标记是迁移账本、不是配置项，不该登记进注册表"
+        );
+        let mut user = tv("[keys]\nkey_actions_materialized = 1\n");
+        prune_redundant(&mut user, &preset);
+        prune_retired(&mut user);
+        assert!(already_materialized(&user), "标记必须在清理后仍然存活");
+    }
+
+    /// ★★ 行为闸：已物化时，折算不得复活用户删掉的绑定。
+    ///
+    /// 这正是报障现场——用户在设置页取消勾选反引号，保存后下次加载又被折算灌回去。
+    #[test]
+    fn materialized_config_stops_reviving_deleted_binding() {
+        let mut c = Config::default();
+        // L2 出厂声明仍在（磁盘上那份我们不删），而用户已把绑定删光。
+        c.input.temp_pinyin.trigger_keys = vec!["backtick".into()];
+        c.keys.key_actions.clear();
+        c.keys.key_actions_materialized = KEY_ACTIONS_MATERIALIZE_VERSION;
+
+        c.normalize();
+
+        assert!(
+            !c.keys.key_actions.contains_key("backtick"),
+            "已物化时 trigger_keys 不得再折算——否则用户的删除永远不生效"
+        );
+        assert!(
+            c.input.temp_pinyin.trigger_keys.is_empty(),
+            "normalize 的后置条件：trigger_keys 恒为空，消费端一律读 key_actions"
+        );
+    }
+
+    /// 反事实对照：未物化时折算照旧（Android 等不跑物化的宿主依赖这条路径）。
+    #[test]
+    fn unmaterialized_config_still_folds_trigger_keys() {
+        let mut c = Config::default();
+        c.input.temp_pinyin.trigger_keys = vec!["backtick".into()];
+        c.keys.key_actions.clear();
+        assert_eq!(c.keys.key_actions_materialized, 0, "前提：未物化");
+
+        c.normalize();
+
+        assert_eq!(
+            c.keys.key_actions.get("backtick").map(String::as_str),
+            Some("temp_pinyin"),
+            "未物化时必须保持原有折算行为，否则 Android 侧引导键当场失效"
         );
     }
 

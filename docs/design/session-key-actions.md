@@ -246,6 +246,13 @@ capslock = "page_prev"
 ⇒ **判据：折算属于「怎么解释配置」，不属于「配置是什么」。** 把视图写回存储就丢掉了用户的
 原始意图，而设置页读的正是存储。
 
+> ★ **姊妹表 `key_actions` 后来在同一个坑上翻了车**（现象一字不差：「删掉一条折算来的绑定，
+> 下次启动又被折算回来」），因为五处 `trigger_keys` 的折算**留在了 `normalize()` 里**、而设置页
+> 的写入口被收编到了折算的**下游**。它没有照搬本节的解法（那等于撤销五c 收编），改走
+> 「把存储层搬到下游、折算一次性落盘后停止」——见
+> [key-actions-materialization.md](key-actions-materialization.md)，其 §3 给出了比本节更好用的
+> 通用判据：**用户在 UI 上做的删除落到哪个键？那个键能否压制出厂值所在的那个键？**
+
 现落点为 `KeysConfig::effective_session_actions()`（纯函数视图），两个消费点各自调用：
 `ConfigBundle::build`（运行时绑定表）与 `hotkey::Compiler`（TSF 转发白名单）。
 ⚠️ 后者**不能**直接读 `config.keys.session_actions`——那只是显式配的那部分，漏掉四组展开的键，

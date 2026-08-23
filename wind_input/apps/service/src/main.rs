@@ -258,6 +258,18 @@ fn main() {
         warn!("Prune user config failed: {e}");
     }
 
+    // D3：把引导键绑定物化进用户层 `keys.key_actions`（一次性，靠版本号幂等）。
+    //
+    // 在此之前，五处 `trigger_keys` 的出厂值住在 L2 且每次 load 都折算进 key_actions，
+    // 而设置页只写 key_actions ⇒ 用户删掉某个出厂绑定后，下次加载又被折算灌回去，
+    // 且备份/还原都带不走「我删过它」。物化之后 key_actions 是唯一真相源。
+    //
+    // 排在 prune 之后：物化是终态写入，应基于已清理干净的用户层。两道安全闸
+    // （漫游未挂载 / data/config.toml 缺席）都退化为「什么都不做」，见函数文档。
+    if let Err(e) = wind_config::Config::materialize_key_actions() {
+        warn!("Materialize key_actions failed: {e}");
+    }
+
     // 3. 创建 DeferredHandler（启动时返回安全默认值）
     let deferred = DeferredHandler::new();
 
