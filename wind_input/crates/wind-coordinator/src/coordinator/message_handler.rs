@@ -887,23 +887,32 @@ impl MessageHandler for Coordinator {
         // `select_char_keys` 为空 → select_char_index 恒 None → 跳过（零回归）。仅在缓冲非空或
         // 有候选时拦截；空缓冲且无候选时放行，让 `,`/`.` 作普通标点（对齐 Go 空缓冲回退标点）。
         //
-        // ★★ 这是标点键的**第三条**通路，且它在标点臂**之前**就 return——空码时
-        // `handle_select_char` 拿不到字源、退到 `keys.overflow.select_char_key`（出厂 `ignore`
-        // ＝吞键并**保留**编码），`input.punct_on_empty_behavior` 根本够不着。症状是「开了以词
-        // 定字之后，空码丢废码只在没配成以词定字的那几个标点上生效」——出厂 `select_char_keys`
-        // 为空所以默认不暴露，正因如此更不容易被发现。
+        // ★★ 这是标点键的**第三条**通路，且它在标点臂**之前**就 return。
+        //
+        // 拦截条件是 `!candidates.is_empty()`，即**以词定字自己的适用条件**：它要从「当前高亮
+        // 候选词」里取第 N 个字，没有候选就没有字源，这个键此刻压根不该算以词定字键。不符合
+        // 条件就整个交给下一环（最终落到标点臂），由 `input.punct_on_empty_behavior` 全权处置
+        // ——三档各自表现由那个开关决定，与本处无关。
+        //
+        // ⛔ **不要把标点策略的取值写进这个条件**（曾经写过 `policy == Commit`）：那是拿下一环
+        // 的配置当本环的判据，两个本该正交的东西被耦合起来。后果是 `commit` 档漏网——空码按
+        // `.` 仍被 `keys.overflow.select_char_key`（出厂 `ignore` ＝吞键并**保留**编码）吞掉，而
+        // 同样配置下没开以词定字的用户得到的是「废码 + 标点一起上屏」。**同一个键、同一个状态，
+        // 行为取决于一个看上去无关的功能开没开**，且症状是「只有 `,` `.` 这两个键不对」，很难
+        // 联想到以词定字。出厂 `select_char_keys` 为空所以默认不暴露，正因如此更难发现。
+        //
+        // 于是 `keys.overflow.select_char_key` 专管**真正的越界**：候选词字数不够（打了 `,` 要
+        // 第 1 字、高亮却是空词组）、联想态无 `input_buffer`。空码不是「以词定字越界」。
         //
         // 修法是**放行**而不是在 overflow 那边复制一份判据：放行后这几个键落回标点臂，与其余
-        // 标点走同一段代码，日后标点臂再改也不会漏掉它们。空码 + `commit` 仍按原路拦截（那一
-        // 态本就是「上屏编码」，与 overflow 的 commit 语义不冲突），零回归。
+        // 标点走同一段代码，日后标点臂再改也不会漏掉它们。
         //
         // 放行安全的依据（改这一段前请重新核一遍）：本行到标点臂之间还有三道拦截，空码下
         // 都够不着——`apply_session_action` 只在**有候选**时生效；`numpad_char` 不认这几个
         // 键；`try_z_fallback` 要求缓冲以 z 开头且破活码前缀。
         if data.modifiers & MOD_SHIFT == 0
-            && (!state.input_buffer.is_empty() || !state.candidates.is_empty())
+            && !state.candidates.is_empty()
             && let Some(char_index) = self.select_char_index(data.key_code)
-            && self.punct_empty_code_policy(&state) == PunctEmptyCodePolicy::Commit
         {
             return self.handle_select_char_with_overflow(
                 &mut state,

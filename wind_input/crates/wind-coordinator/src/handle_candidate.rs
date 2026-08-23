@@ -2586,9 +2586,16 @@ impl Coordinator {
     }
 
     /// 以词定字的完整流程，含 overflow 策略（对齐 Go handleSelectCharWithOverflow）。
-    /// 仅在缓冲非空或有候选时调用（空缓冲且无候选的 `,`/`.` 应作普通标点，由调用方放行）。
-    /// 先尝试正常以词定字；失败（词长不足/空码）则按 `input.overflow.select_char_key` 处理，
-    /// 三策与 select_key overflow 同构：ignore 吞键 / commit 上屏高亮 / commit_and_input 追加字符。
+    ///
+    /// **仅在有候选时调用**：无候选（空缓冲、或打了码但一个候选都没有的「空码」）时这几个键
+    /// 回归标点身份，由调用方放行到标点臂、交 `input.punct_on_empty_behavior` 处置。
+    ///
+    /// 先尝试正常以词定字；失败则按 `keys.overflow.select_char_key` 处理，三策与 select_key
+    /// overflow 同构：ignore 吞键 / commit 上屏高亮 / commit_and_input 追加字符。
+    ///
+    /// ⚠️ 「失败」现在只剩**真正的越界**：候选词字数不足、联想态无 `input_buffer`、高亮下标
+    /// 越界。**空码不再走到这里**——它不是「以词定字越界」，而是「此刻这个键不该算以词定字
+    /// 键」。曾经把空码也算进 overflow，后果是 `punct_on_empty_behavior` 对这几个键整个失效。
     pub(crate) fn handle_select_char_with_overflow(
         &self,
         state: &mut State,

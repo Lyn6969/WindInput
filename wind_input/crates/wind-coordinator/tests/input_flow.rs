@@ -9169,33 +9169,42 @@ fn test_punct_on_empty_clear_no_input_does_not_affect_nonempty_candidates() {
 
 /// ★★ 第三条通路：以词定字（`select_char_keys`）会在标点臂**之前**劫走这几个键。
 ///
-/// 空码时 `handle_select_char` 拿不到字源，退到 `keys.overflow.select_char_key`（出厂
-/// `ignore` ＝吞键并**保留**编码），`punct_on_empty_behavior` 根本够不着。修法是空码且本
-/// 开关非 `commit` 时放行到标点臂。
+/// 空码时 `handle_select_char` 拿不到字源，若仍被拦截就会退到 `keys.overflow.select_char_key`
+/// （出厂 `ignore` ＝吞键并**保留**编码），`punct_on_empty_behavior` 整个够不着。修法是空码时
+/// 一律放行——那不是「以词定字越界」，而是「此刻这个键不该算以词定字键」。
 ///
-/// 断言取 `clear`（而非 `clear_no_input`）：`ignore` 与 `clear_no_input` 都不产出字符，拿
-/// 后者断言的话，修不修都是 `Consumed`/`ClearComposition` 二选一，区分度太低；`clear` 会
-/// 实实在在出一个句号，漏修必红。
+/// ★★★ **三档必须一起断言**。曾经只放行了非 `commit` 两档（拿标点策略的取值当以词定字的
+/// 判据），`commit` 档漏网：开了以词定字得到 `Consumed`（吞键、废码留着），没开得到
+/// `bbqq。`。只测 `clear` 的话那个漏洞完全照不到——**这条测试当初就是这么漏过去的**。
+///
+/// 每档的期望值都取「没开以词定字时该键本来的行为」，即本族其余测试已经钉死的那个结果：
+/// 放行是否正确，判据就是「开不开以词定字，结果一模一样」。
 #[test]
 fn test_punct_on_empty_reaches_select_char_keys() {
     if !has_schemas() {
         return;
     }
-    let mut cfg = config_punct_on_empty_value("clear");
-    cfg.keys.select_char_keys = vec!["comma_period".into()];
-    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
-    type_empty_code(&coord);
-    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText { text, .. } => {
-            assert_eq!(
-                text, "。",
-                "开了以词定字后，空码丢废码仍须生效——这几个键被 select_char 提前劫走了"
-            );
+    for (tier, expect) in [
+        // commit：废码 + 标点一起上屏（与 test_punct_on_empty_commit_still_outputs_raw_code 同）
+        ("commit", Some("bbqq。")),
+        // clear：丢废码，只出标点（与 test_punct_on_empty_clear_discards_raw_code 同）
+        ("clear", Some("。")),
+        // clear_no_input：什么都不出，收组合（与 test_punct_on_empty_clear_no_input_swallows_punct 同）
+        ("clear_no_input", None),
+    ] {
+        let mut cfg = config_punct_on_empty_value(tier);
+        cfg.keys.select_char_keys = vec!["comma_period".into()];
+        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+        type_empty_code(&coord);
+        let act = coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN));
+        match (expect, &act) {
+            (Some(want), KeyAction::InsertText { text, .. }) => assert_eq!(
+                text, want,
+                "{tier} 档：开了以词定字后行为须与没开时一致，实际: {text:?}"
+            ),
+            (None, KeyAction::ClearComposition) => {}
+            _ => panic!("{tier} 档：空码 + 以词定字应放行到标点臂，期望 {expect:?}，实际: {act:?}"),
         }
-        other => panic!(
-            "空码 + 以词定字：应放行到标点臂并按 clear 处理，实际: {:?}",
-            other
-        ),
     }
 }
 
