@@ -1899,9 +1899,25 @@ BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint
     //    Consume (clear) to prevent stale values in apps where OnEndEdit fires late (e.g., WeChat)
     // 2. Fallback to digit pass-through tracking (for editors like EverEdit where TSF text access fails)
     uint16_t prevChar = (uint16_t)_pTextService->ConsumeCachedPrevChar();
-    // Digit pass-through fallback: only apply for period/comma keys (smart punct targets).
-    if (prevChar == 0 && _lastPassthroughDigit != 0 &&
-        (keyCode == VK_OEM_PERIOD || keyCode == VK_OEM_COMMA))
+    // 备用通路的消费判据：**任何标点键**都如实带上 prevChar，不在这里挑「哪些标点算数」。
+    //
+    // ★ 这里曾硬编码 `keyCode == VK_OEM_PERIOD || VK_OEM_COMMA`，等于把服务端的
+    // `input.punct.smart_list` 抄了一份到 DLL——而出厂默认就是 ".,:"，冒号从设计上就
+    // 拿不到备用值，且会落进下面的 else 把已记的数字**清零**（连带毁掉紧随其后的句号）。
+    // 用户自定义 `?` `!` 等更是全军覆没。同一语义判据写在两处，必然漂移。
+    //
+    // 分工边界：DLL 只上报**事实**（光标前一个字符是什么），服务端 wind-punct 的
+    // `is_smart_punct_after_digit` 持有全部**策略**（smart_after_digit 总开关 +
+    // smart_list 成员判定 + 0x30..=0x39 数字判定）。多报一个标点键的 prevChar 不会
+    // 有副作用：不在 smart_list 里的标点，服务端自己会判 false。
+    // （对称的另一半——「哪些键**产出数字**」——只能留在本文件，见头文件
+    //  _DigitCharFromVk 注释：那些键透传出去了，服务端根本看不到。）
+    //
+    // 用 ClassifyInputKey 而非 IsPunctuationKey：前者额外覆盖 Shift+主键盘数字
+    // （`!` `@` `#`…，见 HotkeyManager.cpp 的 Number 分支），后者只列 11 个 OEM 键。
+    const BOOL isPunctKey =
+        (CHotkeyManager::ClassifyInputKey(keyCode, modifiers) == HotkeyType::Punctuation);
+    if (prevChar == 0 && _lastPassthroughDigit != 0 && isPunctKey)
     {
         prevChar = (uint16_t)_lastPassthroughDigit;
         _lastPassthroughDigit = 0;  // 已消费，清除以避免后续标点误判
@@ -1911,12 +1927,11 @@ BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint
         WIND_LOG_DEBUG_FMT(L"smart_punct_digit_fallback: prevChar from passthrough digit, vk=0x%02X\n",
                            keyCode);
     }
-    // Clear stale digit passthrough when any non-smart-punct key is sent to Go.
+    // Clear stale digit passthrough when any non-punctuation key is sent to the service.
     // Without this, _lastPassthroughDigit persists through eaten keys (composition,
     // candidate selection, etc.), causing e.g. "58的。" to incorrectly use digit
     // fallback and output "." instead of "。" in non-TSF apps.
-    else if (_lastPassthroughDigit != 0 &&
-             keyCode != VK_OEM_PERIOD && keyCode != VK_OEM_COMMA)
+    else if (_lastPassthroughDigit != 0 && !isPunctKey)
     {
         _lastPassthroughDigit = 0;
     }

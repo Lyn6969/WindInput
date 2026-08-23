@@ -61,12 +61,35 @@
 刻意不记：它提交后立刻又起了组合，光标前是组合内容而非 `response.text` 末位。全角数字
 （U+FF10-FF19）也刻意不记，服务端只认 ASCII `0x30`-`0x39`。
 
-**未修的同族缺口**：备用通路的消费判据仍硬编码 `keyCode == VK_OEM_PERIOD || VK_OEM_COMMA`
-（消费与清零两处）。用户把 `input.punct.smart_list` 配成含 `:` `?` `!` 等时，这些键在读不回
-文档的宿主里拿不到备用 `prevChar`，功能失效。要修得干净需要把 `smart_list` 像
-`CONFIG_KEY_CUSTOM_EN_PUNCT` 那样推送给 DLL，并在 DLL 侧做字符→VK 映射，属于新增配置通道，
-本次未做。注意小键盘小数点 `VK_DECIMAL` **不在此列**——它被归为 `Number`、中文模式下直接
+注意小键盘小数点 `VK_DECIMAL` **不在此列**——它被归为 `Number`、中文模式下直接
 透传出半角 `.`，压根不进引擎，结果本来就是对的。
+
+### 4b. 同族缺口：消费判据抄了一份 `smart_list`（出厂默认的冒号就失效）
+
+第 4 条当时留下一句「未修」：备用通路的**消费**判据硬编码
+`keyCode == VK_OEM_PERIOD || VK_OEM_COMMA`（消费与清零两处）。这不是「只差自定义符号」的
+小缺口——出厂默认 `input.punct.smart_list = ".,:"`（`data/config.toml`）**本来就带冒号**，
+所以读不回文档的宿主里，冒号从设计上就拿不到备用 `prevChar`，且会落进 `else` 分支把已记
+的数字**清零**，连带毁掉紧随其后的句号（`1:.` 两个都不生效）。
+
+当时判断「要修得干净需要把 `smart_list` 推给 DLL 并做字符→VK 映射，属于新增配置通道」。
+**这个判断是错的，方向反了。** 正确的分工不是让 DLL 也知道 `smart_list`，而是让 DLL
+**别再知道**它：
+
+- DLL 侧只上报**事实**——「光标前一个字符是什么」。消费判据放宽成「这一键是不是标点键」
+  （`ClassifyInputKey(...) == HotkeyType::Punctuation`，比 `IsPunctuationKey` 多覆盖
+  Shift+主键盘数字产出的 `!` `@` `?` 等）。
+- 服务端 `wind-punct::is_smart_punct_after_digit` 持有全部**策略**：`smart_after_digit`
+  总开关 + `smart_list` 成员判定 + `0x30..=0x39` 数字判定。多报一个不在 `smart_list` 里的
+  标点键的 `prevChar` 没有副作用，服务端自己判 false。
+
+零新增配置通道、零协议变更，改动只是删掉那份过时的策略快照（`VK_OEM_PERIOD || VK_OEM_COMMA`
+正是 `smart_list` 早期默认值 `".,"` 的快照，后来列表加了 `:` 而 DLL 那份没跟上）。
+
+**★ 判断一个条件该放边界哪一侧，问「这个信息另一侧看得见吗」**：「光标前是数字」只有 DLL
+看得见（数字键透传出去，根本不进 IPC），所以「哪些键**产出数字**」必须留在 DLL；而「这个
+符号参不参与智能标点」服务端自己就有配置，DLL 判就是抄——抄了就会漂移。同一条边界上的两个
+判据，方向可以是相反的。
 
 **验证锚点**：备用通路命中时打 `smart_punct_digit_fallback`（DEBUG）。主路径能读回时该行
 不出现——两条通路症状相同、成因不同，只有这条日志分得开。它同时是「新 DLL 是否真的编进/
