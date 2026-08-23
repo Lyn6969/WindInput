@@ -23,4 +23,6 @@ pub use config::{
 };
 pub use dir_var::{dir_var, dir_var_help, dir_var_names, dir_var_str, is_dir_var};
 pub use runtime_state::RuntimeState;
-pub use schema::{OverlaySpec, Schema};
+pub use schema::{
+    CandidateSpec, OverlaySpec, PhrasesSpec, PunctIntent, PunctSpec, Schema, SchemaBehavior,
+};

@@ -92,6 +92,27 @@ pub struct Schema {
     /// 见 `docs/redesign/overlay-mode-config.md`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlaySpec>,
+    /// **方案级标点态意图**（`[punct]` 段）。默认 `Follow` = 不干预。
+    ///
+    /// 与 [`Self::candidate`] 共用「代际感知覆盖」：方案意图是默认值，用户在本方案期间
+    /// 手动 `toggle_punct` 的值胜出，切走再切回后手动值随 `schema_generation` 失效。
+    /// 见 `docs/design/schema-scoped-behavior.md` §2、§4。
+    ///
+    /// ⛔ 本段刻意**只有 `mode`**：`custom_mappings` / `smart_after_digit` 那些是另一个
+    /// 量级（前者有严格的列序契约，方案级覆盖要先回答「整表替换还是逐键合并」）。
+    /// 段名留成 `punct` 就是为了以后能加，但不要顺手塞进来。
+    #[serde(default)]
+    pub punct: PunctSpec,
+    /// **方案级候选呈现**（`[candidate]` 段）。默认 `Follow` = 跟随下一层。
+    ///
+    /// ⚠️ 与 [`OverlaySpec::candidate_layout`] **两段并存、语义不同，不要合并**：
+    /// 那份是「本方案被叠加激活期间」的布局（有进入/退出生命周期），本段是「本方案作为
+    /// 常驻 active 方案期间」的布局。一个方案可以两段都写，取值互不干扰。
+    #[serde(default)]
+    pub candidate: CandidateSpec,
+    /// **方案级短语加载**（`[phrases]` 段）。默认全开。
+    #[serde(default)]
+    pub phrases: PhrasesSpec,
 }
 
 /// overlay 激活面配置（`[overlay]`）。
@@ -508,6 +529,113 @@ impl DictSpec {
 /// **例外：`dictionaries`** 走 [`merge_dict_overrides`] 的按 id 稀疏合并——词库的
 /// path/label/base_order 等结构定义必须始终以方案文件为准，override 层只表达用户开关。
 ///
+/// 方案级标点态意图（`[punct]` 段）。
+///
+/// 取值词汇刻意与 [`crate::config::LayoutIntent`] 同构（`Follow` 打头且是 default）：
+/// 让「方案级」与「全局」在用户眼里是同一件事的两个层级，而不是两套发明出来的词。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PunctSpec {
+    #[serde(default)]
+    pub mode: PunctIntent,
+}
+
+/// 标点态三态。`Follow` = 本方案不干预，沿用用户当前状态 / 全局配置。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PunctIntent {
+    #[default]
+    Follow,
+    Chinese,
+    English,
+}
+
+impl PunctIntent {
+    /// 折成布尔目标态；`Follow` → `None`（不干预）。
+    ///
+    /// 与 `LayoutIntent` 的 `Follow` 一样表示「跟随下一层」，故返回 `Option` 而不是
+    /// 默认值——调用方据此决定「要不要写」，而不是「写什么」。
+    pub fn resolve(self) -> Option<bool> {
+        match self {
+            Self::Follow => None,
+            Self::Chinese => Some(true),
+            Self::English => Some(false),
+        }
+    }
+}
+
+/// 方案级候选呈现（`[candidate]` 段）。
+///
+/// 字段叫 `layout` 而不是 `candidate_layout`：段名已含 `candidate`，再写就是
+/// `candidate.candidate_layout`（违反 `config-design-rules` §R3 的路径冗余）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateSpec {
+    #[serde(default)]
+    pub layout: crate::config::LayoutIntent,
+}
+
+/// 方案级短语加载（`[phrases]` 段）。
+///
+/// ## ★ 这里刻意**没有**三态
+///
+/// 设计稿曾把 `categories` 写成 `Option<Vec<String>>`，用「键缺失 = 全部 / 空数组 =
+/// 一条都不要」表达三态。作废理由：**「一条都不要」已经由 `enabled = false` 表达**，
+/// `enabled = true` + `categories = []` 是一个语义重复的状态。既然重复，就不必区分
+/// 缺失与空 ⇒ 两个字段都用朴素 `Vec`，语义完全对称：**空 = 不施加这一项限制**。
+///
+/// 判据可复用：**给一族过滤器加维度前，先问「这个三态里有没有一态已经被别的字段表达了」**。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhrasesSpec {
+    /// 本方案是否加载短语。`false` ⇒ 短语层对本方案整体关闭（六个消费点全部短路）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 分类白名单。**空 = 不施加这一项限制**（全部分类），不是「一条都不要」。
+    ///
+    /// 空串 `""` 匹配未分类短语（store 里 `category` 的默认值就是空串，不引入映射名）。
+    /// ⚠️ 分类 UI 落地之前所有存量短语都是未分类，此时任何非空白名单都会把短语全部滤掉。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    /// 分类黑名单。空 = 不排除；在 [`Self::categories`] 之后再减。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_categories: Vec<String>,
+}
+
+impl Default for PhrasesSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            categories: Vec::new(),
+            exclude_categories: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 方案级行为覆盖三段的合订快照（`EngineManager::active_behavior` 的返回体）。
+///
+/// 三段合成一个缓存条目而不是各存各的：它们同源（一次 `read_schema`）、同批失效，
+/// 分三个缓存等于同一个方案读三次盘、加三个失效点——`key_actions` / `session_actions`
+/// 那两个缓存已经因为「同批失效要接两处」在注释里互相提醒过一次。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaBehavior {
+    pub punct: PunctIntent,
+    pub candidate_layout: crate::config::LayoutIntent,
+    pub phrases: PhrasesSpec,
+}
+
+impl Schema {
+    /// 抽出方案级行为覆盖三段。
+    pub fn behavior(&self) -> SchemaBehavior {
+        SchemaBehavior {
+            punct: self.punct.mode,
+            candidate_layout: self.candidate.layout,
+            phrases: self.phrases.clone(),
+        }
+    }
+}
+
 /// 这是 `schema_overrides/{id}.toml` 折叠到方案文件之上的**唯一**合并实现：
 /// 引擎加载（wind-engine `read_schema`）与方案包导出（wind-transfer）共用，
 /// 两边对「定制后的方案长什么样」必须同源，否则导出的包与实际打字行为不一致。

@@ -278,6 +278,15 @@ pub struct EngineManager {
     /// 与 [`Self::key_actions_cache`] 同构、**同批失效**：两个失效点（`invalidate_schema`
     /// 按 id 移除、配置热重载整表清空）都要接，漏一处的表现是「设置页改了不生效」。
     session_actions_cache: Mutex<HashMap<String, Arc<std::collections::BTreeMap<String, String>>>>,
+    /// 方案级行为覆盖缓存（schema_id → `[punct]` / `[candidate]` / `[phrases]` 三段快照）。
+    ///
+    /// 三段合成**一个**缓存条目而不是各存各的：它们同源（一次 `read_schema`）、同批失效。
+    /// 分三个缓存等于同一个方案读三次盘、加三个失效点——上面两个表已经因为「同批失效
+    /// 要接两处」在注释里互相提醒过一次，不要把这个数量再翻倍。
+    ///
+    /// 与 [`Self::key_actions_cache`] 同批失效：`invalidate_schema` 按 id 移除、
+    /// 配置热重载整表清空，两处都要接。
+    behavior_cache: Mutex<HashMap<String, Arc<wind_config::SchemaBehavior>>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
     /// overlay 方案注册表缓存（见 [`Self::overlay_modes`]）。
@@ -460,6 +469,7 @@ impl EngineManager {
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             session_actions_cache: Mutex::new(HashMap::new()),
+            behavior_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             overlay_cache: Mutex::new(None),
             override_dir,
@@ -1604,6 +1614,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        self.behavior_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
         self.name_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1726,6 +1740,10 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.session_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.behavior_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -2002,6 +2020,51 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, Arc::clone(&table));
         table
+    }
+
+    /// 当前方案的**行为覆盖三段**（`[punct]` / `[candidate]` / `[phrases]`，方案文件内联 +
+    /// `schema_overrides` 已合并）。
+    ///
+    /// 与 [`Self::active_key_actions`] 的取表规则逐条相同：
+    /// - **混输方案不下钻 `primary_schema`**——这三段都是「用户在这个方案里想要什么」，
+    ///   属于方案自身的交互属性，不像码表行为那样是「这张码表怎么工作」。混输方案想配
+    ///   就在自己文件里配；
+    /// - 读不到方案（文件缺失 / 解析失败）时返回 default = 一段都不覆盖；
+    /// - 返回 `Arc`：`[phrases]` 含两个 `Vec<String>`，而消费点在候选构建热路径上。
+    ///
+    /// 见 `docs/design/schema-scoped-behavior.md` §6.5。
+    pub fn active_behavior(&self) -> Arc<wind_config::SchemaBehavior> {
+        self.behavior_for(&self.active_schema_id())
+    }
+
+    /// 指定方案的行为覆盖三段。
+    ///
+    /// 独立于 [`Self::active_behavior`] 暴露，是因为短语作用域的归属方案**不一定是
+    /// active**——临时英文归 `english` 桶而主方案常是五笔/混输（见
+    /// `effective_data_schema`）。按 active 取值会给临英套上主方案的短语开关。
+    pub fn behavior_for(&self, schema_id: &str) -> Arc<wind_config::SchemaBehavior> {
+        if let Some(cached) = self
+            .behavior_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+        {
+            return Arc::clone(cached);
+        }
+        let spec = Arc::new(
+            Self::read_schema(
+                schema_id,
+                self.data_dir.as_deref(),
+                self.override_dir.as_deref(),
+            )
+            .map(|s| s.behavior())
+            .unwrap_or_default(),
+        );
+        self.behavior_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(schema_id.to_string(), Arc::clone(&spec));
+        spec
     }
 
     /// **所有**可用方案的 `[key_actions]` 里出现过的键名（并集，去重）。
@@ -4622,6 +4685,102 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// 方案级 `[punct]` / `[candidate]` / `[phrases]`：内联 + override 合并，三段同批失效。
+    ///
+    /// 与 `active_key_actions_merges_schema_file_and_override_per_key` 同形，
+    /// 但这里额外钉住**三段共用一个缓存条目**时的失效正确性：override 只改一段，
+    /// 另两段不能被顺手清成默认值（三段合订的实现方式若写成「读一段存一段」就会）。
+    #[test]
+    fn active_behavior_merges_schema_file_and_override() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_beh_data");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        let mut f = std::fs::File::create(schemas.join("beh.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]
+id = \"beh\"
+[engine]
+type = \"codetable\"
+             [punct]
+mode = \"english\"
+             [candidate]
+layout = \"vertical\"
+             [phrases]
+enabled = false
+"
+        )
+        .unwrap();
+        drop(f);
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_beh_overrides");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "beh".to_string();
+        cfg.schema.available = vec!["beh".to_string()];
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
+
+        let inline = mgr.active_behavior();
+        assert_eq!(inline.punct, wind_config::PunctIntent::English);
+        assert_eq!(inline.candidate_layout, wind_config::LayoutIntent::Vertical);
+        assert!(!inline.phrases.enabled);
+
+        // 用户 override：只改布局，不提另外两段。
+        let ov: toml::Value = toml::from_str(
+            "[candidate]
+layout = \"horizontal\"
+",
+        )
+        .unwrap();
+        mgr.write_schema_override("beh", &ov).unwrap();
+
+        let merged = mgr.active_behavior();
+        assert_eq!(
+            merged.candidate_layout,
+            wind_config::LayoutIntent::Horizontal,
+            "override 覆盖同段"
+        );
+        assert_eq!(
+            merged.punct,
+            wind_config::PunctIntent::English,
+            "override 未提及的段必须保留——三段合订若写成「读一段存一段」这里会回落 Follow"
+        );
+        assert!(!merged.phrases.enabled, "override 未提及的段必须保留");
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// 读不到方案（文件缺失）时三段全部回落默认值 = 一段都不覆盖。
+    ///
+    /// 这条不是凑数：默认值若不是「不覆盖」，一个装歪的方案包就会静默改掉用户的标点态
+    /// 与候选方向，而用户找不到是谁改的。
+    #[test]
+    fn active_behavior_defaults_to_no_override_when_schema_missing() {
+        let mut cfg = Config::default();
+        cfg.schema.active = "nonexistent_schema".to_string();
+        let dir = std::env::temp_dir().join("wind_eng_beh_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("schemas")).unwrap();
+        let mgr = EngineManager::with_store_override(&cfg, Some(&dir), None, Some(dir.clone()));
+
+        let b = mgr.active_behavior();
+        assert_eq!(b.punct, wind_config::PunctIntent::Follow);
+        assert_eq!(b.candidate_layout, wind_config::LayoutIntent::Follow);
+        assert!(
+            b.phrases.enabled,
+            "短语默认加载——默认关会让所有方案静默失去短语"
+        );
+        assert!(b.phrases.categories.is_empty());
+        assert!(b.phrases.exclude_categories.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `schema_code_char_set` 必须与引擎构建同规则：`leading_chars` 为空时等于全集。
