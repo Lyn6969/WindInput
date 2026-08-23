@@ -197,15 +197,28 @@ impl Coordinator {
         if let Some(seq) = flushed {
             // 与 `terminate_auto_phrase` 的「终止信号」日志对齐：本路径同样会造词，
             // 缺了它排查时会看到「凭空出现的已造词」，误以为触发源丢了。
-            debug!(
-                "auto-phrase: 终止信号 {} → flush {} 字",
-                if all_han {
-                    "多字词上屏"
-                } else {
-                    "非汉字上屏"
-                },
-                seq.len()
-            );
+            //
+            // ⚠️ **三条来源必须分开写**。`flushed` 为 `Some` 有两个出处：多字词终止
+            // （`AutoPhraseBuf::on_commit` 的 `!is_single`）与**单字 idle 超时**（`stale`），
+            // 两者 `all_han` 同为 true。原先只按 `all_han` 二分，于是超时被一律打成
+            // 「多字词上屏」——真机日志里一条单字上屏的记录长得和词组上屏一模一样。
+            // 这不是措辞瑕疵而是**会把排查带向相反结论**：`aqgy` 那次事故里，按 Y 上屏的
+            // 是单字「葡」，日志却说「多字词上屏」，照字面读会得出「第 4 码上屏了词组」。
+            //
+            // 判据无需回改 `on_commit` 签名：`all_han` 且 `text` 为单字时，能走到这里就
+            // 只可能是 stale 分支（单字未超时恒返回 `None`，压根进不来）。
+            if !all_han {
+                debug!("auto-phrase: 终止信号 非汉字上屏 → flush {} 字", seq.len());
+            } else if text.chars().count() > 1 {
+                debug!("auto-phrase: 终止信号 多字词上屏 → flush {} 字", seq.len());
+            } else {
+                // 语义与上面两条**不同**：序列不是被终止，而是超时截断后本字另起一段。
+                debug!(
+                    "auto-phrase: 空闲超时（间隔 > {:?}）→ flush {} 字，本字另起新序列",
+                    idle,
+                    seq.len()
+                );
+            }
             self.flush_auto_phrase(&seq);
         }
     }
