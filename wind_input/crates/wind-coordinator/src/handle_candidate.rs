@@ -2670,10 +2670,28 @@ impl Coordinator {
         }
     }
 
-    /// $CC 命令候选选中：清理组合区、隐藏 UI，把命令源放独立线程异步执行。
-    /// **异步是必须的**：控制器经 Weak 回调 handle_menu_command 等自锁方法，而此刻本线程
-    /// 仍持 state 锁（std::sync::Mutex 非可重入），同线程重入即死锁——交独立线程待本次按键
-    /// 处理释放锁后再跑（对齐 Go「不在 SearchCommand 持锁路径里再 Lock」的约束）。
+    /// $CC 命令候选选中：**纯文本命令走同步上屏**，含副作用命令清理组合区 + 独立线程异步执行。
+    ///
+    /// # 纯文本命令必须与普通短语同路
+    ///
+    /// 动作链全为 `type()` 的命令（≈带模板的词条）没有任何需要回调 coordinator 的副作用，
+    /// 求值只读快照 —— 于是它可以、也**必须**走与普通短语完全相同的同步上屏：
+    /// `commit_candidate` + 返回 `InsertText`，由 TSF 在**本次按键的组合区仍活跃时**
+    /// 经 `SetText + EndComposition` 提交。
+    ///
+    /// 走异步会实质改变上屏语义，而不只是慢一点：`spawn_command_action` 先返回
+    /// `ClearComposition` 结束 composition，命令线程稍后再推一个裸 `CMD_COMMIT_TEXT`，
+    /// 此刻宿主侧**已无 composition**，TSF 只能退到 `InsertTextAtSelection` 裸插入。
+    /// 两条分支对宿主的含义不同：composition 提交被 Word/WPS 当作「输入法上屏」处理，
+    /// 文本里的 `\n` 规范化成段落标记；裸插入是纯字符流，`\n` 原样落进段落内部。
+    /// 真机现场：同一首带换行的诗，做成普通短语词条正常分段，封进 `$CC` 的 `type()`
+    /// 就挤成一行 —— 文本内容与调用参数完全一致，差别只在「组合区还在不在」。
+    ///
+    /// # 含副作用命令：异步仍是必须的
+    ///
+    /// 控制器经 Weak 回调 handle_menu_command 等自锁方法，而此刻本线程仍持 state 锁
+    /// （std::sync::Mutex 非可重入），同线程重入即死锁——交独立线程待本次按键处理释放锁
+    /// 后再跑（对齐 Go「不在 SearchCommand 持锁路径里再 Lock」的约束）。
     pub(crate) fn commit_command(&self, state: &mut State, cand: &Candidate) -> KeyAction {
         // 命令 nav（从前缀列举选中）携完整码 group_code，用它作执行输入上下文
         // （让 code()/input() 等按完整码求值）；精确码命令 group_code 空 → 用当前缓冲。
@@ -2682,8 +2700,35 @@ impl Coordinator {
         } else {
             cand.group_code.clone()
         };
+        // 纯文本命令 → 同步上屏（与顶码 / 自动上屏的 `command_auto_outcome` 同一判据）。
+        // 求值出空文本时**不**走这里：那是「选中了却没内容」，交异步路径正常清组合收尾。
+        if let Some(text) = self.eval_command_text_only(&cand.phrase_template, &input)
+            && !text.is_empty()
+        {
+            let chinese_mode = state.chinese_mode;
+            // 记账码传 `input`、来源如实传 `cand.source`（短语）——与 `commit_top_text` 的
+            // 命令顶码分支同构：`record_selection` 据来源拦掉短语，求值文本不进 FREQ 表。
+            let out = self.commit_candidate(state, &text, None, cand.source, &input);
+            self.notify_ui_hide();
+            return Self::commit_action(out, chinese_mode);
+        }
         self.reset_pinyin_composition(state);
         self.spawn_command_action(cand, input)
+    }
+
+    /// 该候选是否为**纯文本 `$CC` 命令**——动作链全 `type()`、无副作用、且求值文本非空。
+    ///
+    /// 键盘路径不需要它（[`Self::commit_command`] 内部直接按求值结果分流，只求值一次）；
+    /// 鼠标路径必须先于分支判断问一次，因为「进不进命令特判分支」这个决定要在求值之前做出。
+    /// 两处判据同源于此，避免鼠标与键盘对同一条命令给出不同的上屏语义。
+    ///
+    /// 求值本身只读快照（见 [`Coordinator::eval_command_text_only`] 的锁说明），
+    /// 可在持 state 锁时调用。
+    fn command_commits_text(&self, cand: &Candidate, input: &str) -> bool {
+        cand.is_command
+            && self
+                .eval_command_text_only(&cand.phrase_template, input)
+                .is_some_and(|t| !t.is_empty())
     }
 
     /// `$CC` 命令执行核心：隐藏 UI + 把命令源放独立线程异步执行，返回 `ClearComposition`。
@@ -3296,8 +3341,24 @@ impl Coordinator {
         // 移动端不翻页（滚动条不动 `current_page`），页首恒为 0，于是如实记成绝对位次
         // ——「用户选了第 37 个」正是首选率统计要回答的问题。
         let page_local = idx.saturating_sub(self.page_range(&state).0);
+        // 主输入路（含辅助码）的判据，下方两处共用。
+        let main_path = state.active.is_none() || state.active == Some(ModeKind::AuxCode);
+        // **纯文本命令走下方 `commit_selected`**，不进本分支：其 `is_command` 守卫经
+        // `commit_command` 同步上屏产出 `InsertText`，由 `push_mouse_action` 编成
+        // `CMD_COMMIT_TEXT`，宿主侧仍是「组合区活跃时提交」。走本分支则先 ClearComposition
+        // 再裸插入，换行等语义随之改变（原委见 [`Self::commit_command`]）。
+        // overlay 路径不在此列：它有各自的退出闭包，仍按 `overlay_commit_command` 语义异步执行。
+        let cmd_commits_text = main_path
+            && self.command_commits_text(&state.candidates[idx], {
+                let gc = &state.candidates[idx].group_code;
+                if gc.is_empty() {
+                    &state.input_buffer
+                } else {
+                    gc
+                }
+            });
         // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。
-        if state.candidates[idx].is_command {
+        if state.candidates[idx].is_command && !cmd_commits_text {
             let src = state.candidates[idx].phrase_template.clone();
             // 命令 nav 携完整码 group_code 作执行输入；精确码命令用当前缓冲。
             let gc = state.candidates[idx].group_code.clone();
@@ -3331,7 +3392,7 @@ impl Coordinator {
         // `commit_selected` 才有分步转换——走下面的 overlay 分支会 `commit_candidate`
         // 直接清空 `input_buffer`，于是「没时间」这类分步组句在鼠标点「没」时把剩余
         // 拼音一并丢掉，而键盘选同一个候选却能继续组句。同一候选两种入口两种结果。
-        if state.active.is_none() || state.active == Some(ModeKind::AuxCode) {
+        if main_path {
             let cand = state.candidates[idx].clone();
             let chinese_mode = state.chinese_mode;
             // 鼠标页内位置 = page_local（候选首选率统计，与数字键的 num-1 同义）。
