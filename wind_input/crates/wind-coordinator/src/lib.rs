@@ -43,6 +43,7 @@ pub mod layout;
 pub mod pipeline;
 pub(crate) mod preedit_cursor;
 mod quick_eval;
+pub(crate) mod schema_scope;
 pub(crate) mod short_code_yield;
 pub mod stats;
 pub mod theme_query;

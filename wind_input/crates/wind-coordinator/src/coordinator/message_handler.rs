@@ -137,6 +137,9 @@ impl MessageHandler for Coordinator {
                 self.show_status();
                 Some(self.build_status())
             }
+            // 用户手动切标点：不需要额外记「手动值」——schema_scope_gen 守卫本身就实现了
+            // 「本代际内手动值胜出」（代际未变时 sync_schema_scope 直接返回，不会来覆盖）。
+            // 见 crate::schema_scope 模块文档最后一节。
             "toggle_punct" => {
                 let effective_chinese = {
                     let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -447,6 +450,12 @@ impl MessageHandler for Coordinator {
         // 顶层 record_input_stats 仅在未置位时兜底（对齐 Go handle_key_event 开头 reset）。
         self.stat_recorded
             .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 方案级行为覆盖的**兜底**同步点：代际未变时是一次 atomic load + 比较，可忽略。
+        // 它保证「切方案后 [punct] 没落地」最迟在下一次按键收敛——其余三个调用点
+        // （push_state_update / show_status / apply_ui_config）只是让它当场可见。
+        // 见 crate::schema_scope 模块文档。
+        self.sync_schema_scope_locked();
 
         // ── 小键盘归一化（numpad_behavior = follow_main）──
         // 「同主键盘区数字」的语义 = 小键盘键就是主键盘键，故在此改写键码后交由既有主键盘

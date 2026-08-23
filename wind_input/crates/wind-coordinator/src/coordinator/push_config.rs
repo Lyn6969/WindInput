@@ -354,6 +354,8 @@ impl Coordinator {
     }
 
     pub(crate) fn push_state_update(&self) {
+        // 推的是标点态等状态位，先让方案级覆盖落地，否则切方案后工具栏要等下一次按键才更新。
+        self.sync_schema_scope_locked();
         // 图标位图与状态推送同源同时机，且**发布必须先于推送**——顺序的理由与保证方式
         // 见 status_with_icon_published。
         let s = self.status_with_icon_published();

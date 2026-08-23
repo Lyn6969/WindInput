@@ -352,6 +352,18 @@ pub(crate) struct State {
     pub(crate) chinese_mode: bool,
     pub(crate) full_width: bool,
     pub(crate) chinese_punct: bool,
+    /// 方案级行为覆盖已落地到的**活跃方案代际**（`EngineManager::schema_generation`）。
+    ///
+    /// 见 `docs/design/schema-scoped-behavior.md` §4。初值是哨兵 `u64::MAX`，保证首次
+    /// `sync_schema_scope` 必然执行一次——用 0 的话它恰好等于代际初值，启动时方案声明的
+    /// `[punct]` 就永远落不下去（且完全静默）。
+    pub(crate) schema_scope_gen: u64,
+    /// 候选布局的**本代际手动覆盖**（`Some(true)` = 用户在本方案期间手动切成了竖排）。
+    ///
+    /// 只在方案声明了非 `Follow` 的 `[candidate] layout` 时才会被写入——方案没意见时
+    /// 命令栏切换照旧改全局基线并写盘（那才是用户要的「全局改方向」）。
+    /// 随 `schema_scope_gen` 变化清空：切走再切回，回到方案意图。
+    pub(crate) layout_manual: Option<bool>,
     /// 简繁转换开关（运行时切换；commit 时把简体输出转繁体）
     pub(crate) s2t_enabled: bool,
     /// 检索范围过滤模式（smart/general/gb18030；运行时切换）
@@ -1642,6 +1654,9 @@ impl Coordinator {
                 chinese_mode: init_chinese,
                 full_width: init_full,
                 chinese_punct: init_punct,
+                // 哨兵：与任何真实代际都不相等，保证首次 sync_schema_scope 必执行。
+                schema_scope_gen: u64::MAX,
+                layout_manual: None,
                 s2t_enabled: config.input.s2t.enabled,
                 filter_mode: wind_candidate::FilterMode::from_config(&config.input.filter_mode),
                 scope_relaxed: false,
@@ -3003,7 +3018,9 @@ impl Coordinator {
         {
             // 调用点（启动 / 配置重载）均不持 state 锁；加锁顺序 state → candidate_layout_sent
             // 与 notify_ui_update 一致，不构成环。
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // 热重载可能换了活跃方案（设置页改 schema.active 即走这里），先同步方案级覆盖。
+            self.sync_schema_scope(&mut state);
             self.sync_candidate_layout(&state);
         }
         // 编码显示方式（ui.candidate.preedit_display）
@@ -3863,6 +3880,32 @@ impl Coordinator {
     /// 切换候选布局方向（横排 ↔ 竖排），下发 UI 并持久化。命令栏 ime.toggle("layout")。
     /// 切换时 composition 已清（命令选中即 ClearComposition），下次输入按新方向渲染。
     fn cmd_toggle_layout(&self) {
+        // ── 方案声明了方向时：只翻本方案的手动覆盖，不动全局基线、不写盘 ──────────
+        //
+        // 判据是「用户此刻表达的是什么」：在一个 `[candidate] layout = "vertical"` 的方案里
+        // 按切换，他要的是「这个方案里我要横排」，不是「把全局默认改成横排」。后者的效果
+        // 要等切到别的方案才显形，用户完全无法把它和刚才那次按键联系起来。
+        //
+        // 手动值随 `schema_scope_gen` 失效：切走再切回，回到方案意图（见 crate::schema_scope）。
+        if self.schema_layout_intent() != wind_config::LayoutIntent::Follow {
+            let vertical = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                // 先收敛代际，否则刚切完方案就按切换会基于上个方案的手动值取反。
+                self.sync_schema_scope(&mut state);
+                // 翻转的基准是**当前实际生效值**，不是基线——基线在方案意图之下，
+                // 对它取反在强制竖排的方案里一次都不会改变用户看到的方向。
+                let want = !self.desired_vertical(&state);
+                state.layout_manual = Some(want);
+                self.sync_candidate_layout(&state);
+                want
+            };
+            self.show_tip(if vertical {
+                "候选:竖排"
+            } else {
+                "候选:横排"
+            });
+            return;
+        }
         let vertical = {
             let mut v = self
                 .candidate_vertical
@@ -4857,6 +4900,8 @@ impl Coordinator {
     /// 文本与上次显示的完全相同时**整个跳过**，不弹窗——用户通过 `ui.status.items`
     /// 关掉某段后，切换该状态不再改变气泡文本，弹一个和上次一模一样的气泡纯属噪声。
     pub(crate) fn show_status(&self) {
+        // 同 push_state_update：状态泡文案含标点态，先让方案级覆盖落地。
+        self.sync_schema_scope_locked();
         let text = self.status_indicator_text();
         {
             let last = self

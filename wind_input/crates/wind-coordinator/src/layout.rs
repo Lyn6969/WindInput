@@ -61,13 +61,33 @@ pub(crate) fn intent_for(
 
 /// 意图叠加到基线上得出实际方向（true = 竖排）。
 ///
-/// `Follow` 与 `Vertical` 只在 `baseline == true` 时才有区别——前者跟着基线变、后者恒定。
-/// 这正是三态相对旧布尔 `force_vertical` 的全部增量，测试必须覆盖这一格。
-pub(crate) fn vertical_for(intent: LayoutIntent, baseline: bool) -> bool {
-    match intent {
+/// 完整优先级链：**加词 > 独占模式 > 手动值 > 方案 > 全局基线**，
+/// 其中前两级已由 [`intent_for`] 折成 `mode` 这一个参数。
+///
+/// ★ `Follow` 的语义是**「跟随下一层」**，不是「跟随全局基线」——加了方案层之后这两者
+/// 不再等价。唯一能区分新旧实现的格子是「模式 `Follow` + 方案 `Vertical` + 基线横排」，
+/// 旧实现给横排、新实现给竖排，测试必须钉住它。
+///
+/// `manual` = 用户在本方案期间手动切换的方向（已判过代际，见 [`crate::schema_scope`]）。
+/// 它排在模式之下：模式（临英、快符、加词面板）是更内层的临时态，其布局意图是「这段时间
+/// 的候选长这样」，本就该压过用户对整个方案的偏好；且模式退出后手动值自动重新生效。
+pub(crate) fn vertical_for(
+    mode: LayoutIntent,
+    manual: Option<bool>,
+    schema: LayoutIntent,
+    baseline: bool,
+) -> bool {
+    match mode {
         LayoutIntent::Vertical => true,
         LayoutIntent::Horizontal => false,
-        LayoutIntent::Follow => baseline,
+        LayoutIntent::Follow => match manual {
+            Some(v) => v,
+            None => match schema {
+                LayoutIntent::Vertical => true,
+                LayoutIntent::Horizontal => false,
+                LayoutIntent::Follow => baseline,
+            },
+        },
     }
 }
 
@@ -94,7 +114,12 @@ impl Coordinator {
             .candidate_vertical
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        vertical_for(self.layout_intent(state), baseline)
+        vertical_for(
+            self.layout_intent(state),
+            state.layout_manual,
+            self.schema_layout_intent(),
+            baseline,
+        )
     }
 
     /// 当前期望的候选方向（测试/诊断用，对齐 `debug_in_temp_pinyin` 的既有形态）。
@@ -151,6 +176,14 @@ mod tests {
     }
 
     /// 造一份 `[overlay]` 段快照（= 特殊模式那一路的配置来源）。
+    /// 只考察「模式意图 + 全局基线」两层的简写：无手动值、方案无意见。
+    ///
+    /// 方案层与手动层是后加的（`docs/design/schema-scoped-behavior.md` §3），既有用例
+    /// 考察的是模式层语义，用它保持原样可读——**不要**让每个既有断言都去写两个 `None`。
+    fn v_only_mode(mode: LayoutIntent, baseline: bool) -> bool {
+        vertical_for(mode, None, LayoutIntent::Follow, baseline)
+    }
+
     fn overlay_with(intent: LayoutIntent) -> OverlaySpec {
         OverlaySpec {
             candidate_layout: intent,
@@ -183,7 +216,7 @@ mod tests {
             ] {
                 let cfg = cfg_with(intent);
                 let ovs = overlay_with(intent);
-                let got = vertical_for(intent_for(&cfg, Some(&ovs), Some(mode), false), baseline);
+                let got = v_only_mode(intent_for(&cfg, Some(&ovs), Some(mode), false), baseline);
                 assert_eq!(
                     got, want,
                     "mode={mode:?} intent={intent:?} baseline={baseline} 应得 {want}"
@@ -199,8 +232,8 @@ mod tests {
         let ovs = overlay_with(LayoutIntent::Vertical);
         let ov = Some(&ovs);
         assert_eq!(intent_for(&cfg, ov, None, false), LayoutIntent::Follow);
-        assert!(!vertical_for(intent_for(&cfg, ov, None, false), false));
-        assert!(vertical_for(intent_for(&cfg, ov, None, true), true));
+        assert!(!v_only_mode(intent_for(&cfg, ov, None, false), false));
+        assert!(v_only_mode(intent_for(&cfg, ov, None, true), true));
     }
 
     /// 加词优先于底层模式：底层要横排，加词仍按加词的意图。
@@ -236,11 +269,11 @@ mod tests {
             "无 [overlay] 快照时回落跟随全局"
         );
         // 回落后仍跟随基线两个方向。
-        assert!(vertical_for(
+        assert!(v_only_mode(
             intent_for(&cfg, None, Some(ModeKind::Mix(9)), false),
             true
         ));
-        assert!(!vertical_for(
+        assert!(!v_only_mode(
             intent_for(&cfg, None, Some(ModeKind::Mix(9)), false),
             false
         ));
@@ -294,7 +327,7 @@ mod tests {
     fn builtin_quick_mix_defaults_to_vertical() {
         let cfg = Config::default();
         assert!(
-            vertical_for(intent_for(&cfg, None, Some(ModeKind::Mix(0)), false), false),
+            v_only_mode(intent_for(&cfg, None, Some(ModeKind::Mix(0)), false), false),
             "内置 quick_mix 应出厂竖排"
         );
     }
@@ -303,6 +336,95 @@ mod tests {
     #[test]
     fn add_word_defaults_to_vertical() {
         let cfg = Config::default();
-        assert!(vertical_for(intent_for(&cfg, None, None, true), false));
+        assert!(v_only_mode(intent_for(&cfg, None, None, true), false));
+    }
+    /// ★ 方案层：`Follow` 的语义是**「跟随下一层」**，不是「跟随全局基线」。
+    ///
+    /// 第一行是**唯一能区分新旧实现的一格**——旧实现里模式 `Follow` 直接取基线，
+    /// 方案说了竖排也没用。漏了它，整个方案层等于没测。
+    #[test]
+    fn schema_layer_sits_between_manual_and_baseline() {
+        use LayoutIntent::{Follow, Horizontal, Vertical};
+        for (mode, manual, schema, baseline, want, why) in [
+            (
+                Follow,
+                None,
+                Vertical,
+                false,
+                true,
+                "唯一区分新旧语义的一格",
+            ),
+            (
+                Follow,
+                None,
+                Horizontal,
+                true,
+                false,
+                "方案压过基线，另一个方向",
+            ),
+            (Follow, None, Follow, true, true, "方案无意见时才跟基线"),
+            (Follow, None, Follow, false, false, "同上，另一个方向"),
+            (Horizontal, None, Vertical, true, false, "模式压过方案"),
+            (
+                Vertical,
+                None,
+                Horizontal,
+                false,
+                true,
+                "模式压过方案，另一个方向",
+            ),
+            (Follow, Some(false), Vertical, true, false, "手动值压过方案"),
+            (
+                Follow,
+                Some(true),
+                Horizontal,
+                false,
+                true,
+                "手动值压过方案，另一个方向",
+            ),
+            (
+                Horizontal,
+                Some(true),
+                Vertical,
+                true,
+                false,
+                "模式压过手动值",
+            ),
+            (
+                Follow,
+                Some(true),
+                Follow,
+                false,
+                true,
+                "方案无意见时手动值仍压过基线",
+            ),
+        ] {
+            assert_eq!(
+                vertical_for(mode, manual, schema, baseline),
+                want,
+                "mode={mode:?} manual={manual:?} schema={schema:?} baseline={baseline}: {why}"
+            );
+        }
+    }
+
+    /// 方案层不得影响 `intent_for` 本身——它只回答「模式怎么想」。
+    ///
+    /// 分层的意义在于每层各答各的问题。若有人图省事把方案意图折进 `intent_for`，
+    /// 「模式 Follow」与「模式没意见但方案有意见」就再也分不开，手动层无处插入。
+    #[test]
+    fn intent_for_answers_mode_layer_only() {
+        let cfg = cfg_with(LayoutIntent::Follow);
+        for &mode in MODES {
+            assert_eq!(
+                intent_for(
+                    &cfg,
+                    Some(&overlay_with(LayoutIntent::Follow)),
+                    Some(mode),
+                    false
+                ),
+                LayoutIntent::Follow,
+                "mode={mode:?}：模式层没意见就该是 Follow，与方案层无关"
+            );
+        }
     }
 }
