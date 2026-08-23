@@ -330,6 +330,22 @@ public:
             {
                 // 把 composition range 内容替换为最终文字; _text 为空则等价于清空。
                 pRange->SetText(ec, TF_ST_CORRECTION, _text.c_str(), (LONG)_text.length());
+                // **必须在 EndComposition 之前清掉组合态的显示属性**（下划线挂在
+                // GUID_PROP_ATTRIBUTE 上, 由 _SetDisplayAttribute 在每次 UpdateComposition
+                // 时写入）。TSF 不保证宿主会在 EndComposition 时自行清除: 部分宿主（实测
+                // WPS）会把它留在已上屏的文字上, 且属性一旦残留就沿用到之后所有输入——
+                // 表现为"某次上屏之后连普通字、英文都带下划线"。微软 SampleIME / Weasel
+                // 同样在结束组合前显式 Clear。
+                //
+                // 位置不可挪动: 必须在 SetText 之后（此时 range 恰好覆盖新文字）、
+                // Collapse 之前（塌缩后 range 长度为 0, Clear 到的是空区间, 等于没清）。
+                ITfProperty* pDisplayAttrProp = nullptr;
+                if (SUCCEEDED(_pContext->GetProperty(GUID_PROP_ATTRIBUTE, &pDisplayAttrProp)) &&
+                    pDisplayAttrProp != nullptr)
+                {
+                    pDisplayAttrProp->Clear(ec, pRange);
+                    pDisplayAttrProp->Release();
+                }
                 // 光标定位到插入文本之后, 作为后续输入起点。
                 pRange->Collapse(ec, TF_ANCHOR_END);
                 TF_SELECTION sel = {};
@@ -5716,6 +5732,19 @@ void CTextService::HandlePairCommitPush(const std::wstring& text, uint32_t moveL
     _pKeyEventSink->HandlePairCommitPush(text, moveLeft);
 }
 
+BOOL CTextService::CommitTextViaSyntheticKey(const std::wstring& text, BOOL replacingHeld)
+{
+    if (_pKeyEventSink != nullptr &&
+        _pKeyEventSink->QueueAsyncCommitViaSyntheticKey(text, replacingHeld))
+    {
+        return TRUE;
+    }
+    // KeyEventSink 未装配，或合成按键注入失败（SendInput 出错，极罕见）：退回旧的
+    // 直接异步提交，保证至少不丢字（代价是回到 nonKeyContext 的已知问题面）。
+    WIND_LOG_WARN(L"CommitTextViaSyntheticKey: falling back to direct async CommitText\n");
+    return CommitText(text, TRUE, replacingHeld);
+}
+
 BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 {
     if (count <= 0)
@@ -5814,6 +5843,52 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 // Commit text atomically: end composition + insert text in a single EditSession.
 // This avoids race conditions in browsers where async EndComposition could clear
 // text that was inserted by a subsequent synchronous InsertText.
+// 把上屏文本里的换行统一规范化为 CR（U+000D），就地改写 `text`，返回换行个数。
+// `\r\n` 折成一个 CR（它是一个换行的两字符写法，逐个转会多出一行），孤立的 `\n`
+// 转成 `\r`，已经是 `\r` 的原样保留。
+//
+// # 为什么是 CR 而不是 LF
+//
+// CR 是 **Windows 文本模型的段落分隔符**，不是 Word 的个别癖好：RichEdit / TOM /
+// TSF 这条线上，宿主文本存储里的段落边界历来就是 CR，`ITfRange::SetText` 写进去的
+// 正是那个存储。纯文本类宿主（记事本、终端、Edit 控件）对 CR/LF/CRLF 三种都宽容，
+// 所以此前一路用 LF 也没露出问题——**是它们宽容，不是 LF 正确**。
+//
+// 真机现场（2026-08-23）：同一段带换行的文本，记事本与 WPS 正常分段，Word 里每个
+// 换行处渲染成一段类似 Tab 的空白——LF 落进 Word 的文本流里根本不构成段落边界。
+// 词条改写成 `\r` 后 Word 立刻正常，据此定位。
+//
+// # 为什么规范化在这一层
+//
+// 词库/cmdbar 的转义层不做这件事：那里遵循「真实文本是唯一事实、转义只在系统边界
+// 发生」——词条写 `\n` 就该得到真实的 LF。CR 是 Windows 这个**平台**的表达方式，
+// 换算属于平台边界的职责，所以落在 TSF 出口。Rust 侧同样不做：macOS 的 IMKit 用
+// LF，跨平台的协调器不该背 Windows 的文本约定。
+//
+// 于是用户在任何词条里都只写 `\n`，在所有宿主上都正确；普通短语也不必为此单独
+// 支持 `\r` 转义。
+static int NormalizeNewlinesToCR(std::wstring& text)
+{
+    int count = 0;
+    size_t write = 0;
+    for (size_t read = 0; read < text.length(); read++)
+    {
+        wchar_t ch = text[read];
+        if (ch == L'\r' || ch == L'\n')
+        {
+            // CRLF：跳过紧随的 LF，整体只产出一个 CR。
+            if (ch == L'\r' && read + 1 < text.length() && text[read + 1] == L'\n')
+                read++;
+            text[write++] = L'\r';
+            count++;
+            continue;
+        }
+        text[write++] = ch;
+    }
+    text.resize(write);
+    return count;
+}
+
 BOOL CTextService::CommitText(const std::wstring& text, BOOL nonKeyContext, BOOL replacingHeld)
 {
     // hold 预览态活跃时（智能符号已把中文符号放进组合、等 press2），本次提交必须交代
@@ -5837,6 +5912,19 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL nonKeyContext, BOOL
     // 顶码聚合：真正提交 = 待提交前缀 + 本次文本（微软 IME 的延迟提交在此收口）。
     std::wstring full = _pendingCommitPrefix + text;
     _pendingCommitPrefix.clear();
+
+    // **换行规范化：一律转成 CR**。见 NormalizeNewlinesToCR 的说明。放在这里是因为
+    // 本行之后 full 会分发给 EditSession 与 SendInput 兜底两条路，一处规范化两条都覆盖；
+    // 也在诊断日志之前，让日志统计的就是真正交给宿主的那份。
+    int convertedNewlines = NormalizeNewlinesToCR(full);
+
+    // 诊断用：只统计换行符个数、不打印正文（日志隐私红线）。用来确认到本函数为止
+    // 换行是否还完整——如果这里已经是 0，说明丢字发生在 Rust/IPC 一侧；如果这里
+    // 不为 0 但宿主里没体现出分段，说明问题出在 TSF/宿主对本次提交的处理上。
+    {
+        WIND_LOG_DEBUG_FMT(L"CommitText: textLen=%zu, newlines=%d, nonKeyContext=%d, replacingHeld=%d\n",
+                           full.length(), convertedNewlines, (int)nonKeyContext, (int)replacingHeld);
+    }
 
     LARGE_INTEGER startTime, endTime, freq;
     QueryPerformanceCounter(&startTime);

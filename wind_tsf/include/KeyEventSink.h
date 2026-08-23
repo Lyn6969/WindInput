@@ -4,6 +4,7 @@
 #include "IPCClient.h"
 #include <string>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <set>
 #include <vector>
@@ -139,6 +140,25 @@ public:
     // 到 SendInput 的宿主（部分终端模拟器/微信/纯文本编辑器）——否则注入的退格/字符键
     // 会被自己的钩子截获重新处理，导致文字重复上屏（同 _SimulatePairKey 用的机制）。
     void MarkSyntheticKey(WORD vk) { _PushSkipKey(vk); }
+
+    // 供 CTextService::CommitTextViaSyntheticKey 调用：把待提交文本缓冲起来，自注入一个
+    // 保留 VK（VK_ASYNC_COMMIT_TRIGGER），让真正的 CommitText 挪到 OnKeyDown 里执行——
+    // 那才是 TSF 认可的"按键处理期间"，TF_ES_SYNC 合法，宿主自身的输入时处理链路
+    // （AutoCorrect……）才会被触发，且规避了 Word 对非按键上下文同步会话的拒绝
+    // （nonKeyContext 的已知问题面）。
+    //
+    // 内嵌 `\n` 的文本无需在这里做任何特殊处理：它由宿主按「输入法上屏」语义自行
+    // 规范化成分段。Word/WPS 里换行不生效的那类现象，根因在**上游有没有活跃 composition**
+    // （无 composition 时 TSF 只能退到裸插入，换行就只是普通字符），已在协调器侧
+    // 让纯文本 `$CC` 命令走回同步上屏路径解决，不属于本层的职责。
+    //
+    // 不能复用 `_skipKeys`：那套是"识别出自生成键→直接放行不处理"，用于让宿主看到一个
+    // "干净"的按键；这里要的是相反方向——"识别出触发键→吃掉→转入我们自己的同步提交"，
+    // 必须是独立的判据与独立的队列，见 `_TryConsumeAsyncCommitTrigger`。
+    //
+    // 返回 FALSE＝合成按键注入失败（SendInput 出错，极罕见），调用方应回退到旧的
+    // `CommitText(text, TRUE)` 直接异步提交，保证至少不丢字。
+    BOOL QueueAsyncCommitViaSyntheticKey(const std::wstring& text, BOOL replacingHeld);
 
 private:
     static constexpr uint32_t ENGLISH_STATS_REPORT_COUNT = 5;
@@ -381,6 +401,29 @@ private:
     int _skipKeyCount = 0;
     void _PushSkipKey(WORD vk);
     BOOL _TryConsumeSkipKey(WPARAM wParam);
+
+    // ========================================================================
+    // Async commit via synthetic key (nonKeyContext → key-context 提交)
+    // ========================================================================
+    // Win32 虚拟键码表中的保留/未分配值（见 MSDN Virtual-Key Codes），真实键盘永远不会
+    // 产生，专供本类内部识别、不会与任何真实按键或热键组合冲突。
+    static constexpr WORD VK_ASYNC_COMMIT_TRIGGER = 0xE8;
+
+    // 一个待执行的提交：文本原样保留（含内嵌换行），到 OnKeyDown 里一次性同步提交。
+    struct PendingAsyncCommit {
+        std::wstring text;
+        BOOL replacingHeld = FALSE;
+    };
+    // 队列而非单槽：鼠标可能连续快速点选，多个 push 可能在上一个触发键送达前叠加。
+    // 上限只是防御性上界，避免目标窗口已经失焦、触发键永远送不达时无限增长。
+    static constexpr size_t MAX_PENDING_ASYNC_COMMITS = 16;
+    std::deque<PendingAsyncCommit> _pendingAsyncCommits;
+
+    // OnTestKeyDown/OnKeyDown 最前面调用：命中触发键就弹出队首、返回 TRUE。
+    BOOL _TryConsumeAsyncCommitTrigger(WPARAM wParam, PendingAsyncCommit& out);
+
+    // 自注入一次触发键（down+up）。返回 FALSE＝SendInput 失败。
+    BOOL _SendAsyncCommitTriggerKey();
 
     // English mode input stats counter
     struct EnglishStatsCounter {

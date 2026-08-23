@@ -160,6 +160,17 @@ public:
     BOOL CommitText(const std::wstring& text, BOOL nonKeyContext = FALSE,
                     BOOL replacingHeld = FALSE);
 
+    // `CommitText(text, TRUE, ...)` 的替代：不直接在当前（非按键）调用栈里发起异步
+    // EditSession，而是缓冲文本 + 合成一个触发键，把真正的提交挪到 OnKeyDown 里、
+    // 以**按键上下文**同步提交——TF_ES_SYNC 合法，宿主自身的输入时处理链路（含内嵌
+    // `\n` 转真实分段）才会被触发。用于鼠标点候选等 push 提交路径（见 .cpp 调用点）。
+    //
+    // 触发键队列是 KeyEventSink 自己的成员，实现留在那边，这里只做转发 + 失败兜底
+    // （同 HandlePairCommitPush 的先例：消息窗只拿得到 TextService）。合成按键注入
+    // 失败（KeyEventSink 未装配 / SendInput 出错）时退回旧的 `CommitText(text, TRUE, ...)`
+    // 直接异步提交，保证至少不丢字。
+    BOOL CommitTextViaSyntheticKey(const std::wstring& text, BOOL replacingHeld = FALSE);
+
     // 把光标前 count 个已上屏字符替换为 text（智能符号纠错替换）。
     // 优先走 TSF 同步 EditSession（原子、不受输入队列时序/修饰键影响）；
     // 失败时回退到 SendInput（count 次 Backspace + Unicode 注入 text）。

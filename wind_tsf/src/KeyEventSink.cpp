@@ -267,6 +267,15 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
 {
     *pfEaten = FALSE;
 
+    // 合成提交触发键：无条件吃下，不流入下面任何按键逻辑（大小写/会话/热键判据……）。
+    // 真正的提交在 OnKeyDown 里执行——那才是 TSF 认可的"按键处理期间"。放在最前面，
+    // 与状态（_isComposing 等）无关：不管此刻是否在组合中，触发键都必须先被截获。
+    if (wParam == VK_ASYNC_COMMIT_TRIGGER && !_pendingAsyncCommits.empty())
+    {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
+
     // Auto-pair: bypass IME for self-generated SendInput keys (VK_LEFT/RIGHT/DELETE/BACK)
     if (_TryConsumeSkipKey(wParam))
     {
@@ -772,6 +781,32 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
 STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lParam, BOOL* pfEaten)
 {
     *pfEaten = FALSE;
+
+    // 合成提交触发键：这里才是真正的提交点——TSF 认可的"按键处理期间"，
+    // CommitText 内部据此走 TF_ES_SYNC 而非 nonKeyContext 的异步会话。
+    // 见 KeyEventSink.h 的 QueueAsyncCommitViaSyntheticKey 注释与
+    // CTextService::CommitTextViaSyntheticKey 的调用点。
+    {
+        PendingAsyncCommit pending;
+        if (_TryConsumeAsyncCommitTrigger(wParam, pending))
+        {
+            *pfEaten = TRUE;
+            WIND_LOG_DEBUG_FMT(L"AsyncCommitTrigger: committing via synchronous edit session, textLen=%zu\n",
+                               pending.text.length());
+            _pTextService->CommitText(pending.text, /*nonKeyContext=*/FALSE, pending.replacingHeld);
+            if (!_pendingAsyncCommits.empty())
+            {
+                // 队列里还有后续提交（连续快速点选）：再次自注入触发键，让它在自己的
+                // OnKeyDown 周期里执行，保持"一次按键一次提交"的语义。
+                if (!_SendAsyncCommitTriggerKey())
+                {
+                    WIND_LOG_WARN(L"AsyncCommitTrigger: chained trigger key injection failed, dropping remaining commits\n");
+                    _pendingAsyncCommits.clear();
+                }
+            }
+            return S_OK;
+        }
+    }
 
     // Ctrl+Shift+F12: Dump TSF ring buffer logs to clipboard (debug aid for AppContainer)
     if (wParam == VK_F12 && (GetKeyState(VK_CONTROL) & 0x8000)
@@ -1342,6 +1377,14 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
 {
     *pfEaten = FALSE;
 
+    // 合成提交触发键的 keyup 半程：down 已经在 OnTestKeyDown/OnKeyDown 里处理完毕，
+    // 这里只需干净吃掉，不流入下面任何 keyup 逻辑（toggle/CapsLock 判据……）。
+    if (wParam == VK_ASYNC_COMMIT_TRIGGER)
+    {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
+
     // Auto-pair: bypass IME for self-generated SendInput key releases
     if (_TryConsumeSkipKey(wParam))
     {
@@ -1400,6 +1443,15 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
 STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam, BOOL* pfEaten)
 {
     *pfEaten = FALSE;
+
+    // 合成提交键（VK_ASYNC_COMMIT_TRIGGER）的 keyup 半程：已在 OnTestKeyUp 里吃过，这里
+    // 直接放行返回，避免它被下面 direct_commit / auto-pair / 修饰键状态机等逻辑误当成
+    // 真实按键处理——注意与下一行注释里的「顶码触发键」不是同一个概念，只是恰好同名字。
+    if (wParam == VK_ASYNC_COMMIT_TRIGGER)
+    {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
 
     // direct_commit 顶码：余码新组合在触发键 keyup 才开（下一个 keyup 即触发键 keyup）。
     // 先到者开组合，另一处 HasDeferredComposition()==FALSE 后自然 no-op。
@@ -2751,6 +2803,62 @@ BOOL CKeyEventSink::_TryConsumeSkipKey(WPARAM wParam)
         return TRUE;
     }
     return FALSE;
+}
+
+BOOL CKeyEventSink::_SendAsyncCommitTriggerKey()
+{
+    // down+up 一次性提交（同 _SimulatePairKey/_ReplayKeyToHost 的批量提交先例），避免
+    // 被并发的真实键鼠输入从中间穿插。VK_ASYNC_COMMIT_TRIGGER 是保留/未分配值，无需
+    // 走 _PushSkipKey——它不会被当成真实按键，也不该被"直接放行"，而是要被
+    // OnTestKeyDown/OnKeyDown 的专门分支吃掉、转入我们自己的同步提交。
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_ASYNC_COMMIT_TRIGGER;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_ASYNC_COMMIT_TRIGGER;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    if (sent != 2)
+    {
+        WIND_LOG_WARN_FMT(L"_SendAsyncCommitTriggerKey: SendInput sent %u of 2\n", sent);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL CKeyEventSink::QueueAsyncCommitViaSyntheticKey(const std::wstring& text, BOOL replacingHeld)
+{
+    if (text.empty())
+        return TRUE; // 无事可做，不必绕一圈合成按键。
+
+    if (_pendingAsyncCommits.size() >= MAX_PENDING_ASYNC_COMMITS)
+    {
+        // 队列积压＝上一批触发键没有正常送达/消费（多半是目标窗口已经失焦）。继续囤积
+        // 只会让文本越堆越多、之后乱序上屏，故整体清空并留痕——好过无界增长或半截乱序。
+        WIND_LOG_WARN(L"QueueAsyncCommitViaSyntheticKey: pending queue full, dropping all pending commits\n");
+        _pendingAsyncCommits.clear();
+    }
+    _pendingAsyncCommits.push_back(PendingAsyncCommit{text, replacingHeld});
+
+    if (!_SendAsyncCommitTriggerKey())
+    {
+        WIND_LOG_WARN_FMT(L"QueueAsyncCommitViaSyntheticKey: trigger key injection failed, textLen=%zu\n",
+                          text.length());
+        _pendingAsyncCommits.pop_back();
+        return FALSE;
+    }
+    WIND_LOG_DEBUG_FMT(L"QueueAsyncCommitViaSyntheticKey: queued textLen=%zu, pending=%zu\n",
+                       text.length(), _pendingAsyncCommits.size());
+    return TRUE;
+}
+
+BOOL CKeyEventSink::_TryConsumeAsyncCommitTrigger(WPARAM wParam, PendingAsyncCommit& out)
+{
+    if (wParam != VK_ASYNC_COMMIT_TRIGGER || _pendingAsyncCommits.empty())
+        return FALSE;
+    out = _pendingAsyncCommits.front();
+    _pendingAsyncCommits.pop_front();
+    return TRUE;
 }
 
 void CKeyEventSink::_RecordEnglishKeyTrace(WPARAM wParam, uint32_t modifiers)

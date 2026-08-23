@@ -954,10 +954,16 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // EndComposition could clear the just-inserted text, especially in apps
             // like VSCode and browsers when InlinePreedit is disabled.
             //
-            // nonKeyContext=TRUE：这里是裸窗口消息回调（鼠标点候选经 push 通道过来），
-            // 不在按键上下文里，Word 会拒发同步会话。传 FALSE 的表现是 Word 里打 sfge
-            // 点候选得到 "Sfge杜甫"（组合原码被 finalize + 正文 SendInput 追加）。
-            pThis->_pTextService->CommitText(pData->text, TRUE);
+            // 改走合成提交键：缓冲文本 + 自注入触发键，把提交挪到 OnKeyDown 里以按键
+            // 上下文同步执行，而不是在这里（裸窗口消息回调，鼠标点候选经 push 通道
+            // 过来）直接发起异步会话。
+            //
+            // 这不只是把 `CommitText(text, TRUE)` 的已知问题（Word 拒同步会话导致
+            // "Sfge杜甫" 那类组合孤儿 finalize + 重复上屏）换个方式绕开——按键上下文本身
+            // 会触发宿主自己的输入时处理链路（AutoCorrect/内嵌 `\n` 转真实分段……），
+            // 这些在纯异步 EditSession 里不会发生，是 CommitTextViaSyntheticKey 存在
+            // 的主要原因。注入失败时内部退回旧的 `CommitText(text, TRUE)`，不会丢字。
+            pThis->_pTextService->CommitTextViaSyntheticKey(pData->text);
             // Reset KeyEventSink state so shortcut keys work again.
             // 保留配对状态：上屏只是在光标处插入文本，已配对的右符号仍在光标右侧
             // （`（你好|）`）。此前一并清零 _pairPendingDepth，导致中文模式下
