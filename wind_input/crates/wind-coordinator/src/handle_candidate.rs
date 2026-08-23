@@ -991,12 +991,29 @@ impl Coordinator {
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
         // 词库 `$CC` 命令词条经 finalize_candidates 展开后 text 已改写为 display 标签，而引擎
         // 意向 commit_text 是原始 `$CC` 源 → 按 phrase_template 补匹配（否则意向恒被误否决）。
-        let outcome = match auto_commit.filter(|t| {
-            state
-                .candidates
-                .iter()
-                .any(|c| &c.text == t || (c.is_command && &c.phrase_template == t))
-        }) {
+        let outcome = match auto_commit
+            .filter(|t| {
+                state
+                    .candidates
+                    .iter()
+                    .any(|c| &c.text == t || (c.is_command && &c.phrase_template == t))
+            })
+            // 短语侧否决：引擎的「唯一」判在**码表候选子集**上跑（`decide_auto_commit` 按
+            // `c.code == input` 筛，而短语候选的 code 恒为空串、且在引擎 convert 之后才由协调器
+            // 追加）⇒ 同码短语对它完全不可见。真机现场 `aqgy`：短语「东乌珠穆沁旗」+ 码表
+            // 「葡」共两条候选，却被判成唯一而自动上屏——**关掉开关有两条候选、开了反而只剩
+            // 一条**，显示与处置对不上，用户配的短语连露面的机会都没有。
+            //
+            // 判据与 [`Self::phrase_vetoes_top_code`] 同构（共用 `phrase_owns_code`）：整串已是
+            // 精确码短语，或还能续打成更长短语 → 这个码位归用户的短语管，不许引擎替他做主。
+            // 后半条不可省——**码长超过方案满码长的短语**（5 码短语落在 4 码方案里）在码表侧
+            // 恰是「精确唯一 + 无更长后继」，正是自动上屏最爱命中的形态，一上屏那条短语就
+            // 永远打不出来（顶码路径为同一原因补过同一道闸）。
+            //
+            // 惰性：`filter` 只在引擎已放行（`Some`）时才求值，故全量扫短语码表的代价不落在
+            // 每次按键上——与 `phrase_vetoes_top_code` 的调用点选择同源。
+            .filter(|_| !self.phrase_vetoes_auto_commit(&state.input_buffer))
+        {
             Some(_) => {
                 // 一致性：自动上屏文本取「实际显示的首候选」，与空格/点选同源，杜绝
                 // "显示藏、全码上屏駏"的漂移（首候选已由档位排序保证是五笔精确全码）。
@@ -1105,6 +1122,36 @@ impl Coordinator {
     /// 调用点刻意放在 `handle_top_code` **返回 Some 之后**：本判据要全量扫短语码表，而
     /// 引擎侧首道闸（开关 + 码长 ≤ 满码长）极廉价且绝大多数按键都在那里返回 None。
     pub(crate) fn phrase_vetoes_top_code(&self, input: &str) -> bool {
+        self.phrase_owns_code(input)
+    }
+
+    /// 短语侧对**全码唯一自动上屏**的否决。判据与 [`Self::phrase_vetoes_top_code`] 同构，
+    /// 补的同样是引擎侧够不到的那一半。
+    ///
+    /// 引擎的 `decide_auto_commit` 在**码表候选子集**上判唯一（按 `c.code == input` 筛），而
+    /// 短语候选的 `code` 恒为空串、且在引擎 `convert` 之后才由协调器追加 ⇒ 短语对那道判据
+    /// 完全不可见。于是同码短语 + 唯一码表字会被判成「唯一候选」直接上屏：**关掉开关时
+    /// 候选面有两条、开了反而只剩一条**，显示与处置对不上。
+    ///
+    /// 真机现场（v0.118.0）：用户短语 `aqgy → 东乌珠穆沁旗`（w=1000）与五笔 `aqgy → 葡`
+    /// （w=1379）同码，敲完第 4 码当场上屏「葡」，候选窗从未显示（日志里只有 HideCandidates、
+    /// 无 UpdateCandidates），用户根本没有按空格的机会。
+    ///
+    /// ⚠️ 两条判据缺一不可，理由与顶码那侧完全一致：`has_longer_code` 管的是**码长超过方案
+    /// 满码长的短语**（5 码短语落在 4 码方案里），它在码表侧恰好呈现为「精确唯一 + 无更长
+    /// 后继」——正是自动上屏最爱命中的形态，一旦上屏那条短语就永远打不出来。
+    pub(crate) fn phrase_vetoes_auto_commit(&self, input: &str) -> bool {
+        self.phrase_owns_code(input)
+    }
+
+    /// 「这个码位归短语管」的单一判据：整串已是精确码短语，或还能续打成更长短语。
+    ///
+    /// 顶码与全码自动上屏两条路径**共用**它——两者都是「引擎替用户做主上屏」，短语层的
+    /// 否决条件本就是同一个。曾各写一份，分叉只是时间问题（自动上屏那份一开始压根没写，
+    /// 于是同一个缺口在第二条路径上原样重现了一次）。
+    ///
+    /// 全量扫短语码表，调用方须把它放在「引擎已决定上屏」之后作二道闸，不可每键必查。
+    fn phrase_owns_code(&self, input: &str) -> bool {
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
         phrases.has_exact_code(input) || phrases.has_longer_code(input)
     }
