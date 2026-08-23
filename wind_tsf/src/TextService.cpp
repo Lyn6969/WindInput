@@ -312,6 +312,44 @@ public:
     }
 
     // ITfEditSession
+    // 在当前选区直接插入文本 (不经 composition)。用于无 active composition 的兜底路径
+    // (鼠标上屏 / GetRange 失败)。
+    HRESULT _InsertAtSelection(TfEditCookie ec, const std::wstring& text)
+    {
+        if (text.empty())
+            return S_OK;
+
+        ITfInsertAtSelection* pInsertAtSel = nullptr;
+        HRESULT hr = _pContext->QueryInterface(IID_ITfInsertAtSelection, (void**)&pInsertAtSel);
+        if (FAILED(hr) || pInsertAtSel == nullptr)
+        {
+            WIND_LOG_DEBUG(L"CCommitTextEditSession: Failed to get ITfInsertAtSelection\n");
+            return E_FAIL;
+        }
+
+        ITfRange* pRange = nullptr;
+        hr = pInsertAtSel->InsertTextAtSelection(ec, 0, text.c_str(), (LONG)text.length(), &pRange);
+        pInsertAtSel->Release();
+
+        if (FAILED(hr))
+        {
+            WIND_LOG_DEBUG_FMT(L"CCommitTextEditSession: InsertTextAtSelection failed hr=0x%08X\n", hr);
+            return hr;
+        }
+
+        if (pRange != nullptr)
+        {
+            pRange->Collapse(ec, TF_ANCHOR_END);
+            TF_SELECTION sel = {};
+            sel.range = pRange;
+            sel.style.ase = TF_AE_NONE;
+            sel.style.fInterimChar = FALSE;
+            _pContext->SetSelection(ec, 1, &sel);
+            pRange->Release();
+        }
+        return S_OK;
+    }
+
     STDMETHODIMP DoEditSession(TfEditCookie ec)
     {
         // 标准 IME 提交语义: 把最终上屏文字 SetText 到 composition range 后再
@@ -322,29 +360,82 @@ public:
         // "IME 取消了 composition + 旁路插入了一段普通文本", 跟打/统计类应用会
         // 把这次上屏误判为"非 IME 输入", 影响正确率统计。原子性由单一 EditSession
         // 保证 (历史 02a753f 修的浏览器异步竞态), 与此次模式调整正交。
+
+        // ── 已知宿主缺陷: WPS 对"以换行结尾的上屏文本" ─────────────────────────
+        // 上屏文本以换行结尾时, WPS 会在此后把新的组合区渲染成带下划线的组合态, 且
+        // 重绘、换光标位置都不消失 (文档格式本身是干净的, 故不是字符格式而是残留的
+        // display attribute)。**本层刻意不做任何规避**: 我们的提交流程完全符合 TSF
+        // 标准语义 (SetText + 清 GUID_PROP_ATTRIBUTE + EndComposition, 与 Weasel /
+        // 微软 SampleIME 一致), 末尾换行也没有任何特殊处理, 问题在 WPS 一侧。
+        //
+        // 排查记录 (2026-08-23), 避免后人重走:
+        //  - 两次 Clear (SetText 前后各一次, 且 SetText 后重新 GetRange 取 range):
+        //    日志显示均返回 S_OK 且区间精确覆盖全文 —— 清除请求就没有被 WPS 采纳;
+        //  - SetText 的 flags 由 TF_ST_CORRECTION 改为 0 (该 flag 要求宿主保留原文本
+        //    格式, 语义上上屏本就不是"更正"): 改动本身正确并已保留, 但不解决本现象;
+        //  - 摘掉末尾换行、EndComposition 后再 InsertTextAtSelection 补回: 无效, 已回退。
+        //  - 对照: key.type 正常, 因为它走 SendInput 把换行拆成真实回车按键, 全程不经
+        //    composition —— 那是按键模拟语义, 与 IME 上屏语义不同, 不可用来实现 type()。
+        //  - 范围: 与 $CC/type() 无关, 普通短语词条末尾带换行同样触发。
         if (_pComposition != nullptr)
         {
             BOOL committedViaComposition = FALSE;
             ITfRange* pRange = nullptr;
             if (SUCCEEDED(_pComposition->GetRange(&pRange)))
             {
-                // 把 composition range 内容替换为最终文字; _text 为空则等价于清空。
-                pRange->SetText(ec, TF_ST_CORRECTION, _text.c_str(), (LONG)_text.length());
-                // **必须在 EndComposition 之前清掉组合态的显示属性**（下划线挂在
+                // 在 EndComposition 之前清掉组合态的显示属性（下划线挂在
                 // GUID_PROP_ATTRIBUTE 上, 由 _SetDisplayAttribute 在每次 UpdateComposition
-                // 时写入）。TSF 不保证宿主会在 EndComposition 时自行清除: 部分宿主（实测
-                // WPS）会把它留在已上屏的文字上, 且属性一旦残留就沿用到之后所有输入——
-                // 表现为"某次上屏之后连普通字、英文都带下划线"。微软 SampleIME / Weasel
-                // 同样在结束组合前显式 Clear。
+                // 时写入）。TSF 不保证宿主会在 EndComposition 时自行清除, 微软 SampleIME /
+                // Weasel 同样在结束组合前显式 Clear。
                 //
-                // 位置不可挪动: 必须在 SetText 之后（此时 range 恰好覆盖新文字）、
-                // Collapse 之前（塌缩后 range 长度为 0, Clear 到的是空区间, 等于没清）。
+                // SetText 前后各清一次: Clear 作用于 range 的当前覆盖区间, 而 SetText 前后
+                // range 覆盖的是两段不同的文本（旧组合文本 / 新上屏文本）。都不可挪到
+                // Collapse 之后: 塌缩后 range 长度为 0, 清到的是空区间。
                 ITfProperty* pDisplayAttrProp = nullptr;
-                if (SUCCEEDED(_pContext->GetProperty(GUID_PROP_ATTRIBUTE, &pDisplayAttrProp)) &&
-                    pDisplayAttrProp != nullptr)
+                HRESULT hrProp = _pContext->GetProperty(GUID_PROP_ATTRIBUTE, &pDisplayAttrProp);
+                if (FAILED(hrProp) || pDisplayAttrProp == nullptr)
                 {
-                    pDisplayAttrProp->Clear(ec, pRange);
+                    WIND_LOG_WARN_FMT(L"CCommitTextEditSession: GetProperty(GUID_PROP_ATTRIBUTE) failed hr=0x%08X, prop=%p\n",
+                                      hrProp, (void*)pDisplayAttrProp);
+                }
+                HRESULT hrClearBefore = E_FAIL;
+                if (pDisplayAttrProp != nullptr)
+                    hrClearBefore = pDisplayAttrProp->Clear(ec, pRange);
+
+                // 把 composition range 内容替换为最终文字; _text 为空则等价于清空。
+                //
+                // **flags 必须是 0，不能用 TF_ST_CORRECTION**。后者的语义是"本次替换是对
+                // 已有文本的更正", 契约要求宿主**尽量保留原文本的格式与属性**——而这里被
+                // 替换掉的原文本正是带着组合态下划线的 preedit, 于是宿主忠实地把下划线
+                // "保留"给了上屏后的定稿文字, 而且是作为文档里的真实字符格式写进去的。
+                // 一旦落进文档, 它就成了光标处的当前格式, 之后新输入的普通字、英文全都
+                // 继承下划线, 且 TSF 侧再怎么 Clear 属性都无效（清得掉 property, 清不掉
+                // 文档内容自身的格式）。
+                //
+                // 上屏是"定稿", 语义上本就不是更正; Weasel 的 CInsertTextEditSession 同样
+                // 用 flags=0。代价是宿主会把它当作新输入、可能触发自动更正类处理, 这对
+                // 中文上屏无实际影响, 且正是"让宿主按输入法上屏来对待"所期望的。
+                pRange->SetText(ec, 0, _text.c_str(), (LONG)_text.length());
+
+                // SetText 之后重新取一次 composition range 再 Clear: 上面那个 pRange 是
+                // 替换**之前**取的, 它在替换后是否仍覆盖新文本属于宿主实现细节, 重新取
+                // 才与实现无关。
+                HRESULT hrClearAfter = E_FAIL;
+                if (pDisplayAttrProp != nullptr)
+                {
+                    ITfRange* pRangeFresh = nullptr;
+                    if (SUCCEEDED(_pComposition->GetRange(&pRangeFresh)) && pRangeFresh != nullptr)
+                    {
+                        hrClearAfter = pDisplayAttrProp->Clear(ec, pRangeFresh);
+                        pRangeFresh->Release();
+                    }
+                    else
+                    {
+                        hrClearAfter = pDisplayAttrProp->Clear(ec, pRange);
+                    }
                     pDisplayAttrProp->Release();
+                    WIND_LOG_DEBUG_FMT(L"CCommitTextEditSession: display attr cleared before=0x%08X after=0x%08X\n",
+                                       hrClearBefore, hrClearAfter);
                 }
                 // 光标定位到插入文本之后, 作为后续输入起点。
                 pRange->Collapse(ec, TF_ANCHOR_END);
@@ -370,37 +461,12 @@ public:
             WIND_LOG_DEBUG(L"CCommitTextEditSession: GetRange failed, falling back to InsertTextAtSelection\n");
         }
 
-        // 无 active composition 的回退路径 (鼠标上屏 / 上述 GetRange 失败兜底): 走 InsertTextAtSelection。
-        if (!_text.empty())
+        // 无 active composition 的回退路径 (鼠标上屏 / 上述 GetRange 失败兜底): 走
+        // InsertTextAtSelection。此路本就没有 composition, 换行不必摘出, 整串照发。
         {
-            ITfInsertAtSelection* pInsertAtSel = nullptr;
-            HRESULT hr = _pContext->QueryInterface(IID_ITfInsertAtSelection, (void**)&pInsertAtSel);
-            if (FAILED(hr) || pInsertAtSel == nullptr)
-            {
-                WIND_LOG_DEBUG(L"CCommitTextEditSession: Failed to get ITfInsertAtSelection\n");
-                return E_FAIL;
-            }
-
-            ITfRange* pRange = nullptr;
-            hr = pInsertAtSel->InsertTextAtSelection(ec, 0, _text.c_str(), (LONG)_text.length(), &pRange);
-            pInsertAtSel->Release();
-
+            HRESULT hr = _InsertAtSelection(ec, _text);
             if (FAILED(hr))
-            {
-                WIND_LOG_DEBUG_FMT(L"CCommitTextEditSession: InsertTextAtSelection failed hr=0x%08X\n", hr);
                 return hr;
-            }
-
-            if (pRange != nullptr)
-            {
-                pRange->Collapse(ec, TF_ANCHOR_END);
-                TF_SELECTION sel = {};
-                sel.range = pRange;
-                sel.style.ase = TF_AE_NONE;
-                sel.style.fInterimChar = FALSE;
-                _pContext->SetSelection(ec, 1, &sel);
-                pRange->Release();
-            }
         }
 
         _success = TRUE;
