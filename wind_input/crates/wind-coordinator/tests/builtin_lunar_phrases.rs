@@ -40,7 +40,7 @@ fn festival_day() -> DateTime<Local> {
 fn texts(layer: &wind_phrase::PhraseLayer, code: &str, now: DateTime<Local>) -> Vec<String> {
     let host = wind_phrase::PhraseHost::empty();
     layer
-        .lookup_at(code, now, &[], &host)
+        .lookup_at(code, now, &[], &host, &wind_phrase::PhraseScope::ALL)
         .into_iter()
         .map(|h| h.text)
         .collect()

@@ -1517,6 +1517,7 @@ impl Coordinator {
                                 text: e.text.clone(),
                                 weight: e.weight,
                                 position: e.position,
+                                category: e.category.clone(),
                             })
                             .collect();
                         if let Ok(st) = store.sync_system_phrases(&sys) {
@@ -1533,7 +1534,14 @@ impl Coordinator {
                     .enabled_phrases_for_input()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|p| (p.code, p.text, p.weight, p.position, p.is_system));
+                    .map(|p| wind_phrase::PhraseSeed {
+                        code: p.code,
+                        text: p.text,
+                        weight: p.weight,
+                        position: p.position,
+                        is_system: p.is_system,
+                        category: p.category,
+                    });
                 std::sync::RwLock::new(wind_phrase::PhraseLayer::from_records(recs))
             } else {
                 std::sync::RwLock::new(wind_phrase::PhraseLayer::default())
@@ -3392,7 +3400,7 @@ impl Coordinator {
         // `zzsfa`（短语里没有这条码）会顶出 `zzsfz` 的内容，而正确行为是落进空码。
         let pre_display_first = state.candidates.first().cloned().filter(|c| {
             c.source == CandidateSource::CodeTable
-                || ((c.is_phrase || c.is_command) && self.phrase_has_exact_code(&pre_buf))
+                || ((c.is_phrase || c.is_command) && self.phrase_has_exact_code(state, &pre_buf))
         });
         // 在光标处插入（光标在末尾时等价于旧的 push）。后续顶码/候选刷新一律按整串
         // 缓冲判定，与光标位置无关——光标只是编辑位置，不参与引擎查询。
@@ -3410,14 +3418,14 @@ impl Coordinator {
         let top_code = self
             .engine_mgr
             .handle_top_code(&state.input_buffer)
-            .filter(|_| !self.phrase_vetoes_top_code(&state.input_buffer))
+            .filter(|_| !self.phrase_vetoes_top_code(state, &state.input_buffer))
             // 切点修正：引擎把 prefix 固定切在 `max_code_length`，而**短语码长不受方案满码长
             // 约束**（5 码短语 `zzsfz` 落在 4 码五笔里）。顶码前的缓冲若恰是一条精确码短语，
             // 就以短语码为切点。不修则 `zzsfza` 被切成 `zzsf` + `za`，与 `pre_buf` 对不上而
             // 落进「多级溢出」分支，又因 `zzsf` 在码表无字放弃顶码——表现为「进空码不顶码」。
             // pre_buf 长度恰为满码长时两种切法本就重合（`zzbd` 一类），行为不变。
             .map(|(engine_top, remainder)| {
-                if self.phrase_has_exact_code(&pre_buf) {
+                if self.phrase_has_exact_code(state, &pre_buf) {
                     let rem: String = state
                         .input_buffer
                         .chars()
@@ -5406,12 +5414,19 @@ impl Coordinator {
 
     /// 从 store 重建短语层（短语类 RPC 改动后调用，使输入期即时生效）。
     pub(crate) fn rebuild_phrases(&self) {
-        let recs: Vec<(String, String, i32, i32, bool)> = match self.store.as_ref() {
+        let recs: Vec<wind_phrase::PhraseSeed> = match self.store.as_ref() {
             Some(store) => store
                 .enabled_phrases_for_input()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|p| (p.code, p.text, p.weight, p.position, p.is_system))
+                .map(|p| wind_phrase::PhraseSeed {
+                    code: p.code,
+                    text: p.text,
+                    weight: p.weight,
+                    position: p.position,
+                    is_system: p.is_system,
+                    category: p.category,
+                })
                 .collect(),
             None => Vec::new(),
         };
@@ -5486,6 +5501,7 @@ impl Coordinator {
                 text: e.text.clone(),
                 weight: e.weight,
                 position: e.position,
+                category: e.category.clone(),
             })
             .collect();
         match store.ensure_system_phrases(&sys) {
@@ -5513,6 +5529,7 @@ impl Coordinator {
                 text: e.text.clone(),
                 weight: e.weight,
                 position: e.position,
+                category: e.category.clone(),
             })
             .collect();
         // 先认领：历史上 `add_phrase`/wdict 导入撞键时会把系统行降级成用户行，此后

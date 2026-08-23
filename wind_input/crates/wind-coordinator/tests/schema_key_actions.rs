@@ -740,11 +740,19 @@ fn z_fallback_does_not_hijack_digits_for_temp_pinyin() {
 ///
 /// 真机上正是它们让 `has_code_prefix("z")` 为真。headless 测试的 `store` 是 `None`、
 /// 短语层恒空，不显式装载的话下面这些用例测的全是「z 是死码」那条分支——与真机分叉。
-fn zz_system_phrases() -> Vec<(String, String, i32, i32, bool)> {
-    vec![
-        ("zzbd".into(), "、".into(), 0, 0, true),
-        ("zzsz".into(), "…".into(), 0, 0, true),
-    ]
+fn seed(code: &str, text: &str) -> wind_phrase::PhraseSeed {
+    wind_phrase::PhraseSeed {
+        code: code.into(),
+        text: text.into(),
+        weight: 0,
+        position: 0,
+        is_system: true,
+        category: String::new(),
+    }
+}
+
+fn zz_system_phrases() -> Vec<wind_phrase::PhraseSeed> {
+    vec![seed("zzbd", "、"), seed("zzsz", "…")]
 }
 
 /// ★★ `input.phrase.min_prefix` 对**绑了动作的字母同样有效**——反馈不能拿短语顶上。
@@ -795,7 +803,7 @@ fn min_prefix_respected_on_unbound_letter() {
         Some(ov.clone()),
     );
     let mut phrases = zz_system_phrases();
-    phrases.push(("ccbd".into(), "○".into(), 0, 0, true));
+    phrases.push(seed("ccbd", "○"));
     coord.debug_install_phrases(phrases);
 
     coord.handle_key_event(&key('C' as u32));
@@ -904,7 +912,7 @@ fn exact_code_phrase_still_yields_regardless_of_min_prefix() {
     let ov = make_override("zexact", "wubi86", "z = \"mix:quick_mix\"");
     let cfg = cfg_for("wubi86"); // min_prefix = 2
     let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
-    coord.debug_install_phrases(vec![("z".into(), "◎".into(), 0, 0, true)]);
+    coord.debug_install_phrases(vec![seed("z", "◎")]);
 
     coord.handle_key_event(&key(VK_Z));
     assert_eq!(

@@ -28,6 +28,62 @@ pub struct PhraseEntry {
     pub position: i32,
     /// 是否系统短语（来自 system.phrases.toml / store `is_system=true`）；false=用户短语。
     pub is_system: bool,
+    /// 分类（`""` = 未分类）。方案级 `[phrases]` 按它做白/黑名单过滤，见 [`PhraseScope`]。
+    pub category: String,
+}
+
+/// 方案级短语作用域：一次查询里「哪些短语算数」。
+///
+/// # ★ 为什么它是**必填参数**而不是 `Option` 或另开一族 `*_scoped` 方法
+///
+/// 短语查询有六个消费点（两处候选生成、两处「这个码位归短语管」的判据、临英两处）。
+/// **只漏掉 `phrase_owns_code` 的表现是：短语候选不出现了，但顶码与自动上屏仍被短语层
+/// 否决 ⇒ 打字卡住不上屏，且零日志。** 可选参数或并行方法族都把「别漏」变成自觉，
+/// 而这里必须是编译期强制——新增查询方法时同样躲不过。
+///
+/// 见 `docs/design/schema-scoped-behavior.md` §6.3。
+#[derive(Debug, Clone, Copy)]
+pub struct PhraseScope<'a> {
+    /// 本方案是否加载短语。`false` ⇒ 所有查询直接短路。
+    pub enabled: bool,
+    /// 白名单。**空 = 不施加这一项限制**（全部分类），不是「一条都不要」——
+    /// 「一条都不要」由 `enabled = false` 表达。空串 `""` 匹配未分类短语。
+    pub categories: &'a [String],
+    /// 黑名单。空 = 不排除；在白名单之后再减。
+    pub exclude: &'a [String],
+}
+
+impl PhraseScope<'_> {
+    /// 不施加任何限制。测试与「无方案上下文」的调用点用。
+    ///
+    /// 它仍然是**显式写出来的**决定，与「忘了过滤」在代码里长得不一样——这正是必填参数
+    /// 想要的效果。
+    pub const ALL: PhraseScope<'static> = PhraseScope {
+        enabled: true,
+        categories: &[],
+        exclude: &[],
+    };
+
+    /// 这条短语算不算数。
+    pub fn admits(&self, e: &PhraseEntry) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if !self.categories.is_empty() && !self.categories.iter().any(|c| c == &e.category) {
+            return false;
+        }
+        !self.exclude.iter().any(|c| c == &e.category)
+    }
+
+    /// 整体关闭的快路径：`has_longer_code` 这类全表扫描据此直接返回，不必逐条问。
+    pub fn is_closed(&self) -> bool {
+        !self.enabled
+    }
+
+    /// 是否**完全不过滤**（只判 enabled，不看分类）——全表扫描的快路径判据。
+    fn admits_everything(&self) -> bool {
+        self.enabled && self.categories.is_empty() && self.exclude.is_empty()
+    }
 }
 
 /// 一条短语命中：展开后的候选文本 + 权重 + 可选命令源 / 前缀导航目标。
@@ -115,6 +171,20 @@ pub struct SystemPhraseEntry {
     pub text: String,
     pub weight: i32,
     pub position: i32,
+    /// 分类（`""` = 未分类），来自 TOML 的 `category` 键。
+    pub category: String,
+}
+
+/// [`PhraseLayer::from_records`] 的输入记录。
+#[derive(Debug, Clone)]
+pub struct PhraseSeed {
+    pub code: String,
+    pub text: String,
+    pub weight: i32,
+    pub position: i32,
+    pub is_system: bool,
+    /// 分类（`""` = 未分类）。
+    pub category: String,
 }
 
 /// 短语层：code → 多条短语
@@ -139,6 +209,9 @@ struct RawPhrase {
     position: Option<i32>,
     #[serde(default)]
     platform: Option<String>,
+    /// 分类（缺省 = 未分类）。方案级 `[phrases] categories` 按它过滤。
+    #[serde(default)]
+    category: Option<String>,
 }
 
 impl PhraseLayer {
@@ -170,6 +243,7 @@ impl PhraseLayer {
                 position: r.position.unwrap_or(0),
                 // system.phrases.toml 内均为系统短语。
                 is_system: true,
+                category: r.category.unwrap_or_default(),
             });
         }
         for v in map.values_mut() {
@@ -205,22 +279,25 @@ impl PhraseLayer {
                 text: r.text,
                 weight: r.weight.unwrap_or(1000),
                 position: r.position.unwrap_or(0),
+                category: r.category.unwrap_or_default(),
             });
         }
         out
     }
 
-    /// 从 (code,text,weight,position,is_system) 记录构建短语层（调用方只传 enabled 项）。
-    pub fn from_records(
-        records: impl IntoIterator<Item = (String, String, i32, i32, bool)>,
-    ) -> Self {
+    /// 从 [`PhraseSeed`] 记录构建短语层（调用方只传 enabled 项）。
+    ///
+    /// 用结构体而不是元组：字段已经六个，位置参数在调用点读不出谁是谁，
+    /// 而 `(String, String, ...)` 里错位两个同类型字段编译器一声不吭。
+    pub fn from_records(records: impl IntoIterator<Item = PhraseSeed>) -> Self {
         let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
-        for (code, text, weight, position, is_system) in records {
-            map.entry(code).or_default().push(PhraseEntry {
-                text,
-                weight,
-                position,
-                is_system,
+        for r in records {
+            map.entry(r.code).or_default().push(PhraseEntry {
+                text: r.text,
+                weight: r.weight,
+                position: r.position,
+                is_system: r.is_system,
+                category: r.category,
             });
         }
         for v in map.values_mut() {
@@ -237,8 +314,14 @@ impl PhraseLayer {
     /// `last` 为上屏历史快照（index 0 = 最近），供命令栏 display 侧的 `last(n)` 使用
     /// （如 `coll` 的 `$CC(last(), ...)` 候选需显示上一次上屏内容）。
     /// `host` 为宿主能力回调束（剪贴板 / 反查），见 [`PhraseHost`]。测试传 [`PhraseHost::empty`]。
-    pub fn lookup(&self, code: &str, last: &[String], host: &PhraseHost<'_>) -> Vec<PhraseHit> {
-        self.lookup_at(code, Local::now(), last, host)
+    pub fn lookup(
+        &self,
+        code: &str,
+        last: &[String],
+        host: &PhraseHost<'_>,
+        scope: &PhraseScope<'_>,
+    ) -> Vec<PhraseHit> {
+        self.lookup_at(code, Local::now(), last, host, scope)
     }
 
     /// 同 lookup，但显式传入时间（便于测试）。
@@ -248,13 +331,20 @@ impl PhraseLayer {
         now: DateTime<Local>,
         last: &[String],
         host: &PhraseHost<'_>,
+        scope: &PhraseScope<'_>,
     ) -> Vec<PhraseHit> {
+        if scope.is_closed() {
+            return Vec::new();
+        }
         let entries = match self.map.get(code) {
             Some(e) => e,
             None => return Vec::new(),
         };
         let mut out = Vec::new();
         for e in entries {
+            if !scope.admits(e) {
+                continue;
+            }
             let sys_start = out.len();
             if is_cmdbar_grammar(&e.text) {
                 // 命令栏路径：display 求值（纯函数 + last/clip 上下文，无副作用服务）。
@@ -345,13 +435,20 @@ impl PhraseLayer {
     /// 是否存在「码以 `code` 开头且严格更长」的短语（含普通字面/模板与 marker，全量扫描）。
     /// 供短语自动上屏的「无更长后继」判据——避免短码短语（如 `ab`）在还能续打成更长短语
     /// （`abc`）时被自动上屏、打断输入。码表侧的更长后继由引擎 `has_longer_code` 判。
-    pub fn has_longer_code(&self, code: &str) -> bool {
-        if code.is_empty() {
+    pub fn has_longer_code(&self, code: &str, scope: &PhraseScope<'_>) -> bool {
+        if code.is_empty() || scope.is_closed() {
             return false;
         }
-        self.map
-            .keys()
-            .any(|k| k.len() > code.len() && k.starts_with(code))
+        if scope.admits_everything() {
+            // 快路径：不过滤时只看键，省掉逐条 admits。
+            return self
+                .map
+                .keys()
+                .any(|k| k.len() > code.len() && k.starts_with(code));
+        }
+        self.map.iter().any(|(k, v)| {
+            k.len() > code.len() && k.starts_with(code) && v.iter().any(|e| scope.admits(e))
+        })
     }
 
     /// 是否存在**码恰为** `code` 的短语（不含更长后继，那是 [`Self::has_longer_code`]）。
@@ -360,11 +457,13 @@ impl PhraseLayer {
     /// `has_full_input_match` 只问码表（`DictManager`），短语层归协调器持有、引擎够不着，
     /// 于是码长超过满码长的短语（如 5 码短语在 4 码方案里）会被判成「溢出该顶字」，
     /// 顶掉前 N 码首选、余码续打——那条短语永远打不出来。
-    pub fn has_exact_code(&self, code: &str) -> bool {
-        if code.is_empty() {
+    pub fn has_exact_code(&self, code: &str, scope: &PhraseScope<'_>) -> bool {
+        if code.is_empty() || scope.is_closed() {
             return false;
         }
-        self.map.get(code).is_some_and(|v| !v.is_empty())
+        self.map
+            .get(code)
+            .is_some_and(|v| v.iter().any(|e| scope.admits(e)))
     }
 
     /// 前缀导航：敲 `code`（长度 ≥ `min_len`）时，列出所有**码以 `code` 开头但更长**的
@@ -374,8 +473,14 @@ impl PhraseLayer {
     ///
     /// 不含精确码本身（走 [`Self::lookup_at`]），不列普通字面/模板短语（无 marker，维持
     /// 精确匹配语义，对齐 Go SearchPrefix 对 `$X` 模板的处理）。
-    pub fn lookup_prefix(&self, code: &str, last: &[String], min_len: usize) -> Vec<PhraseHit> {
-        self.lookup_prefix_at(code, Local::now(), last, min_len)
+    pub fn lookup_prefix(
+        &self,
+        code: &str,
+        last: &[String],
+        min_len: usize,
+        scope: &PhraseScope<'_>,
+    ) -> Vec<PhraseHit> {
+        self.lookup_prefix_at(code, Local::now(), last, min_len, scope)
     }
 
     /// 同 [`Self::lookup_prefix`]，显式传时间便于测试。
@@ -385,8 +490,9 @@ impl PhraseLayer {
         now: DateTime<Local>,
         last: &[String],
         min_len: usize,
+        scope: &PhraseScope<'_>,
     ) -> Vec<PhraseHit> {
-        if code.is_empty() || code.len() < min_len {
+        if code.is_empty() || code.len() < min_len || scope.is_closed() {
             return Vec::new();
         }
         let reg = default_registry();
@@ -406,6 +512,9 @@ impl PhraseLayer {
             }
             let suffix = full_code[code.len()..].to_string();
             for e in entries {
+                if !scope.admits(e) {
+                    continue;
+                }
                 let sys_start = out.len();
                 let phrase = match parse(&e.text) {
                     Ok(p) => p,
@@ -820,14 +929,40 @@ mod tests {
     #[test]
     fn has_longer_code_detects_strict_prefix() {
         let layer = PhraseLayer::from_records([
-            ("date".to_string(), "X".to_string(), 0, 0, false),
-            ("dates".to_string(), "Y".to_string(), 0, 0, false),
+            PhraseSeed {
+                code: "date".into(),
+                text: "X".into(),
+                weight: 0,
+                position: 0,
+                is_system: false,
+                category: String::new(),
+            },
+            PhraseSeed {
+                code: "dates".into(),
+                text: "Y".into(),
+                weight: 0,
+                position: 0,
+                is_system: false,
+                category: String::new(),
+            },
         ]);
-        assert!(layer.has_longer_code("dat"), "date/dates 都比 dat 长");
-        assert!(layer.has_longer_code("date"), "存在更长码 dates");
-        assert!(!layer.has_longer_code("dates"), "dates 已最长，无更长后继");
-        assert!(!layer.has_longer_code("zzz"), "无以 zzz 为前缀的短语");
-        assert!(!layer.has_longer_code(""), "空码不算");
+        assert!(
+            layer.has_longer_code("dat", &PhraseScope::ALL),
+            "date/dates 都比 dat 长"
+        );
+        assert!(
+            layer.has_longer_code("date", &PhraseScope::ALL),
+            "存在更长码 dates"
+        );
+        assert!(
+            !layer.has_longer_code("dates", &PhraseScope::ALL),
+            "dates 已最长，无更长后继"
+        );
+        assert!(
+            !layer.has_longer_code("zzz", &PhraseScope::ALL),
+            "无以 zzz 为前缀的短语"
+        );
+        assert!(!layer.has_longer_code("", &PhraseScope::ALL), "空码不算");
     }
 
     fn fixed() -> DateTime<Local> {
@@ -847,13 +982,14 @@ mod tests {
     /// `type()`），以及**查不到时整条候选消失**而不是留一条空白的。
     #[test]
     fn clipboard_reverse_renders_and_drops_when_nothing_found() {
-        let layer = PhraseLayer::from_records(vec![(
-            "cofc".into(),
-            "{dict.rev(clip())}".into(),
-            2000,
-            0,
-            true,
-        )]);
+        let layer = PhraseLayer::from_records(vec![PhraseSeed {
+            code: "cofc".into(),
+            text: "{dict.rev(clip())}".into(),
+            weight: 2000,
+            position: 0,
+            is_system: true,
+            category: String::new(),
+        }]);
         let clip = |_n: i64| "好人".to_string();
         // 只认「好」，借此模拟「这个字查不到」。
         let reverse = |text: &str, _fmt: &str| {
@@ -867,7 +1003,7 @@ mod tests {
             clip: &clip,
             reverse: &reverse,
         };
-        let hits = layer.lookup_at("cofc", fixed(), &[], &host);
+        let hits = layer.lookup_at("cofc", fixed(), &[], &host, &PhraseScope::ALL);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "好: vbg hǎo");
         assert!(
@@ -882,7 +1018,9 @@ mod tests {
             reverse: &reverse,
         };
         assert!(
-            layer.lookup_at("cofc", fixed(), &[], &host).is_empty(),
+            layer
+                .lookup_at("cofc", fixed(), &[], &host, &PhraseScope::ALL)
+                .is_empty(),
             "剪贴板为空时不得产出空白候选"
         );
     }
@@ -893,7 +1031,14 @@ mod tests {
     #[test]
     fn reverse_group_drops_tail_when_clipboard_is_shorter() {
         let src = r#"$SS("反查", "{dict.rev(clip(),1)}", "{dict.rev(clip(),2)}", "{dict.rev(clip(),3)}")"#;
-        let layer = PhraseLayer::from_records(vec![("cofc".into(), src.into(), 2000, 0, true)]);
+        let layer = PhraseLayer::from_records(vec![PhraseSeed {
+            code: "cofc".into(),
+            text: src.into(),
+            weight: 2000,
+            position: 0,
+            is_system: true,
+            category: String::new(),
+        }]);
         let clip = |_n: i64| "好人".to_string(); // 只有 2 个字，第 3 个元素必然落空
         let reverse = |text: &str, _f: &str| format!("{text}=x");
         let host = PhraseHost {
@@ -901,7 +1046,7 @@ mod tests {
             reverse: &reverse,
         };
         let texts: Vec<String> = layer
-            .lookup_at("cofc", fixed(), &[], &host)
+            .lookup_at("cofc", fixed(), &[], &host, &PhraseScope::ALL)
             .into_iter()
             .map(|h| h.text)
             .collect();
@@ -1055,6 +1200,7 @@ mod tests {
                 weight: 1000,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         map.insert(
@@ -1064,6 +1210,7 @@ mod tests {
                 weight: 900,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         map.insert(
@@ -1073,6 +1220,7 @@ mod tests {
                 weight: 800,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         // $CC 命令短语（有动作）：暂不显现（待动作执行通路），避免误上屏 display 标签。
@@ -1083,24 +1231,25 @@ mod tests {
                 weight: 700,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
         let now = fixed();
-        let rq = layer.lookup_at("rq", now, &[], &no_clip());
+        let rq = layer.lookup_at("rq", now, &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(rq.len(), 1);
         assert_eq!(rq[0].text, "2026-06-14");
         assert_eq!(rq[0].weight, 1000);
-        let js = layer.lookup_at("js", now, &[], &no_clip());
+        let js = layer.lookup_at("js", now, &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(js.len(), 1);
         assert_eq!(js[0].text, "7");
         // 旧简单模板路径仍工作；source_text 保留未展开原文（右键禁用短语用）。
-        let old = layer.lookup_at("old", now, &[], &no_clip());
+        let old = layer.lookup_at("old", now, &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(old.len(), 1);
         assert_eq!(old[0].text, "2026-06-14");
         assert_eq!(old[0].source_text, "$Y-$MM-$DD");
         // 命令短语：display 为标签，携带命令源（选中时执行动作）。
-        let cmd = layer.lookup_at("cmd", now, &[], &no_clip());
+        let cmd = layer.lookup_at("cmd", now, &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(cmd.len(), 1);
         assert_eq!(cmd[0].text, "切简繁");
         assert_eq!(
@@ -1210,6 +1359,7 @@ mod tests {
                 weight: 1800,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         map.insert(
@@ -1219,11 +1369,12 @@ mod tests {
                 weight: 100,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
 
-        let hits = layer.lookup_prefix_at("zzsf", fixed(), &[], 2);
+        let hits = layer.lookup_prefix_at("zzsf", fixed(), &[], 2, &PhraseScope::ALL);
         let stat = hits
             .iter()
             .find(|h| h.text == "TEST")
@@ -1236,7 +1387,7 @@ mod tests {
         assert_eq!(marker.comment, "zab", "marker 短语的既有行为不得变");
 
         // 精确命中（lookup）无剩余编码，不得凭空冒出注释。
-        let exact = layer.lookup_at("zzsfz", fixed(), &[], &no_clip());
+        let exact = layer.lookup_at("zzsfz", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].comment, "", "精确路径不得带剩余编码注释");
     }
@@ -1251,10 +1402,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_at("fh", fixed(), &[], &no_clip());
+        let got = layer.lookup_at("fh", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         let src = r#"$SS("符号", "（）", "【】")"#;
         assert_eq!(
             got,
@@ -1276,10 +1428,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_at("zzsz", fixed(), &[], &no_clip());
+        let got = layer.lookup_at("zzsz", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         let src = r#"$AA("数字", "①②③")"#;
         assert_eq!(
             got,
@@ -1302,6 +1455,7 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         map.insert(
@@ -1311,6 +1465,7 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         map.insert(
@@ -1320,10 +1475,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_prefix_at("zz", fixed(), &[], 2);
+        let got = layer.lookup_prefix_at("zz", fixed(), &[], 2, &PhraseScope::ALL);
         assert_eq!(got.len(), 2);
         // 同权重按完整码字母序 zzbd < zzsz。
         assert_eq!(got[0].text, "标点");
@@ -1344,15 +1500,29 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
         // 前缀长度 < min_len → 不触发。
-        assert!(layer.lookup_prefix_at("z", fixed(), &[], 2).is_empty());
+        assert!(
+            layer
+                .lookup_prefix_at("z", fixed(), &[], 2, &PhraseScope::ALL)
+                .is_empty()
+        );
         // 精确码本身（== 完整码）不作为导航候选返回（只列更长的码）。
-        assert!(layer.lookup_prefix_at("zzbd", fixed(), &[], 2).is_empty());
+        assert!(
+            layer
+                .lookup_prefix_at("zzbd", fixed(), &[], 2, &PhraseScope::ALL)
+                .is_empty()
+        );
         // 真前缀 → 1 个导航候选。
-        assert_eq!(layer.lookup_prefix_at("zz", fixed(), &[], 2).len(), 1);
+        assert_eq!(
+            layer
+                .lookup_prefix_at("zz", fixed(), &[], 2, &PhraseScope::ALL)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1365,6 +1535,7 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         map.insert(
@@ -1374,10 +1545,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_prefix_at("co", fixed(), &[], 2);
+        let got = layer.lookup_prefix_at("co", fixed(), &[], 2, &PhraseScope::ALL);
         // $CC 默认列出（百度），显式 {prefix: false} 退出列举（退出）。
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "百度");
@@ -1399,10 +1571,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_prefix_at("co", fixed(), &[], 2);
+        let got = layer.lookup_prefix_at("co", fixed(), &[], 2, &PhraseScope::ALL);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "剪贴板加词:");
         assert!(got[0].command_src.is_some());
@@ -1420,10 +1593,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_prefix_at("r", fixed(), &[], 1);
+        let got = layer.lookup_prefix_at("r", fixed(), &[], 1, &PhraseScope::ALL);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "2026-06-14");
         assert!(got[0].command_src.is_none());
@@ -1448,18 +1622,19 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
         // 前缀路径：不得出候选，更不得把字面 `$NOPE` 端上来
-        let pre = layer.lookup_prefix_at("r", fixed(), &[], 1);
+        let pre = layer.lookup_prefix_at("r", fixed(), &[], 1, &PhraseScope::ALL);
         assert!(
             pre.is_empty(),
             "展开失败的模板不该出现在前缀候选里，实得 {:?}",
             pre.iter().map(|h| &h.text).collect::<Vec<_>>()
         );
         // 精确路径：同样不出候选
-        let exact = layer.lookup_at("rq", fixed(), &[], &no_clip());
+        let exact = layer.lookup_at("rq", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert!(exact.is_empty(), "精确路径同样应跳过该条");
     }
 
@@ -1476,15 +1651,16 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
         // fixed() = 2026-06-14，非节日
-        let exact = layer.lookup_at("nl", fixed(), &[], &no_clip());
+        let exact = layer.lookup_at("nl", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(exact.len(), 1, "非节日也该出候选");
         assert_eq!(exact[0].text, "丙午年四月廿九");
 
-        let pre = layer.lookup_prefix_at("n", fixed(), &[], 1);
+        let pre = layer.lookup_prefix_at("n", fixed(), &[], 1, &PhraseScope::ALL);
         assert_eq!(pre.len(), 1);
         assert_eq!(pre[0].text, "丙午年四月廿九", "两条路径给出同一个答案");
     }
@@ -1500,11 +1676,12 @@ mod tests {
                 weight: 2000,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
         let recent = vec!["上次内容".to_string()];
-        let got = layer.lookup_at("coll", fixed(), &recent, &no_clip());
+        let got = layer.lookup_at("coll", fixed(), &recent, &no_clip(), &PhraseScope::ALL);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "上次内容"); // display = last() 显示上次上屏
         assert!(got[0].command_src.is_some()); // 仍是命令（选中执行 type(last())）
@@ -1513,10 +1690,24 @@ mod tests {
     #[test]
     fn from_records_builds_lookup() {
         let layer = PhraseLayer::from_records([
-            ("bj".to_string(), "北京".to_string(), 1000, 0, false),
-            ("bj".to_string(), "北京市".to_string(), 500, 1, true),
+            PhraseSeed {
+                code: "bj".into(),
+                text: "北京".into(),
+                weight: 1000,
+                position: 0,
+                is_system: false,
+                category: String::new(),
+            },
+            PhraseSeed {
+                code: "bj".into(),
+                text: "北京市".into(),
+                weight: 500,
+                position: 1,
+                is_system: true,
+                category: String::new(),
+            },
         ]);
-        let hits = layer.lookup("bj", &[], &no_clip());
+        let hits = layer.lookup("bj", &[], &no_clip(), &PhraseScope::ALL);
         // 两条同码，按 weight 降序
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].text, "北京");
@@ -1544,17 +1735,18 @@ mod tests {
                 weight: 100,
                 position: 0,
                 is_system: true,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
 
         // 精确匹配路径
-        let got = layer.lookup_at("date", fixed(), &[], &no_clip());
+        let got = layer.lookup_at("date", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(got.len(), 1, "${{YC}} 模板短语不应被丢弃");
         assert_eq!(got[0].text, "二〇二六年六月十四日");
 
         // 前缀枚举路径（lookup_prefix 的 Literal 分支同样要展开）
-        let got = layer.lookup_prefix_at("dat", fixed(), &[], 2);
+        let got = layer.lookup_prefix_at("dat", fixed(), &[], 2, &PhraseScope::ALL);
         assert_eq!(got.len(), 1, "前缀枚举也不应丢弃 ${{YC}} 模板短语");
         assert_eq!(got[0].text, "二〇二六年六月十四日");
     }
@@ -1574,24 +1766,25 @@ mod tests {
                 weight: 1000,
                 position: 0,
                 is_system: true,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
 
         // 精确匹配路径：必须出候选，且不是字面量。
-        let got = layer.lookup_at("uuid", fixed(), &[], &no_clip());
+        let got = layer.lookup_at("uuid", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(got.len(), 1, "$uuid 短语不应被丢弃");
         assert_ne!(got[0].text, "$uuid", "应展开而非原样上屏");
         assert_eq!(got[0].text.len(), 36, "默认格式为带横杠 UUID");
         assert_eq!(got[0].text.matches('-').count(), 4);
 
         // 前缀枚举路径：同样展开，不再回退成字面 `$uuid`。
-        let got_prefix = layer.lookup_prefix_at("uui", fixed(), &[], 2);
+        let got_prefix = layer.lookup_prefix_at("uui", fixed(), &[], 2, &PhraseScope::ALL);
         assert_eq!(got_prefix.len(), 1);
         assert_ne!(got_prefix[0].text, "$uuid");
 
         // 每次求值都是新值（区别于 date/time 的秒级稳定值）。
-        let again = layer.lookup_at("uuid", fixed(), &[], &no_clip());
+        let again = layer.lookup_at("uuid", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert_ne!(got[0].text, again[0].text, "uuid 应每次重新生成");
     }
 
@@ -1606,10 +1799,11 @@ mod tests {
                 weight: 1,
                 position: 0,
                 is_system: true,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_at("yy", fixed(), &[], &no_clip());
+        let got = layer.lookup_at("yy", fixed(), &[], &no_clip(), &PhraseScope::ALL);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "年份2026");
     }
@@ -1626,6 +1820,7 @@ mod tests {
                 weight: 800,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         // $CC 命令短语：码 yxbd，保证命令短语仍正常工作
@@ -1636,10 +1831,11 @@ mod tests {
                 weight: 500,
                 position: 0,
                 is_system: false,
+                category: String::new(),
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_prefix_at("y", fixed(), &[], 1);
+        let got = layer.lookup_prefix_at("y", fixed(), &[], 1, &PhraseScope::ALL);
         // 静态短语应出现
         let static_hit = got.iter().find(|h| h.text == "user@example.com");
         assert!(static_hit.is_some(), "静态短语应出现在前缀结果中");

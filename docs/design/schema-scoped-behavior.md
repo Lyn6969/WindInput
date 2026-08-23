@@ -1,6 +1,7 @@
 # 方案级行为覆盖（标点 / 候选布局 / 短语加载）与英文方案原文候选
 
-状态：📝 设计定稿，**未实施**（本轮只出文档，代码另开会话）
+状态：✅ **四阶段已实施**（分支 `feat/schema-scoped-behavior`，全 workspace 3158 测试通过），**未真机验证**
+实施中被既有测试抓出的四条设计外后果已回写本文（§5.6、§6.3.1）。
 起因：英文方案（`data/schemas/english.schema.toml`）在真实使用中暴露四处「方案级表达力缺失」——
 切到英文要英文标点、要竖排、不要加载短语，以及英文特有的「输入即内容」导致词频置顶反而挡住原文。
 
@@ -510,6 +511,23 @@ impl PhraseScope<'_> {
     pub fn is_closed(&self) -> bool { !self.enabled }
 }
 ```
+
+### 6.3.1 实施记录：变异验证证实了「候选面断言不够」
+
+实施后做了变异验证——把 `phrase_owns_code` 的 scope 换成 `PhraseScope::ALL`（模拟漏接）：
+
+| 用例 | 变异后 |
+|---|---|
+| `phrases_off_does_not_veto_top_code`（问 `phrase_owns_code`） | **FAILED** ✅ |
+| 三条 categories 用例（同样问 `phrase_owns_code`） | **FAILED** ✅ |
+| `phrases_off_removes_all_phrase_candidates`（断言候选面） | **仍然 ok** ⚠️ |
+
+⇒ ★★ **只断言「候选里有没有短语」的测试，在这一处漏接时照样通过。**
+这正是必须把 `phrase_owns_code` 单独暴露成 `debug_phrase_owns_code` 的理由：
+它的失效不可从候选面观察，用户能观察到的只有「打字有时候就卡住了」。
+
+⇒ 可复用形状：**当一处逻辑的失效表现是「另一个正常功能停止工作」而不是「本功能出错」时，
+测试必须能直接问它那一位**，不能靠观察周边现象。
 
 ### 6.4 作用域判据：复用 `effective_data_schema`
 

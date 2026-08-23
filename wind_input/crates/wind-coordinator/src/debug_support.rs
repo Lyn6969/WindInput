@@ -50,7 +50,18 @@ impl Coordinator {
     /// 分支，真机跑的是「z 有 37 条 `zz*` 前缀」那条——两边结构性分叉，测试再绿也盖不住真机。
     ///
     /// 这个缺口让「让位判据与候选构建门槛不同源」整个漏到真机（见 `has_code_prefix` 文档）。
-    pub fn debug_install_phrases(&self, records: Vec<(String, String, i32, i32, bool)>) {
+    /// 「这个码位归短语管」的判据（测试/诊断用）。
+    ///
+    /// ★ 暴露它是因为它的失效**不可从候选面观察**：方案级作用域漏接时，候选面上短语已经
+    /// 消失了（那两处过滤生效了），而顶码与全码自动上屏仍被否决 ⇒ 打字卡住不上屏、零日志。
+    /// 测试只能直接问这一位，断言「候选里有没有短语」在漏接时照样通过。
+    /// 见 `docs/design/schema-scoped-behavior.md` §6.3。
+    pub fn debug_phrase_owns_code(&self, code: &str) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.phrase_owns_code(&state, code)
+    }
+
+    pub fn debug_install_phrases(&self, records: Vec<wind_phrase::PhraseSeed>) {
         *self.phrases.write().unwrap_or_else(|e| e.into_inner()) =
             wind_phrase::PhraseLayer::from_records(records);
     }
@@ -158,7 +169,9 @@ impl Coordinator {
         self.phrases
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .lookup(code, &[], &host)
+            // 诊断口径：看**全部**短语，不套方案级作用域——这个 API 回答的是「库里有什么」，
+            // 不是「当前方案能用什么」。后者由候选路径自己过滤。
+            .lookup(code, &[], &host, &wind_phrase::PhraseScope::ALL)
             .into_iter()
             .map(|c| c.text)
             .collect()

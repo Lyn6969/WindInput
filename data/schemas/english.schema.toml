@@ -9,6 +9,25 @@ description = "英文输入（词库补全）；也供临时英文与融合英�
 [engine]
 type = "english"
 
+# 英文方案不加载短语：定制短语的码与英文词直接撞车（`date` / `tel` / `em` 这类既是
+# 短语码也是英文词），打英文时会莫名跳出中文内容。
+#
+# 分类落地后可改成只加载某几类，如 `categories = ["工作"]`（不写 = 全部分类；
+# 空串 "" 匹配未分类短语）。见 docs/design/schema-scoped-behavior.md §6。
+[phrases]
+enabled = false
+
+# 候选竖排：英文词长短不一，横排一行放不下几个。
+# follow（默认，跟随全局） | vertical | horizontal
+[candidate]
+layout = "vertical"
+
+# 英文方案下用英文标点。用户仍可在本方案期间按 toggle_punct 临时切回中文标点，
+# 切走再切回本方案时恢复英文标点（代际感知覆盖，见设计文档 §4）。
+# follow（默认，不干预） | chinese | english
+[punct]
+mode = "english"
+
 [engine.codetable]
 # 英文词最长安全上界（前缀匹配用；english 引擎不触发顶码/自动上屏）。
 max_code_length = 32

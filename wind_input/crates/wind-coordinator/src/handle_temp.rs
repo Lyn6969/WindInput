@@ -87,9 +87,18 @@ impl Coordinator {
         // 单字母或 z 缓冲串，而那些前缀下都还有别的短语撑着，故不影响既有判定；
         // 若将来有「整个前缀只剩一条瞬时短语」的情形，这里会翻转成 false。
         let host = wind_phrase::PhraseHost::empty();
+        // 方案级短语作用域取**活跃方案**而不是 `effective_data_schema`：本判据服务于「按键
+        // 让位」，只在普通输入态（`state.active == None`）被调用，那时两者恒等。
+        // ⚠️ 若日后在 overlay 语境里调用它，要改成传 state 走 `phrase_spec_of`。
+        let spec = self
+            .engine_mgr
+            .behavior_for(&self.engine_mgr.active_schema_id())
+            .phrases
+            .clone();
+        let scope = crate::schema_scope::phrase_scope(&spec);
         // 存在性判据用 `1`：只问「有没有以 code 开头的短语」，与显示门槛无关（见函数文档）。
-        !phrases.lookup(code, &recent, &host).is_empty()
-            || !phrases.lookup_prefix(code, &recent, 1).is_empty()
+        !phrases.lookup(code, &recent, &host, &scope).is_empty()
+            || !phrases.lookup_prefix(code, &recent, 1, &scope).is_empty()
     }
 
     /// z-fallback 夺取（对齐 Go `decideEngineDefaultZFallback` + `enterTempPinyinFromZBuffer`）：

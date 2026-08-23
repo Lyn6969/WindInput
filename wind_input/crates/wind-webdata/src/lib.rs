@@ -4239,6 +4239,7 @@ mod tests {
                 text: "$date".into(),
                 weight: 1000,
                 position: 0,
+                category: String::new(),
             }])
             .unwrap();
 
@@ -6185,6 +6186,7 @@ mod phrase_shadowing_tests {
                     text: "别的".into(),
                     weight: 1,
                     position: 0,
+                    category: String::new(),
                 }])
             })
             .unwrap();

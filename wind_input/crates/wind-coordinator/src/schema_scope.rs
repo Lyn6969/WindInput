@@ -67,9 +67,42 @@ impl Coordinator {
         self.sync_schema_scope(&mut state);
     }
 
+    /// 当前输入语境的**短语加载规格**（`[phrases]` 段）。
+    ///
+    /// # ★ 归属方案取 `effective_data_schema`，不是 active
+    ///
+    /// 它已经是词频读端（`apply_freq_rerank_in`）、写端（`record_selection_in`）与右键菜单
+    /// （`candidate_op_scope`）三处共用的归属源 ⇒ 临时英文自动按 `english` 方案的
+    /// `[phrases]` 走，不会出现「候选归 english 桶、短语归五笔」的错配。
+    ///
+    /// ⚠️ **绝不能改用 `overlay_engine_schema`**：它在 `show_candidates = false` 时返回
+    /// `None`（它回答的是「要不要出候选」，不是「数据算谁的」）。拿它当归属，用户一关候选
+    /// 显示，短语作用域就静默换回主方案。这条坑 2026-08-21 已经踩过一次。
+    pub(crate) fn phrase_spec_of(&self, state: &State) -> std::sync::Arc<wind_config::PhrasesSpec> {
+        let id = self
+            .effective_data_schema(state)
+            .unwrap_or_else(|| self.engine_mgr.active_schema_id());
+        let behavior = self.engine_mgr.behavior_for(&id);
+        // `behavior_for` 返回整段快照的 Arc；这里只要 `[phrases]` 那一段，克隆一次
+        // （两个 Vec，通常都是空的）好过让调用方拿着整段。
+        std::sync::Arc::new(behavior.phrases.clone())
+    }
+
     /// 当前方案声明的候选布局意图（`[candidate] layout`）。
     pub(crate) fn schema_layout_intent(&self) -> wind_config::LayoutIntent {
         self.engine_mgr.active_behavior().candidate_layout
+    }
+}
+
+/// 把 `[phrases]` 规格折成一次查询的作用域。
+///
+/// 单独一个自由函数而不是方法：`PhraseScope` 借用 spec 里的两个 `Vec`，调用点必须先把
+/// spec 绑成局部变量再取 scope，方法形态反而藏不住这一步。
+pub(crate) fn phrase_scope(spec: &wind_config::PhrasesSpec) -> wind_phrase::PhraseScope<'_> {
+    wind_phrase::PhraseScope {
+        enabled: spec.enabled,
+        categories: &spec.categories,
+        exclude: &spec.exclude_categories,
     }
 }
 

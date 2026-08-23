@@ -660,8 +660,12 @@ impl Coordinator {
             self.finalize_candidates(result.completion_hints, &state.input_buffer);
         let mut completion_pool: Vec<Candidate> = Vec::new();
         let mut candidates = self.finalize_candidates(result.candidates, &state.input_buffer);
+        // 方案级短语作用域：`[phrases] enabled/categories/exclude_categories`。
+        // 归属方案取 `effective_data_schema`（临英归 english），见 phrase_spec_of。
+        let phrase_spec = self.phrase_spec_of(state);
+        let phrase_scope = crate::schema_scope::phrase_scope(&phrase_spec);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
-        if !phrases.is_empty() {
+        if !phrases.is_empty() && !phrase_scope.is_closed() {
             let recent = self.recent_commits_snapshot();
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
             // 含 {clip()}（如 coad）时按需读取；非 windows 返回空。
@@ -689,7 +693,7 @@ impl Coordinator {
                 clip: &clip,
                 reverse: &reverse,
             };
-            for hit in phrases.lookup(&state.input_buffer, &recent, &host) {
+            for hit in phrases.lookup(&state.input_buffer, &recent, &host, &phrase_scope) {
                 let is_command = hit.command_src.is_some();
                 let is_system = hit.is_system;
                 // 稳定 id 取**模板原文**：text 可能是求值结果（date/time/clip），逐日变化。
@@ -787,7 +791,7 @@ impl Coordinator {
                 && candidates.is_empty()
                 && state.input_buffer.chars().count() < self.engine_mgr.active_max_code_length();
             let prefix_hits = if !exact_only || complete_fallback {
-                phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix)
+                phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix, &phrase_scope)
             } else {
                 Vec::new()
             };
@@ -1045,7 +1049,7 @@ impl Coordinator {
             //
             // 惰性：`filter` 只在引擎已放行（`Some`）时才求值，故全量扫短语码表的代价不落在
             // 每次按键上——与 `phrase_vetoes_top_code` 的调用点选择同源。
-            .filter(|_| !self.phrase_vetoes_auto_commit(&state.input_buffer))
+            .filter(|_| !self.phrase_vetoes_auto_commit(state, &state.input_buffer))
         {
             Some(_) => {
                 // 一致性：自动上屏文本取「实际显示的首候选」，与空格/点选同源，杜绝
@@ -1122,11 +1126,12 @@ impl Coordinator {
         if self.engine_mgr.has_longer_code(input) {
             return None;
         }
+        let phrase_spec = self.phrase_spec_of(state);
         if self
             .phrases
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .has_longer_code(input)
+            .has_longer_code(input, &crate::schema_scope::phrase_scope(&phrase_spec))
         {
             return None;
         }
@@ -1154,8 +1159,8 @@ impl Coordinator {
     ///
     /// 调用点刻意放在 `handle_top_code` **返回 Some 之后**：本判据要全量扫短语码表，而
     /// 引擎侧首道闸（开关 + 码长 ≤ 满码长）极廉价且绝大多数按键都在那里返回 None。
-    pub(crate) fn phrase_vetoes_top_code(&self, input: &str) -> bool {
-        self.phrase_owns_code(input)
+    pub(crate) fn phrase_vetoes_top_code(&self, state: &State, input: &str) -> bool {
+        self.phrase_owns_code(state, input)
     }
 
     /// 短语侧对**全码唯一自动上屏**的否决。判据与 [`Self::phrase_vetoes_top_code`] 同构，
@@ -1173,8 +1178,8 @@ impl Coordinator {
     /// ⚠️ 两条判据缺一不可，理由与顶码那侧完全一致：`has_longer_code` 管的是**码长超过方案
     /// 满码长的短语**（5 码短语落在 4 码方案里），它在码表侧恰好呈现为「精确唯一 + 无更长
     /// 后继」——正是自动上屏最爱命中的形态，一旦上屏那条短语就永远打不出来。
-    pub(crate) fn phrase_vetoes_auto_commit(&self, input: &str) -> bool {
-        self.phrase_owns_code(input)
+    pub(crate) fn phrase_vetoes_auto_commit(&self, state: &State, input: &str) -> bool {
+        self.phrase_owns_code(state, input)
     }
 
     /// 「这个码位归短语管」的单一判据：整串已是精确码短语，或还能续打成更长短语。
@@ -1184,9 +1189,14 @@ impl Coordinator {
     /// 于是同一个缺口在第二条路径上原样重现了一次）。
     ///
     /// 全量扫短语码表，调用方须把它放在「引擎已决定上屏」之后作二道闸，不可每键必查。
-    fn phrase_owns_code(&self, input: &str) -> bool {
+    pub(crate) fn phrase_owns_code(&self, state: &State, input: &str) -> bool {
+        // ★ 这一处**最不能漏**方案级作用域：漏了它，英文方案下短语候选不出现（上面两处
+        // 已过滤），但顶码与自动上屏仍被短语层否决 ⇒ 打字卡住不上屏，且零日志。
+        // 见 `docs/design/schema-scoped-behavior.md` §6.3。
+        let spec = self.phrase_spec_of(state);
+        let scope = crate::schema_scope::phrase_scope(&spec);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
-        phrases.has_exact_code(input) || phrases.has_longer_code(input)
+        phrases.has_exact_code(input, &scope) || phrases.has_longer_code(input, &scope)
     }
 
     /// 这串码是否**恰好**是一条短语的编码（[`wind_phrase::PhraseLayer::has_exact_code`] 直通）。
@@ -1196,11 +1206,13 @@ impl Coordinator {
     /// 短语层。真机现场：5 码短语 `zzsfz` 在敲到 `zzsf` 时就以 `is_prefix=false` 的形态出现在
     /// 候选首位（前缀命中不打标记），顶码把它当成「`zzsf` 的首选」兑现，于是打 `zzsfa`
     /// （短语里根本没有这条码）反而上屏了 `zzsfz` 的内容。
-    pub(crate) fn phrase_has_exact_code(&self, code: &str) -> bool {
+    pub(crate) fn phrase_has_exact_code(&self, state: &State, code: &str) -> bool {
+        let spec = self.phrase_spec_of(state);
+        let scope = crate::schema_scope::phrase_scope(&spec);
         self.phrases
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .has_exact_code(code)
+            .has_exact_code(code, &scope)
     }
 
     /// 短语自动上屏的最短码长门槛。

@@ -18,6 +18,9 @@ pub struct SystemPhrase {
     pub text: String,
     pub weight: i32,
     pub position: i32,
+    /// 分类（`""` = 未分类）。供方案级 `[phrases] categories` 过滤，见
+    /// `docs/design/schema-scoped-behavior.md` §6。
+    pub category: String,
 }
 
 /// 系统短语同步统计。
@@ -49,6 +52,11 @@ pub struct PhraseRecord {
     /// sync 会重新插入系统条目（调用方须补一次 sync，见 `resync_system_phrases_after_user_reset`）。
     #[serde(default)]
     pub overrides_system: bool,
+    /// 分类（`""` = 未分类）。方案级 `[phrases]` 按它做白/黑名单过滤。
+    ///
+    /// ⚠️ 分类 UI 落地之前所有存量记录都是 `""`，此时任何非空白名单都会把短语全部滤掉。
+    #[serde(default)]
+    pub category: String,
 }
 
 /// value 部分（text/code 存于 key）。
@@ -64,6 +72,9 @@ struct PhraseValue {
     is_system: bool,
     #[serde(default)]
     overrides_system: bool,
+    /// 分类（`""` = 未分类）。`serde(default)` 保证既有记录反序列化后为空串。
+    #[serde(default)]
+    category: String,
 }
 
 /// 分发导入时一条短语相对本地库的落点。
@@ -134,6 +145,7 @@ impl Store {
                         enabled: val.enabled,
                         is_system: val.is_system,
                         overrides_system: val.overrides_system,
+                        category: val.category,
                     });
                 }
             }
@@ -175,6 +187,8 @@ impl Store {
                 // 用户优先：撞键即转为用户行，输入期与列表都以用户这条为准。
                 is_system: false,
                 overrides_system: shadows_system,
+                // 新建的用户短语未分类。分类目前只能由系统短语 TOML 声明或将来的 GUI 设置。
+                category: String::new(),
             },
         )
     }
@@ -234,6 +248,7 @@ impl Store {
             enabled: true,
             is_system: false,
             overrides_system: false,
+            category: String::new(),
         });
         let nc = new_code.unwrap_or(code);
         let nt = new_text.unwrap_or(text);
@@ -245,6 +260,8 @@ impl Store {
             // 编辑既有条目不改归属：在系统短语列表里调权重仍是系统条目，不因此转成用户行。
             // 本位只记录 `add_phrase` 撞键形成的遮蔽关系。
             overrides_system: cur.overrides_system,
+            // 编辑既有条目不改分类——本函数改的是 code/text/weight/position。
+            category: cur.category.clone(),
         };
         // 键改变 → 先删旧键
         if nc != code || nt != text {
@@ -261,6 +278,7 @@ impl Store {
             enabled: true,
             is_system: false,
             overrides_system: false,
+            category: String::new(),
         });
         cur.enabled = enabled;
         self.put_phrase(code, text, cur)
@@ -312,6 +330,8 @@ impl Store {
                         // 本分支只处理已是系统行的条目（用户行在上面 continue 掉了），
                         // 系统行不存在遮蔽关系。
                         overrides_system: false,
+                        // 分类随 TOML 刷新：它是系统短语定义的一部分，与 weight/position 同源。
+                        category: e.category.clone(),
                     };
                     self.put_phrase(&e.code, &e.text, val)?;
                     stats.updated += 1;
@@ -326,6 +346,7 @@ impl Store {
                             enabled: true,
                             is_system: true,
                             overrides_system: false,
+                            category: e.category.clone(),
                         },
                     )?;
                     stats.added += 1;
@@ -451,6 +472,9 @@ impl Store {
                     enabled: r.enabled,
                     is_system: false,
                     overrides_system,
+                    // 分发导入的短语不带分类：`PhraseIo` 是跨设备传输格式，给它加字段
+                    // 是导入导出契约的变更，与本需求无关。导入后落为未分类。
+                    category: String::new(),
                 },
             )?;
         }
@@ -538,6 +562,7 @@ impl Store {
                         enabled: true,
                         is_system: true,
                         overrides_system: false,
+                        category: e.category.clone(),
                     },
                 )?;
                 n += 1;
@@ -624,12 +649,14 @@ mod tests {
                 text: "$date".into(),
                 weight: 1000,
                 position: 0,
+                category: String::new(),
             },
             SystemPhrase {
                 code: "em".into(),
                 text: "（＾＿＾）".into(),
                 weight: 1000,
                 position: 0,
+                category: String::new(),
             },
         ];
         let st = s.sync_system_phrases(&v1).unwrap();
@@ -643,12 +670,14 @@ mod tests {
                 text: "（＾＿＾）".into(),
                 weight: 500,
                 position: 0,
+                category: String::new(),
             },
             SystemPhrase {
                 code: "nn".into(),
                 text: "你好".into(),
                 weight: 1000,
                 position: 0,
+                category: String::new(),
             },
         ];
         let st2 = s.sync_system_phrases(&v2).unwrap();
@@ -673,6 +702,7 @@ mod tests {
             text: "系统".into(),
             weight: 1,
             position: 0,
+            category: String::new(),
         }])
         .unwrap();
         // 再同步（sys 消失）应删 sys 但保留用户 me
@@ -706,12 +736,14 @@ mod tests {
                 text: "甲".into(),
                 weight: 1,
                 position: 0,
+                category: String::new(),
             },
             SystemPhrase {
                 code: "b".into(),
                 text: "乙".into(),
                 weight: 1,
                 position: 0,
+                category: String::new(),
             },
         ])
         .unwrap();
@@ -754,6 +786,7 @@ mod tests {
             text: "甲".into(),
             weight: 1,
             position: 0,
+            category: String::new(),
         }])
         .unwrap();
         s.add_phrase("u", "用户", 0, 1).unwrap();
@@ -825,6 +858,7 @@ mod tests {
             text: "二〇二六年".into(),
             weight: 9,
             position: 5,
+            category: String::new(),
         }];
         s.sync_system_phrases(&sys).unwrap();
 
@@ -867,6 +901,7 @@ mod tests {
             text: "$Y年$M月$D日".into(),
             weight: 1000,
             position: 1,
+            category: String::new(),
         }];
         s.sync_system_phrases(&sys).unwrap();
 
@@ -927,6 +962,7 @@ mod tests {
             text: "$Y年$M月$D日".into(),
             weight: 1000,
             position: 1,
+            category: String::new(),
         }];
         s.sync_system_phrases(&sys).unwrap();
         s.add_phrase("date", "$Y年$M月$D日", 9, 5000).unwrap();
@@ -960,12 +996,14 @@ mod tests {
                 text: "甲".into(),
                 weight: 1000,
                 position: 1,
+                category: String::new(),
             },
             SystemPhrase {
                 code: "b".into(),
                 text: "乙".into(),
                 weight: 1000,
                 position: 2,
+                category: String::new(),
             },
         ];
         s.sync_system_phrases(&sys).unwrap();
@@ -1004,6 +1042,7 @@ mod tests {
             text: "甲".into(),
             weight: 1000,
             position: 1,
+            category: String::new(),
         }];
         s.sync_system_phrases(&sys).unwrap();
         s.update_phrase("a", "甲", None, None, Some(9), Some(5555))
@@ -1029,6 +1068,7 @@ mod tests {
             text: "（＾＿＾）".into(),
             weight: 1000,
             position: 0,
+            category: String::new(),
         }])
         .unwrap();
         s.update_phrase("em", "（＾＿＾）", None, None, None, Some(42))
@@ -1050,6 +1090,7 @@ mod tests {
             text: "二〇二六年".into(),
             weight: 9,
             position: 5,
+            category: String::new(),
         }];
         // 手工制造受损现场：用户行在先，且与系统条目同键
         s.add_phrase("date", "二〇二六年", 0, 1).unwrap();
@@ -1079,6 +1120,7 @@ mod tests {
             text: "北京".into(),
             weight: 9,
             position: 0,
+            category: String::new(),
         }])
         .unwrap();
         // 用户行应保持 is_system=false，不被系统化

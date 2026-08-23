@@ -43,7 +43,7 @@ fn factory_cofc_parses_and_renders_clipboard_lookup() {
         reverse: &reverse,
     };
 
-    let hits = layer().lookup("cofc", &[], &host);
+    let hits = layer().lookup("cofc", &[], &host, &wind_phrase::PhraseScope::ALL);
     assert_eq!(
         hits.len(),
         1,
@@ -65,7 +65,7 @@ fn factory_cofc_parses_and_renders_clipboard_lookup() {
 /// 自解释。改提示语时要顺带想一下它在这个位置读起来是否成立。
 #[test]
 fn factory_cofc_shows_meaningful_label_in_prefix_nav() {
-    let hits = layer().lookup_prefix("co", &[], 1);
+    let hits = layer().lookup_prefix("co", &[], 1, &wind_phrase::PhraseScope::ALL);
     let cofc: Vec<_> = hits
         .iter()
         .filter(|h| h.nav_code.as_deref() == Some("cofc"))
@@ -96,7 +96,7 @@ fn factory_cofc_hints_when_empty_and_never_commits_the_hint() {
             clip: &clip,
             reverse: &reverse,
         };
-        let hits = layer().lookup("cofc", &[], &host);
+        let hits = layer().lookup("cofc", &[], &host, &wind_phrase::PhraseScope::ALL);
         assert_eq!(hits.len(), 1, "{name}：应出一条提示候选，而不是什么都没有");
         assert!(
             hits[0].text.contains("剪贴板"),
