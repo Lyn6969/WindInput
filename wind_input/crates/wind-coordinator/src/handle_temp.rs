@@ -4,8 +4,7 @@
 //! 触发键判定、进入/退出、候选刷新、按键处理、选词上屏。
 
 use crate::coordinator::{
-    Coordinator, ENGINE_MAX_CANDIDATES, State, TEMP_PINYIN_MAX_CANDIDATES, en_case_variants,
-    numpad_char, punct_char,
+    Coordinator, ENGINE_MAX_CANDIDATES, State, TEMP_PINYIN_MAX_CANDIDATES, numpad_char, punct_char,
 };
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
@@ -761,14 +760,32 @@ impl Coordinator {
         if buf.is_empty() {
             return;
         }
-        // 首候选始终是用户所打原文（保证能上屏自己输入的内容）。
-        let mut cands = vec![Candidate {
-            text: buf.clone(),
-            natural_order: 0,
-            ..Default::default()
-        }];
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(buf.clone());
+        // 头部候选：原文 + 大小写变形，两者各有开关（`input.temp_english.*`）。
+        //
+        // 与英文方案那一侧**配置各自独立、实现共用**（见 crate::english_candidates）：
+        // 分歧只允许出现在「要不要生成」，不允许出现在「生成什么」——否则同一串输入在两个
+        // 入口给出的候选不一样，而用户根本不知道自己此刻在哪条路径上。
+        //
+        // ⚠️ 两个开关都关且词库无命中时，最终候选会是空的。那不是缺陷：下方空格臂的判据是
+        // `!state.candidates.is_empty()`（**实际候选**），空候选会正确落到「上屏缓冲原文」。
+        //
+        // ★ 变形候选**还要求当前真的在出候选**（`show_candidates` 开且英文方案可用）：
+        // 关掉候选显示时列表里只应剩原文那一条。这不是洁癖——临英的数字键判据是
+        // 「除原文外还有没有别的候选」（有则选词、无则入缓冲），变形候选在候选关闭时冒出来
+        // 会让 `Ver2b` 里的 `2` 被当成选词键；次选键越界回落标点的判据同理。
+        // 原文那条不受此限：它在候选关闭时仍是「空格上屏什么」的依据（既有语义）。
+        let dict_schema = self.overlay_engine_schema(state);
+        let (want_raw, want_variants) = {
+            let te = &self.rt().config.input.temp_english;
+            (te.raw_candidate, te.case_variants && dict_schema.is_some())
+        };
+        let mut cands =
+            crate::english_candidates::english_head_candidates(&buf, want_raw, want_variants);
+        let mut seen: std::collections::HashSet<String> =
+            cands.iter().map(|c| c.text.clone()).collect();
+        for (i, c) in cands.iter_mut().enumerate() {
+            c.natural_order = i as i32;
+        }
         // 去重按精确文本；入列时补 `natural_order`（= 入列序）。取整条 `Candidate` 而非
         // 只取文本：词库候选的 `source` / `code` 是词频记账与重排的依据，在这里丢掉的话
         // 下游再也拿不回来。
@@ -779,23 +796,7 @@ impl Coordinator {
             c.natural_order = cands.len() as i32;
             cands.push(c);
         };
-        if let Some(schema) = self.overlay_engine_schema(state) {
-            // 大小写变形（全小写 / 首字母大写 / 全大写，去掉与原文相同者）。
-            // 可关：变形项每条都占一个候选位，每页 5 条时能吃掉一半。
-            //
-            // 与首候选（原文）一样**不带 `source` / `code`**：它们没有词库来源，记账端据此
-            // 把它们排除在词频之外（见 `record_temp_english_selection`）。
-            if self.rt().config.input.temp_english.case_variants {
-                for v in en_case_variants(&buf) {
-                    push_cand(
-                        Candidate {
-                            text: v,
-                            ..Default::default()
-                        },
-                        &mut cands,
-                    );
-                }
-            }
+        if let Some(schema) = dict_schema {
             // 词库段起点：下面的词频重排与候选调整**只作用于这一段**。
             let dict_start = cands.len();
             let code = buf.to_lowercase();

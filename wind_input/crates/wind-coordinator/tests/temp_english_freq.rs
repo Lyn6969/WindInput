@@ -350,11 +350,19 @@ fn temp_english_freq_carries_over_to_english_schema() {
     assert_eq!(coord.active_schema_id(), "english");
     type_word(&coord, "hel");
 
+    // ⚠️ 断言落在**词库段首位**（下标 1）而不是整列首位：英文方案的第 0 条恒是所打原文
+    // （`schema.english.raw_candidate` 默认开），调频只在词库段内部生效——原文与变形被
+    // `split_off(dict_start)` 挡在重排之外，见 `docs/design/schema-scoped-behavior.md` §5.2。
+    let page = coord.debug_page_texts();
     assert_eq!(
-        coord.debug_page_texts().first().map(String::as_str),
+        page.first().map(String::as_str),
+        Some("hel"),
+        "英文方案首候选恒是所打原文，实得 {page:?}"
+    );
+    assert_eq!(
+        page.get(1).map(String::as_str),
         Some(picked.as_str()),
-        "临英里选过的「{picked}」应在英文方案下升到首位，实得 {:?}",
-        coord.debug_page_texts()
+        "临英里选过的「{picked}」应在英文方案下升到词库段首位，实得 {page:?}"
     );
 }
 

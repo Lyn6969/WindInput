@@ -304,7 +304,13 @@ impl Default for SchemaConfig {
 /// 英文自 0.114 起是可切换方案，行为不再挂靠码表段——那是历史包袱：英文引擎复用了
 /// 码表的重排路径，配置就顺手挂在了 `schema.codetable` 下，于是纯码表用户的「上屏行为」
 /// 里混着只对英文生效的项，而英文用户改调频策略又会连带改掉五笔的。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+///
+/// ⚠️ **不 derive `Default`**：本段有默认 `true` 的字段，而 `derive(Default)` 只会给 bool
+/// 零值。serde 的 `#[serde(default = "default_true")]` 只在**反序列化缺键**时生效，
+/// 管不着 `Config::default()` 这条路——两条路不一致的后果是「出厂配置文件里写着 true、
+/// 代码里的默认值却是 false」，而这种分叉只有端到端测试才看得见
+/// （见 `config-design-rules` §R4「L1 与 L2 必须一致」）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EnglishGlobal {
     #[serde(default)]
     pub frequency: EnglishFrequency,
@@ -318,6 +324,35 @@ pub struct EnglishGlobal {
     /// - **不含**回车上屏原码（终结性动作）、标点键顶屏（会得到 `hello ,`）、顶码。
     #[serde(default)]
     pub commit_space: bool,
+    /// 首候选是用户所打原文（英文方案下的「输入即内容」保证）。**默认开**。
+    ///
+    /// 英文引擎的特殊性：输入串本身就是合法上屏内容。而调频一旦把某个词顶到首位，
+    /// 想上屏所打原文就只剩回车这一条路，而回车是终结性动作、会打断连续输入流。
+    /// 码表方案没有这个问题——`aaaa` 不是可上屏文本，所以这条**不下放给码表**。
+    ///
+    /// 与 `input.temp_english.raw_candidate` 是**两个作用域各一份**，不是两个真相源：
+    /// 用户对「中文里插一个英文词」与「长时打英文」的需求本就可能相反。
+    #[serde(default = "default_true")]
+    pub raw_candidate: bool,
+    /// 生成大小写变形候选（全小写 / 首字母大写 / 全大写）。**默认关**。
+    ///
+    /// ★ 与临英那份（`input.temp_english.case_variants`，默认**开**）默认值刻意相反，
+    /// 这正是「两个作用域场景不同」的证据：临英是「中文里插一个英文词」，人名与专有名词
+    /// 要首字母大写是刚需；英文方案是长时打英文，每条变形吃一个候选位，每页 5 条时吃掉
+    /// 一半。⛔ 合并成一个键必然改掉其中一侧的既有行为。
+    #[serde(default)]
+    pub case_variants: bool,
+}
+
+impl Default for EnglishGlobal {
+    fn default() -> Self {
+        Self {
+            frequency: EnglishFrequency::default(),
+            commit_space: false,
+            raw_candidate: true,
+            case_variants: false,
+        }
+    }
 }
 
 /// 英文调频（[schema.english.frequency]）。
@@ -2374,6 +2409,16 @@ pub struct TempEnglishConfig {
     /// 临英常设 `candidate_layout = "horizontal"`，此时生效的是本项而非竖排那份。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_template_horizontal: CommentTemplateOverride,
+    /// 首候选是用户所打原文（保证能上屏自己输入的内容）。
+    ///
+    /// **默认开 = 保持既有行为**：此前这条是硬编码、不可配的。开成配置项是因为「打英文时
+    /// 总是走词库补全」也是一种合理偏好——原文占掉首位，常用词就永远在 2 号键。
+    ///
+    /// ⚠️ 与 [`Self::case_variants`] **同时关闭**且词库无命中时，候选列表会是空的。
+    /// 那不是缺陷：临英空格臂的判据是「实际候选是否为空」而非本配置，空候选会正确落到
+    /// 「上屏缓冲原文」的兜底分支。见 `handle_temp.rs` 空格臂。
+    #[serde(default = "default_true")]
+    pub raw_candidate: bool,
     /// 生成大小写变形候选（全小写 / 首字母大写 / 全大写）。
     ///
     /// 关掉后候选只剩输入原文 + 词库匹配。变形候选的代价是**每条都占一个候选位**：
@@ -2395,6 +2440,7 @@ impl Default for TempEnglishConfig {
             symbol_chars: default_temp_english_symbol_chars(),
             space_as_input: false,
             candidate_layout: LayoutIntent::default(),
+            raw_candidate: true,
             case_variants: true,
             comment_template_vertical: None,
             comment_template_horizontal: None,

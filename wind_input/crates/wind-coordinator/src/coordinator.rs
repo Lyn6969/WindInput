@@ -22,8 +22,8 @@ mod push_config;
 // 平移到子模块的项以原路径保真（handle_* 均经 `crate::coordinator::` 引用，勿改回直连）。
 pub(crate) use crate::config_bundle::{ConfigBundle, schema_key_union};
 pub(crate) use crate::key_convert::{
-    char_to_main_vk, en_case_variants, full_width_source_char, numpad_char, numpad_to_main,
-    printable_char, punct_char, wind_mods_to_win32,
+    char_to_main_vk, full_width_source_char, numpad_char, numpad_to_main, printable_char,
+    punct_char, wind_mods_to_win32,
 };
 use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;

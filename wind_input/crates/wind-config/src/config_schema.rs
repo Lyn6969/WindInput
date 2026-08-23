@@ -156,6 +156,8 @@ static REGISTRY: &[ConfigField] = &[
         Enum(ENGLISH_CODE_SCOPE_VALUES),
     ),
     f("schema.english.commit_space", Bool),
+    f("schema.english.raw_candidate", Bool),
+    f("schema.english.case_variants", Bool),
     f("schema.codetable.auto_phrase.enabled", Bool),
     f("schema.codetable.auto_phrase.min_phrase_len", Int),
     f("schema.codetable.auto_phrase.max_phrase_len", Int),
@@ -278,6 +280,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.temp_english.allow_symbols", Bool),
     f("input.temp_english.symbol_chars", Str),
     f("input.temp_english.space_as_input", Bool),
+    f("input.temp_english.raw_candidate", Bool),
     f("input.temp_english.case_variants", Bool),
     f(
         "input.temp_english.candidate_layout",

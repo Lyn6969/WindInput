@@ -13,6 +13,7 @@ pub(crate) mod debug_support;
 #[cfg(windows)]
 pub mod direct_switch;
 pub mod edit_ops;
+pub(crate) mod english_candidates;
 #[cfg(test)]
 mod freq_learn_tests;
 pub mod handle_addword;

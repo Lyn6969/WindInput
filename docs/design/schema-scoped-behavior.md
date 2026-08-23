@@ -366,6 +366,52 @@ case_variants = false     # 新增，默认 false
 
 同型教训：[`project_english_commit_space`]「给开关找接线点前先问『那条路走得到吗』」。
 
+### 5.6 实施记录：两个设计时没预见到的后果
+
+两条都是实施阶段被**既有测试当场抓住**的，记在这里免得下次重做时再踩。
+
+#### ① 原文候选改变了「空格上屏原码」的**路径归属**
+
+`schema.english.commit_space` 的生效范围里本就写着「**空格上屏原码**（打了词库里没有的
+词）」。加了原文候选之后，这条路不再走「无候选时的兜底分支」，而是变成了「选中首候选」
+——而选词分支的补空格判据是 `source == CandidateSource::English`，头部候选刻意不带
+`source`（带了就会往词频表写孤儿键）⇒ **既有契约静默漏补**。
+
+`tests/english_commit_space.rs` 里 6 条一起变红，指向的正是这一处。
+
+修法：新增 `english_appends_space_for(source, text, input)`，判据加一项
+「上屏文本 == 当前输入串」。★ **判据要落在「这是不是原码」的定义上，而不是「这条候选有
+没有 source」——后者是实现细节。** 三个消费点（`commit_candidate`、`commit_selected`、
+IPC 排水路径的两个分支）全部换用它，漏一个就是「键盘补了、排水路径没补」的间歇性不一致。
+
+⚠️ 连带影响：`raw_code_space_commit_appends_space` / `raw_code_enter_commit_does_not_append_space`
+两条测试的前提（「该串在词库中无候选」）不再成立，必须**显式关掉 `raw_candidate`** 才能
+继续测那条兜底出口；`appended_space_does_not_pollute_freq_key` 的断言要从 `after[0]`
+移到 `after[1]`（首位恒是原文，调频只在词库段内部生效）。
+
+#### ② 变形候选的生成条件必须跟随「是否真的在出候选」
+
+把 `case_variants` 抽进共用函数时，我顺手把它从 `if let Some(schema) = …` 块**内**移到了
+块外——于是 `show_candidates = false`（关掉候选显示）时也会产出变形候选。
+
+后果不在显示，而在**按键判据**：临英的数字键判据是「除原文外还有没有别的候选」
+（有则选词、无则入缓冲），变形候选在候选关闭时冒出来，`Ver2b` 里的 `2` 就被当成了选词键；
+次选键越界回落标点的判据同理。`input_flow.rs` 两条一起变红。
+
+⇒ 原文与变形**不是同一层**：原文那条在候选关闭时仍有意义（它是「空格上屏什么」的依据），
+变形那几条只有在真的展示候选时才有意义。共用函数吃两个独立的布尔参数，正是为了让调用方
+各自决定这件事。
+
+#### ③ `EnglishGlobal` 不能 `derive(Default)`
+
+serde 的 `#[serde(default = "default_true")]` **只在反序列化缺键时生效**，管不着
+`Config::default()` 那条路。本段有默认 `true` 的字段（`raw_candidate`），而
+`derive(Default)` 只会给 bool 零值 ⇒ 出厂配置文件里写着 `true`、代码里的默认值却是
+`false`。这种 L1/L2 分叉只有端到端测试看得见（`config-design-rules` §R4）。
+
+⇒ 手写 `impl Default for EnglishGlobal`。**凡是给已有配置段新增「默认 true」的字段，
+先看那个段是不是 `derive(Default)`。**
+
 ---
 
 ## 六、`[phrases]`：方案级短语加载与分类

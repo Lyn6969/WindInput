@@ -21,6 +21,7 @@ use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP};
 const VK_SPACE: u32 = 0x20;
 const VK_RETURN: u32 = 0x0D;
 const VK_2: u32 = 0x32;
+const VK_3: u32 = 0x33;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -157,12 +158,18 @@ fn mouse_select_appends_space() {
 ///
 /// 这条走的是与选词完全不同的出口（`VK_SPACE` 空码分支），判据也不同——那里没有候选可依，
 /// 用的是方案口径 `english_space_enabled`。
+///
+/// ⚠️ **必须显式关掉 `raw_candidate`**：它默认开，会把所打原文作为首候选钉进列表，于是
+/// 「无候选」这个前提不再成立、本条要测的兜底出口根本走不到（走的是选中首候选那条）。
+/// 有原文候选时的对应行为另见 `tests/english_head_candidates.rs`。
 #[test]
 fn raw_code_space_commit_appends_space() {
     if !has_english_schema() {
         return;
     }
-    let coord = Coordinator::new_headless(english_config(true), Some(&data_dir()));
+    let mut cfg = english_config(true);
+    cfg.schema.english.raw_candidate = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     // 前提：该串在词库中无候选。若日后词库收录了它，前提失效 → 显式失败而非静默变成
     // 「测了另一条通路」。
@@ -187,7 +194,10 @@ fn raw_code_enter_commit_does_not_append_space() {
     if !has_english_schema() {
         return;
     }
-    let coord = Coordinator::new_headless(english_config(true), Some(&data_dir()));
+    // 同上：关掉原文候选，否则「无候选」的前提不成立。
+    let mut cfg = english_config(true);
+    cfg.schema.english.raw_candidate = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     let nonsense = "qwxzjv";
     type_word(&coord, nonsense);
@@ -293,20 +303,29 @@ fn appended_space_does_not_pollute_freq_key() {
 
     type_word(&coord, "hel");
     let page = coord.debug_page_texts();
-    assert!(page.len() >= 2, "需至少两个候选，实际 {page:?}");
-    let second = page[1].clone();
+    assert!(page.len() >= 3, "需原文 + 至少两个词库候选，实际 {page:?}");
+    // page[0] 恒是所打原文（raw_candidate 默认开），词库段从 1 开始。
+    let second = page[2].clone();
 
-    // 选中第二个候选（带空格上屏）
-    let text = commit_text(&coord.handle_key_event(&key_event(VK_2, EVENT_KEY_DOWN)));
+    // 数字键 3 选中词库段的第二条（带空格上屏）
+    let text = commit_text(&coord.handle_key_event(&key_event(VK_3, EVENT_KEY_DOWN)));
     assert_eq!(text, format!("{second} "), "选中时应补空格");
 
-    // 再打一次同样的码：记账键若干净，该词应升到首位。
+    // 再打一次同样的码：记账键若干净，该词应升到**词库段**首位。
+    //
+    // ⚠️ 断言落在 `after[1]` 而不是 `after[0]`——首位恒是原文，调频只在词库段内部生效
+    // （原文与变形被 `split_off(dict_start)` 挡在重排之外，见设计文档 §5.2）。
     type_word(&coord, "hel");
     let after = coord.debug_page_texts();
     assert_eq!(
-        after.first(),
+        after.first().map(String::as_str),
+        Some("hel"),
+        "首位恒是所打原文"
+    );
+    assert_eq!(
+        after.get(1),
         Some(&second),
-        "选过的词应因调频升到首位；纹丝不动说明记账键被尾空格污染成了孤儿键。实际候选: {after:?}"
+        "选过的词应因调频升到词库段首位；纹丝不动说明记账键被尾空格污染成了孤儿键。实际候选: {after:?}"
     );
     let _ = std::fs::remove_file(&path);
 }
