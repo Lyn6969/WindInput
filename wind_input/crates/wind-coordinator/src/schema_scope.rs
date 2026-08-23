@@ -54,8 +54,27 @@ impl Coordinator {
         state.schema_scope_gen = generation;
         // 布局手动值随代际失效。标点不需要对应动作，理由见模块文档最后一节。
         state.layout_manual = None;
-        if let Some(v) = self.engine_mgr.active_behavior().punct.resolve() {
-            state.chinese_punct = v;
+        match self.engine_mgr.active_behavior().punct.resolve() {
+            Some(v) => {
+                // 首次被方案意图覆盖时记下原值。已经是 `Some` 就不再覆写——从一个有意图的
+                // 方案切到另一个有意图的方案时，要还原的仍是**最初那个**全局态，
+                // 而不是上一个方案强加的值。
+                if state.punct_before_schema.is_none() {
+                    state.punct_before_schema = Some(state.chinese_punct);
+                }
+                state.chinese_punct = v;
+            }
+            None => {
+                // 方案没意见：把被覆盖的值还回去。`take` 同时清掉标记——下次再进有意图的
+                // 方案时重新记，故连续切换不会越还越旧。
+                //
+                // ⚠️ 这里**不能**写成「什么都不做」：那正是 2026-08-23 真机报的
+                // 「从五笔切到英文标点变英文，切回五笔还是英文」——`Follow` 的语义是
+                // 「回到不受方案影响的那个值」，而不是「保持上一个方案留下的值」。
+                if let Some(v) = state.punct_before_schema.take() {
+                    state.chinese_punct = v;
+                }
+            }
         }
     }
 

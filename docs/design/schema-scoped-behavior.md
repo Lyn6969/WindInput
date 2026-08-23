@@ -252,6 +252,46 @@ fn sync_schema_scope(&self, state: &mut State) {
 
 调用点：`handle_key_event` 入口、`push_state_update`、`show_status`、语言栏图标刷新。
 
+#### ⚠️ 2026-08-23 真机修正：`Follow` 不等于「什么都不做」
+
+初版把「方案无意图」实现成了「不写 `chinese_punct`」，真机当场报障：
+**「从五笔切到英文，标点变英文；切回五笔，还是英文标点」**。
+
+根因是**标点缺一层基线**。布局的基线是 `candidate_vertical` 镜像，方案意图不写它，
+`Follow` 每次重算自然回落；而 `state.chinese_punct` 既是当前值又是唯一存储，被英文方案
+覆盖成 `false` 之后，切回 `Follow` 方案时**没有可回落的原值**——「不干预」于是退化成了
+「保持上一个方案强加的值」。
+
+⇒ ★ **`Follow` 的语义是「回到不受方案影响的那个值」，不是「保持现状」。**
+加 `State::punct_before_schema: Option<bool>`：
+
+```rust
+match intent.resolve() {
+    // 首次被覆盖时记原值。已是 Some 就不再覆写——从一个有意图的方案切到另一个有意图的
+    // 方案时，要还原的仍是最初那个全局态，而不是上一个方案强加的值。
+    Some(v) => {
+        if state.punct_before_schema.is_none() {
+            state.punct_before_schema = Some(state.chinese_punct);
+        }
+        state.chinese_punct = v;
+    }
+    // take 同时清标记，故连续切换不会越还越旧。
+    None => if let Some(v) = state.punct_before_schema.take() { state.chinese_punct = v },
+}
+```
+
+**这不是被否决的那种「保存 / 回放」**：被否决的是「进入模式时保存、在 8 个清空点各写一遍
+恢复」。这里保存与恢复**都在同一个函数里**，由代际驱动、幂等、代际不变就不动，
+没有任何分散的恢复点可漏。
+
+★★ 测试要两条一起才钉得住语义：只测「切回来变回中文」的话，一个「切回 Follow 方案时
+硬置中文」的错误实现照样通过——必须再加一条「用户先把全局态改成英文标点」的路径，
+断言还原的是**用户自己设的值**。变异验证（还原成旧实现）精确红在这两条。
+
+⚠️ 已知边界：per-app `initial_punct` 不改代际，故它在「某个方案正覆盖着标点」期间生效时，
+`punct_before_schema` 记的仍是更早的值，切回 `Follow` 方案会还原成那个而不是 per-app 值。
+两项都配的用户极少，暂不处理。
+
 ★ **这个形态的关键性质：漏调一个点的后果是「晚一拍」而不是「永不生效」**——
 下一次按键必然经过 `handle_key_event`。这正是它优于命令式写法的地方，也是可以接受
 「调用点不止一个」的理由。命令式写法漏一条路径就是永久失效。

@@ -358,6 +358,21 @@ pub(crate) struct State {
     /// `sync_schema_scope` 必然执行一次——用 0 的话它恰好等于代际初值，启动时方案声明的
     /// `[punct]` 就永远落不下去（且完全静默）。
     pub(crate) schema_scope_gen: u64,
+    /// 被方案级 `[punct]` 覆盖**之前**的标点态。`None` = 当前没有方案在覆盖它。
+    ///
+    /// # 为什么标点需要它而布局不需要
+    ///
+    /// 布局的基线是 `candidate_vertical` 镜像，方案意图不写它，`Follow` 每次重算时自然
+    /// 回落到基线。标点没有这样一层：`state.chinese_punct` 既是当前值又是唯一存储，
+    /// 被英文方案覆盖成 `false` 之后，切回一个 `Follow`（= 不干预）的方案时就**没有可回落
+    /// 的原值**——真机现象是「从五笔切到英文，标点变英文；切回五笔，标点还是英文」。
+    ///
+    /// # 这不是被否决的那种「保存 / 回放」
+    ///
+    /// 被否决的是「进入模式时保存、在 8 个清空点各写一遍恢复」那种形态。这里保存与恢复
+    /// **都在 `sync_schema_scope` 一个函数里**，由代际驱动、幂等、代际不变就不动，
+    /// 没有任何分散的恢复点可漏。
+    pub(crate) punct_before_schema: Option<bool>,
     /// 候选布局的**本代际手动覆盖**（`Some(true)` = 用户在本方案期间手动切成了竖排）。
     ///
     /// 只在方案声明了非 `Follow` 的 `[candidate] layout` 时才会被写入——方案没意见时
@@ -1664,6 +1679,7 @@ impl Coordinator {
                 chinese_punct: init_punct,
                 // 哨兵：与任何真实代际都不相等，保证首次 sync_schema_scope 必执行。
                 schema_scope_gen: u64::MAX,
+                punct_before_schema: None,
                 layout_manual: None,
                 s2t_enabled: config.input.s2t.enabled,
                 filter_mode: wind_candidate::FilterMode::from_config(&config.input.filter_mode),
