@@ -62,6 +62,21 @@ const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 /// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
 pub(crate) const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
 
+/// 「正在建立词库索引…」提示延后多久才弹（见 `Coordinator::spawn_index_warm`）。
+///
+/// 索引自 2026-08-24 起落盘为 `.wridx`，于是同一件事有两种量级完全不同的结果：
+/// **复用磁盘缓存约几十毫秒**（feihuzj2 251 万词实测 47.8ms），冷建才是秒级。
+/// 无条件先弹提示就等于给一次根本不存在的等待配了个说明，用户看到的是
+/// 「明明该直接 mmap，怎么还在建索引」。
+///
+/// 判据刻意选「**慢不慢**」而不是「**要不要做事**」：慢不慢不需要预测，到点还没干完
+/// 就是真慢。预测式的做法（先问缓存新不新鲜）得在协调器里复刻一份
+/// `build_reverse_index_for` 的判定，那正是本仓反复吃亏的「同一份推导写两处」。
+///
+/// 取值：明显长于复用（几十毫秒）、又明显短于冷建（秒级），且落在「用户开始觉得卡」
+/// 的门槛附近。
+const INDEX_TOAST_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// 把 `caret_offset_*` 的 dp 值按显示器缩放换算成物理像素偏移。纯函数，与 DPI 查询解耦，
 /// 可脱离真实系统单测——`dpi_scale_for_point` 那部分才是不可控的平台调用，两者故意分开。
 fn dp_offset_to_pixels(dx_dp: i32, dy_dp: i32, scale: f32) -> (i32, i32) {
@@ -3093,26 +3108,56 @@ impl Coordinator {
             return;
         };
         let sid = schema_id.to_string();
+        // 提示交给一个计时线程延后弹，见 [`INDEX_TOAST_DELAY`]。
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let done = done.clone();
+            let weak = weak.clone();
+            let toast = std::thread::Builder::new()
+                .name("reverse-index-toast".into())
+                .spawn(move || {
+                    std::thread::sleep(INDEX_TOAST_DELAY);
+                    if done.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(c) = weak.upgrade() else {
+                        return;
+                    };
+                    // upgrade 期间可能刚好干完，再确认一次
+                    if done.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    // 让用户知道「编码/联想这一会儿是缺的」而不是坏了。
+                    // ⚠️ 这条提示**伴随**真实工作、且以下面的重渲染收尾；不要把它改成那种
+                    // 「弹个准备中然后什么也不发生」的提示——那种做法在本仓被删过一次
+                    // （见 handle_mode.rs 关于 is_loaded 守卫的说明）。延后弹并不违背这条：
+                    // 它只在工作**确实还在进行**时才出现。
+                    c.show_toast(
+                        "正在建立词库索引…",
+                        ToastPosition::BottomCenter,
+                        ToastKind::Info,
+                    );
+                });
+            if let Err(e) = toast {
+                debug!("无法启动索引提示计时线程: {e}（不影响索引构建）");
+            }
+        }
+        let done_if_unspawned = done.clone();
         let spawned = std::thread::Builder::new()
             .name("reverse-index-build".into())
             .spawn(move || {
                 let Some(c) = weak.upgrade() else {
+                    done.store(true, std::sync::atomic::Ordering::Release);
                     return;
                 };
-                // 让用户知道「编码/联想这一会儿是缺的」而不是坏了。
-                // ⚠️ 这条提示**伴随**真实工作、且以下面的重渲染收尾；不要把它改成那种
-                // 「弹个准备中然后什么也不发生」的提示——那种做法在本仓被删过一次
-                // （见 handle_mode.rs 关于 is_loaded 守卫的说明）。
-                c.show_toast(
-                    "正在建立词库索引…",
-                    ToastPosition::BottomCenter,
-                    ToastKind::Info,
-                );
                 let t0 = std::time::Instant::now();
                 let built_index = c.engine_mgr.prewarm_reverse_index(&sid);
                 if with_single_char {
                     c.engine_mgr.prewarm_single_char_codes(&sid);
                 }
+                // 必须在重渲染**之前**置位：重渲染本身也要花时间，拖在它后面会让
+                // 一次快速复用照样弹出提示——那正是本次要消灭的现象。
+                done.store(true, std::sync::atomic::Ordering::Release);
                 if !built_index && !with_single_char {
                     return; // 等锁期间已被别的线程建好，且无别的活要干
                 }
@@ -3125,6 +3170,9 @@ impl Coordinator {
                 }
             });
         if let Err(e) = spawned {
+            // 构建线程没起来 ⇒ 计时线程手里的 done 永远不会置位，会弹出一条
+            // 「正在建立词库索引…」而根本没有人在建。用留下的这份把它按掉。
+            done_if_unspawned.store(true, std::sync::atomic::Ordering::Release);
             warn!("无法启动反查索引构建线程: {e}");
         }
     }
