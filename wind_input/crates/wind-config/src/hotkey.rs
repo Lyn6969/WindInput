@@ -583,12 +583,30 @@ pub fn compile_modifier_key_up_hash(vk: u32) -> Option<u32> {
     }
 }
 
-/// 展开 "ctrl+number" / "ctrl+shift+number" 为 0-9 共 10 个 session 热键
+/// 候选操作热键模板（`keys.pin_candidate` / `keys.delete_candidate`）→ 期望的修饰位集合。
+///
+/// 这两项的值是**模板**而非普通热键串：`number` 是数字键组 0–9 的占位符，一条模板展开成
+/// 10 个键。值域故意收窄成下面这几项；`none`（以及任何其它值）返回 `None` ＝不绑定。
+///
+/// ★ **编译端与消费端的唯一真相源**。编译端（[`compile_number_hotkey`]）拿它算 TSF 转发表，
+/// 消费端（`Coordinator::match_candidate_action_key`）拿它判命中。两边各写一份白名单的话，
+/// 加一个取值只改一边的表现是「TSF 转发了但没人认」或「认得但 TSF 根本不发」——两种都不报错、
+/// 只是按下去毫无反应。
+///
+/// ⚠️ 返回值必须与实际修饰位做**相等**比较，不能按位包含：`ctrl+number` 的位集合是
+/// `ctrl+alt+number` 的**子集**，用包含判据的话前者会把后者的按键恒久劫走。
+pub fn number_template_mods(template: &str) -> Option<u32> {
+    match template.trim().to_lowercase().as_str() {
+        "ctrl+number" => Some(MOD_CTRL),
+        "ctrl+shift+number" => Some(MOD_CTRL | MOD_SHIFT),
+        _ => None,
+    }
+}
+
+/// 展开候选操作热键模板为 0-9 共 10 个 session 热键。值域见 [`number_template_mods`]。
 fn compile_number_hotkey(template: &str) -> Vec<HotkeyEntry> {
-    let mods = match template.trim().to_lowercase().as_str() {
-        "ctrl+number" => MOD_CTRL,
-        "ctrl+shift+number" => MOD_CTRL | MOD_SHIFT,
-        _ => return Vec::new(),
+    let Some(mods) = number_template_mods(template) else {
+        return Vec::new();
     };
     (0u32..=9)
         .map(|d| {
@@ -742,33 +760,14 @@ fn parse_key_name(name: &str) -> Option<u32> {
     }
 }
 
-/// 从配置中解析热键中的数字键部分（用于 delete_candidate、pin_candidate 等动态热键）
-///
-/// 例如 "ctrl+shift+number" 中的 "number" 表示 1-9 数字键
-/// 返回 (modifiers, 0) 表示匹配任意数字键
-pub fn parse_hotkey_prefix(s: &str) -> Option<(u32, bool)> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-
-    let mut modifiers: u32 = 0;
-    let mut has_number = false;
-
-    for part in s.split('+') {
-        let part = part.trim().to_lowercase();
-        match part.as_str() {
-            "ctrl" | "control" => modifiers |= MOD_CTRL,
-            "alt" => modifiers |= MOD_ALT,
-            "shift" => modifiers |= MOD_SHIFT,
-            "win" | "super" => modifiers |= MOD_WIN,
-            "number" | "digit" => has_number = true,
-            _ => {}
-        }
-    }
-
-    Some((modifiers, has_number))
-}
+// `parse_hotkey_prefix`（"ctrl+shift+number" → (modifiers, has_number)）已删除：全仓无调用者，
+// 而它做的事正是 [`number_template_mods`] 的事。留着就是同一份逻辑的第三份写法——本仓已经因为
+// 「两份手写清单慢慢漂移」翻过车（`hotkey_action_entry` 白名单 vs 设置页 `verb_allowed`）。
+//
+// ★ 它与 `number_template_mods` 有一处**语义差异**，不是等价物：它「解析得动就收」，
+// `alt+number`、`win+number` 都会返回一个修饰位；而模板值域是**白名单**，只认那几项。
+// 后者是有意的——放开值域会引入一批「配了但静默失效」的取值（`alt+number` 撞宿主菜单
+// 加速键与小键盘 Unicode 输入），而失效点在 TSF 侧，用户这边只看到「按了没反应」。
 
 #[cfg(test)]
 mod tests {
@@ -836,6 +835,38 @@ mod tests {
         assert!(entries[0].tsf_hash & HOTKEY_POLICY_SESSION != 0);
         assert_eq!(entries[0].match_hash, key_hash(MOD_CTRL | MOD_SHIFT, 0x30));
         assert!(compile_number_hotkey("none").is_empty());
+    }
+
+    #[test]
+    fn test_number_template_mods_is_whitelist_not_parser() {
+        // 白名单，不是「解析得动就收」：值域外的写法一律不绑定（含已删除的
+        // `parse_hotkey_prefix` 曾经会放行的 alt/win 变体）。
+        assert_eq!(number_template_mods("ctrl+number"), Some(MOD_CTRL));
+        assert_eq!(
+            number_template_mods("Ctrl+Shift+Number"), // 大小写/空白不敏感
+            Some(MOD_CTRL | MOD_SHIFT)
+        );
+        assert_eq!(number_template_mods(" ctrl+number "), Some(MOD_CTRL));
+        for bad in ["none", "", "alt+number", "win+number", "ctrl+shift+e"] {
+            assert_eq!(number_template_mods(bad), None, "{bad:?} 不该被接受");
+        }
+    }
+
+    #[test]
+    fn test_number_template_mods_are_pairwise_distinct() {
+        // 回归：消费端按**相等**比较修饰位，前提是任意两项的位集合不相等。
+        // （更强的性质——不存在子集关系——已不再要求：等值判据对子集免疫，
+        //   这正是 `ctrl+alt+number` 能安全加进值域的原因。）
+        let all = ["ctrl+number", "ctrl+shift+number"];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    number_template_mods(a),
+                    number_template_mods(b),
+                    "{a:?} 与 {b:?} 修饰位相同，等值判据无法区分"
+                );
+            }
+        }
     }
 
     #[test]

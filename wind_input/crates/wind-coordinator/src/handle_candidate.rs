@@ -3312,24 +3312,32 @@ impl Coordinator {
     }
 
     /// 候选词操作热键匹配（对齐 Go matchCandidateActionKey，但 `0` 扩展为第 10 候选）。
-    /// template ∈ {"ctrl+number","ctrl+shift+number"}，命中返回 1-based 页内序号(1-10)，否则 0。
+    /// 命中返回 1-based 页内序号(1-10)，否则 0。模板值域见 [`wind_config::hotkey::number_template_mods`]。
     /// 数字键 1-9 → 序号 1-9；`0` → 序号 10（候选窗最多 10 项，与主键盘/小键盘选词一致）。
-    fn match_candidate_action_key(
-        template: &str,
-        has_ctrl: bool,
-        has_shift: bool,
-        key_code: u32,
-    ) -> usize {
+    ///
+    /// ★★ **修饰位按「相等」判，不按「包含」判**。此前这里写的是
+    /// `"ctrl+number" if has_ctrl && !has_shift`，压根不看 Alt ⇒ **Ctrl+Alt+3 会命中
+    /// `ctrl+number` 那条臂、把第 3 个候选静默置顶**，而 TSF 侧对「有会话 + Ctrl/Alt +
+    /// 非注册热键」走的是 cleanup 通路（`KeyEventSink.cpp` 的 `isCtrlAltCleanup`）——键照样
+    /// 发过来、之后又 `pfEaten=FALSE` 交还宿主，于是宿主快捷键与置顶**同时**发生。
+    ///
+    /// ⇒ 通则：**模板值域里一旦有两项存在子集关系，包含式判据就必然让宽的那项劫走窄的那项。**
+    /// 相等判据还有一个附带好处：值域再加取值也不必回头补 `!has_xxx` 排他条件。
+    fn match_candidate_action_key(template: &str, modifiers: u32, key_code: u32) -> usize {
         // 0x30..=0x39 = '0'..'9'；'0' 映射为第 10 个候选。
         let num = match key_code {
             0x30 => 10,
             0x31..=0x39 => (key_code - 0x30) as usize,
             _ => return 0,
         };
-        match template.trim().to_lowercase().as_str() {
-            "ctrl+number" if has_ctrl && !has_shift => num,
-            "ctrl+shift+number" if has_ctrl && has_shift => num,
-            _ => 0,
+        let Some(want) = wind_config::hotkey::number_template_mods(template) else {
+            return 0; // "none" 或任何非法值 ＝ 未绑定
+        };
+        // 只比通用修饰位：左右具体位（MOD_LCTRL 等）由 TSF 附带，模板不区分左右。
+        if modifiers & wind_config::hotkey::MOD_GENERIC_MASK == want {
+            num
+        } else {
+            0
         }
     }
 
@@ -3338,17 +3346,20 @@ impl Coordinator {
     /// 命中即消费按键。
     /// 复用 `candidate_op`（页内序号驱动的 shadow 改写 + 重排重绘）。
     pub(crate) fn handle_candidate_action_hotkey(&self, data: &KeyEventData) -> Option<KeyAction> {
-        use wind_ipc::protocol::{MOD_CTRL, MOD_SHIFT};
+        use wind_ipc::protocol::MOD_CTRL;
+        // 早退纯属省事：现值域里每一项都带 Ctrl（见 `number_template_mods`）。这是**值域约束**
+        // 而非机制约束——真正的裁决在 `match_candidate_action_key` 的等值比较里，值域若哪天
+        // 收进不带 Ctrl 的模板，删掉这一段即可，不必改判据。
         if data.modifiers & MOD_CTRL == 0 {
             return None;
         }
-        let has_shift = data.modifiers & MOD_SHIFT != 0;
         let h = &self.rt().config.keys;
         // 删除优先匹配（与 Go 顺序一致：DeleteCandidate 先于 PinCandidate）。
+        // ⚠️ 这个顺序现在只用来兜「两项配了同一个模板」的退化情形：等值判据已经保证不同模板
+        // 互斥，不再像包含式判据那样靠先后顺序来「侥幸不出错」。
         let del =
-            Self::match_candidate_action_key(&h.delete_candidate, true, has_shift, data.key_code);
-        let pin =
-            Self::match_candidate_action_key(&h.pin_candidate, true, has_shift, data.key_code);
+            Self::match_candidate_action_key(&h.delete_candidate, data.modifiers, data.key_code);
+        let pin = Self::match_candidate_action_key(&h.pin_candidate, data.modifiers, data.key_code);
         let (op, num) = if del > 0 {
             (CandidateOp::Delete, del)
         } else if pin > 0 {

@@ -282,6 +282,65 @@ fn test_delete_candidate_hotkey_shift_gating() {
 }
 
 #[test]
+fn test_candidate_action_hotkey_modifier_exact_match() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_LCTRL, MOD_SHIFT};
+    // 回归：候选热键的修饰位按**相等**判，不按包含判。
+    //
+    // 旧判据是 `"ctrl+number" if has_ctrl && !has_shift`（完全不看 Alt）⇒ 出厂配置
+    // （pin=ctrl+number）下按 Ctrl+Alt+2 会命中 pin 那条臂、把第 2 个候选静默置顶，
+    // 而 TSF 侧同时把这个键交还宿主 ⇒ 宿主快捷键与置顶同时发生，用户完全看不出原因。
+    // 每条用例都要重新起一段组合：不命中候选热键的 Ctrl/Alt 组合会落到「清空组合并隐藏
+    // 候选窗」那条兜底臂（`ClearComposition`），把缓冲清空。
+    let fresh = || {
+        let c = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+        for ch in ['a', 'a', 'a', 'a'] {
+            press_letter(&c, ch);
+        }
+        c
+    };
+
+    // ① 多一个 Alt ⇒ 与 pin(ctrl+number) / delete(ctrl+shift+number) 都不相等。
+    //    正确结局是落到兜底臂 `ClearComposition`（语义：组合清掉，键仍归宿主），
+    //    **不是** `Consumed`（那才是「被候选热键认领了」）。
+    let coord = fresh();
+    let ctrl_alt =
+        coord.handle_key_event(&key_event_mods(0x32, EVENT_KEY_DOWN, MOD_CTRL | MOD_ALT));
+    assert!(
+        matches!(ctrl_alt, KeyAction::ClearComposition),
+        "出厂配置下 Ctrl+Alt+2 不该被候选热键认领（旧实现会误置顶），实际: {:?}",
+        ctrl_alt
+    );
+
+    // ② Ctrl+Shift+Alt 同理：比 delete 模板多一位。
+    let coord = fresh();
+    let all_three = coord.handle_key_event(&key_event_mods(
+        0x33,
+        EVENT_KEY_DOWN,
+        MOD_CTRL | MOD_SHIFT | MOD_ALT,
+    ));
+    assert!(
+        matches!(all_three, KeyAction::ClearComposition),
+        "Ctrl+Shift+Alt+3 不该被删除热键认领，实际: {:?}",
+        all_three
+    );
+
+    // ③ 左右具体位（TSF 的 `GetCurrentModifiers` 恒附带，见 BinaryProtocol.h）**不参与比较**。
+    //    漏掉这条掩码的话等值判据会一个都匹配不上——把功能整个判死，失效方向与 ①② 相反，
+    //    而 ①② 全绿。**两个方向各要有一条用例**。
+    let coord = fresh();
+    let with_specific =
+        coord.handle_key_event(&key_event_mods(0x32, EVENT_KEY_DOWN, MOD_CTRL | MOD_LCTRL));
+    assert!(
+        matches!(with_specific, KeyAction::Consumed),
+        "带左 Ctrl 具体位的 Ctrl+2 仍应命中置顶，实际: {:?}",
+        with_specific
+    );
+}
+
+#[test]
 fn test_overflow_number_key_ignore_default() {
     if !has_schemas() {
         return;
