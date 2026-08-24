@@ -61,6 +61,18 @@ pub trait DictLayer: Send + Sync {
             .any(|c| c.code.chars().count() > n)
     }
 
+    /// 全量枚举本层的 `(code, text, weight)`，供**离线索引构建**使用
+    /// （当前唯一消费方：码表整句的简码索引 `wind_engine::codetable::sentence`）。
+    ///
+    /// ⚠️ **不是查询接口**：它是 O(全表) 的，绝不能出现在按键链路上。
+    /// 默认实现为空——与 [`Self::search_abbrev`] 同一取舍：默认「枚举不到」好过默认
+    /// 「静默全表扫」，让没有廉价枚举能力的层（redb / 内存 trie）在测试里立刻暴露，
+    /// 而不是不知不觉继承一份全表遍历的代价。
+    ///
+    /// `weight` 须是该层**对外的有效权重**（经 `default_weight` / `weight_norm` 换算后），
+    /// 与 [`Self::search`] 返回的候选同域——否则索引里的权重与查询结果对不上。
+    fn for_each_entry(&self, _f: &mut dyn FnMut(&str, &str, i32)) {}
+
     /// 该层当前是否启用：禁用层在 composite 查询时被跳过（不出候选）。默认始终启用。
     /// 用于码表扩展词库的运行时热插拔——禁用的扩展层仍常驻（已 mmap），仅不参与查询。
     fn enabled(&self) -> bool {

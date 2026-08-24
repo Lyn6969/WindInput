@@ -92,6 +92,18 @@ impl CompositeDict {
             .any(|l| l.has_longer_code(prefix))
     }
 
+    /// 全量枚举各**启用**层的 `(code, text, weight)`，供离线索引构建
+    /// （见 `DictLayer::for_each_entry`）。**不去重、不排序**——跨层同 `(code, text)`
+    /// 会各报一次，由调用方按自己的语义合并；这里替它去重反而会丢掉「哪一层出的」这件事。
+    ///
+    /// ⚠️ O(全表)，绝不能出现在按键链路上。
+    pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
+        let layers = self.layers.read().unwrap();
+        for l in layers.iter().filter(|l| l.enabled()) {
+            l.for_each_entry(f);
+        }
+    }
+
     /// 跨层合并：遍历各层收集候选，按 text 去重——
     ///   - 保留**高优先级层**(先出现)的词条信息(code/natural_order)；
     ///   - 但**继承后续层中同 text 的更高权重**(用户词不因低权重丢失码表词的自然排序位)；
