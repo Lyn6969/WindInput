@@ -8,6 +8,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// 反查索引的存储与查询已下沉到 [`crate::reverseidx`]（`.wridx` 格式，可 mmap）。
+/// 这里保留再导出，是因为它的构建入口（`build_reverse_index_from`）天然属于本模块
+/// ——它要遍历 [`CachedDict`]，而消费方一直是 `use wind_dict::cached::ReverseIndex`。
+pub use crate::reverseidx::{CodeList, ReverseIndex};
+
 /// 一条查询命中，含音节边界。由 [`CachedDict::search_with_boundary`] /
 /// [`CachedDict::search_prefix_with_boundary`] 返回（拼音专用）。
 #[derive(Debug, Clone)]
@@ -390,6 +395,22 @@ impl CachedDict {
         build_single_char_full_codes_from(std::slice::from_ref(self), max_code_length)
     }
 
+    /// 本词库**实际读取的文件**；内存模式无文件 → `None`。
+    ///
+    /// 供二级缓存（`.wridx` 反查索引）判定「我派生自哪几个文件、它们变了没有」。
+    /// 取的是 reader 自报的路径而非调用方重新推导——`load_dicts_individually` 里
+    /// wdat 路径的推导分了三个分支（普通 / english 小写 / rime_pinyin 合并），
+    /// 在别处照抄一遍必然会有一天与它分叉。
+    ///
+    /// `None` 有明确后果：内存模式意味着这份词库根本没有稳定的磁盘产物，
+    /// 以它为源的二级缓存不该落盘（见 `EngineManager::build_reverse_index_for`）。
+    pub fn source_file(&self) -> Option<&Path> {
+        match self {
+            Self::Mmap(reader) => Some(reader.path()),
+            Self::Memory(_) => None,
+        }
+    }
+
     /// 总条目数
     pub fn len(&self) -> usize {
         match self {
@@ -417,13 +438,22 @@ impl CachedDict {
 /// 各库的 wdat 由 [`crate::reader_pool`] 按路径共享，活着的引擎通常已持有同一批 reader，
 /// 故这里的「逐库打开」几乎零成本：不重新解析、不新增映射。
 pub fn build_reverse_index_from(dicts: &[CachedDict]) -> ReverseIndex {
+    ReverseIndex::from_bytes(serialize_reverse_index_from(dicts))
+}
+
+/// 同 [`build_reverse_index_from`]，但停在**序列化镜像**这一步。
+///
+/// 分出这个入口是为了让调用方能「先落盘、再从盘上打开」——那条路径能把索引字节
+/// 从进程私有内存里彻底移出去（mmap），而 [`build_reverse_index_from`] 得到的
+/// 索引恒常驻。两者产出的字节**完全相同**，故行为无差。
+pub fn serialize_reverse_index_from(dicts: &[CachedDict]) -> Vec<u8> {
     let mut pairs: Vec<(String, String, i32)> = Vec::new();
     for d in dicts {
         d.for_each_entry(&mut |code, text, weight| {
             pairs.push((text.to_string(), code.to_string(), weight));
         });
     }
-    ReverseIndex::build(pairs)
+    crate::reverseidx::serialize(pairs)
 }
 
 /// 从**多个词库**构建单字全码表。判据与单库版完全一致（见
@@ -465,323 +495,6 @@ pub fn build_single_char_full_codes_from(
         });
     }
     best.into_iter().map(|(k, (code, _))| (k, code)).collect()
-}
-
-/// 反查索引:词 → 该词在词库中的全部编码(码长升序→字典序,已去重)。
-///
-/// 紧凑存储——按词升序的定长条目数组 + 两个共享文本 arena,相比
-/// `HashMap<String, Vec<String>>`(桶空位 + 每词一个 `Vec` + 每个词/码各一次堆分配)
-/// 省数倍内存:十万词级码表实测 12.9 MB → 约 2.4 MB。查询走二分——反查仅用于悬停 [编码]
-/// 段与拼音编码提示,均为低频路径,无需 O(1)。
-#[derive(Default)]
-pub struct ReverseIndex {
-    /// 按 `text` 升序(字节序)。
-    entries: Vec<ReverseEntry>,
-    /// 每个编码在 `codes` 中的结束偏移,按条目序连续。
-    /// 单个编码的文本区间 = [前一项, 本项),首项起点为 0。
-    code_ends: Vec<u32>,
-    /// 所有词按条目序连续拼接。
-    texts: String,
-    /// 所有编码按条目序连续拼接。
-    codes: String,
-}
-
-struct ReverseEntry {
-    /// 词在 `texts` 中的区间 [text_start, text_end)。
-    /// 起止都存(而非沿用前一条目的终点)是为了能直接用标准库 `binary_search_by`。
-    text_start: u32,
-    text_end: u32,
-    /// 本词编码在 `code_ends` 中的结束下标;起点 = 前一条目的 `code_end_idx`(首条为 0)。
-    code_end_idx: u32,
-    /// 该词在词库中的**最大**权重(同词多码时取最高)。
-    ///
-    /// 反查本身用不到它——加它是为了 [`ReverseIndex::texts_with_prefix`]:词语联想要的是
-    /// 「以『中』开头的**最常用**的几个词」,而 `entries` 是按字典序排的,不带权重就只能给出
-    /// 字典序前几个(「中一」「中丁」…),那不是任何人想要的。
-    ///
-    /// 每词 4 字节。十万词级码表约 400 KB,相对本结构 2.4 MB 的量级可以接受。
-    weight: i32,
-}
-
-impl ReverseIndex {
-    /// 从 (词, 编码, 权重) 三元组构建。同一 (词, 编码) 重复只留一份;
-    /// 每词的编码按「码长升序→字典序」排,权重取该词全部条目中的最大值。
-    fn build(mut pairs: Vec<(String, String, i32)>) -> Self {
-        // 全局一次排序即同时满足:词分组相邻、组内码长升序、同长按字典序。
-        // 权重不参与排序——它是分组内的聚合量,不影响条目次序。
-        pairs.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.1.len().cmp(&b.1.len()))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        // 去重按 (词, 码) 而非整个三元组:同一 (词, 码) 在扩展库里可能带不同权重,
-        // 用整元组去重会让它们都留下,同一个码在候选里出现两次。
-        pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-        let mut entries = Vec::new();
-        let mut code_ends = Vec::with_capacity(pairs.len());
-        let mut texts = String::new();
-        let mut codes = String::with_capacity(pairs.iter().map(|p| p.1.len()).sum());
-        let mut i = 0;
-        while i < pairs.len() {
-            let text = pairs[i].0.clone();
-            let text_start = texts.len() as u32;
-            texts.push_str(&text);
-            let mut j = i;
-            let mut weight = i32::MIN;
-            while j < pairs.len() && pairs[j].0 == text {
-                codes.push_str(&pairs[j].1);
-                code_ends.push(codes.len() as u32);
-                weight = weight.max(pairs[j].2);
-                j += 1;
-            }
-            entries.push(ReverseEntry {
-                text_start,
-                text_end: texts.len() as u32,
-                code_end_idx: code_ends.len() as u32,
-                weight,
-            });
-            i = j;
-        }
-        entries.shrink_to_fit();
-        code_ends.shrink_to_fit();
-        texts.shrink_to_fit();
-        codes.shrink_to_fit();
-        Self {
-            entries,
-            code_ends,
-            texts,
-            codes,
-        }
-    }
-
-    /// 二分查词,返回其编码列表视图;词不在索引中返回 `None`。
-    pub fn codes_of(&self, text: &str) -> Option<CodeList<'_>> {
-        let i = self
-            .entries
-            .binary_search_by(|e| self.text_of(e).cmp(text))
-            .ok()?;
-        let start = if i == 0 {
-            0
-        } else {
-            self.entries[i - 1].code_end_idx as usize
-        };
-        Some(CodeList {
-            index: self,
-            start,
-            end: self.entries[i].code_end_idx as usize,
-        })
-    }
-
-    /// **词语联想的取数口**：以 `prefix` 开头、且**严格更长**的词，按权重降序取前 `limit` 条。
-    ///
-    /// 返回 (整词, 权重)。上屏时补的是整词去掉 `prefix` 之后的部分——那一步在调用方做，
-    /// 因为「显示整词、只上屏剩余」是展示层的决定，本层只负责把词捞出来。
-    ///
-    /// # 为什么能这么便宜
-    ///
-    /// `entries` 本就按 `text` 字节序升序（反查用二分的前提）。字节序下同前缀的词必然连续，
-    /// 于是二分找到下界后顺序走到第一个不匹配即止——**无需任何额外索引**。
-    ///
-    /// ⚠️ 前缀本身要排除（`e_text.len() > prefix.len()`）：「中」的联想不该包含「中」自己。
-    ///
-    /// 扫描长度是该前缀下的词数（「中」约数千），每次上屏一次，微秒级。刻意不做提前截断
-    /// ——按权重取 top-N **必须看完全部候选**，扫到一半就停会退化成「字典序前 N 里权重
-    /// 最高的那几个」，那是个看起来对、实则完全不对的结果。
-    pub fn texts_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(&str, i32)> {
-        if prefix.is_empty() || limit == 0 {
-            return Vec::new();
-        }
-        // 下界：第一个 >= prefix 的条目。prefix 自身若在库中会落在这里，靠下面的长度判据排除。
-        let lo = self.entries.partition_point(|e| self.text_of(e) < prefix);
-        let mut hits: Vec<(&str, i32)> = Vec::new();
-        for e in &self.entries[lo..] {
-            let t = self.text_of(e);
-            if !t.starts_with(prefix) {
-                break; // 字节序保证同前缀连续，第一个不匹配即到头
-            }
-            if t.len() > prefix.len() {
-                hits.push((t, e.weight));
-            }
-        }
-        // 权重降序；同权按词短优先（「中国」比「中国人民」更常用作联想），再按字典序定序。
-        hits.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.0.len().cmp(&b.0.len()))
-                .then_with(|| a.0.cmp(b.0))
-        });
-        hits.truncate(limit);
-        hits
-    }
-
-    fn text_of(&self, e: &ReverseEntry) -> &str {
-        &self.texts[e.text_start as usize..e.text_end as usize]
-    }
-
-    /// 按 `code_ends` 全局下标取单个编码文本。
-    fn code_at(&self, j: usize) -> &str {
-        let start = if j == 0 {
-            0
-        } else {
-            self.code_ends[j - 1] as usize
-        };
-        &self.codes[start..self.code_ends[j] as usize]
-    }
-
-    /// 收录的词数。
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// 本索引占用的**堆字节数**（四个 arena 的实际用量，不含分配器余量）。
-    ///
-    /// 供「按规模决定要不要常驻」这类策略取真值——十万词级与两百万词级差着两个量级，
-    /// 拍脑袋的常数阈值只会在其中一端出错。
-    pub fn heap_bytes(&self) -> usize {
-        self.entries.len() * std::mem::size_of::<ReverseEntry>()
-            + self.code_ends.len() * std::mem::size_of::<u32>()
-            + self.texts.len()
-            + self.codes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-/// 某词的编码列表视图:按需从 arena 切片,取用不分配。
-#[derive(Clone, Copy)]
-pub struct CodeList<'a> {
-    index: &'a ReverseIndex,
-    /// `code_ends` 下标区间 [start, end)
-    start: usize,
-    end: usize,
-}
-
-impl<'a> CodeList<'a> {
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.start >= self.end
-    }
-
-    /// 末位 = 最长码(全码)。简码可能被一级简码占用,取全码最稳。
-    pub fn last(&self) -> Option<&'a str> {
-        (self.start < self.end).then(|| self.index.code_at(self.end - 1))
-    }
-
-    /// 按序遍历(码长升序)。
-    pub fn iter(self) -> impl Iterator<Item = &'a str> {
-        (self.start..self.end).map(move |j| self.index.code_at(j))
-    }
-
-    /// 以 `sep` 连接全部编码(如 `a/ab/abc`)。
-    pub fn join(self, sep: &str) -> String {
-        self.iter().collect::<Vec<_>>().join(sep)
-    }
-}
-
-#[cfg(test)]
-mod reverse_prefix_tests {
-    //! `texts_with_prefix`：词语联想的取数口。
-    use super::*;
-
-    fn idx() -> ReverseIndex {
-        // (词, 码, 权重)。刻意让**字典序**与**权重序**相反——两者一致的话，
-        // 「按权重排」和「按字典序排」会得出同样的结果，本组测试就什么都没验到。
-        ReverseIndex::build(vec![
-            ("中".into(), "a".into(), 1000),
-            ("中一".into(), "aa".into(), 1),
-            ("中丁".into(), "ab".into(), 2),
-            ("中国".into(), "ac".into(), 900),
-            ("中国人".into(), "acd".into(), 800),
-            ("中间".into(), "ad".into(), 700),
-            ("丰".into(), "b".into(), 500),
-            ("串".into(), "c".into(), 400),
-        ])
-    }
-
-    #[test]
-    fn ranks_by_weight_not_dictionary_order() {
-        let i = idx();
-        let out = i.texts_with_prefix("中", 3);
-        let texts: Vec<_> = out.iter().map(|(t, _)| *t).collect();
-        assert_eq!(
-            texts,
-            ["中国", "中国人", "中间"],
-            "取的是最常用的三个，不是字典序前三（那会是 中一/中丁/中国）"
-        );
-    }
-
-    /// ★ 前缀词**自己**必须排除：「中」的联想不该包含「中」。
-    ///
-    /// 它的权重恰恰常常是全场最高（单字比词常用），不排除就会稳定占据首位，
-    /// 而选中它等于上屏一个空串。
-    #[test]
-    fn excludes_the_prefix_itself() {
-        let i = idx();
-        let out = i.texts_with_prefix("中", 9);
-        assert!(
-            !out.iter().any(|(t, _)| *t == "中"),
-            "前缀本身不是它自己的联想"
-        );
-        assert_eq!(out.len(), 5, "中一/中丁/中国/中国人/中间");
-    }
-
-    /// 扫描必须在第一个不匹配处停下，且不越界到相邻前缀。
-    #[test]
-    fn does_not_leak_into_neighbouring_prefixes() {
-        let i = idx();
-        let out = i.texts_with_prefix("丰", 9);
-        assert!(out.is_empty(), "「丰」没有更长的词");
-        let out = i.texts_with_prefix("串", 9);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn empty_prefix_or_zero_limit_yields_nothing() {
-        assert!(idx().texts_with_prefix("", 9).is_empty());
-        assert!(idx().texts_with_prefix("中", 0).is_empty());
-    }
-
-    #[test]
-    fn unknown_prefix_yields_nothing() {
-        assert!(idx().texts_with_prefix("龘", 9).is_empty());
-    }
-
-    /// 同权时短词优先——「中国」比「中国人民」更适合当联想。
-    #[test]
-    fn same_weight_prefers_shorter() {
-        let i = ReverseIndex::build(vec![
-            ("中国人民".into(), "a".into(), 5),
-            ("中国".into(), "b".into(), 5),
-        ]);
-        let out = i.texts_with_prefix("中", 2);
-        assert_eq!(out[0].0, "中国");
-    }
-
-    /// 权重取该词全部条目里的**最大**值——同一个词在主库与扩展库各有一条时，
-    /// 取到低的那个会让它在联想里莫名靠后。
-    #[test]
-    fn weight_is_max_across_codes() {
-        let i = ReverseIndex::build(vec![
-            ("中国".into(), "a".into(), 1),
-            ("中国".into(), "bb".into(), 900),
-            ("中间".into(), "c".into(), 500),
-        ]);
-        let out = i.texts_with_prefix("中", 2);
-        assert_eq!(out[0].0, "中国", "取 900 而不是 1");
-    }
-
-    /// 反查本身（`codes_of`）不能被权重改动破坏。
-    #[test]
-    fn codes_of_still_works() {
-        let i = idx();
-        let codes: Vec<_> = i.codes_of("中国").unwrap().iter().collect();
-        assert_eq!(codes, ["ac"]);
-        assert!(i.codes_of("不存在").is_none());
-    }
 }
 
 #[cfg(test)]
@@ -1052,9 +765,10 @@ mod tests {
 
         assert_eq!(union.len(), via_merged.len(), "词数必须一致");
         assert_eq!(
-            union.heap_bytes(),
-            via_merged.heap_bytes(),
-            "存储布局必须一致（逐位等价的强判据）"
+            union.image(),
+            via_merged.image(),
+            "两条路径的序列化镜像必须逐字节相同——这是「逐位等价」最直接的判据\
+             （此前只比了总字节数，两份布局不同而大小恰好相等时会漏过）"
         );
         for text in ["工", "中", "大", "太"] {
             let u: Vec<_> = union.codes_of(text).unwrap().iter().collect();

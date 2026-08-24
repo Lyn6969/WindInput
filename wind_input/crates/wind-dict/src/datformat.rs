@@ -817,6 +817,12 @@ struct DatView {
 
 pub struct WdatReader {
     mmap: Mmap,
+    /// 本 reader 映射的文件路径。
+    ///
+    /// 不是给日志用的：**二级缓存要靠它认出「我是从哪几个文件派生出来的」**
+    /// （见 `reverseidx` 的 `.wridx` 指纹）。自己在调用方那边重新推导一遍那些路径，
+    /// 就是本仓反复出现的「同一份推导写两处、其中一处悄悄过时」。
+    path: std::path::PathBuf,
     leaf_count: u32,
     str_off: usize, // 共享字符串池（主表与简拼共用）
     main: DatView,
@@ -929,6 +935,7 @@ impl WdatReader {
         );
         Ok(Self {
             mmap,
+            path: path.to_path_buf(),
             leaf_count,
             str_off,
             main,
@@ -938,6 +945,11 @@ impl WdatReader {
 
     pub fn key_count(&self) -> u32 {
         self.leaf_count
+    }
+
+    /// 本 reader 映射的 wdat 文件路径（见字段注释：供二级缓存认源）。
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     #[inline]

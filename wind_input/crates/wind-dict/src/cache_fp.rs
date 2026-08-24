@@ -123,6 +123,95 @@ pub fn write_cache_fp(cache: &Path, sources: &[&Path], tag: &str) {
     }
 }
 
+// ───────────────── 二级缓存：以「缓存产物」而非「源文件」为源 ─────────────────
+
+/// 某个缓存产物的**稳定摘要**，供二级缓存（由缓存派生的缓存）校验用。
+///
+/// # 为什么二级缓存不能直接哈希源文件
+///
+/// 反查索引 `.wridx` 派生自一个方案的全部 `.wdat`。若照 [`fingerprint`] 的做法去读
+/// **yaml 源**，feihuzj2 那种方案每次启动都要读满 250 MB 才能回答「缓存还能不能用」
+/// ——而复用命中时本该是零成本。
+///
+/// 但每个 `.wdat` 自己就有一份 `.fp`，那 16 个十六进制字符已经编码了
+/// 「解析语义版本 + tag + 该 yaml 的全部内容」。于是二级缓存只要哈希这些摘要，
+/// 判别力与直接读源**完全相同**，I/O 却从几百 MB 降到几百字节。
+///
+/// # 三级回退，每级都有明确含义
+///
+/// 1. `fp:<hash>` —— 有指纹 sidecar（正常路径）；
+/// 2. `sz:<len>:<mtime>` —— 无 sidecar（wdat-only 分发的用户投放词库就没有）。
+///    这里用 mtime 是安全的：mtime 之所以在源文件上不可信，是因为 scp/部署会刷新它，
+///    而**缓存产物与用户投放的二进制只会被整体替换**，替换必然改 mtime。
+/// 3. `absent` —— 文件读不到。稳定可哈希，语义是「这一份此刻不在」。
+pub fn cache_digest(cache: &Path) -> String {
+    if let Ok(s) = std::fs::read_to_string(fp_sidecar(cache)) {
+        return format!("fp:{}", s.trim());
+    }
+    let Ok(meta) = std::fs::metadata(cache) else {
+        return "absent".to_string();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("sz:{}:{}", meta.len(), mtime)
+}
+
+/// 二级缓存的指纹：混入解析语义版本 + tag + 各源摘要。
+///
+/// 与 [`fingerprint`] 不同，**它不会失败**——摘要本身已经把「读不到」表达成了
+/// `absent`（见 [`cache_digest`]），故没有「无法判定」这一态。
+fn derived_fingerprint(source_digests: &[String], tag: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u32(PARSE_SEMANTICS_VERSION);
+    h.write(tag.as_bytes());
+    h.write_u8(0xfe);
+    for d in source_digests {
+        h.write(d.as_bytes());
+        h.write_u8(0xff); // 分隔，避免相邻摘要拼接歧义
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// 二级缓存是否可复用。源是 [`cache_digest`] 摘要而非文件路径，其余语义同
+/// [`cache_is_fresh`]（**摘要的顺序参与哈希**：词库次序变了索引内容也会变）。
+pub fn derived_cache_is_fresh(cache: &Path, source_digests: &[String], tag: &str) -> bool {
+    if !cache.exists() {
+        return false;
+    }
+    let fp = derived_fingerprint(source_digests, tag);
+    matches!(std::fs::read_to_string(fp_sidecar(cache)), Ok(s) if s.trim() == fp)
+}
+
+/// 二级缓存构建成功后写指纹 sidecar。失败留痕，理由同 [`write_cache_fp`]。
+pub fn write_derived_cache_fp(cache: &Path, source_digests: &[String], tag: &str) {
+    let fp = derived_fingerprint(source_digests, tag);
+    if let Err(e) = std::fs::write(fp_sidecar(cache), fp) {
+        tracing::warn!(
+            "写入二级缓存指纹 sidecar 失败 {}: {} —— 缓存已建好但下次仍会全量重建。",
+            fp_sidecar(cache).display(),
+            e
+        );
+    }
+}
+
+/// 反查索引（`.wridx`）的指纹 tag。
+///
+/// ⚠️ **序列化产出的字节语义一变就必须 +1**。文件头里的格式 `VERSION` 只挡得住**布局**
+/// 变化，挡不住「同样的布局、不同的内容」——而后者同样会让存量缓存变成错的。
+///
+/// 这不是假想：本格式落地当天就撞上一次。权重聚合从「按 (词,码) 去重**之后**取 max」
+/// 改成「去重**之前**取 max」，wubi86 的索引前后都是 2338080 字节、布局一位没动，
+/// `VERSION` 对它完全无感。当时还没发布，直接清掉存量文件即可；**一旦发布，
+/// 同类改动就只能靠这里 +1**，否则用户机器上那份错索引会被永久复用。
+///
+/// 历史：
+/// - v1 = 初始（含「权重在去重前聚合」的语义；发布前的中间态未单独计版）
+pub const REVERSE_INDEX_TAG: &str = "reverse-index/v1";
+
 /// 词库缓存的 tag：区分 code 列是否被小写化（`dict_type = english` 走小写）。
 pub fn dict_tag(lowercase_code: bool) -> &'static str {
     if lowercase_code {
@@ -284,5 +373,93 @@ mod tests {
         let cache = std::env::temp_dir().join("wind_fp_test_nope.cache");
         let _ = std::fs::remove_file(&cache);
         assert!(!cache_is_fresh(&cache, &[&src], "t"));
+    }
+
+    /// 二级缓存摘要的三级回退各有确定取值，且**互不相等**——三者若有两个碰撞，
+    /// 「有指纹」与「只有文件」就会被当成同一状态。
+    #[test]
+    fn cache_digest_falls_back_in_three_distinguishable_levels() {
+        let src = tmp("digest_src.txt", b"payload");
+        let cache = tmp("digest.cache", b"<built>");
+        // ② 无 sidecar → sz:len:mtime
+        let by_meta = cache_digest(&cache);
+        assert!(
+            by_meta.starts_with("sz:"),
+            "无指纹应回退到 (长度, mtime): {by_meta}"
+        );
+        // ① 有 sidecar → fp:<hash>，且优先于 ②
+        write_cache_fp(&cache, &[&src], "t");
+        let by_fp = cache_digest(&cache);
+        assert!(by_fp.starts_with("fp:"), "有指纹时必须优先取指纹: {by_fp}");
+        assert_ne!(by_fp, by_meta);
+        // ③ 文件不在 → absent
+        let gone = std::env::temp_dir().join("wind_fp_test_digest_absent");
+        let _ = std::fs::remove_file(&gone);
+        let mut side = gone.clone().into_os_string();
+        side.push(".fp");
+        let _ = std::fs::remove_file(side);
+        assert_eq!(cache_digest(&gone), "absent");
+    }
+
+    /// 二级缓存端到端：摘要不变则复用，任一摘要变了/顺序变了/tag 变了都必须失效。
+    ///
+    /// 顺序那条尤其要紧：反查索引的内容依赖词库次序（同词多码的排列），
+    /// 只把摘要当无序集合会让「调整扩展库顺序」静默复用错误索引。
+    #[test]
+    fn derived_cache_tracks_digests_order_and_tag() {
+        let cache = tmp("derived.cache", b"<index>");
+        let a = "fp:aaaaaaaaaaaaaaaa".to_string();
+        let b = "fp:bbbbbbbbbbbbbbbb".to_string();
+
+        write_derived_cache_fp(&cache, &[a.clone(), b.clone()], REVERSE_INDEX_TAG);
+        assert!(derived_cache_is_fresh(
+            &cache,
+            &[a.clone(), b.clone()],
+            REVERSE_INDEX_TAG
+        ));
+        // 某个词库变了
+        let b2 = "fp:cccccccccccccccc".to_string();
+        assert!(!derived_cache_is_fresh(
+            &cache,
+            &[a.clone(), b2],
+            REVERSE_INDEX_TAG
+        ));
+        // 顺序变了
+        assert!(!derived_cache_is_fresh(
+            &cache,
+            &[b.clone(), a.clone()],
+            REVERSE_INDEX_TAG
+        ));
+        // 少了一个词库
+        assert!(!derived_cache_is_fresh(
+            &cache,
+            std::slice::from_ref(&a),
+            REVERSE_INDEX_TAG
+        ));
+        // tag 变了（格式/语义升级）。刻意用一个**不可能成为真实 tag** 的串——
+        // 写成「下一个版本号」的话，`REVERSE_INDEX_TAG` 升版那天这条会静默变成
+        // 「拿同一个 tag 比同一个 tag」，从此恒真。（本测试已经这么绊过一次。）
+        assert!(!derived_cache_is_fresh(
+            &cache,
+            &[a, b],
+            "reverse-index/<某个不同的 tag>"
+        ));
+    }
+
+    /// 二级缓存的「源缺失」是可哈希的稳定状态（`absent`），而**补上之后必须失效**。
+    /// 这是一级指纹那条 30 秒重建 bug 的同族形态，在二级上提前钉死。
+    #[test]
+    fn derived_cache_handles_absent_source_and_its_return() {
+        let cache = tmp("derived_absent.cache", b"<index>");
+        let present = "fp:1111111111111111".to_string();
+        write_derived_cache_fp(&cache, &[present.clone(), "absent".into()], "t");
+        assert!(
+            derived_cache_is_fresh(&cache, &[present.clone(), "absent".into()], "t"),
+            "源稳定缺失时二级缓存必须可复用"
+        );
+        assert!(
+            !derived_cache_is_fresh(&cache, &[present, "fp:2222222222222222".into()], "t"),
+            "缺失的源后来出现，必须让缓存失效"
+        );
     }
 }
