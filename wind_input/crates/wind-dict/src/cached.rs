@@ -96,10 +96,12 @@ impl CachedDict {
     ) -> anyhow::Result<Self> {
         // wdat-only：用户只投放编译好的二进制词库、不带 yaml 源（对齐 Go 的 wdb-only 分发）。
         //
-        // 必须抢在 cache_is_valid 之前——指纹机制以「源不可读 = 需重建」为语义
-        // （`cache_fp::fingerprint` 读不到源即返回 None），而这里恰恰无源可重建，
-        // 走进去必然判定失效；也必须抢在下面 `CodetableDict::load(yaml_path)?` 之前，
-        // 那是硬失败点（文件不存在直接 Err，后续写缓存/mmap 都不会执行）。
+        // 必须抢在 cache_is_valid 之前：本模式下压根没有 yaml 源，而 cache_is_valid 问的是
+        // 「缓存与**源**是否一致」——对无源可比的场景，那个问题本身就没有意义。
+        // （2026-08-24 起 `cache_fp::fingerprint` 把「源缺失」当作可哈希的稳定事实而非失败，
+        // 故这里不再能靠「缺源必判失效」兜底，顺序更是必须的。）
+        // 也必须抢在下面 `CodetableDict::load(yaml_path)?` 之前，那是硬失败点
+        // （文件不存在直接 Err，后续写缓存/mmap 都不会执行）。
         if !yaml_path.is_file()
             && let Some(sidecar) = wdat_sibling(yaml_path)
             && sidecar.is_file()
@@ -362,11 +364,7 @@ impl CachedDict {
     /// 供悬停 [编码] 段显示完整打法列表(如 `a/ab/abc`)与拼音编码提示(取末位=最长码,
     /// 全码最稳——简码可能被一级简码等占用)。取词库实际码,避免按字生成码却打不出的错配。
     pub fn build_reverse_index(&self) -> ReverseIndex {
-        let mut pairs: Vec<(String, String, i32)> = Vec::new();
-        self.for_each_entry(&mut |code, text, weight| {
-            pairs.push((text.to_string(), code.to_string(), weight));
-        });
-        ReverseIndex::build(pairs)
+        build_reverse_index_from(std::slice::from_ref(self))
     }
 
     /// 构建**单字全码表**：汉字 → 该字在本词库中的全码。供码表造词按 `[[encoder.rules]]`
@@ -389,10 +387,59 @@ impl CachedDict {
         &self,
         max_code_length: usize,
     ) -> std::collections::HashMap<char, String> {
-        use std::collections::HashMap;
-        // 值存 (code, weight)；weight 仅用于比较，不外传。
-        let mut best: HashMap<char, (String, i32)> = HashMap::new();
-        self.for_each_entry(&mut |code, text, weight| {
+        build_single_char_full_codes_from(std::slice::from_ref(self), max_code_length)
+    }
+
+    /// 总条目数
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Mmap(reader) => reader.key_count() as usize,
+            Self::Memory(dict) => dict.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 从**多个词库**构建反查索引，等价于「先合并成一份再构建」，但**不产出中间文件**。
+///
+/// # 为什么等价（这条等价性是删掉 `combined.wdat` 的全部依据）
+///
+/// [`ReverseIndex::build`] 自己就会按 `(text, code)` 去重、并把权重取为该词全部条目的
+/// **最大值**。这恰好覆盖了合并步骤所做的一切（按 code 聚合、同 text 保留更高权重）——
+/// 于是「喂各库条目的原始并集」与「喂合并后的结果」产出的索引**逐位相同**。
+///
+/// 真机实测（feihuzj2，11 库 253 万条）：两条路径都得到 2519693 词、95.4 MB，
+/// 而直接构建 1.85 秒、经 `combined.wdat` 需 30 秒建文件 + 3.2 秒建索引。
+///
+/// 各库的 wdat 由 [`crate::reader_pool`] 按路径共享，活着的引擎通常已持有同一批 reader，
+/// 故这里的「逐库打开」几乎零成本：不重新解析、不新增映射。
+pub fn build_reverse_index_from(dicts: &[CachedDict]) -> ReverseIndex {
+    let mut pairs: Vec<(String, String, i32)> = Vec::new();
+    for d in dicts {
+        d.for_each_entry(&mut |code, text, weight| {
+            pairs.push((text.to_string(), code.to_string(), weight));
+        });
+    }
+    ReverseIndex::build(pairs)
+}
+
+/// 从**多个词库**构建单字全码表。判据与单库版完全一致（见
+/// [`CachedDict::build_single_char_full_codes`] 的四条），只是候选来自各库并集。
+///
+/// 与反查索引同理，判据「码长 → 权重 → 码字典序」对条目到达顺序不敏感，
+/// 故并集与合并结果等价——这也是它能一起摆脱 `combined.wdat` 的原因。
+pub fn build_single_char_full_codes_from(
+    dicts: &[CachedDict],
+    max_code_length: usize,
+) -> std::collections::HashMap<char, String> {
+    use std::collections::HashMap;
+    // 值存 (code, weight)；weight 仅用于比较，不外传。
+    let mut best: HashMap<char, (String, i32)> = HashMap::new();
+    for d in dicts {
+        d.for_each_entry(&mut |code, text, weight| {
             let mut it = text.chars();
             let (Some(ch), None) = (it.next(), it.next()) else {
                 return; // 只收单字条目
@@ -416,20 +463,8 @@ impl CachedDict {
                 }
             }
         });
-        best.into_iter().map(|(k, (code, _))| (k, code)).collect()
     }
-
-    /// 总条目数
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Mmap(reader) => reader.key_count() as usize,
-            Self::Memory(dict) => dict.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    best.into_iter().map(|(k, (code, _))| (k, code)).collect()
 }
 
 /// 反查索引:词 → 该词在词库中的全部编码(码长升序→字典序,已去重)。
@@ -595,6 +630,17 @@ impl ReverseIndex {
     /// 收录的词数。
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// 本索引占用的**堆字节数**（四个 arena 的实际用量，不含分配器余量）。
+    ///
+    /// 供「按规模决定要不要常驻」这类策略取真值——十万词级与两百万词级差着两个量级，
+    /// 拍脑袋的常数阈值只会在其中一端出错。
+    pub fn heap_bytes(&self) -> usize {
+        self.entries.len() * std::mem::size_of::<ReverseEntry>()
+            + self.code_ends.len() * std::mem::size_of::<u32>()
+            + self.texts.len()
+            + self.codes.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -971,6 +1017,81 @@ mod tests {
             vec!["cc"]
         );
         assert!(idx.codes_of("").is_none(), "空词不应命中");
+    }
+
+    /// ★★★ **P1 的全部依据**：「逐库并集」与「先合并再构建」必须产出**完全相同**的索引。
+    ///
+    /// 这条等价性成立，才谈得上删掉 `combined.wdat`（230MB 文件 + 30 秒构建）。
+    /// 样本刻意覆盖三种合并才会遇到的冲突形态——只有其中任一被处理错，两侧就会分叉：
+    ///   ① 同 (text, code) 在两库权重不同  ② 同 text 不同 code 分散在两库
+    ///   ③ 同 code 不同 text 分散在两库
+    #[test]
+    fn union_of_dicts_equals_merged_dict_for_reverse_index() {
+        // 两个分库。
+        let mut a = CodetableDict::empty();
+        a.merge_single("aaaa".into(), "工".into(), 100, 0);
+        a.merge_single("a".into(), "工".into(), 50, 1); // ② 同词另一个码
+        a.merge_single("khk".into(), "中".into(), 10, 2); // ① 低权重那份
+        a.merge_single("de".into(), "大".into(), 7, 3); // ③ 同码不同词
+        let mut b = CodetableDict::empty();
+        b.merge_single("khk".into(), "中".into(), 999, 0); // ① 高权重那份
+        b.merge_single("de".into(), "太".into(), 8, 1); // ③ 同码另一个词
+        b.merge_single("khkkhk".into(), "中".into(), 5, 2);
+
+        // 合并版：按 combined 的语义（同 code 聚合，同 text 取更高权重）手工合成一份。
+        let mut merged = CodetableDict::empty();
+        merged.merge_single("aaaa".into(), "工".into(), 100, 0);
+        merged.merge_single("a".into(), "工".into(), 50, 1);
+        merged.merge_single("khk".into(), "中".into(), 999, 2); // 取 max
+        merged.merge_single("de".into(), "大".into(), 7, 3);
+        merged.merge_single("de".into(), "太".into(), 8, 4);
+        merged.merge_single("khkkhk".into(), "中".into(), 5, 5);
+
+        let union = build_reverse_index_from(&[CachedDict::Memory(a), CachedDict::Memory(b)]);
+        let via_merged = CachedDict::Memory(merged).build_reverse_index();
+
+        assert_eq!(union.len(), via_merged.len(), "词数必须一致");
+        assert_eq!(
+            union.heap_bytes(),
+            via_merged.heap_bytes(),
+            "存储布局必须一致（逐位等价的强判据）"
+        );
+        for text in ["工", "中", "大", "太"] {
+            let u: Vec<_> = union.codes_of(text).unwrap().iter().collect();
+            let m: Vec<_> = via_merged.codes_of(text).unwrap().iter().collect();
+            assert_eq!(u, m, "{text} 的编码列表必须一致");
+        }
+        // 权重取 max 这一点单独验：它决定词语联想的排序，错了很难被上面几条发现。
+        assert_eq!(
+            union.texts_with_prefix("中", 9),
+            via_merged.texts_with_prefix("中", 9),
+            "联想排序（依赖每词的 max 权重）必须一致"
+        );
+    }
+
+    /// 同上，针对单字全码表——它与反查索引共用同一条「摆脱 combined」的依据。
+    #[test]
+    fn union_of_dicts_equals_merged_dict_for_single_char_codes() {
+        let mut a = CodetableDict::empty();
+        a.merge_single("a".into(), "工".into(), 9999, 0); // 简码，权重极高但不该胜出
+        a.merge_single("khk".into(), "中".into(), 10, 1);
+        let mut b = CodetableDict::empty();
+        b.merge_single("aaaa".into(), "工".into(), 1, 0); // 全码，应胜出
+        b.merge_single("khk".into(), "中".into(), 999, 1);
+        b.merge_single("khkkhk".into(), "中".into(), 9999, 2); // 超上限闸，应被排除
+
+        let mut merged = CodetableDict::empty();
+        merged.merge_single("a".into(), "工".into(), 9999, 0);
+        merged.merge_single("aaaa".into(), "工".into(), 1, 1);
+        merged.merge_single("khk".into(), "中".into(), 999, 2);
+        merged.merge_single("khkkhk".into(), "中".into(), 9999, 3);
+
+        let union =
+            build_single_char_full_codes_from(&[CachedDict::Memory(a), CachedDict::Memory(b)], 4);
+        let via_merged = CachedDict::Memory(merged).build_single_char_full_codes(4);
+        assert_eq!(union, via_merged);
+        assert_eq!(union.get(&'工').map(String::as_str), Some("aaaa"));
+        assert_eq!(union.get(&'中').map(String::as_str), Some("khk"));
     }
 
     #[test]

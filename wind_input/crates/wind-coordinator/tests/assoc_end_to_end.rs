@@ -57,7 +57,19 @@ fn coord_tweak(
     cfg.input.association.kind = kind.to_string();
     cfg.input.association.mode = "one_shot".to_string();
     tweak(&mut cfg);
-    Coordinator::new_headless(cfg, Some(&dir))
+    let c = Coordinator::new_headless(cfg, Some(&dir));
+    prewarm(&c);
+    c
+}
+
+/// 词语联想的数据源是**反查索引**，而它在生产里由启动后的后台预热线程建好
+/// （`construct.rs` → `prewarm_indexes`）。headless 协调器不跑那个线程。
+///
+/// 索引改成「没就绪就返回空、绝不在按键线程上现建」之后（避免大词库把整机卡住），
+/// 测试若不自己预热，`assoc_prefix_words` 会如实给出「无联想」——那测的是夹具缺陷，
+/// 不是产品行为。生产/测试/移动端共用同一个 `prewarm_indexes`，三处不会漂移。
+fn prewarm(c: &Coordinator) {
+    c.prewarm_indexes();
 }
 
 fn coord_mode(kind: &str, schema: &str, mode: &str) -> std::sync::Arc<Coordinator> {
@@ -69,7 +81,9 @@ fn coord_mode(kind: &str, schema: &str, mode: &str) -> std::sync::Arc<Coordinato
     cfg.input.symbol.smart_mode = false;
     cfg.input.association.kind = kind.to_string();
     cfg.input.association.mode = mode.to_string();
-    Coordinator::new_headless(cfg, Some(&dir))
+    let c = Coordinator::new_headless(cfg, Some(&dir));
+    prewarm(&c);
+    c
 }
 
 fn press(c: &Coordinator, code: &str) {
@@ -578,6 +592,7 @@ fn space_commits_false_outputs_space_not_candidate() {
     cfg.input.association.kind = "word".to_string();
     cfg.input.association.space_commits = false;
     let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    prewarm(&c); // 本例自己造协调器，没走 coord_* 夹具，须显式预热（理由见 prewarm）
     press(&c, "q");
     c.handle_key_event(&key_event(0x20)); // 第一次空格：正常选词上屏「我」
     let hits = assoc_texts(&c);

@@ -168,7 +168,7 @@ impl Coordinator {
 
     /// 造词是否启用（码表/混输方案 + 开关开启）。拼音方案走 `[pinyin.auto_learn]` 的
     /// 选词即学路线，不进本缓冲。
-    fn auto_phrase_enabled(&self) -> bool {
+    pub(crate) fn auto_phrase_enabled(&self) -> bool {
         !self.engine_mgr.is_pinyin() && self.engine_mgr.codetable_settings().auto_phrase.enabled
     }
 
@@ -278,6 +278,28 @@ impl Coordinator {
             } else {
                 active.clone()
             };
+        // ★★★ 索引未就绪时**跳过本次造词**并后台预热，两条理由缺一不可：
+        //
+        // ① 不能在此现建：本函数跑在上屏（按键）线程上，而单字全码表与反查索引都是
+        //    惰性全量构建，大词库上是秒级——TSF→服务同步 IPC，那一等就是整机卡顿。
+        // ② **更不能把「没就绪」当成「查不到」继续往下走**：下面的查重①靠
+        //    `word_codes_in` 判断系统词库是否已有这个「码+词」。拿空结果去判，
+        //    `"".split('/')` 产出 `[""]`，永远不等于非空的 code ⇒ 去重判据**静默失效**
+        //    ⇒ 往临时层写入一条系统词库本就有的重复条目。那不是「这一屏少显示点东西」，
+        //    而是**写进 redb 的持久错误**：候选出现重复项，且该条目计入提升计数、
+        //    可能被 `maybe_promote_temp` 永久固化进用户词库。
+        //
+        // 自动造词是机会性功能，丢掉这一次完全无感；下次上屏时通常已就绪。
+        if self
+            .engine_mgr
+            .reverse_index_if_ready(&encode_schema)
+            .is_none()
+            || !self.engine_mgr.single_char_codes_ready(&encode_schema)
+        {
+            debug!("auto-phrase: 词库索引未就绪，跳过本次造词并后台预热");
+            self.ensure_word_encoding_async(&encode_schema);
+            return;
+        }
         let code = match self.engine_mgr.encode_word(&encode_schema, &word) {
             Ok(c) => c,
             Err(e) => {
@@ -289,7 +311,12 @@ impl Coordinator {
         };
         // 查重①系统词库：反查索引给的是该词在词库里的**实际**编码列表（`a/ab/abc`），
         // 命中同码即说明系统库已收录这个「码+词」，不必再造。
-        let existing = self.engine_mgr.word_codes_in(&encode_schema, &word);
+        // 上面的就绪闸保证了这里的 `None` 不可能是「索引没建好」，故 `unwrap_or_default`
+        // 是安全的——它只会在「方案 id 为空」时兜底，而那种情况下本来也无从查重。
+        let existing = self
+            .engine_mgr
+            .word_codes_in(&encode_schema, &word)
+            .unwrap_or_default();
         if existing.split('/').any(|c| c == code) {
             debug!("auto-phrase: 系统词库已有 {} -> {}，跳过", code, word);
             return;

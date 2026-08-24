@@ -17,7 +17,7 @@ use crate::pinyin::{Config as PinyinConfig, PinyinEngine};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wind_candidate::CandidateSource;
 use wind_config::Config;
 use wind_config::schema::{DictSpec, Schema, merge_toml};
@@ -322,6 +322,10 @@ pub struct EngineManager {
     /// 每方案构建锁（single-flight）：同一方案的引擎/缓存构建串行，避免后台预热与首次
     /// 切换并发时重复构建同一份大缓存；不同方案可并行构建（缓存在各自子目录，互不冲突）。
     build_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 反查索引的每方案构建锁。与 `build_locks` **刻意分开**：索引构建（秒级、上百 MB）
+    /// 不该和引擎构建互相阻塞，两者的等待方也不同（前者是后台线程，后者是切换方案的用户）。
+    /// 兼作「是否正在建」的判据（`try_lock` 失败即在建），供打字线路决定要不要再 spawn。
+    index_build_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -480,6 +484,7 @@ impl EngineManager {
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
             build_locks: Mutex::new(HashMap::new()),
+            index_build_locks: Mutex::new(HashMap::new()),
         };
         // 仅同步构建活跃方案；其余方案由 Coordinator 启动后台预热（prewarm_schema）提前构建，
         // 避免首次切换时同步重熔大词库卡顿。单飞构建锁保证预热与切换不重复构建。
@@ -596,19 +601,23 @@ impl EngineManager {
     /// 被一级简码等占用),不存在返回空。对齐 Go `manager_convert.go` 的
     /// ApplyCodeHintsToCandidates——用主码表**反向索引**取实际码,而非按字生成码再校验
     /// (后者生成码常与码表实际码不一致,导致全被拒)。
-    pub fn codetable_reverse_hint(&self, text: &str) -> String {
+    /// **返回 `None` 表示反查索引尚未就绪**，不是「查不到」——见 [`Self::word_codes_in`]
+    /// 的三态说明。展示类调用方 `unwrap_or_default()` 即可。
+    pub fn codetable_reverse_hint(&self, text: &str) -> Option<String> {
         let primary = self
             .primary_codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if primary.is_empty() {
-            return String::new();
+            return Some(String::new()); // 没有主码表＝确定没有编码可显示，不是「没就绪」
         }
-        self.reverse_index_for(&primary)
-            .codes_of(text)
-            .and_then(|codes| codes.last().map(str::to_string))
-            .unwrap_or_default()
+        Some(
+            self.reverse_index_if_ready(&primary)?
+                .codes_of(text)
+                .and_then(|codes| codes.last().map(str::to_string))
+                .unwrap_or_default(),
+        )
     }
 
     /// 用**主拼音方案**为词推断带空格的音节码（`行长` → `hang zhang`），供候选注释的注音
@@ -666,7 +675,40 @@ impl EngineManager {
     /// 查 `schema_id` 方案词库中 `text` 的**全部**实际编码,按码长升序以 `/` 连接
     /// (如 `a/ab/abc`,供悬停 [编码] 段);方案 id 为空或词不在词库返回空——
     /// 不按取码规则生成,生成码常与词库实际码不一致。
-    pub fn word_codes_in(&self, schema_id: &str, text: &str) -> String {
+    /// # 三态返回（**别把后两者混为一谈**）
+    ///
+    /// - `None` —— **反查索引尚未就绪**（正在后台构建，或还没人触发构建）。
+    /// - `Some("")` —— 索引已就绪，但这个词不在词库里。
+    /// - `Some(codes)` —— 就绪且查到。
+    ///
+    /// 分开这两者是**正确性要求**，不是洁癖：加词去重（`handle_addword`）拿它判断
+    /// 「系统词库里已经有这个码+词了吗」。若把「没就绪」当成「查不到」，去重判据直接失效
+    /// ⇒ 往临时层写入一条系统词库已有的重复条目 ⇒ 候选出现重复项，且该条目会计入
+    /// 提升计数、可能被**永久固化**进用户词库。这是一次真实的 wrong-action 风险，
+    /// 而非「这一屏少显示点东西」。
+    ///
+    /// 展示类调用方（悬停 [编码] 段、候选注释）`unwrap_or_default()` 即可 —— 这一次
+    /// 不显示编码，下一次索引好了自然就有了。
+    ///
+    /// **本方法绝不阻塞**。需要「等到就绪为止」的调用方用
+    /// [`Self::word_codes_in_blocking`]，并且必须清楚自己会等上秒级。
+    pub fn word_codes_in(&self, schema_id: &str, text: &str) -> Option<String> {
+        if schema_id.is_empty() {
+            return Some(String::new()); // 没指定方案＝确定无从查起，不是「没就绪」
+        }
+        Some(
+            self.reverse_index_if_ready(schema_id)?
+                .codes_of(text)
+                .map(|codes| codes.join("/"))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// 同 [`Self::word_codes_in`]，但**索引没建好就地建**（可能阻塞秒级）。
+    ///
+    /// 只给「宁可等、也不能拿到错误答案」的调用方用——目前只有加词去重。
+    /// ⚠️ **绝不可用在按键处理链路上**：TSF→服务是同步 IPC，那一等就是整机卡顿。
+    pub fn word_codes_in_blocking(&self, schema_id: &str, text: &str) -> String {
         if schema_id.is_empty() {
             return String::new();
         }
@@ -718,16 +760,38 @@ impl EngineManager {
         if schema_id.is_empty() || prefix.is_empty() || limit == 0 {
             return Vec::new();
         }
-        self.reverse_index_for(schema_id)
-            .texts_with_prefix(prefix, limit)
+        // 索引没就绪就这次不联想（**不阻塞按键线程**）。联想是锦上添花，且
+        // `maybe_enter_assoc` 在无候选时直接返回、不改任何状态，降级完全无副作用。
+        let Some(idx) = self.reverse_index_if_ready(schema_id) else {
+            return Vec::new();
+        };
+        idx.texts_with_prefix(prefix, limit)
             .into_iter()
             .map(|(t, w)| (t.to_string(), w))
             .collect()
     }
 
-    /// 取 `schema_id` 的反查索引,缺则全量构建并缓存。
+    /// 已建好的反查索引；**没有就返回 `None`，绝不现建**。
+    ///
+    /// 供打字链路上的展示类消费方（候选注释 `${code}`、悬停 [编码] 段、词语联想）使用：
+    /// 它们宁可这一次不显示编码，也不能让按键处理停下来等一次秒级构建
+    /// ——TSF→服务是**同步 IPC**，那一停就是整机卡顿（真机实测 29.5 秒）。
+    pub fn reverse_index_if_ready(&self, schema_id: &str) -> Option<Arc<ReverseIndex>> {
+        self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned()
+    }
+
+    /// 取 `schema_id` 的反查索引,缺则全量构建并缓存（**会阻塞秒级**）。
+    ///
     /// 内存护栏:最多保留两份——本次请求方 + 全局主码表(悬停查活跃码表、拼音提示查主码表,
     /// 两者常为同一方案;方案切换的残留索引随下次构建清退)。
+    ///
+    /// ⚠️ **只该在两种场合调用**：后台预热线程，或用户主动发起、本就预期要等的操作
+    /// （如加词去重校验——那里返回空表会导致**重复加词**，是正确性问题，不能降级）。
+    /// 打字链路一律用 [`Self::reverse_index_if_ready`]。
     fn reverse_index_for(&self, schema_id: &str) -> Arc<ReverseIndex> {
         // primary 在 reverse_index 锁外取,避免嵌套锁。
         let primary = self
@@ -735,14 +799,87 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = guard.get(schema_id) {
-            return m.clone();
+        // 快路径：已建好直接返回。
+        if let Some(m) = self.reverse_index_if_ready(schema_id) {
+            return m;
         }
+        // ★ 构建**必须在锁外**：这是一次秒级、且要分配上百 MB 的操作，握着锁做等于
+        //   让所有线程（包括查别的方案的）一起排队。此前正是持锁构建。
+        //   代价是两个线程可能同时建同一份（少见且无害，各自算完最后一个写入者生效）。
         let m = Arc::new(self.build_reverse_index_for(schema_id));
+        let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
+        // 复查：等待期间别的线程可能已经建好并写入，此时沿用它，避免同一份索引在内存里
+        // 存在两个副本（各 95MB 量级）。
+        if let Some(existing) = guard.get(schema_id) {
+            return existing.clone();
+        }
         guard.insert(schema_id.to_string(), m.clone());
         guard.retain(|k, _| k == schema_id || k == &primary);
         m
+    }
+
+    /// 后台预热反查索引：把「首次使用时才建」提前到预热线程。
+    ///
+    /// 该索引原本是懒构建——第一次按键触发候选注释/悬停时才建，而它对大词库是秒级操作，
+    /// 恰好落在打字的同步链路上。预热线程本就在启动后 1.5 秒跑，把这件事挪进去，
+    /// 绝大多数用户就再也碰不到它。
+    ///
+    /// 幂等；返回是否真的执行了构建（供调用方计时/记日志）。
+    ///
+    /// 走 `index_build_locks` 单飞：并发调用只有一个真在建，其余等它建完后看到已就绪即返回。
+    /// 与 `ensure_loaded` 同一套「取锁 → 复查」形态。
+    pub fn prewarm_reverse_index(&self, schema_id: &str) -> bool {
+        if schema_id.is_empty() || self.reverse_index_if_ready(schema_id).is_some() {
+            return false;
+        }
+        let lock = self.index_build_lock_for(schema_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 抢到锁后复查：等待期间可能已被另一线程建好。
+        if self.reverse_index_if_ready(schema_id).is_some() {
+            return false;
+        }
+        let _ = self.reverse_index_for(schema_id);
+        true
+    }
+
+    /// 该方案的反查索引是否**正在后台构建**。
+    ///
+    /// 打字线路据此决定「要不要再起一个后台构建线程」——没有它，索引没建好期间的
+    /// 每一次按键都会 spawn 一个新线程去建同一份东西。
+    pub fn is_building_reverse_index(&self, schema_id: &str) -> bool {
+        !schema_id.is_empty()
+            && self.reverse_index_if_ready(schema_id).is_none()
+            && self.index_build_lock_for(schema_id).try_lock().is_err()
+    }
+
+    /// 单字全码表是否已就绪。它与反查索引同为**惰性全量构建**（同一批词库、同一量级），
+    /// 因此同样不能在按键线程上现建。只缓存一份，故判据是「缓存的就是这个方案」。
+    pub fn single_char_codes_ready(&self, schema_id: &str) -> bool {
+        matches!(
+            self.single_char_codes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref(),
+            Some((id, _)) if id == schema_id
+        )
+    }
+
+    /// 后台预热单字全码表（供自动造词取码）。幂等；返回是否真的建了。
+    pub fn prewarm_single_char_codes(&self, schema_id: &str) -> bool {
+        if schema_id.is_empty() || self.single_char_codes_ready(schema_id) {
+            return false;
+        }
+        let _ = self.single_char_full_codes(schema_id);
+        true
+    }
+
+    fn index_build_lock_for(&self, schema_id: &str) -> Arc<Mutex<()>> {
+        self.index_build_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(schema_id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// 按方案全量构建反查索引(汉字/词 → 全部编码,码长升序)。失败返回空表。
@@ -756,18 +893,23 @@ impl EngineManager {
         else {
             return ReverseIndex::default();
         };
-        match Self::load_dictionary(&schema, &schemas) {
-            Some(dict) => {
-                let idx = dict.build_reverse_index();
-                info!(
-                    "Built code-hint reverse index: {} ({} texts)",
-                    schema_id,
-                    idx.len()
-                );
-                idx
-            }
-            None => ReverseIndex::default(),
+        let dicts = Self::load_dicts_individually(&schema, &schemas);
+        if dicts.is_empty() {
+            return ReverseIndex::default();
         }
+        // 顺手清掉旧版留下的合并缓存（本方案已不再需要它）。
+        Self::purge_legacy_combined(&schema, &schemas);
+        let t0 = std::time::Instant::now();
+        let idx = wind_dict::cached::build_reverse_index_from(&dicts);
+        info!(
+            "Built code-hint reverse index: {} ({} texts, {} dicts, {:.1} MB, {:?})",
+            schema_id,
+            idx.len(),
+            dicts.len(),
+            idx.heap_bytes() as f64 / 1024.0 / 1024.0,
+            t0.elapsed()
+        );
+        idx
     }
 
     /// 取 `schema_id` 的单字全码表，缺则构建并缓存（只留一份，见字段注释）。
@@ -803,19 +945,19 @@ impl EngineManager {
             return HashMap::new();
         };
         let cap = schema.engine.codetable.max_code_length;
-        match Self::load_dictionary(&schema, &data_dir.join("schemas")) {
-            Some(dict) => {
-                let idx = dict.build_single_char_full_codes(cap);
-                info!(
-                    "Built single-char full-code table: {} ({} chars, cap={})",
-                    schema_id,
-                    idx.len(),
-                    cap
-                );
-                idx
-            }
-            None => HashMap::new(),
+        let dicts = Self::load_dicts_individually(&schema, &data_dir.join("schemas"));
+        if dicts.is_empty() {
+            return HashMap::new();
         }
+        let idx = wind_dict::cached::build_single_char_full_codes_from(&dicts, cap);
+        info!(
+            "Built single-char full-code table: {} ({} chars, cap={}, {} dicts)",
+            schema_id,
+            idx.len(),
+            cap,
+            dicts.len()
+        );
+        idx
     }
 
     /// 按方案的 `[[encoder.rules]]` 为词计算码表词组编码（造词/加词统一入口）。
@@ -3272,26 +3414,128 @@ impl EngineManager {
         out
     }
 
-    /// 加载 schema 的词典：合并所有 enabled 词库（主词库 + default_enabled 附加库）。
+    /// 方案实际参与构建的词库列表：启用的全部；**一个都没启用时兜底取首个**
+    /// （否则整方案无候选，比"少一个扩展库"糟糕得多）。
     ///
-    /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
-    /// - 码表反查索引用（build_primary_reverse_index）：主库 + 扩展库合并到 .combined.wdat。
-    ///   注意 live 查询层已改为 load_codetable_layers 的每库独立层，此处仅供反查索引复用。
-    fn load_dictionary(schema: &Schema, schemas_dir: &Path) -> Option<CachedDict> {
-        // 收集 enabled 词库（保持 schema 顺序：主库在前，扩展库在后）
-        let mut enabled: Vec<&DictSpec> = schema
+    /// 抽成单一函数是刚性要求：[`Self::load_dictionary`]（拼音引擎用）与
+    /// [`Self::load_dicts_individually`]（两个索引构建方用）**必须选出同一批库**。
+    /// 两处各写一份必然漂移，症状是「候选里有的词，悬停却查不到编码」——错位无声、
+    /// 且没有任何测试会失败。
+    fn enabled_dict_specs(schema: &Schema) -> Vec<&DictSpec> {
+        let enabled: Vec<&DictSpec> = schema
             .dictionaries
             .iter()
             .filter(|d| d.is_enabled() && !d.path.is_empty())
             .collect();
-        if enabled.is_empty() {
-            enabled = schema
-                .dictionaries
-                .iter()
-                .filter(|d| !d.path.is_empty())
-                .take(1)
-                .collect();
+        if !enabled.is_empty() {
+            return enabled;
         }
+        schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.path.is_empty())
+            .take(1)
+            .collect()
+    }
+
+    /// 按方案加载**全部启用词库，各自独立**——不合并、不产出中间文件。
+    ///
+    /// # 为什么两个索引构建方要走这里而不是 [`Self::load_dictionary`]
+    ///
+    /// 反查索引与单字全码表都只需要「全部条目」，而 `load_dictionary` 的多库分支为此
+    /// 先合成一个 `combined.wdat`：feihuzj2 方案上那是 **230MB 文件 + 30 秒构建**，
+    /// 而两条路径产出的索引**逐位相同**（等价性论证与测试见
+    /// [`wind_dict::cached::build_reverse_index_from`]）。直接逐库读只要 1.85 秒。
+    ///
+    /// 词库选取规则与 `load_dictionary` 保持一致（启用优先、全禁用时兜底取首个），
+    /// **两处必须同源**：不一致会让「候选里有的词，悬停却查不到编码」这类错位出现，
+    /// 且极难归因。
+    ///
+    /// 各库经 [`wind_dict::reader_pool`] 按路径共享 mmap，活跃引擎通常已持有同一批
+    /// reader，故这里几乎零成本：不重新解析、不新增映射。
+    fn load_dicts_individually(schema: &Schema, schemas_dir: &Path) -> Vec<CachedDict> {
+        Self::enabled_dict_specs(schema)
+            .iter()
+            .filter_map(|e| {
+                let full = Self::resolve_dict_file(&e.path, schemas_dir);
+                let dtype = if e.dict_type.is_empty() {
+                    "rime_codetable"
+                } else {
+                    e.dict_type.as_str()
+                };
+                match dtype {
+                    // rime 主表须经 import_tables 展开，否则只读到头部元数据。
+                    "rime_pinyin" => Self::load_rime_pinyin_dict(&full),
+                    // english：code 列小写化，与 load_codetable_layers 的缓存 tag 一致，
+                    // 否则会另建一份大小写不同的 wdat。
+                    t => {
+                        CachedDict::load_at_with(&full, &cache_path(&full, "wdat"), t == "english")
+                            .ok()
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// 清理本方案遗留的 `combined.wdat` —— 改用逐库构建之前那个中间产物
+    /// （feihuzj2 方案上是 **230MB**，且此后再不会有人读它）。
+    ///
+    /// 只对**确定不再需要它**的方案动手：非拼音方案的 live 引擎走 `load_codetable_layers`
+    /// 的每库独立层，两个索引构建方已改走 [`Self::load_dicts_individually`]，于是
+    /// combined 再无消费方。拼音方案的多库分支仍可能需要它（见 [`Self::load_dictionary`]），
+    /// 一律不动 —— 判据取 [`Schema::is_pinyin`] 而非自己比字符串，因为它还正确处理了
+    /// `engine.type` 缺省、要靠默认词库类型反推的那种方案。
+    ///
+    /// 删不掉就算了（正被别的进程映射、或无权限）：这只是块浪费的磁盘，不是正确性问题，
+    /// 下次再来一遍即可。
+    fn purge_legacy_combined(schema: &Schema, schemas_dir: &Path) {
+        if schema.is_pinyin() {
+            return;
+        }
+        let Some(first) = Self::enabled_dict_specs(schema).first().copied() else {
+            return;
+        };
+        let combined = cache_path(
+            &Self::resolve_dict_file(&first.path, schemas_dir),
+            "combined.wdat",
+        );
+        let Ok(meta) = std::fs::metadata(&combined) else {
+            return; // 不存在＝已经清过或从未产生，正常路径
+        };
+        match std::fs::remove_file(&combined) {
+            Ok(()) => {
+                let mut fp = combined.clone().into_os_string();
+                fp.push(".fp");
+                let _ = std::fs::remove_file(std::path::PathBuf::from(fp));
+                info!(
+                    "已清理遗留的合并缓存 {}（释放 {:.1} MB，该文件已无消费方）",
+                    combined.display(),
+                    meta.len() as f64 / 1024.0 / 1024.0
+                );
+            }
+            Err(e) => debug!(
+                "遗留合并缓存 {} 暂时删不掉（{e}），不影响功能，下次再试",
+                combined.display()
+            ),
+        }
+    }
+
+    /// 加载 schema 的词典：合并所有 enabled 词库（主词库 + default_enabled 附加库）。
+    ///
+    /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
+    /// - 多库 → `.combined.wdat`。
+    ///
+    /// ⚠️ **现存唯一的多库消费方是拼音引擎**（`PinyinEngine` 只持有一个 `CachedDict`、
+    /// 没有 composite 分层，故多库拼音方案必须拿到合并视图）。出厂 pinyin/shuangpin
+    /// 各只声明 1 个词库、走单库快路径，因此**出厂配置下 `combined.wdat` 根本不会产生**；
+    /// 只有用户经 `schema_overrides` 给拼音方案加第二个词库才会触发。
+    ///
+    /// 码表/英文的 live 查询走 `load_codetable_layers` 的每库独立层；两个索引构建方
+    /// 已改走 [`Self::load_dicts_individually`]，不再经过这里。
+    fn load_dictionary(schema: &Schema, schemas_dir: &Path) -> Option<CachedDict> {
+        // 收集 enabled 词库（保持 schema 顺序：主库在前，扩展库在后）。
+        // 与索引构建方共用同一份选取逻辑，见 enabled_dict_specs 的说明。
+        let enabled = Self::enabled_dict_specs(schema);
         if enabled.is_empty() {
             warn!("No usable dictionary in schema");
             return None;

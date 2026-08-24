@@ -209,7 +209,25 @@ DictManager（每方案一个）→ CompositeDict
        ↓ merge_search：跳禁用层 / 按 text 去重（继承更高 weight，
        ↓                前缀取最短码且 boundary 随行）/ sort_by(better)
        ↓ better: weight↓ → base_order↑ → natural_order↑ → code → text
+
+索引类产物（与 live 查询层无关，懒构建）
+  ├─ 反查索引 ReverseIndex（词 → 全部编码）  供悬停[编码]/编码提示/词语联想
+  └─ 单字全码表 HashMap<char,String>          供造词按 encoder.rules 组码
+       ↑ 两者都经 load_dicts_individually 逐库读取，**不再合成 combined.wdat**
 ```
+
+> **`combined.wdat` 已退出索引链路**（2026-08-24）。此前两个索引构建方经
+> `load_dictionary` 的多库分支先合成一份 `combined.wdat` 再建索引；feihuzj2 方案
+> （11 库 253 万条）上那是 **230MB 文件 + 30 秒构建**，而两条路径产出的索引**逐位相同**
+> —— `ReverseIndex::build` 自身已按 `(text, code)` 去重并取权重最大值，完整覆盖了合并
+> 语义。改逐库直读后同一份索引只要 **1.85 秒**。等价性由
+> `cached.rs` 的 `union_of_dicts_equals_merged_dict_for_*` 两个测试锁定。
+>
+> `load_dictionary`（连同 `combined.wdat`）**现存唯一消费方是拼音引擎**——`PinyinEngine`
+> 只持有单个 `CachedDict`、无 composite 分层，故多库拼音方案必须拿到合并视图。
+> 出厂 pinyin/shuangpin 各只声明 1 个词库、走单库快路径，**出厂配置下 combined 根本不会
+> 产生**；只有用户经 `schema_overrides` 给拼音方案加第二个词库才会触发。
+> 非拼音方案遗留的 combined 文件由 `purge_legacy_combined` 在首次建索引时顺手清掉。
 
 **触发时机**：进程启动（仅活跃方案同步构建）、后台逐方案预热、方案切换、首次按键懒加载、
 配置热重载（清空全部引擎）、单方案失效（override 写入/方案包导入/删除）。
@@ -246,10 +264,20 @@ DictManager（每方案一个）→ CompositeDict
 ```rust
 fingerprint(sources) =
     hash( PARSE_SEMANTICS_VERSION            // ← 关键
-        + Σ(file_name + len + 全部内容 + 0xff 分隔) )
+        + tag                                 // 解析方式（lowercase / 缓存种类）
+        + Σ(file_name + 存在性 + len + 全部内容 + 0xff 分隔) )
 ```
 
 **刻意不用 mtime**：scp/部署会刷新 mtime，导致每次全量重建（300MB）。
+
+**「源文件缺失」是可哈希的状态，不是失败**（2026-08-24 修）：旧实现 `fs::read(p).ok()?`
+让任一源读不到就整份指纹 `None` ⇒ `.fp` 永不写、`cache_is_fresh` 恒 false ⇒ **每次全量重建**。
+真机 feihuzj2 方案 11 个词库里 `feihuzj2_extra_gr.dict.yaml` 不存在（`default_enabled = true`
+但文件没装），于是 `combined.wdat` 每次引擎重建都要重算 30 秒；**磁盘上「其余 .fp 都在、
+唯独它没有」是该故障唯一的外部指纹**。现在缺失记 `0`、存在记 `1`+长度+内容：一直缺则指纹
+稳定可复用，后来补上则指纹改变、缓存正确失效。
+⚠️ 只有 `NotFound` 这么处理；**权限/IO 故障仍返回 `None` 强制重建**——那是「读不出来」
+而非「不存在」，把瞬时故障固化进指纹会让故障恢复后继续复用错误缓存。
 
 **`PARSE_SEMANTICS_VERSION` 的意义**：指纹若只覆盖源数据，它回答的是「**源文件**变了吗」，
 而真正该回答的是「这份缓存和**当前程序**会产出的结果一致吗」。两者平时重合，**恰在解析器

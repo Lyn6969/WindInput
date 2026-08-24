@@ -475,7 +475,10 @@ impl crate::coordinator::Coordinator {
         let single = text.chars().count() == 1;
         Some(match name {
             "char" => text.to_string(),
-            "code" => self.engine_mgr.codetable_reverse_hint(text),
+            // `?`：索引未就绪时**当作「本变量解析不出」**，而不是当作空码。
+            // 于是 `reverse_render` 的 found 判据照常生效——整条反查候选这一次不出现，
+            // 而不是出现一条编码栏空着的半成品。索引建好后下一次按键即恢复。
+            "code" => self.engine_mgr.codetable_reverse_hint(text)?,
             // `code_all` —— 该字在码表里的**全部**码位，默认 `/` 连接（`我` → `q/trn/trnt`）。
             //
             // 与 `code` 的分工照搬同文件 `chaizi` / `chaizi_all` 的既有惯例：不带后缀取单个，
@@ -487,7 +490,8 @@ impl crate::coordinator::Coordinator {
             // 恰恰是最没用的答案 —— 简码才是用户要的。
             "code_all" => {
                 let sid = self.engine_mgr.code_source_schema();
-                let codes = self.engine_mgr.word_codes_in(&sid, text);
+                // `?` 的理由同上面的 `code`：区分「索引没就绪」与「查不到」。
+                let codes = self.engine_mgr.word_codes_in(&sid, text)?;
                 match arg {
                     // `word_codes_in` 固定用 `/` 连接，换分隔符只能在这里替。
                     Some(sep) if !codes.is_empty() => codes.replace('/', sep),
@@ -551,7 +555,9 @@ impl crate::coordinator::Coordinator {
             "code_hint" => c.comment.clone(),
             "code" => {
                 if pinyin_hint && c.source == CandidateSource::Pinyin {
-                    self.engine_mgr.codetable_reverse_hint(&c.text)
+                    // `?`：索引未就绪 ⇒ 本变量未解析（与 eval_text_var 同一语义）。
+                    // 注释是装饰，这一次不显示即可，绝不为它卡住按键线程。
+                    self.engine_mgr.codetable_reverse_hint(&c.text)?
                 } else {
                     String::new()
                 }
@@ -569,7 +575,7 @@ impl crate::coordinator::Coordinator {
             "code_all" => {
                 if pinyin_hint && c.source == CandidateSource::Pinyin {
                     let sid = self.engine_mgr.code_source_schema();
-                    let codes = self.engine_mgr.word_codes_in(&sid, &c.text);
+                    let codes = self.engine_mgr.word_codes_in(&sid, &c.text)?;
                     match arg {
                         Some(sep) if !codes.is_empty() => codes.replace('/', sep),
                         _ => codes,

@@ -3016,6 +3016,119 @@ impl Coordinator {
         });
     }
 
+    /// 确保 `schema_id` 的反查索引在**后台**建好；已就绪、或已有线程在建，则什么都不做。
+    ///
+    /// # 为什么只能派活、不能等
+    ///
+    /// 唯一调用点在候选刷新链路（`notify_ui_update`）里，那里**正持着 state 锁**，
+    /// 且整条链路身处 TSF→服务的**同步 IPC** 中。索引对超大词库是秒级构建，在此等待
+    /// 就是让整台机器停住——真机 feihuzj2（253 万条）实测卡死 29.5 秒。
+    /// 故本次渲染照常完成，只是暂时没有编码段；建好后由本线程重渲染一次补上。
+    ///
+    /// # 去重
+    ///
+    /// 构建期间的**每一次按键**都会走到这里，没有 `is_building_reverse_index` 这道闸，
+    /// 就会每按一键 spawn 一个线程去建同一份上百 MB 的东西。
+    /// （引擎侧那道闸用 `try_lock`，与 `ensure_loaded` 的 single-flight 同源。）
+    /// **阻塞地**建好那些「首次查询才会惰性构建」的索引（反查索引）。
+    ///
+    /// 生产路径由启动后的预热线程调用（见 `construct.rs`）；测试与移动端 `prepare()`
+    /// 也走这里——三方共用一条路径，避免各写一份预热逻辑而互相漂移。
+    ///
+    /// ⚠️ 会阻塞秒级，**只可在后台线程/测试里调用**，绝不能进按键链路。
+    pub fn prewarm_indexes(&self) {
+        // 悬停 [编码] / 编码提示取 code_source_schema，词语联想取 assoc_word_schema。
+        // 混输下两者通常都解析到同一个主码表成员，故去重后一般只建一份。
+        // 两者相同时不必去重：prewarm_reverse_index 幂等，第二次直接返回。
+        let ids = [
+            self.engine_mgr.code_source_schema(),
+            self.engine_mgr.assoc_word_schema(),
+        ];
+        for id in ids.iter().filter(|s| !s.is_empty()) {
+            let t0 = std::time::Instant::now();
+            if self.engine_mgr.prewarm_reverse_index(id) {
+                debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
+            }
+        }
+        // 自动造词开着才预热单字全码表：它是另一次全量扫描（同量级），关着的用户
+        // 不该为一个用不到的功能付出启动时间与内存。开着而不预热则第一次上屏必卡，
+        // 因为造词跑在上屏线程上。
+        if self.auto_phrase_enabled() {
+            let sid = self.engine_mgr.code_source_schema();
+            if !sid.is_empty() {
+                let t0 = std::time::Instant::now();
+                if self.engine_mgr.prewarm_single_char_codes(&sid) {
+                    debug!("预热单字全码表 {} 用时 {:?}", sid, t0.elapsed());
+                }
+            }
+        }
+    }
+
+    fn ensure_reverse_index_async(&self, schema_id: &str) {
+        self.spawn_index_warm(schema_id, false);
+    }
+
+    /// 同上，另带**单字全码表**（自动造词取码用）。
+    ///
+    /// 造词路径两样东西都要：全码表用来按 `[[encoder.rules]]` 组码，反查索引用来做
+    /// 「系统词库是否已有这个码+词」的查重。两者都是惰性全量构建，而造词跑在上屏
+    /// （按键）线程上，故一律后台预热、本次跳过。
+    pub(crate) fn ensure_word_encoding_async(&self, schema_id: &str) {
+        self.spawn_index_warm(schema_id, true);
+    }
+
+    fn spawn_index_warm(&self, schema_id: &str, with_single_char: bool) {
+        if schema_id.is_empty() {
+            return;
+        }
+        let index_ready = self.engine_mgr.reverse_index_if_ready(schema_id).is_some();
+        let single_char_ready =
+            !with_single_char || self.engine_mgr.single_char_codes_ready(schema_id);
+        if (index_ready && single_char_ready)
+            || self.engine_mgr.is_building_reverse_index(schema_id)
+        {
+            return;
+        }
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        let sid = schema_id.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("reverse-index-build".into())
+            .spawn(move || {
+                let Some(c) = weak.upgrade() else {
+                    return;
+                };
+                // 让用户知道「编码/联想这一会儿是缺的」而不是坏了。
+                // ⚠️ 这条提示**伴随**真实工作、且以下面的重渲染收尾；不要把它改成那种
+                // 「弹个准备中然后什么也不发生」的提示——那种做法在本仓被删过一次
+                // （见 handle_mode.rs 关于 is_loaded 守卫的说明）。
+                c.show_toast(
+                    "正在建立词库索引…",
+                    ToastPosition::BottomCenter,
+                    ToastKind::Info,
+                );
+                let t0 = std::time::Instant::now();
+                let built_index = c.engine_mgr.prewarm_reverse_index(&sid);
+                if with_single_char {
+                    c.engine_mgr.prewarm_single_char_codes(&sid);
+                }
+                if !built_index && !with_single_char {
+                    return; // 等锁期间已被别的线程建好，且无别的活要干
+                }
+                debug!("后台建成词库索引 {} 用时 {:?}", sid, t0.elapsed());
+                // 重渲染当前这屏候选，把编码段补上——否则要等用户下一次按键。
+                // 与 reload_user_config / set_filter_mode 的「改完就地重刷」同构。
+                let s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !s.input_buffer.is_empty() {
+                    c.notify_ui_update(&s);
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("无法启动反查索引构建线程: {e}");
+        }
+    }
+
     /// 服务重启后由新进程在就绪时弹一次「服务已重启」提示。
     ///
     /// 「重启服务」把旧进程连同其 UI 窗口线程一起销毁，退出前发 toast 用户看不到，
@@ -4166,6 +4279,12 @@ impl Coordinator {
             .code_enabled
             .then(|| self.engine_mgr.code_source_schema())
             .filter(|s| !s.is_empty());
+        // 反查索引没就绪就**在后台建**，本次先不显示编码段（绝不在此等）。
+        // 索引对超大词库是秒级构建，而这里是按键处理链路、且正持有 state 锁——
+        // 真机上曾因此让整机卡死 29.5 秒。
+        if let Some(sid) = code_schema.as_deref() {
+            self.ensure_reverse_index_async(sid);
+        }
         let code_source_name = code_schema.as_deref().and_then(|sid| {
             let indirect = force_hint || sid != self.engine_mgr.active_schema_id();
             indirect.then(|| {
@@ -4188,9 +4307,11 @@ impl Coordinator {
                 // 反查提示按截断后文本生成：超长候选（如长短语）逐字反查会撑爆气泡且显示不全，
                 // 只提示实际显示出的字（… 为非 CJK，tooltip_for 自动滤除，不影响反查内容）。
                 // [编码] 段按候选**完整原文**查词库（截断/繁化文本词库里没有；查不到=None 不显示）。
+                // `word_codes_in` 返回 None＝**反查索引尚未就绪**（区别于「查不到」的
+                // Some("")）。此时本段不显示，并已在循环外触发后台构建，建好后自动补上。
                 let word_code = code_schema
                     .as_deref()
-                    .map(|sid| self.engine_mgr.word_codes_in(sid, &c.text))
+                    .and_then(|sid| self.engine_mgr.word_codes_in(sid, &c.text))
                     .filter(|s| !s.is_empty());
                 let mut tooltip = reverse.tooltip_for(
                     &disp,

@@ -7495,6 +7495,13 @@ fn auto_phrase_coord(tag: &str, enabled: bool) -> (Arc<Coordinator>, Arc<Store>,
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(Store::open(&db).unwrap());
     let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), Arc::clone(&store));
+    // 造词要用的两张表（反查索引 + 单字全码表）都是惰性全量构建，生产里由启动后的
+    // 后台预热线程建好（construct.rs → prewarm_indexes）。headless 不跑那个线程。
+    //
+    // 而造词路径现在会在它们未就绪时**主动跳过**——那是刻意的：跑在上屏线程上不能现建
+    // （大词库秒级、TSF 同步 IPC 会卡整机），更不能把「没就绪」当成「查不到」继续，
+    // 否则查重失效、会往临时层写系统词库已有的重复条目。故测试须自己预热。
+    coord.prewarm_indexes();
     (coord, store, db)
 }
 
