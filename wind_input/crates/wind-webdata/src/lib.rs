@@ -2314,7 +2314,10 @@ pub trait WebDataRpc: WebDataHost {
                 })
             })
             .collect();
-        Ok(json!({ "items": rows }))
+        // 裸数组，与 `quick.list` / `phrase.list` 一致：设置页的非分页类别一律按数组解析
+        // （`WordRow::parse_list` 的 `paged=false` 分支走 `v.as_array()`），包成
+        // `{items:[…]}` 会解析出空表——而且不报错，界面只是一直显示「0 条」。
+        Ok(json!(rows))
     }
 
     fn web_common_chars_query(&self, params: &Value) -> anyhow::Result<Value> {
@@ -4361,6 +4364,76 @@ mod tests {
             Coordinator::new_headless_with_store(Config::default(), None, store),
             path,
         )
+    }
+
+    fn common_char_rows_rpc(c: &Coordinator) -> Vec<Value> {
+        c.web_data_rpc("commonChars.list", &json!({}))
+            .unwrap()
+            .as_array()
+            .expect("commonChars.list 应返回**裸数组**")
+            .clone()
+    }
+
+    /// `commonChars.*` 五个方法的往返契约。
+    ///
+    /// ⚠️ 列表必须是裸数组（与 `quick.list` / `phrase.list` 一致）：设置页的非分页类别走
+    /// `WordRow::parse_list` 的 `v.as_array()` 分支，包成 `{items:[…]}` 会解析出空表
+    /// **且不报错**——界面只是一直显示「0 条」，没有任何线索指向 RPC 形状。
+    ///
+    /// ⚠️ 本装置没有 data_dir ⇒ 出厂基表为空 ⇒ 所有字的出厂判定都是「生僻」。故这里只
+    /// 测 `common:true` 方向：设成 `false` 与出厂同向，按设计会**删覆盖**而不是写记录
+    /// （见 `Coordinator::apply_common_target`），在这个装置下等于无操作。
+    #[test]
+    fn common_chars_rpc_roundtrip() {
+        let c = coord("commonchars");
+        assert!(common_char_rows_rpc(&c).is_empty(), "初始应为空表");
+
+        c.web_data_rpc("commonChars.set", &json!({ "char": "槮", "common": true }))
+            .unwrap();
+        let rows = common_char_rows_rpc(&c);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["char"], json!("槮"));
+        assert_eq!(rows[0]["common"], json!(true));
+        assert!(
+            rows[0].get("baseCommon").is_some(),
+            "出厂判定必须一起给：界面靠它显示「出厂 → 现在」的对照"
+        );
+
+        let q = c
+            .web_data_rpc("commonChars.query", &json!({ "char": "槮" }))
+            .unwrap();
+        assert_eq!(q["governed"], json!(true));
+        assert_eq!(q["override"], json!(true));
+        assert_eq!(q["effective"], json!(true));
+
+        // 管辖域外的字符：query 如实说不管辖，set 直接报错而不是静默存一条死记录。
+        let q2 = c
+            .web_data_rpc("commonChars.query", &json!({ "char": "、" }))
+            .unwrap();
+        assert_eq!(q2["governed"], json!(false));
+        assert!(
+            c.web_data_rpc("commonChars.set", &json!({ "char": "、", "common": false }))
+                .is_err(),
+            "域外字符必须拒绝——读端根本不查它，存了也永不生效且无任何报错"
+        );
+
+        // 多字符一律拒绝，不取首字符：悄悄截取会让用户以为整个词都标记了。
+        assert!(
+            c.web_data_rpc("commonChars.query", &json!({ "char": "我们" }))
+                .is_err()
+        );
+
+        c.web_data_rpc("commonChars.reset", &json!({ "char": "槮" }))
+            .unwrap();
+        assert!(common_char_rows_rpc(&c).is_empty(), "恢复出厂后该行消失");
+
+        for ch in ["槮", "鬱"] {
+            c.web_data_rpc("commonChars.set", &json!({ "char": ch, "common": true }))
+                .unwrap();
+        }
+        assert_eq!(common_char_rows_rpc(&c).len(), 2);
+        c.web_data_rpc("commonChars.clear", &json!({})).unwrap();
+        assert!(common_char_rows_rpc(&c).is_empty(), "整表恢复出厂");
     }
 
     fn quick_rows(c: &Coordinator) -> Vec<Value> {
