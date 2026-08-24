@@ -16,8 +16,15 @@ use std::path::Path;
 /// 「这个字出厂就常用」还是「用户把它设成了常用」，而界面要显示的正是这个差别
 /// （「出厂：生僻 → 现在：常用」），「恢复出厂」也需要知道回退到哪一边。
 pub struct CommonChars {
-    /// 出厂基表。
+    /// 出厂基表（判定用，O(1) 查表）。
     base: HashSet<char>,
+    /// 出厂基表的**原始顺序**（列举用）。
+    ///
+    /// 单独留一份 Vec 而不是从 `base` 迭代：`common_chars.txt` 是按级别顺序拼接的
+    /// （一级 3500 → 二级 3000 → 三级其余），而 HashSet 的迭代序是随机的。设置页要按
+    /// 字表原序列出全表，从 HashSet 取会得到一份每次启动都不一样的乱序清单——分页更是
+    /// 直接失效（第 2 页的内容会随机变）。8104 个 char 约 32KB，代价可以忽略。
+    base_order: Vec<char>,
     /// 用户覆盖：`true` = 强制判为常用，`false` = 强制判为生僻。只含被碰过的字。
     overrides: HashMap<char, bool>,
 }
@@ -27,6 +34,7 @@ impl CommonChars {
     /// 失败（文件缺失）返回空集；上层应在空集时退化为"不过滤"。
     pub fn load(path: &Path) -> Self {
         let mut base = HashSet::new();
+        let mut base_order = Vec::new();
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
                 let line = line.trim();
@@ -34,24 +42,65 @@ impl CommonChars {
                     continue;
                 }
                 for ch in line.chars() {
-                    if is_han(ch) {
-                        base.insert(ch);
+                    // `insert` 返回 false = 重复字，不再追加进顺序表：字表里若有重复
+                    // （历史数据难免），列表会出现两行一模一样的字。
+                    if is_han(ch) && base.insert(ch) {
+                        base_order.push(ch);
                     }
                 }
             }
         }
         Self {
             base,
+            base_order,
             overrides: HashMap::new(),
         }
     }
 
     /// 由一批字直接构造基表（测试与内存态装配用）。
     pub fn from_base(chars: impl IntoIterator<Item = char>) -> Self {
+        let mut base = HashSet::new();
+        let mut base_order = Vec::new();
+        for ch in chars {
+            if base.insert(ch) {
+                base_order.push(ch);
+            }
+        }
         Self {
-            base: chars.into_iter().collect(),
+            base,
+            base_order,
             overrides: HashMap::new(),
         }
+    }
+
+    /// 全表列举：出厂字（按字表原序）+ 用户加的、**不在出厂表里**的字（追加在后）。
+    ///
+    /// 返回 `(字, 出厂是否常用, 现在是否常用)`。设置页靠它列全表并搜索——只列「改过的」
+    /// 那几条不足以回答用户最常问的那个问题：「这个字现在算不算常用」。
+    ///
+    /// 追加的那批（用户把某个不在规范表里的字设成了常用）出厂判定恒 false，
+    /// 语义就是「出厂没有它」。
+    pub fn list_all(&self) -> Vec<(char, bool, bool)> {
+        let mut out: Vec<(char, bool, bool)> = self
+            .base_order
+            .iter()
+            .map(|&c| (c, true, self.is_char_common(c)))
+            .collect();
+        // 覆盖里那些不在出厂表的字：按码位排序后追加，保证顺序稳定（HashMap 迭代序随机，
+        // 直接追加会让这批字每次刷新都换位置）。
+        let mut extra: Vec<char> = self
+            .overrides
+            .keys()
+            .copied()
+            .filter(|c| !self.base.contains(c))
+            .collect();
+        extra.sort_unstable();
+        out.extend(
+            extra
+                .into_iter()
+                .map(|c| (c, false, self.is_char_common(c))),
+        );
+        out
     }
 
     /// **整体替换**用户覆盖（调用方从 store 全量读出后灌进来）。
@@ -341,6 +390,57 @@ mod tests {
             // 域外 ⇒ 被忽略，不拖累判定。
             assert!(cc.is_string_common(&ch.to_string()), "{ch} 应被忽略");
         }
+    }
+
+    /// 全表列举：**按字表原序**，用户加的字追加在后。
+    ///
+    /// 顺序是硬要求：`common_chars.txt` 按级别拼接（一级→二级→三级），设置页分页浏览
+    /// 全靠它。若从 `HashSet` 迭代，每次启动的顺序都不一样，第 2 页的内容会随机变。
+    #[test]
+    fn list_all_keeps_table_order_and_appends_extras() {
+        let mut cc = CommonChars::from_base(['一', '乙', '二']);
+        assert_eq!(
+            cc.list_all(),
+            vec![('一', true, true), ('乙', true, true), ('二', true, true)],
+            "无覆盖时＝字表原序，且默认与现在一致"
+        );
+
+        // 一个降级（在表内）+ 一个新增（不在表内）。
+        cc.set_overrides([('乙', false), ('槮', true)]);
+        assert_eq!(
+            cc.list_all(),
+            vec![
+                ('一', true, true),
+                // 默认仍是常用，现在被改成生僻——两个值都要保留，界面靠差异显示对照。
+                ('乙', true, false),
+                ('二', true, true),
+                // 表外字追加在最后，默认判定恒 false（＝出厂表里没有它）。
+                ('槮', false, true),
+            ]
+        );
+    }
+
+    /// 表外字按码位排序追加：`HashMap` 迭代序随机，直接追加会让这批字每次刷新都换位置。
+    #[test]
+    fn list_all_orders_extras_deterministically() {
+        let mut cc = CommonChars::from_base(['一']);
+        cc.set_overrides([('鬱', true), ('槮', true), ('乂', true)]);
+        let extras: Vec<char> = cc
+            .list_all()
+            .into_iter()
+            .skip(1)
+            .map(|(c, _, _)| c)
+            .collect();
+        let mut sorted = extras.clone();
+        sorted.sort_unstable();
+        assert_eq!(extras, sorted, "表外字必须按码位升序，顺序才稳定");
+    }
+
+    /// 字表里的重复字只列一次——历史数据里难免有重复，列两行一模一样的字很怪。
+    #[test]
+    fn list_all_dedupes_repeated_chars() {
+        let cc = CommonChars::from_base(['一', '乙', '一']);
+        assert_eq!(cc.list_all().len(), 2);
     }
 
     /// 域外字符即使被强行写入覆盖也不生效——这正是准入判据必须与读端同源的原因。

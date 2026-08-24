@@ -47,8 +47,8 @@ pub trait WebDataHost {
     /// 快捷输入格式表的设置页全貌（含被停用的条目）。
     fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow>;
 
-    /// 常用字表的用户覆盖：设置页列表（**只含改过的字**，不是那 8104 个出厂字）。
-    fn common_char_rows(&self) -> Vec<crate::handle_common_chars::CommonCharRow>;
+    /// 常用字表：设置页列表（**全表**，`query` 非空时只留出现在查询串里的字）。
+    fn common_char_rows(&self, query: &str) -> Vec<crate::handle_common_chars::CommonCharRow>;
 
     /// 某个字的当前状态：出厂判定 / 覆盖 / 是否受管辖。设置页「添加」时预览与校验用。
     fn common_char_state(&self, ch: char) -> crate::handle_common_chars::CommonCharState;
@@ -167,8 +167,8 @@ impl WebDataHost for Coordinator {
     fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow> {
         Coordinator::quick_format_rows(self)
     }
-    fn common_char_rows(&self) -> Vec<crate::handle_common_chars::CommonCharRow> {
-        Coordinator::common_char_rows(self)
+    fn common_char_rows(&self, query: &str) -> Vec<crate::handle_common_chars::CommonCharRow> {
+        Coordinator::common_char_rows(self, query)
     }
     fn common_char_state(&self, ch: char) -> crate::handle_common_chars::CommonCharState {
         Coordinator::common_char_state(self, ch)

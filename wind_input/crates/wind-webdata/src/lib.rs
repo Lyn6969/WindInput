@@ -385,7 +385,7 @@ pub trait WebDataRpc: WebDataHost {
             // ── quick.*（快捷输入格式表的用户调整，全局，redb 持久化）──
             // 基表（模板与出厂顺序）在 system.quick.toml，**RPC 一律不写它**：
             // 那会抢走高级用户手写文件的所有权，见 handle_quick_format 模块文档。
-            "commonChars.list" => self.web_common_chars_list(),
+            "commonChars.list" => self.web_common_chars_list(params),
             "commonChars.query" => self.web_common_chars_query(params),
             "commonChars.set" => self.web_common_chars_set(params),
             "commonChars.reset" => self.web_common_chars_reset(params),
@@ -2294,30 +2294,49 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({ "ok": true }))
     }
 
-    // ── 常用字表的用户覆盖（右键「设为生僻字/常用字」的设置页一侧）────────────
+    // ── 常用字表（右键「设为生僻字/常用字」的设置页一侧）────────────────────
     //
-    // 列表**只含用户改过的字**，不是那 8104 个出厂字：存储本就是稀疏的，界面因此天然是
-    // 一份「我的调整」。要在 8104 个字里翻页找一个字的界面根本没法用，而那也不是用户
-    // 想在这个页面里做的事。
+    // 列表是**全表**（出厂字 + 用户加的），不是只列改过的那几条：用户来这个页面最常问的
+    // 是「这个字现在算不算常用」，只列改动答不了。改过的行带 `adjusted` 标记，
+    // 「恢复默认」据此只对它们放行。
 
-    fn web_common_chars_list(&self) -> anyhow::Result<Value> {
-        let rows: Vec<Value> = self
-            .common_char_rows()
+    /// 全表 + 搜索 + 分页。
+    ///
+    /// **分页而不是一次全发**：8104 条约 400KB JSON，每次刷新都整份过一遍 IPC 不划算，
+    /// 而且设置页那套表格框架本就有服务端分页（`dict`/`freq` 走的同一条）。
+    /// 故返回 `{items,total}` 而不是裸数组——与非分页类别的形状**刻意不同**，
+    /// 由 spec 的 `paged: true` 决定走哪个解析分支。
+    fn web_common_chars_list(&self, params: &Value) -> anyhow::Result<Value> {
+        let query = params
+            .get("prefix")
+            .or_else(|| params.get("query"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let rows = self.common_char_rows(query);
+        let total = rows.len();
+        let offset = usize_param(params, "offset", 0);
+        // limit=0 视为不限（调用方不分页时直接全取）。
+        let limit = match usize_param(params, "limit", 0) {
+            0 => total,
+            n => n,
+        };
+        let items: Vec<Value> = rows
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|r| {
                 json!({
                     "char": r.ch.to_string(),
                     "common": r.common,
-                    // 出厂判定要一起给：界面靠它显示「出厂：常用 → 现在：生僻」这层对照。
+                    // 默认判定要一起给：界面靠它显示「默认 → 现在」的对照。
                     // 只给 common 的话，用户看到一行「的 · 生僻」不知道自己改的是什么。
                     "baseCommon": r.base_common,
+                    // 这一行改过没有。设置页据此决定「恢复默认」灰不灰。
+                    "adjusted": r.overridden,
                 })
             })
             .collect();
-        // 裸数组，与 `quick.list` / `phrase.list` 一致：设置页的非分页类别一律按数组解析
-        // （`WordRow::parse_list` 的 `paged=false` 分支走 `v.as_array()`），包成
-        // `{items:[…]}` 会解析出空表——而且不报错，界面只是一直显示「0 条」。
-        Ok(json!(rows))
+        Ok(json!({ "items": items, "total": total }))
     }
 
     fn web_common_chars_query(&self, params: &Value) -> anyhow::Result<Value> {
@@ -4366,37 +4385,44 @@ mod tests {
         )
     }
 
-    fn common_char_rows_rpc(c: &Coordinator) -> Vec<Value> {
-        c.web_data_rpc("commonChars.list", &json!({}))
-            .unwrap()
-            .as_array()
-            .expect("commonChars.list 应返回**裸数组**")
-            .clone()
+    /// `commonChars.list` 是**分页**类别：返回 `{items,total}`，不是裸数组。
+    /// 形状由 spec 的 `paged: true` 决定走哪个解析分支，两边对不上会解析出空表且不报错。
+    fn common_char_rows_rpc(c: &Coordinator, params: Value) -> (Vec<Value>, usize) {
+        let v = c.web_data_rpc("commonChars.list", &params).unwrap();
+        let items = v
+            .get("items")
+            .and_then(|x| x.as_array())
+            .expect("commonChars.list 应返回 {items,total}")
+            .clone();
+        let total = v.get("total").and_then(|x| x.as_u64()).unwrap() as usize;
+        (items, total)
     }
 
     /// `commonChars.*` 五个方法的往返契约。
     ///
-    /// ⚠️ 列表必须是裸数组（与 `quick.list` / `phrase.list` 一致）：设置页的非分页类别走
-    /// `WordRow::parse_list` 的 `v.as_array()` 分支，包成 `{items:[…]}` 会解析出空表
-    /// **且不报错**——界面只是一直显示「0 条」，没有任何线索指向 RPC 形状。
-    ///
-    /// ⚠️ 本装置没有 data_dir ⇒ 出厂基表为空 ⇒ 所有字的出厂判定都是「生僻」。故这里只
-    /// 测 `common:true` 方向：设成 `false` 与出厂同向，按设计会**删覆盖**而不是写记录
+    /// ⚠️ 本装置没有 data_dir ⇒ 默认字表为空 ⇒ 全表里只剩用户加的字。故这里只测
+    /// `common:true` 方向：设成 `false` 与默认同向，按设计会**删覆盖**而不是写记录
     /// （见 `Coordinator::apply_common_target`），在这个装置下等于无操作。
+    /// 「全表按字表原序 + 追加」那部分在 `wind-candidate` 的 `list_all` 用例里测。
     #[test]
     fn common_chars_rpc_roundtrip() {
         let c = coord("commonchars");
-        assert!(common_char_rows_rpc(&c).is_empty(), "初始应为空表");
+        assert_eq!(common_char_rows_rpc(&c, json!({})).1, 0, "初始应为空表");
 
         c.web_data_rpc("commonChars.set", &json!({ "char": "槮", "common": true }))
             .unwrap();
-        let rows = common_char_rows_rpc(&c);
-        assert_eq!(rows.len(), 1);
+        let (rows, total) = common_char_rows_rpc(&c, json!({}));
+        assert_eq!((rows.len(), total), (1, 1));
         assert_eq!(rows[0]["char"], json!("槮"));
         assert_eq!(rows[0]["common"], json!(true));
         assert!(
             rows[0].get("baseCommon").is_some(),
-            "出厂判定必须一起给：界面靠它显示「出厂 → 现在」的对照"
+            "默认判定必须一起给：界面靠它显示「默认 → 现在」的对照"
+        );
+        assert_eq!(
+            rows[0]["adjusted"],
+            json!(true),
+            "改过的行要标出来——设置页靠它决定「恢复默认」灰不灰"
         );
 
         let q = c
@@ -4425,15 +4451,37 @@ mod tests {
 
         c.web_data_rpc("commonChars.reset", &json!({ "char": "槮" }))
             .unwrap();
-        assert!(common_char_rows_rpc(&c).is_empty(), "恢复出厂后该行消失");
+        assert_eq!(
+            common_char_rows_rpc(&c, json!({})).1,
+            0,
+            "恢复默认后该行回落默认判定；本装置默认表为空，故整行消失"
+        );
 
         for ch in ["槮", "鬱"] {
             c.web_data_rpc("commonChars.set", &json!({ "char": ch, "common": true }))
                 .unwrap();
         }
-        assert_eq!(common_char_rows_rpc(&c).len(), 2);
+        assert_eq!(common_char_rows_rpc(&c, json!({})).1, 2);
+
+        // 搜索：只留出现在查询串里的字。用户既可以只打一个字，也可以粘一整句。
+        let (rows, total) = common_char_rows_rpc(&c, json!({ "prefix": "槮" }));
+        assert_eq!((rows.len(), total), (1, 1), "搜一个字应只剩它");
+        assert_eq!(rows[0]["char"], json!("槮"));
+        assert_eq!(
+            common_char_rows_rpc(&c, json!({ "prefix": "槮鬱" })).1,
+            2,
+            "整句搜索列出句中所有命中的字"
+        );
+        assert_eq!(common_char_rows_rpc(&c, json!({ "prefix": "的" })).1, 0);
+
+        // 分页：total 是**过滤后的总数**，不是当页条数——设置页靠它算总页数。
+        let (page, total) = common_char_rows_rpc(&c, json!({ "offset": 0, "limit": 1 }));
+        assert_eq!((page.len(), total), (1, 2), "当页 1 条、总数仍是 2");
+        let (page2, _) = common_char_rows_rpc(&c, json!({ "offset": 1, "limit": 1 }));
+        assert_ne!(page2[0]["char"], page[0]["char"], "第二页要换一条");
+
         c.web_data_rpc("commonChars.clear", &json!({})).unwrap();
-        assert!(common_char_rows_rpc(&c).is_empty(), "整表恢复出厂");
+        assert_eq!(common_char_rows_rpc(&c, json!({})).1, 0, "整表恢复默认");
     }
 
     fn quick_rows(c: &Coordinator) -> Vec<Value> {

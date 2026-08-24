@@ -16,16 +16,19 @@
 
 use tracing::{debug, warn};
 
-/// 设置页列表的一行：**只列用户改过的字**（稀疏存储的直接好处——列表天然是
-/// 「我的调整」，而不是让人在 8104 个字里翻页找）。
+/// 设置页列表的一行。
+///
+/// 列的是**全表**（出厂字 + 用户加的），不是只列改过的那几条：用户来这个页面最常问的
+/// 是「这个字现在算不算常用」，只列改动答不了。改过的那些靠 [`Self::overridden`] 标出来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommonCharRow {
     pub ch: char,
-    /// 用户设定的方向。
+    /// **当前生效**的判定（用户改过就是用户设的，否则跟随默认）。
     pub common: bool,
-    /// 出厂判定。界面靠它显示「出厂：常用 → 现在：生僻」这层对照，
-    /// 没有它，用户看到一行「的 · 生僻」根本不知道自己改的是什么。
+    /// 默认判定（出厂字表说了算）。界面靠它显示「默认 → 现在」的对照。
     pub base_common: bool,
+    /// 这一行被用户改过。决定「恢复默认」能不能点——没改过的行点它没有意义。
+    pub overridden: bool,
 }
 
 /// 某个字的当前状态（设置页「添加」时的预览与校验）。
@@ -117,26 +120,24 @@ impl crate::Coordinator {
         })
     }
 
-    /// 设置页列表：**只含用户改过的字**，按码位升序（store 的键序）。
-    pub(crate) fn common_char_rows(&self) -> Vec<CommonCharRow> {
-        let Some(store) = self.store.as_ref() else {
-            return Vec::new();
-        };
-        let rows = match store.list_common_char_overrides() {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("常用字覆盖: 列举失败: {e}");
-                return Vec::new();
-            }
-        };
-        // 出厂判定从**内存镜像**取，不再读一次文件：镜像与过滤层用的是同一份数据，
-        // 分头取值会让界面显示的「出厂判定」与实际生效的那份悄悄错开。
+    /// 设置页列表：**全表**（出厂字按字表原序 + 用户加的追加在后），可按 `query` 过滤。
+    ///
+    /// 数据全部取自**内存镜像**，不再单独读一次 store：镜像与过滤层用的是同一份数据，
+    /// 分头取值会让界面显示的判定与实际生效的那份悄悄错开。
+    ///
+    /// `query` 非空时只保留「出现在查询串里」的字——用户想查某个字就直接把它打进搜索框，
+    /// 粘一整句进去则列出这句话里的所有字，两种用法都成立。
+    pub(crate) fn common_char_rows(&self, query: &str) -> Vec<CommonCharRow> {
         let cc = self.common_chars.read().unwrap_or_else(|e| e.into_inner());
-        rows.into_iter()
-            .map(|o| CommonCharRow {
-                ch: o.ch,
-                common: o.common,
-                base_common: cc.is_base_common(o.ch),
+        let q: Vec<char> = query.trim().chars().collect();
+        cc.list_all()
+            .into_iter()
+            .filter(|(ch, _, _)| q.is_empty() || q.contains(ch))
+            .map(|(ch, base_common, common)| CommonCharRow {
+                ch,
+                common,
+                base_common,
+                overridden: cc.override_of(ch).is_some(),
             })
             .collect()
     }
@@ -269,9 +270,12 @@ impl crate::Coordinator {
             return;
         };
         // 目标 = 当前判定取反。菜单文案正是按 `mark.common` 二选一的，两边同源。
-        if !self.apply_common_target(mark.ch, !mark.common) {
+        let target = !mark.common;
+        if !self.apply_common_target(mark.ch, target) {
+            warn!("常用字标记: {} 写库未生效，跳过重建", mark.ch);
             return;
         }
+        let before = state.candidates.len();
         // 重建候选：`is_common` 一变，过滤（智能 / 常用字档）与**排序**都会跟着变——
         // 后者容易被忘：混输的拼音精确档拿 `is_common` 当提档准入（`is_pinyin_exact_tier`），
         // 只重绘不重建的话，用户会看到「标记了，但候选顺序还是老样子」。
@@ -285,6 +289,26 @@ impl crate::Coordinator {
         } else {
             self.update_candidates(state);
         }
+        // ★ 诊断「点了没反应」用：把「判定真的变了吗」与「候选面因此变了吗」分开打。
+        //
+        // 这两件事**经常不同时发生**，而混在一起看会把正常行为误判成缺陷：智能档只在
+        // 同码位**还有别的常用字**时才压得住降级的字；若它是孤儿码位，判定变了而候选面
+        // 一模一样，属正确表现。反过来，`生效=false` 才是真的没写进去。
+        let now_common = self
+            .common_chars
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_char_common(mark.ch);
+        debug!(
+            "常用字标记: {} {}→{}（生效={}）；候选 {} → {} 条，码={}",
+            mark.ch,
+            if mark.common { "常用" } else { "生僻" },
+            if target { "常用" } else { "生僻" },
+            now_common == target,
+            before,
+            state.candidates.len(),
+            state.input_buffer
+        );
         self.notify_ui_update(state);
     }
 }
