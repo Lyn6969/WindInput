@@ -134,7 +134,7 @@ impl Coordinator {
         // 全拼出厂 `separator = "auto"` + `'` 作选词键 = 反引号恒为分隔符——
         // 若不告警，用户在 schema_overrides 里绑了 `backtick = "aux_code"` 会
         // **完全无反应且无任何日志**，正是本仓反复出现的「配了没反应」型缺陷。
-        if self.pinyin_separator_key(key_code) {
+        if self.manual_separator_key(key_code) {
             self.warn_aux_code_key_taken(key_code);
             return None;
         }

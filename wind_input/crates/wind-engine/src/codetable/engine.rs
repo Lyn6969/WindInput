@@ -71,6 +71,13 @@ pub struct CommitOptions {
     pub single_code_complete: bool,
     /// 基础排序维度（weight 降序 / natural 出现序）。见 [`BaseSort`]。
     pub base_sort: BaseSort,
+    /// 整句输入：超码长的串自动切分成多个编码单元并组句。
+    /// 见 `docs/design/codetable-sentence-input.md` 与 [`super::sentence`]。
+    ///
+    /// **方案级引擎固定参数**（同 `max_code_length` / `base_sort`），不是可回落全局的
+    /// 行为 tri-state：一张码表能不能整句取决于它的编码结构（定长？简码体系多深？），
+    /// 是方案属性而非用户偏好。出厂关闭。
+    pub sentence_input: bool,
 }
 
 /// 码表引擎
@@ -85,6 +92,11 @@ pub struct CodeTableEngine {
     /// 方案级引擎固定参数，由协调器经 `EngineManager::active_input_chars()` 按方案取用。
     /// 挂在引擎上，方案切换时自然跟着换，不会像全局快照那样读到别的方案的集合。
     charset: wind_config::CodeCharSet,
+    /// 整句解码器（`opts.sentence_input` 关闭时为 `None`）。
+    ///
+    /// 它内部两张表都是 `OnceLock` 懒构建的全表扫描——关闭的方案连这个结构都不建；
+    /// 开启的方案由 [`Self::prewarm_sentence`] 在后台线程提前填好，不占按键线程。
+    sentence: Option<super::sentence::CodeSentenceDecoder>,
 }
 
 impl CodeTableEngine {
@@ -93,10 +105,14 @@ impl CodeTableEngine {
         if opts.auto_commit_min_len == 0 {
             opts.auto_commit_min_len = max_code_length;
         }
+        let sentence = opts
+            .sentence_input
+            .then(|| super::sentence::CodeSentenceDecoder::new(max_code_length));
         Self {
             max_code_length,
             opts,
             dm,
+            sentence,
             // 默认 `a-z`，与历史硬编码 `VK_A..=VK_Z` 逐键等价。构建方按方案配置
             // 再 `with_charset` 覆盖——如此所有既有调用点（含测试）无需改动。
             charset: wind_config::CodeCharSet::default_alpha(),
@@ -107,6 +123,107 @@ impl CodeTableEngine {
     pub fn with_charset(mut self, charset: wind_config::CodeCharSet) -> Self {
         self.charset = charset;
         self
+    }
+
+    /// 指明**整句词频**的来源目录（见 `sentence::SentenceFreq`）。词库到首次整句解码时才读。
+    ///
+    /// 整句未开启时是 no-op —— 没有解码器可交代。
+    pub fn with_sentence_schemas_dir(mut self, dir: std::path::PathBuf) -> Self {
+        if let Some(d) = self.sentence.take() {
+            self.sentence = Some(d.with_schemas_dir(dir));
+        }
+        self
+    }
+
+    /// 注入**已加载的**拼音词库作为整句词频来源。测试与探针走这个。
+    pub fn with_sentence_pinyin_dict(
+        mut self,
+        dict: std::sync::Arc<wind_dict::cached::CachedDict>,
+    ) -> Self {
+        if let Some(d) = self.sentence.take() {
+            self.sentence = Some(d.with_pinyin_dict(dict));
+        }
+        self
+    }
+
+    /// 后台预热整句的两张懒表（简码索引 + 拼音词频）。整句未开启时是 no-op。
+    ///
+    /// 由构建方在引擎组装完毕、**所有 `with_*` 都已调用之后**调用一次——预热线程读的是
+    /// 那时的 `freq_source`，早于 `with_sentence_schemas_dir` 就白跑一趟没词频的预热。
+    /// 开销数字与「为什么必须搬到后台」见 `sentence::LazyTables`。
+    pub fn prewarm_sentence(&self) {
+        if let Some(d) = &self.sentence {
+            d.prewarm(Arc::clone(&self.dm));
+        }
+    }
+
+    /// 整句解码：产出一条覆盖整串的整句候选，或 `None`。
+    ///
+    /// # 三道门槛
+    ///
+    /// 1. **功能开启**（`opts.sentence_input`）；
+    /// 2. **超码长**——码长内的串本就是一个编码单元，切它没有意义，且真机上正是那个
+    ///    区间最容易出事：`aaw`（本意 `aawt`→「工作」）会被读成「工工人」之类。
+    ///    这条门槛与混输侧 `in_code_len_opts()` 关掉拼音残码整句的判据是同一条
+    ///    （「这串还可能是码表码吗」）；
+    /// 3. **整串无精确解**——对齐 librime `table_translator` 的
+    ///    `if (enable_sentence_ && !translation)`：整串在码表里查得到词就不进整句路径，
+    ///    否则同一个词会以两种身份进列表再被去重逻辑合并。
+    ///
+    /// # 返回
+    ///
+    /// `(整句候选, 编码单元切分串)`。切分串给组合区显示用
+    /// （见 `ConvertResult::preedit_codetable`），无整句解时为空串。
+    fn decode_sentence(
+        &self,
+        input: &str,
+        candidates: &[Candidate],
+    ) -> (Option<Candidate>, String) {
+        let none = (None, String::new());
+        let Some(decoder) = self.sentence.as_ref() else {
+            return none;
+        };
+        if input.chars().count() <= self.max_code_length {
+            return none;
+        }
+        if candidates.iter().any(|c| c.is_exact_code) {
+            return none;
+        }
+        let Some(r) = decoder.decode(input, &self.dm) else {
+            return none;
+        };
+        let split = r.split_code(input);
+        (
+            Some(Candidate {
+                text: r.text,
+                code: input.to_string(),
+                weight: super::sentence::SENTENCE_WEIGHT_BASE,
+                source: CandidateSource::CodeTable,
+                is_sentence: true,
+                // 词库里没有以它为整体的词条 —— 自动造词据此判「值不值得学」
+                // （见 `Candidate::is_synthesized` 文档：不能用 `is_sentence` 代替）。
+                is_synthesized: true,
+                // ⚠️ `consumed_length` 留 0（= 消费整串）：整句只在覆盖整串时才产出
+                // （见 `CodeSentenceDecoder::decode`），故不打破全仓「码表候选
+                // consumed_length 恒 0」的约定。分段上屏留到后续阶段。
+                consumed_length: 0,
+                // ⚠️ `boundary` 也留 0：该字段是**音节**边界，域是拼音；码表码没有音节
+                // 语义（`BoundaryResolution::NoInfo` 的既定含义就是「非拼音方案」）。
+                // 填编码单元的切分位会让它在入库契约里被当成音节真值 —— 整句若被自动造词
+                // 学进用户词库，那份假边界会一路传下去。切分显示另找出口。
+                boundary: 0,
+                ..Default::default()
+            }),
+            split,
+        )
+    }
+
+    /// 整句解的**切分分段**（诊断/探针用）。`None` = 未开启整句或解不出。
+    ///
+    /// 存在的理由：只看整句首选文本看不出错在哪一段，而「切错了」与「同一条边上同码
+    /// 选错了」是两类完全不同的问题，修法也完全不同。
+    pub fn sentence_segments(&self, input: &str) -> Option<Vec<String>> {
+        Some(self.sentence.as_ref()?.decode(input, &self.dm)?.words)
     }
 
     /// 是否存在比 `input` 更长的后继编码（避免把长码精确匹配的前缀误当全码上屏）。
@@ -272,6 +389,15 @@ impl Engine for CodeTableEngine {
         // 按纯权重推翻本层结果（此前的实际行为）。两处共用 `cmp_exact_first` 这一个键。
         let base_cmp = self.opts.base_sort.cmp();
         candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
+
+        // 整句：超码长且整串无精确解时，把这串码切成多个编码单元组句。
+        //
+        // **排序之后 insert(0)，而不是混进排序**：`base_sort=natural` 的方案忽略权重，
+        // 整句再高的 weight 也排不到前面去（同拼音侧 step ② 的 `insert(0)` 做法）。
+        let (sentence, sentence_split) = self.decode_sentence(input, &candidates);
+        if let Some(c) = sentence {
+            candidates.insert(0, c);
+        }
         // 精确匹配已居首，截断不会再把它挤出配额（此前需一次临时分区保护：单字母等短输入下
         // 前缀候选可达数百，纯按基础序截断会让低权重简码字丢失，此后协调器再排也找不回）。
         candidates.truncate(max_candidates);
@@ -316,11 +442,16 @@ impl Engine for CodeTableEngine {
             commit_text,
             should_clear,
             completion_hints,
+            preedit_codetable: sentence_split,
             ..Default::default()
         })
     }
 
     fn reset(&self) {}
+
+    fn sentence_input_enabled(&self) -> bool {
+        self.sentence.is_some()
+    }
 
     fn engine_type(&self) -> EngineType {
         EngineType::CodeTable
@@ -361,6 +492,14 @@ impl Engine for CodeTableEngine {
 
     fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
         if !self.opts.top_code_commit {
+            return None;
+        }
+        // ★ 整句与顶码抢的是同一个区间（超码长），且顶码是**自动上屏**——它一触发，
+        // 用户根本看不到整句候选。两者语义直接冲突，故整句开启时顶码让位。
+        //
+        // 判据取「功能是否开启」而非「本次有没有解出整句」：后者会让顶码在同一串码上
+        // 时灵时不灵（多打一个字母解出整句就不顶了），是最难排查的那种不一致。
+        if self.sentence.is_some() {
             return None;
         }
         if input.chars().count() <= self.max_code_length {
@@ -862,6 +1001,184 @@ mod tests {
             texts_of(&e, "aa"),
             vec!["主低", "主高", "扩"],
             "natural 模式应按 base_order 分档 + 组内出现序、忽略权重"
+        );
+    }
+
+    // ───────────────────────── 整句输入（sentence_input） ─────────────────────────
+
+    /// 五笔结构的缩微模型（与 `sentence.rs` 单测同源）：一简 / 二简 / 3 码全码 /
+    /// 4 码全码 / 4 码词组俱全，权重照抄极点词库的层级带。
+    const SENTENCE_ENTRIES: &[(&str, &str, i32)] = &[
+        ("a", "工", 9999),
+        ("g", "一", 9999),
+        ("w", "人", 9999),
+        ("aa", "式", 9950),
+        ("wt", "何", 9950),
+        ("hci", "皮", 1200),
+        ("aaaa", "工", 800),
+        ("ggll", "一", 700),
+        ("wtgf", "人", 600),
+        ("aagg", "式", 500),
+        ("aawt", "工作", 1241),
+    ];
+
+    fn sentence_engine(extra: &[(&str, &str, i32)], opts: CommitOptions) -> CodeTableEngine {
+        let mut entries: Vec<(&str, &str, i32)> = SENTENCE_ENTRIES.to_vec();
+        entries.extend_from_slice(extra);
+        engine_opts(&entries, opts)
+    }
+
+    /// 分隔符的字符串形式（测试拼串用）。
+    const SEPS: &str = "'";
+
+    fn sentence_opts() -> CommitOptions {
+        CommitOptions {
+            sentence_input: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sentence_leads_when_input_exceeds_code_length() {
+        // 超码长（8 > 4）且整串无精确解 → 整句候选置顶。
+        let e = sentence_engine(&[], sentence_opts());
+        let r = e.convert("aawtaawt", 50).unwrap();
+        let first = r.candidates.first().expect("应有候选");
+        assert_eq!(first.text, "工作工作");
+        assert!(first.is_sentence, "整句候选须带 is_sentence 供顶部锚定");
+    }
+
+    #[test]
+    fn sentence_consumes_whole_input_and_marks_synthesized() {
+        // ★ 锁住「码表候选 consumed_length 恒 0」这条全仓约定：整句只在覆盖整串时产出，
+        //   故仍然消费整串。清空守护 / 词频记账 / 自动造词缓冲三处都依赖它，
+        //   一旦这里改成分段上屏，那三处必须同时改（见设计文档 §7.1）。
+        let e = sentence_engine(&[], sentence_opts());
+        let first = e.convert("aawtaawt", 50).unwrap().candidates.remove(0);
+        assert_eq!(first.consumed_length, 0, "整句须消费整串");
+        assert_eq!(first.code, "aawtaawt", "整句的 code 是整串输入");
+        assert!(
+            first.is_synthesized,
+            "词库里没有这个词条，自动造词据此判值不值得学"
+        );
+        // boundary 是**音节**边界（拼音域）；码表码无音节语义，必须留 0，
+        // 否则整句被学进用户词库时会带一份假的音节真值。
+        assert_eq!(first.boundary, 0, "码表整句不得填 boundary");
+    }
+
+    #[test]
+    fn sentence_not_produced_within_code_length() {
+        // ★ 真机翻车现场（`mixed/engine.rs` 有记录）：`aaw` 本意是 `aawt`→「工作」，
+        //   若让它进整句路径会被读成「工工人」之类抢走首位。
+        //   码长内的串本就是一个编码单元，切它没有意义。
+        let e = sentence_engine(&[], sentence_opts());
+        let r = e.convert("aaw", 50).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.is_sentence),
+            "码长内不得产出整句候选，实得: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sentence_off_by_default() {
+        // 出厂关闭：同一串输入在默认配置下不该冒出整句。
+        let e = sentence_engine(&[], CommitOptions::default());
+        let r = e.convert("aawtaawt", 50).unwrap();
+        assert!(!r.candidates.iter().any(|c| c.is_sentence));
+    }
+
+    #[test]
+    fn sentence_skipped_when_whole_input_has_exact_match() {
+        // 对齐 librime `enable_sentence_ && !translation`：整串查得到词就不走整句，
+        // 否则同一个词会以两种身份进列表。这里造一条 8 码的用户长词条。
+        let e = sentence_engine(&[("aawtaawt", "工作工作", 300)], sentence_opts());
+        let r = e.convert("aawtaawt", 50).unwrap();
+        let first = r.candidates.first().expect("应有候选");
+        assert!(first.is_exact_code, "整串精确匹配应居首");
+        assert!(
+            !r.candidates.iter().any(|c| c.is_sentence),
+            "整串有精确解时不产整句"
+        );
+    }
+
+    #[test]
+    fn top_code_yields_to_sentence() {
+        // 顶码与整句抢同一个区间（超码长），且顶码是自动上屏、一触发用户就看不到整句。
+        // 判据取「功能是否开启」，故即便本次解不出整句，顶码同样让位——
+        // 否则同一串码上顶码会时灵时不灵。
+        let opts = CommitOptions {
+            top_code_commit: true,
+            sentence_input: true,
+            ..Default::default()
+        };
+        let e = sentence_engine(&[], opts);
+        assert_eq!(e.handle_top_code("aawtaawt"), None, "整句开启时顶码让位");
+        assert_eq!(e.handle_top_code("aawtzzzz"), None, "解不出整句也照样让位");
+
+        // 对照：关掉整句，顶码恢复。
+        let e2 = sentence_engine(
+            &[],
+            CommitOptions {
+                top_code_commit: true,
+                ..Default::default()
+            },
+        );
+        let (top, rest) = e2.handle_top_code("aawtaawt").expect("顶码应触发");
+        assert_eq!((top.as_str(), rest.as_str()), ("工作", "aawt"));
+    }
+
+    #[test]
+    fn sentence_fills_preedit_split() {
+        // 组合区切分串：一长串码配一句话时，用户要看得见引擎把它切成了哪几段。
+        let e = sentence_engine(&[], sentence_opts());
+        let r = e.convert("aawtaawt", 50).unwrap();
+        assert_eq!(r.preedit_codetable, "aawt@aawt".replace('@', SEPS));
+    }
+
+    #[test]
+    fn no_sentence_means_no_preedit_split() {
+        // 码长内不产整句 ⇒ 切分串必须为空，否则组合区会显示一个不对应任何候选的切法。
+        let e = sentence_engine(&[], sentence_opts());
+        assert!(e.convert("aaw", 50).unwrap().preedit_codetable.is_empty());
+        // 关闭整句时同理。
+        let off = sentence_engine(&[], CommitOptions::default());
+        assert!(
+            off.convert("aawtaawt", 50)
+                .unwrap()
+                .preedit_codetable
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn manual_separator_end_to_end() {
+        // 手动分隔符走完整 convert：`aa'wt` 强制两个二简字，且切分串原样保留分隔符。
+        let e = sentence_engine(&[], sentence_opts());
+        let input = format!("aa{SEPS}wt");
+        let r = e.convert(&input, 50).unwrap();
+        let first = r.candidates.first().expect("应有候选");
+        assert!(first.is_sentence, "分隔符输入应产出整句候选");
+        assert_eq!(first.text, "式何");
+        assert_eq!(r.preedit_codetable, input);
+    }
+
+    #[test]
+    fn sentence_input_enabled_reports_state() {
+        // 协调器据此放行分隔符键（见 `manual_separator_key`）。
+        use crate::engine::Engine;
+        assert!(sentence_engine(&[], sentence_opts()).sentence_input_enabled());
+        assert!(!sentence_engine(&[], CommitOptions::default()).sentence_input_enabled());
+    }
+
+    #[test]
+    fn sentence_uses_three_code_full_entry_end_to_end() {
+        // 3 码全码「皮 hci」必须能参与整句 —— 「整句只认 4 码单元」那条捷径的反例。
+        let e = sentence_engine(&[], sentence_opts());
+        let r = e.convert("hciaawt", 50).unwrap();
+        assert_eq!(
+            r.candidates.first().map(|c| c.text.as_str()),
+            Some("皮工作")
         );
     }
 }

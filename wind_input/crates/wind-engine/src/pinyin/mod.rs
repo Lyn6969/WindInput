@@ -3297,6 +3297,8 @@ impl Engine for PinyinEngine {
             preedit_display,
             preedit_fullpinyin,
             preedit_abbrev,
+            // 码表整句专用，拼音引擎恒空（见 ConvertResult::preedit_codetable）。
+            preedit_codetable: String::new(),
             completed_syllables,
             partial_syllable,
             has_partial,

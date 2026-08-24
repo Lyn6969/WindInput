@@ -48,6 +48,17 @@ pub struct ConvertResult {
     /// 击键的两种切法（`wbwn` 双拼切成 `wbwn`／`wf'wt`，简拼该切成 `w'b'w'n`／`w'f'w't`），
     /// 二者必须并存、由高亮决定用哪个——同 `preedit_fullpinyin` 的理由。
     pub preedit_abbrev: String,
+    /// **码表整句的编码单元切分**（`aawtaawt` → `aawt'aawt`）。
+    ///
+    /// 供协调器的高亮跟随：高亮到码表整句候选时显示它，让用户看见引擎把这串码切成了
+    /// 哪几段——不然一长串码配一句话，切错了也无从判断错在哪一段。
+    /// 空串 = 本次没有整句解（或未开启整句）。
+    ///
+    /// ⚠️ **另立字段而非复用 `preedit_pinyin`**：那个的语义是「拼音音节拆分」，
+    /// 协调器按 `source == Pinyin` 决定要不要用它，码表候选走不到那条分支；
+    /// 且混输方案下两者会同时存在（拼音子引擎给音节切分、码表给编码单元切分），
+    /// 必须由高亮候选各选各的。同 `preedit_fullpinyin` 另立的理由。
+    pub preedit_codetable: String,
     /// 已完成音节（拼音 UI 高亮用）
     pub completed_syllables: Vec<String>,
     /// 末尾未完成音节（拼音）
@@ -257,6 +268,14 @@ pub trait Engine: Send + Sync {
 
     /// 最大编码长度（码表引擎返回其码长；拼音等无意义返回 0）。
     /// 供混输引擎的超长分支（pinyin_only_overflow）与顶码裁决判断输入是否溢出。
+    /// 本引擎是否开启了**整句输入**（当前只有码表引擎会返回 true）。
+    ///
+    /// 协调器据此决定手动分隔符键是否放行 —— 分隔符是整句的消歧手段，
+    /// 没开整句时那个键该维持它原本的语义（标点 / 选词）。
+    fn sentence_input_enabled(&self) -> bool {
+        false
+    }
+
     fn max_code_length(&self) -> usize {
         0
     }

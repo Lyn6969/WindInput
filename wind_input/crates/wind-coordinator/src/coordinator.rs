@@ -482,6 +482,10 @@ pub(crate) struct State {
     /// 只有双拼会有值：全拼下简拼分段已经是 `preedit_split_body` 本身
     /// （见 `ConvertResult::preedit_abbrev`）。
     pub(crate) preedit_abbrev_body: String,
+    /// **码表整句**的编码单元切分形态（`aawtaawt` → `aawt'aawt`）。
+    /// 高亮到码表整句候选时 preedit 用它；其余情形不读。
+    /// 空串 = 本次没有整句解（或方案未开整句）。每次 build_candidates 重置。
+    pub(crate) preedit_codetable_body: String,
     /// 候选调整（shadow）规则的**归一编码**；空串 = 落回 `input_buffer`（击键原样）。
     ///
     /// 取自 `ConvertResult::shadow_code`，与 `preedit_split_body` 同生命周期（每次
@@ -1715,6 +1719,7 @@ impl Coordinator {
                 preedit_split_body: String::new(),
                 preedit_fp_body: String::new(),
                 preedit_abbrev_body: String::new(),
+                preedit_codetable_body: String::new(),
                 shadow_code: String::new(),
                 shortcode_tops: [const { None }; 3],
                 candidates: Vec::new(),
