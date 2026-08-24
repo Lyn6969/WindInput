@@ -94,13 +94,14 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
         }
     }
 
-    // 2) base/check 初始化（check=-1 表空闲），root 占位 0。
+    // 2) base/check 初始化（check=-1 表空闲），root 占位 0；空闲位置(1..)串成链表，
+    //    见 FreeList 顶部说明——这是解决大规模 key 集合构建退化为平方级耗时的关键。
     let mut base = vec![0i32; 256];
     let mut check = vec![-1i32; 256];
     check[0] = 0;
-    let mut search_start = 1i32;
+    let mut free = FreeList::new(256);
 
-    // 3) BFS：队列保层序（search_start 单调推进、packing 更好）。
+    // 3) BFS：队列保层序。
     if !codes.is_empty() {
         let mut queue: std::collections::VecDeque<(i32, usize, usize, usize)> =
             std::collections::VecDeque::new();
@@ -132,25 +133,23 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
                 continue;
             }
             child_codes.sort_unstable();
-            let bv = find_base(&child_codes, &mut base, &mut check, search_start);
+            let bv = find_base(&child_codes, &mut base, &mut check, &mut free);
             base[s as usize] = bv;
 
+            // find_base 返回前已确保下面每个目标位置都在 base/check 范围内且空闲，
+            // 这里只需占用（写入 check 并从空闲链表摘除），无需再 grow。
             if let Some(leaf) = terminal {
-                let t = bv; // bv + 0
-                grow(&mut base, &mut check, t as usize);
-                check[t as usize] = s;
-                base[t as usize] = -(leaf as i32) - 1;
+                let t = bv as usize; // bv + 0
+                check[t] = s;
+                base[t] = -(leaf as i32) - 1;
+                free.occupy(t as u32);
             }
             for (b, glo, ghi) in groups {
                 let c = char_map[b as usize];
-                let t = bv + c;
-                grow(&mut base, &mut check, t as usize);
-                check[t as usize] = s;
-                queue.push_back((t, glo, ghi, depth + 1));
-            }
-
-            while (search_start as usize) < check.len() && check[search_start as usize] != -1 {
-                search_start += 1;
+                let t = (bv + c) as usize;
+                check[t] = s;
+                free.occupy(t as u32);
+                queue.push_back((t as i32, glo, ghi, depth + 1));
             }
         }
     }
@@ -171,20 +170,125 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
     }
 }
 
-/// 线性扫描 base 值，使所有 (base+c) 空闲。codes 已升序、非空。
-fn find_base(codes: &[i32], base: &mut Vec<i32>, check: &mut Vec<i32>, search_start: i32) -> i32 {
+/// 空闲槽位链表：把 base/check 中未占用的位置（`check[i]==-1`）串成一条按位置升序的
+/// 双向链表。位置 0 恒为根状态的占位，永不入链。
+///
+/// **它解决的问题**：旧实现里 `find_base` 从一个整数游标逐个探测候选 base 值，游标只在
+/// "已确认占用"的前缀上推进——一次探测中途放弃、试过但没用上的大段位置不会被记住，
+/// 下一次调用又要把同一片已知大概率冲突的区间从头探一遍。在大规模（百万级 key）、编码
+/// 集中在小字母表（如本项目 a-z）的码表下，这片"重复无效探测"随构建推进线性变长，
+/// 总代价退化为 O(状态数²)——真实词库（146 万 key）上实测数分钟不收敛、内存伴随大量
+/// "探测失败也触发扩容"的调用被撑到 GB 级。
+///
+/// 改为只在**当前确实空闲**的位置间跳转，代价与空闲位置数成正比、不受历史已占用区间
+/// 影响，是双数组树构建的标准解法（darts-clone / cedar 等实现均采用同类机制）。
+struct FreeList {
+    /// next[i] = 位置 i 之后第一个空闲位置，0 表示链尾（0 本身不会是空闲位置）。
+    next: Vec<u32>,
+    /// prev[i] = 位置 i 之前第一个空闲位置，0 表示链头。
+    prev: Vec<u32>,
+    /// 当前最小空闲位置，0 表示链表已空（正常构建中不会发生：会先触发扩容）。
+    head: u32,
+    /// 当前最大空闲位置，供扩容时 O(1) 把新增区间接到链尾。
+    tail: u32,
+}
+
+impl FreeList {
+    fn new(cap: usize) -> Self {
+        let mut free = Self {
+            next: vec![0; cap],
+            prev: vec![0; cap],
+            head: 0,
+            tail: 0,
+        };
+        free.link_range(1, cap);
+        free
+    }
+
+    /// 把 `[from, to)` 标记为空闲并接到当前链尾之后（`from` 必须是全新、此前未纳入链表的区间）。
+    fn link_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        for i in from..to {
+            self.next[i] = if i + 1 < to { (i + 1) as u32 } else { 0 };
+            self.prev[i] = if i > from { (i - 1) as u32 } else { self.tail };
+        }
+        if self.tail == 0 {
+            self.head = from as u32;
+        } else {
+            self.next[self.tail as usize] = from as u32;
+        }
+        self.tail = (to - 1) as u32;
+    }
+
+    /// 扩容到 `new_cap`，新增位置全部标记空闲、接到链尾。
+    fn grow_to(&mut self, new_cap: usize) {
+        let old_cap = self.next.len();
+        if new_cap <= old_cap {
+            return;
+        }
+        self.next.resize(new_cap, 0);
+        self.prev.resize(new_cap, 0);
+        self.link_range(old_cap, new_cap);
+    }
+
+    /// 占用位置 `pos`（须原为空闲），从链表摘除。
+    fn occupy(&mut self, pos: u32) {
+        let p = self.prev[pos as usize];
+        let n = self.next[pos as usize];
+        if p != 0 {
+            self.next[p as usize] = n;
+        } else {
+            self.head = n;
+        }
+        if n != 0 {
+            self.prev[n as usize] = p;
+        } else {
+            self.tail = p;
+        }
+    }
+}
+
+/// 在空闲链表中找到能安放 `codes`（已升序、非空）全部转移而不冲突的 base 值：
+/// 只遍历当前空闲位置，不逐整数探测已占用区间——见 [`FreeList`] 顶部说明。
+fn find_base(codes: &[i32], base: &mut Vec<i32>, check: &mut Vec<i32>, free: &mut FreeList) -> i32 {
     let min_code = codes[0];
-    let mut b = search_start;
+    let mut pos = free.head;
     loop {
-        if b + min_code < 1 {
-            b += 1;
+        if pos == 0 {
+            // 空闲位置已耗尽：扩容后必有新空闲位置可用。
+            let new_cap = base.len() * 2;
+            base.resize(new_cap, 0);
+            check.resize(new_cap, -1);
+            free.grow_to(new_cap);
+            pos = free.head;
+            continue;
+        }
+        // 候选 base：令最小编码的目标落在这个空闲位置上。
+        //
+        // `b` 必须 ≥1（不能只满足 `b+min_code>=1`）：`base[s]<0` 是整个格式用来判定
+        // "s 是叶子"的符号约定（见 compute_maxw 与读取侧多处），只有真正的叶子节点会被
+        // 显式写入负的 `-(leaf)-1`；任何**非叶状态**（走到这里、正在为其子节点找 base 的
+        // 节点）的 base 若意外为负，会被这些判定误当成叶子，其整棵子树从此在自顶向下的
+        // 遍历里"消失"（点查询仍能用，因为它按字节走 check[] 链、不看符号——这正是本 bug
+        // 曾经的隐蔽之处：exact match 全绿，只有 MaxW/前缀分支限界会跳过整棵子树）。
+        let b = pos as i32 - min_code;
+        if b < 1 {
+            pos = free.next[pos as usize];
             continue;
         }
         let mut conflict = false;
         for &c in codes {
-            let pos = (b + c) as usize;
-            grow(base, check, pos);
-            if check[pos] != -1 {
+            let t = b + c;
+            let tu = t as usize;
+            if tu >= check.len() {
+                let new_cap = (tu + 1).next_power_of_two().max(base.len() * 2);
+                base.resize(new_cap, 0);
+                check.resize(new_cap, -1);
+                free.grow_to(new_cap);
+            }
+            if check[tu] != -1 {
                 conflict = true;
                 break;
             }
@@ -192,21 +296,8 @@ fn find_base(codes: &[i32], base: &mut Vec<i32>, check: &mut Vec<i32>, search_st
         if !conflict {
             return b;
         }
-        b += 1;
+        pos = free.next[pos as usize];
     }
-}
-
-/// 扩容 base/check 到能容纳索引 `need`（新增位置 check=-1）。
-fn grow(base: &mut Vec<i32>, check: &mut Vec<i32>, need: usize) {
-    if need < base.len() {
-        return;
-    }
-    let mut new_cap = base.len();
-    while need >= new_cap {
-        new_cap *= 2;
-    }
-    base.resize(new_cap, 0);
-    check.resize(new_cap, -1);
 }
 
 // ======================= 写入 =======================
@@ -1960,6 +2051,73 @@ mod tests {
         // 前缀 code0 → code000..code099（100 条）。
         let pre = r.search_prefix("code0", 1000);
         assert_eq!(pre.len(), 100, "code0 前缀应 100 条");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 回归测试：复刻真实故障现场的 key 形态——上百万条、编码几乎全落在 6/8 位、
+    /// 字母表仅 a-z（真实样本见 feihuzj2 方案的 `feihuzj2_extra_jichu_pro.dict.yaml`，
+    /// 146 万 key）。旧的线性探测 `find_base` 在这种"深、密、共享前缀"的输入下会
+    /// 退化为 O(状态数²)，实测数分钟不收敛、内存被撑到 GB 级（见 [`FreeList`] 顶部
+    /// 说明）。这里用 1/5 规模（30 万 key）验证新实现在合理时间内完成且结果正确。
+    #[test]
+    fn large_scale_build_stays_fast_and_correct() {
+        fn gen_code(mut n: u64, len: usize) -> String {
+            let mut buf = vec![b'a'; len];
+            for i in (0..len).rev() {
+                buf[i] = b'a' + (n % 26) as u8;
+                n /= 26;
+            }
+            String::from_utf8(buf).unwrap()
+        }
+        let total = 300_000usize;
+        let mut data: Vec<(String, Vec<(String, i32)>)> = Vec::with_capacity(total);
+        let (mut c4, mut c6, mut c8) = (0u64, 0u64, 0u64);
+        for i in 0..total {
+            // 大致复刻真实文件里 4/6/8 位码的比例（约 1:4:4）。
+            let code = match i % 9 {
+                0 => {
+                    let c = gen_code(c4, 4);
+                    c4 += 1;
+                    c
+                }
+                1..=4 => {
+                    let c = gen_code(c6, 6);
+                    c6 += 1;
+                    c
+                }
+                _ => {
+                    let c = gen_code(c8, 8);
+                    c8 += 1;
+                    c
+                }
+            };
+            data.push((code, vec![(format!("词{i}"), i as i32)]));
+        }
+
+        let p = std::env::temp_dir().join("wdat_large_scale_test.wdat");
+        let start = std::time::Instant::now();
+        let mut w = WdatWriter::new();
+        for (c, e) in &data {
+            w.add(c.clone(), e.clone());
+        }
+        w.write(&p).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("built {total} keys in {elapsed:?}");
+        assert!(
+            elapsed.as_secs() < 30,
+            "{total} 个 key 构建耗时 {elapsed:?}——若退化回平方级复杂度，这里会是\
+             几分钟甚至更久（历史故障见 FreeList 顶部说明）",
+        );
+
+        let r = WdatReader::open(&p).unwrap();
+        assert_eq!(r.key_count() as usize, total);
+        // 抽样点查验证正确性（量太大，不做全量校验）。
+        for i in (0..total).step_by(997) {
+            let (code, _) = &data[i];
+            let res = r.search(code);
+            assert_eq!(res.len(), 1, "{code} 应命中");
+            assert_eq!(res[0].text, format!("词{i}"));
+        }
         let _ = std::fs::remove_file(&p);
     }
 }
