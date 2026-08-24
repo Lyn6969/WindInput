@@ -48,7 +48,11 @@ pub trait WebDataHost {
     fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow>;
 
     /// 常用字表：设置页列表（**全表**，`query` 非空时只留出现在查询串里的字）。
-    fn common_char_rows(&self, query: &str) -> Vec<crate::handle_common_chars::CommonCharRow>;
+    fn common_char_rows(
+        &self,
+        query: &str,
+        only_modified: bool,
+    ) -> Vec<crate::handle_common_chars::CommonCharRow>;
 
     /// 某个字的当前状态：出厂判定 / 覆盖 / 是否受管辖。设置页「添加」时预览与校验用。
     fn common_char_state(&self, ch: char) -> crate::handle_common_chars::CommonCharState;
@@ -167,8 +171,12 @@ impl WebDataHost for Coordinator {
     fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow> {
         Coordinator::quick_format_rows(self)
     }
-    fn common_char_rows(&self, query: &str) -> Vec<crate::handle_common_chars::CommonCharRow> {
-        Coordinator::common_char_rows(self, query)
+    fn common_char_rows(
+        &self,
+        query: &str,
+        only_modified: bool,
+    ) -> Vec<crate::handle_common_chars::CommonCharRow> {
+        Coordinator::common_char_rows(self, query, only_modified)
     }
     fn common_char_state(&self, ch: char) -> crate::handle_common_chars::CommonCharState {
         Coordinator::common_char_state(self, ch)

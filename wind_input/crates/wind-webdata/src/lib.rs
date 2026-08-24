@@ -2312,7 +2312,12 @@ pub trait WebDataRpc: WebDataHost {
             .or_else(|| params.get("query"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let rows = self.common_char_rows(query);
+        // 「只看已修改」：全表 8104 条里自己动过的那几个，靠翻页是找不到的。
+        let only_modified = params
+            .get("onlyModified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let rows = self.common_char_rows(query, only_modified);
         let total = rows.len();
         let offset = usize_param(params, "offset", 0);
         // limit=0 视为不限（调用方不分页时直接全取）。
@@ -4480,8 +4485,21 @@ mod tests {
         let (page2, _) = common_char_rows_rpc(&c, json!({ "offset": 1, "limit": 1 }));
         assert_ne!(page2[0]["char"], page[0]["char"], "第二页要换一条");
 
+        // 「只看已修改」这一档的**独立作用**在这个装置下测不出来（默认表为空 ⇒ 全表本就
+        // 只剩改过的那些，两个口径等价）。真正的用例在
+        // `wind-coordinator/tests/common_chars_override.rs`，那里有真实的 8104 字表。
+        // 这里只确认参数被认得、不报错。
+        assert_eq!(
+            common_char_rows_rpc(&c, json!({ "onlyModified": true })).1,
+            2
+        );
+
         c.web_data_rpc("commonChars.clear", &json!({})).unwrap();
         assert_eq!(common_char_rows_rpc(&c, json!({})).1, 0, "整表恢复默认");
+        assert_eq!(
+            common_char_rows_rpc(&c, json!({ "onlyModified": true })).1,
+            0
+        );
     }
 
     fn quick_rows(c: &Coordinator) -> Vec<Value> {

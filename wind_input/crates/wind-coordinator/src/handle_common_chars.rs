@@ -127,12 +127,15 @@ impl crate::Coordinator {
     ///
     /// `query` 非空时只保留「出现在查询串里」的字——用户想查某个字就直接把它打进搜索框，
     /// 粘一整句进去则列出这句话里的所有字，两种用法都成立。
-    pub(crate) fn common_char_rows(&self, query: &str) -> Vec<CommonCharRow> {
+    ///
+    /// `only_modified` 为真时只留改过的行：全表 8104 条里自己动过的那几个，翻页是找不到的。
+    pub(crate) fn common_char_rows(&self, query: &str, only_modified: bool) -> Vec<CommonCharRow> {
         let cc = self.common_chars.read().unwrap_or_else(|e| e.into_inner());
         let q: Vec<char> = query.trim().chars().collect();
         cc.list_all()
             .into_iter()
             .filter(|(ch, _, _)| q.is_empty() || q.contains(ch))
+            .filter(|(ch, _, _)| !only_modified || cc.override_of(*ch).is_some())
             .map(|(ch, base_common, common)| CommonCharRow {
                 ch,
                 common,
