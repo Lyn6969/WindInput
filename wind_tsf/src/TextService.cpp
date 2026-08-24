@@ -1604,9 +1604,13 @@ STDAPI CTextService::OnKillThreadFocus()
 
 // ============================================================================
 // Win32 RegisterHotKey 支持
-// 候选可见时把 Ctrl+0..9 + Ctrl+Shift+0..9 注册为系统级热键，OS 在 WM_KEYDOWN
-// 派发之前直接消费，规避 QQNT 等 Chromium 类宿主的加速键双处理。无候选时立即
-// UnregisterHotKey 让宿主重获这些键。机制来自第三方输入法的实测验证。
+// 候选可见时把置顶/删词热键注册为系统级热键，OS 在 WM_KEYDOWN 派发之前直接消费，
+// 规避 QQNT 等 Chromium 类宿主的加速键双处理。无候选时立即 UnregisterHotKey 让宿主
+// 重获这些键。机制来自第三方输入法的实测验证。
+//
+// ★ 组合键来自服务端 SESSION 热键表（`keys.pin_candidate` / `keys.delete_candidate`），
+// **本层不写死**。此处原注释写的是「Ctrl+0..9 + Ctrl+Shift+0..9」，与当时的硬编码一致，
+// 副作用是这段代码在 `grep pin_candidate` 里完全隐形——2026-08-24 我据此漏判了整条通路。
 // ============================================================================
 
 BOOL CTextService::_InitHotkeyWindow()
@@ -2180,7 +2184,8 @@ STDAPI CTextService::Abort(void)
 
 void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
 {
-    // 候选可见 → 注册系统级热键拦截 Ctrl+0..9/Ctrl+Shift+0..9；候选消失 → 卸载，
+    // 候选可见 → 注册系统级热键拦截置顶/删词组合键（取自 keys.pin_candidate /
+    // keys.delete_candidate，见 _RegisterCandidateHotkeys）；候选消失 → 卸载，
     // 让宿主重新获得这些键。这是第三方输入法使用的成熟机制，规避 Chromium 类宿主
     // 的加速键双处理。
     if (hasCandidates && !_hotkeysActive)

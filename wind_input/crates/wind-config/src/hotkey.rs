@@ -283,7 +283,14 @@ pub enum KeyDownPolicy {
     Always,
     /// 仅中文模式吃；英文模式放行给宿主（吃掉 Ctrl+= 会让宿主的放大失效）
     ChineseOnly,
-    /// 仅中文模式 + 有会话时吃（置顶/删词 Ctrl+0..9；无会话时宿主可能另有用途）
+    /// 仅中文模式 + 有会话时吃（置顶/删词，组合键见 [`number_template_mods`]；
+    /// 无会话时宿主可能另有用途）。
+    ///
+    /// ⚠️ 带本策略位的 keydown 条目在 TSF 侧还有**第二个消费者**：
+    /// `CTextService::_RegisterCandidateHotkeys` 会在候选可见期间把它们逐个
+    /// `RegisterHotKey` 成系统级热键——**那才是实际生效的通路**，`OnTestKeyDown`
+    /// 的白名单分支只是它失败时的退路。改本策略位的产出前先读
+    /// `docs/design/key-resolver-unification.md` §2.2 的那个警告框。
     Session,
     /// 仅注册转发（翻页键组 `-=`、选词键组 `;'`）：无会话时**放行并继续按常规按键
     /// 逻辑判定**，不是直接不吃——中文模式下它们要当标点处理。

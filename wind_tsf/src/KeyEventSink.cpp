@@ -392,7 +392,13 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         return S_OK;
     }
 
-    // Policy: 仅中文模式 + session 时吃（PinCandidate / DeleteCandidate Ctrl+0..9）
+    // Policy: 仅中文模式 + session 时吃（PinCandidate / DeleteCandidate，组合键见配置）
+    //
+    // ⚠️ 这条分支**平时走不到**：同一批键已被 CTextService::_RegisterCandidateHotkeys
+    // 用 RegisterHotKey 在系统层拦下（候选可见期间），压根不会派发到 OnTestKeyDown。
+    // 它是 RegisterHotKey 失败时（ERROR_HOTKEY_ALREADY_REGISTERED、非前台进程等）的退路。
+    // ⇒ 排查「候选热键不生效」先看 RegisterCandidateHotkeys 的 registered=N/M 日志，
+    //    别从这里开始查。
     if (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyDownSessionHotkey(normalizedKeyHash))
     {
         _CancelPendingToggle(wParam, L"session_hotkey");
@@ -1827,7 +1833,7 @@ BOOL CKeyEventSink::DispatchHotkey(uint32_t vk, uint32_t mods)
 {
     // 走与 OnKeyDown 同一通路：send + handle response。
     // 用于经 WM_HOTKEY（RegisterHotKey 全局拦截）到达的热键：
-    //   - Pin/Delete 候选热键（Ctrl+0..9 / Ctrl+Shift+0..9）：操作已显示候选，不依赖 caret。
+    //   - Pin/Delete 候选热键（组合键取自配置）：操作已显示候选，不依赖 caret。
     //   - AddWord（Ctrl+= 等）：中文+文本框时经全局拦截规避 Chromium 宿主双处理。
     //     composition 由 _HandleServiceResponse 处理 UpdateComposition 建立；caret 定位
     //     由 WM_HOTKEY 分发处先行 SendCaretPositionUpdate 补齐（见 TextService WndProc）。

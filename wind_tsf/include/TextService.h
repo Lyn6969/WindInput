@@ -410,9 +410,10 @@ private:
     ITfSourceSingle* _pSourceSingle;  // 缓存的 ITfSourceSingle 引用（Function Provider 注册用）
     BOOL  _funcProviderRegistered;    // 是否已通过 AdviseSingleSink 注册
 
-    // Win32 RegisterHotKey 支持 — 在候选可见时把 Ctrl+0..9 / Ctrl+Shift+0..9 注册为
-    // 系统级热键，由 OS 在 WM_KEYDOWN 派发之前直接消费，规避 QQNT 类 Chromium 宿主的
-    // 加速键双处理。无候选时立即 UnregisterHotKey 让宿主使用这些热键。
+    // Win32 RegisterHotKey 支持 — 在候选可见时把置顶/删词热键（组合键取自服务端
+    // SESSION 热键表，即 keys.pin_candidate / keys.delete_candidate）注册为系统级热键，
+    // 由 OS 在 WM_KEYDOWN 派发之前直接消费，规避 QQNT 类 Chromium 宿主的加速键双处理。
+    // 无候选时立即 UnregisterHotKey 让宿主使用这些热键。
     HWND  _hHotkeyWnd;                // 隐藏消息窗口，接收 WM_HOTKEY
     ATOM  _hotkeyWndClass;            // RegisterClassEx 返回的窗口类原子
     BOOL  _hotkeysActive;             // 当前是否已 RegisterHotKey 候选热键（组合键取自服务端 SESSION 热键表）

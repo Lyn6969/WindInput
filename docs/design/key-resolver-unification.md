@@ -54,11 +54,31 @@
 |---|---|---|
 | `Always` | （无位） | 中英两模式都吃 |
 | `ChineseOnly` | `0x40000000` | 仅中文模式吃（吃掉 `Ctrl+=` 会让宿主放大失效） |
-| `Session` | `0x80000000` | 仅中文 + 有会话吃（置顶 / 删词 `Ctrl+0..9`） |
+| `Session` | `0x80000000` | 仅中文 + 有会话吃（置顶 / 删词，组合键由 `pin_candidate` / `delete_candidate` 配置，见下方 ⚠️） |
 | `ForwardOnly` | `0x10000000` | 仅注册转发；**无会话时放行并继续按常规按键逻辑判定**，不是直接不吃——中文模式下翻页键、选词键要当标点处理 |
 
 另有正交的 `GLOBAL`（`0x20000000`）：TSF 在「中文 + 焦点在文本框」时用 `RegisterHotKey` 让 OS 在
 `WM_KEYDOWN` 派发前直接消费，规避 QQNT / Tabby 等 Chromium 类宿主无视 `pfEaten` 契约的加速键双处理。
+
+> ### ⚠️⚠️ `RegisterHotKey` **不止 `GLOBAL` 位那一条**——`Session` 位的候选热键也走它
+>
+> 这是本文档 2026-08-24 补的最重要一条，**上一版只写了 `GLOBAL` 那条，害我据此断定
+> 「加一个候选热键取值不用动 C++」，真机当场证伪**。
+>
+> 置顶 / 删词的 `RegisterHotKey` 由**候选可见性**驱动，不由 `GLOBAL` 位驱动：
+> `CTextService::NotifyCandidatesVisibilityChanged` → `_RegisterCandidateHotkeys` /
+> `_UnregisterCandidateHotkeys`，组合键取自 `CHotkeyManager::SessionHotkeys()`。
+>
+> ★★★ **它才是实际生效的那条通路**，`OnTestKeyDown` 里的 `IsKeyDownSessionHotkey`
+> 分支平时根本走不到——`RegisterHotKey` 先于一切拿到键。
+> **判据（可复用）**：tsf 日志里数字键的 `compat.key` 行 **`mods` 恒为 `0x0000`**，
+> 连正常工作的 `Ctrl+数字` 置顶都没有一条带修饰位的记录 ⇒ 那条链路没在参与。
+>
+> ⇒ **改候选热键的值域，必须把这条通路一起数进去。** 它曾把组合键写死成
+> `MOD_CONTROL` / `MOD_CONTROL|MOD_SHIFT`，还把「哪段 id 对应哪个动作」烧进 id 编码，
+> 于是热键表、TSF 转发白名单、协调器判据三处都改对了也没用（已修，`47c1e58c`）。
+> ⚠️ **单元测试对这一族无能为力**：Rust 侧测的是热键表内容，而表一直是对的，
+> 错的是「谁去读表」。这类跨进程能力**只能真机验**。
 
 ⚠️ `ForwardOnly` **绝不能**加在真动作热键上。TSF 侧「无 Ctrl/Alt 且无会话就不吃」的闸门只认这个
 标记；早先该闸门无差别地套在所有无 Ctrl/Alt 的 keydown 热键上，把 `shift+space`
