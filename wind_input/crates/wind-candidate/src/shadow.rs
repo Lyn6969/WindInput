@@ -52,7 +52,24 @@ impl ShadowPinRule {
 /// `deleted` 仍是纯文本匹配：走 shadow 删除的只有系统码表/拼音候选（静态文本），
 /// 短语删除走 `set_phrase_enabled`（按 `(code, phrase_template)` 定位，本就是稳定键，
 /// 见 `delete_candidate_by_source`），故删除侧没有动态候选可失配。
-pub fn apply_shadow(candidates: &mut Vec<Candidate>, deleted: &[String], pinned: &[ShadowPinRule]) {
+///
+/// # 返回值：实际**就位**的置顶规则条数
+///
+/// 供调用方回答「用户对这个码的顺序表达过主张吗」——出简让全据此让路（见 wind-coordinator
+/// 的 `short_code_yield`）。判据必须由本函数交出，而**不是**让调用方另查一次规则：
+/// `(schema, code)` 的取法有 `data_schema_id` 折叠与 `shadow_code_of` 归一两道，两处各取
+/// 一次迟早失配，且失配完全静默（`freq_code` 那次连红四次才把四处遗漏抓干净）。
+///
+/// 只数 `pinned`，**不数 `deleted`**：删除说的是「这条别出现」，与「谁排第一」不是同一
+/// 维度；把删除也算进来会平白关掉大量本该发生的让位。
+///
+/// 数的是**命中**而非规则条数：规则指向的候选可能压根不在本次列表里（检索范围变了、
+/// 被别的规则删掉了），那样的规则没产生任何位次影响，不该算作用户对本次列表的主张。
+pub fn apply_shadow(
+    candidates: &mut Vec<Candidate>,
+    deleted: &[String],
+    pinned: &[ShadowPinRule],
+) -> usize {
     if !deleted.is_empty() {
         candidates.retain(|c| !deleted.iter().any(|d| d == &c.text));
     }
@@ -62,13 +79,16 @@ pub fn apply_shadow(candidates: &mut Vec<Candidate>, deleted: &[String], pinned:
     // 最新项最后 insert 停在最前，得到"后添加者靠前"。
     let mut idx: Vec<(usize, &ShadowPinRule)> = pinned.iter().enumerate().collect();
     idx.sort_by(|a, b| a.1.position.cmp(&b.1.position).then(b.0.cmp(&a.0)));
+    let mut hits = 0usize;
     for (_, rule) in idx {
         if let Some(cur) = candidates.iter().position(|c| rule.matches(c)) {
             let cand = candidates.remove(cur);
             let at = rule.position.min(candidates.len());
             candidates.insert(at, cand);
+            hits += 1;
         }
     }
+    hits
 }
 
 #[cfg(test)]

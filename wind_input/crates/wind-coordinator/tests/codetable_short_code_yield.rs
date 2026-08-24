@@ -12,6 +12,20 @@
 //! - `second_level_shortcode_yields_at_level_two`：档位边界，`wq` 是二简，故档位 2 也该让。
 //!   若把档位判据写反（`>=` 写成 `>` 之类），这条会红而主用例照绿。
 //!
+//! ## ⚠️ 候选调整优先族：四条同样必须合看
+//!
+//! - `pinned_char_keeps_the_full_code_top`：用户把「你」置顶到 `wqiy` ⇒ 让位停手；
+//! - `store_without_pin_still_yields`：**反向对照**，同样带 store、只是不写规则 ⇒ 仍让位。
+//!   缺了它，「凡是带 store 就不让位」这类实现会让上一条假绿；
+//! - `pinning_another_candidate_stops_the_yield_for_the_whole_code`：置顶的不是被沉底的
+//!   那个字 ⇒ 整码照样停手。锁住的是「停整码」而非「只赦免首条」——让位的两步 rotate 会
+//!   让接位词之后的候选各前移一位，只赦免首条治不了那一半；
+//! - `hiding_a_candidate_is_not_a_reorder`：隐藏（`deleted`）**不算**排过序 ⇒ 仍让位。
+//!   判据只数 `pinned`，缺了它，把删除也算进来的实现会静默关掉大量本该发生的让位。
+//!
+//! ⚠️ 这一族**必须用 `new_headless_with_store`**：shadow 规则存在 store 里，而
+//! `new_headless` 的 store 是 `None` —— 用它写这些断言，测的东西压根不存在。
+//!
 //! 用例选 `wqiy`（你 / 仰泳）而不是 `khtk`（路 / 路程）：后者在**发行词库里已经被
 //! `gen_dict` 的 `[demotion]` 让过位**了，首选本就是词，测不出算法层有没有干活。
 //! `[demotion]` 退役后 `khtk` 也会成为可用现场。
@@ -20,6 +34,7 @@
 //! 判据是耗时（正常 1s 量级 vs 跳过 0.0x s）。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use wind_bridge::handler::{KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
@@ -192,4 +207,136 @@ fn char_without_shortcode_top_does_not_yield() {
         Some("匹敌"),
         "首选本就是词时不应有任何改动，实际候选: {head:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 候选调整优先于出简让全
+//
+// `ShadowPin.position` 是**绝对下标**，记的是用户右键当时所见列表里的位次；用户所见正是
+// 让位之后的列表。让位若继续在 `apply_shadow` 之后动手，用户按下标 N 存进去、回放时被挪
+// 到别处，那个下标就再也表达不了任何东西。故让位对「排过序的码」整码停手。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 建一个独立的空 store（每个用例一个文件，避免相互污染）。
+fn fresh_store(name: &str) -> (Arc<wind_store::Store>, PathBuf) {
+    let path = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_file(&path);
+    let store = Arc::new(wind_store::Store::open(&path).unwrap());
+    (store, path)
+}
+
+/// 同 [`candidates_for`]，但带 store —— shadow 规则存在 store 里，`new_headless` 的 store
+/// 是 `None`，用它写候选调整相关的断言等于什么也没测（本仓栽过的形态）。
+fn candidates_with_store(
+    level: usize,
+    code: &str,
+    store: Arc<wind_store::Store>,
+) -> Option<Vec<String>> {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return None;
+    }
+    let coord = Coordinator::new_headless_with_store(wubi_config(level), Some(&d), store);
+    press(&coord, code);
+    Some(coord.debug_all_candidate_texts())
+}
+
+/// 主用例：用户把「你」置顶回 `wqiy` 的首位 ⇒ 让位不得再把它沉底。
+///
+/// 这正是用户报的现场：开了出简让全之后，右键「置顶」写得进去、下次打同一个码却毫无变化。
+#[test]
+fn pinned_char_keeps_the_full_code_top() {
+    let (store, path) = fresh_store("wind_scy_shadow_pinned.redb");
+    store
+        .pin_shadow("wubi86", "wqiy", "你", None, 0)
+        .expect("pin_shadow 失败");
+    let Some(all) = candidates_with_store(3, "wqiy", store) else {
+        return;
+    };
+    let head: Vec<&str> = all.iter().take(6).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("你"),
+        "候选调整优先于出简让全，实际候选: {head:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **反向对照**：同样带 store，只是一条规则都不写 ⇒ 让位照常发生。
+///
+/// 缺了这条，「凡是带 store 就不让位」「store 一接上让位链就断了」之类的实现会让主用例
+/// 假绿。它同时证明 `new_headless_with_store` 这条路径本身没有改变让位行为。
+#[test]
+fn store_without_pin_still_yields() {
+    let (store, path) = fresh_store("wind_scy_shadow_nopin.redb");
+    let Some(all) = candidates_with_store(3, "wqiy", store) else {
+        return;
+    };
+    let head: Vec<&str> = all.iter().take(6).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("仰泳"),
+        "没有任何调整规则时须照常让位（否则主用例是假绿），实际候选: {head:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 停的是**整码**，不只是被沉底的那个字：这里置顶的是「硕大」，而让位要沉底的是「大」。
+///
+/// 只赦免首条的实现会在这里红——让位仍会发生，首选变成「大厦」。而让位的两步 rotate 会把
+/// 接位词之后的候选各前移一位，用户「调到第 N 位」照样会变成第 N-1 位，那半个失效正是本
+/// 用例守的东西。
+#[test]
+fn pinning_another_candidate_stops_the_yield_for_the_whole_code() {
+    let (store, path) = fresh_store("wind_scy_shadow_other.redb");
+    store
+        .pin_shadow("wubi86", "dddd", "硕大", None, 1)
+        .expect("pin_shadow 失败");
+    let Some(all) = candidates_with_store(3, "dddd", store) else {
+        return;
+    };
+    let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("大"),
+        "码上有任何置顶规则就位 ⇒ 整码停手，实际候选: {head:?}"
+    );
+    assert_eq!(
+        all.get(1).map(|s| s.as_str()),
+        Some("硕大"),
+        "置顶规则本身须照常生效（否则上一条可能是 pin 压根没命中造成的），实际候选: {head:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 隐藏**不算**排过序：`deleted` 说的是「这条别出现」，与「谁排第一」不是同一维度。
+///
+/// 把 `deleted` 也算进判据的实现会在这里红——用户随手隐藏一条候选，整码的让位就被静默
+/// 关掉了。对照 `the_yielding_char_sinks_to_the_bottom`：那条是同一个码的无规则版本。
+#[test]
+fn hiding_a_candidate_is_not_a_reorder() {
+    let (store, path) = fresh_store("wind_scy_shadow_deleted.redb");
+    store
+        .delete_shadow("wubi86", "dddd", "硕大")
+        .expect("delete_shadow 失败");
+    let Some(all) = candidates_with_store(3, "dddd", store) else {
+        return;
+    };
+    let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();
+    assert!(
+        !all.iter().any(|t| t == "硕大"),
+        "隐藏规则本身须生效（否则本用例测的不是删除路径），实际候选: {head:?}"
+    );
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("大厦"),
+        "隐藏不是排序主张，让位须照常发生，实际候选: {head:?}"
+    );
+    assert_eq!(
+        all.iter().position(|t| t == "大"),
+        Some(all.len() - 1),
+        "让位的字仍须沉到本码所有候选之后，实际候选: {head:?}"
+    );
+    let _ = std::fs::remove_file(&path);
 }

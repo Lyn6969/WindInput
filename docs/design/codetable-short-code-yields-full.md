@@ -155,6 +155,7 @@ khtk  → 若只看最近一级：kht 的首选已不是「路」→ 判定"无�
 
 ## 6. 让位的施加
 
+- **用户调整过顺序的码整码不让位**——候选调整（shadow `pinned`）优先级高于本功能，见 §6.2
 - **只有单字候选参与让位**（出简让全是字的概念）
 - **只让给多字词**（用户明确要求"让给词语"，不让给另一个单字）
 - 首选与接位者**都必须是码表来源**——让拼音/短语候选降位是 `source_tier` 的地盘，
@@ -191,6 +192,37 @@ candidates[1..normal_len].rotate_left(1); // 字从下标 1 沉到正常段末�
 
 ⚠️ 沉底的边界是 `normal_len`（首个 `is_scope_filtered` 之前），不是整个列表。
 放宽补进来的候选「恒在末尾」是它自己的硬约束，让位的字不能沉到它们后面。
+
+### 6.2 候选调整优先：让位对「排过序的码」整码停手
+用户右键调过这个码的顺序（shadow `pinned` 规则**就位**），让位就整码停手。
+
+理由不是「尊重用户」这种软话，而是 **`ShadowPin.position` 是绝对下标**：它记的是用户右键
+当时**所见列表**里的位次，而用户所见正是让位之后的列表。让位若继续在 `apply_shadow` 之后
+动手，用户按下标 N 存进去、回放时被挪到别处，那个下标就再也表达不了任何东西——position
+的语义先垮了。用户看到的现象是「置顶写得进去，下次打同一个码毫无变化」。
+
+**停的是整码，不只是被沉底的那个字。** 让位的两步 rotate 会让接位词之后的候选各前移一位，
+「调到第 4 位」照样会变成第 3 位；只赦免首条治不了这一半。实测（回退实现跑
+`pinning_another_candidate_stops_the_yield_for_the_whole_code`）：`dddd` 上把「硕大」调到
+第 2 位，让位后列表是 `硕大 | 大厦 | 磕磕碰碰 | 大`——它被挪到了第 1 位。
+
+**只看 `pinned`，不看 `deleted`。** 删除说的是「这条别出现」，与「谁排第一」不是同一维度；
+把删除也算作「排过序」会平白关掉大量本该发生的让位。
+
+**判据由 `apply_shadow` 的返回值交出，让位侧不得自己再查一次规则。** `(schema, code)` 的
+取法有 `data_schema_id` 折叠与 `shadow_code_of` 归一两道，两处各取一次迟早失配，且失配
+完全静默——`freq_code` 那次连红四次才把四处遗漏抓干净。
+
+**为什么不干脆把让位挪到 `apply_shadow` 之前**（那样 shadow 天然压过它，一行改动）：让位
+被 `apply_freq_rerank` 钉在后面（§9 第二条，4 码位 `ProtectPolicy.fallback = 0` 不设保护，
+先让位会被调频原样顶回去），而 `apply_shadow` 就在 `apply_freq_rerank` 与让位之间，没有
+能同时满足两个约束的位置。更要命的是让位会跑在 shadow **删除**之前：用户隐藏掉接位的那个
+词，就会留下 §6.0 警告的形态——`昤 | 路上 | 路` 去掉「路上」得到 `昤 | 路`，首选是生僻字
+而字还沉在底部。所以优先级只能写成判据。
+
+**取舍**：用户只是把某个词往后挪一挪，也会连带让首选从词变回字。可预测性优先——「这个码
+我排过序，就按我排的来」比「有些调整生效有些不生效」好解释得多；不接受的用户把那条调整
+「恢复默认」即可。
 
 ### 6.1 档位：让到第几级简码
 
@@ -235,7 +267,8 @@ candidates[1..normal_len].rotate_left(1); // 字从下标 1 沉到正常段末�
 ```
 crates/wind-coordinator/src/short_code_yield.rs   判定 / 记录 / 淘汰，三个纯函数
 crates/wind-coordinator/src/coordinator.rs        State.shortcode_tops
-crates/wind-coordinator/src/handle_candidate.rs   三处接线（见下）
+crates/wind-coordinator/src/handle_candidate.rs   三处接线（见下）+ apply_shadow 返回让路判据
+crates/wind-candidate/src/shadow.rs               apply_shadow 返回 pin 命中数（判据的唯一取值处）
 crates/wind-config/src/config.rs                  CodetableGlobal.short_code_yield_level
 crates/wind-config/src/schema.rs                  方案级 Option<usize> 覆盖
 crates/wind-config/src/config_schema.rs           注册（守门测试要求 data/config.toml 同步列出）
@@ -247,8 +280,9 @@ crates/wind-config/src/config_schema.rs           注册（守门测试要求 da
 函数开头                          evict_stale   ← 每条返回路径都可能不走到记录点
   … 排序 / 去重 / apply_filter …
   apply_freq_rerank                             ← 让位必须在它之后
-  apply_shadow / 空码补全收口
-让位施加                          apply
+  apply_shadow → user_pinned                    ← 让路判据在这里取出，只此一处
+  空码补全收口（其 apply_shadow 结果并入 user_pinned）
+让位施加                          apply(..., user_pinned)
 记录本级首选                      record_top    ← 记在让位之后，记的是用户实际所见
 state.candidates = candidates
 自动上屏复评（读 first()）
@@ -264,14 +298,21 @@ state.candidates = candidates
   本功能动的是**更长的码位**，两者不在同一码长上，**不打架**。但由此得到硬约束：
   让位必须排在 `apply_freq_rerank` 之后，因为深码位 `fallback = 0` 不设保护，
   先让位会被调频原样顶回去。
+- **`apply_shadow`（候选调整）**：**唯一一个优先级高于本功能的耦合点**，见 §6.2。让位排在
+  它之后是 `apply_freq_rerank` 强加的（上一条），于是优先级只能写成判据而不能靠次序表达。
 - **非五笔方案**：靠 `short_code_yield_level` 的方案级覆盖关掉。「短码首选 = 简码」
   这个等式只对五笔这类前缀式简码成立。
 
 ## 10. 测试
 
-纯函数层 16 个用例在 `short_code_yield.rs` 内；端到端 7 个在
+纯函数层 17 个用例在 `short_code_yield.rs` 内；端到端 11 个在
 `crates/wind-coordinator/tests/codetable_short_code_yield.rs`。两层必须都有——本仓
 「引擎全绿而用户打不出」是反复出现过的形态。
+
+候选调整优先那一族（端到端 4 条，见 §6.2）**必须用 `new_headless_with_store`**：shadow
+规则存在 store 里，而 `new_headless` 的 store 是 `None`，用它写这些断言等于什么也没测。
+其中 `store_without_pin_still_yields` 是不可省的反向对照——没有它，「凡是带 store 就不
+让位」这类实现会让主用例假绿。
 
 端到端用例选 `wqiy`（你 / 仰泳）而非 `khtk`（路 / 路程）：后者在发行词库里已被
 退役前的 `[demotion]` 让过位，首选本就是词，测不出算法层有没有干活。

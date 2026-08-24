@@ -80,14 +80,37 @@ pub(crate) fn record_top(tops: &mut ShortcodeTops, input: &str, candidates: &[Ca
 ///
 /// 缺记录一律不让位（走过临时英文/临时拼音/特殊模式/URL 模式的输入会缺级）——宁可少让，
 /// 不可让错。
+///
+/// `user_pinned` = 本码有置顶规则就位（`apply_shadow` 的返回值）。**候选调整优先于出简
+/// 让全**：用户在这个码上手动排过序，自动让位就不再插手，见下方 `user_pinned` 分支。
 pub(crate) fn apply(
     candidates: &mut [Candidate],
     input: &str,
     tops: &ShortcodeTops,
     level: usize,
+    user_pinned: bool,
 ) -> bool {
     let level = level.min(MAX_LEVEL);
     if level == 0 {
+        return false;
+    }
+    // ── 候选调整优先 ──────────────────────────────────────────────────────────
+    //
+    // 用户右键调过这个码的顺序，让位就整码停手。理由不是「尊重用户」这种软话，而是
+    // **`ShadowPin.position` 是绝对下标**：它记的是用户右键当时**所见列表**里的位次，
+    // 而用户所见正是让位之后的列表。若让位继续在 shadow 之后动手，用户按下标 N 存进去、
+    // 回放时被挪到别处，那个下标就再也表达不了任何东西——position 的语义先垮了。
+    //
+    // 停的是**整码**而不只是被沉底的那个字：让位的两步 rotate 会让接位词之后的候选各前移
+    // 一位，「调到第 4 位」照样会变成第 3 位。只赦免首条治不了这一半。
+    //
+    // 代价（明确的取舍，不是遗漏）：用户只是把某个词往后挪一挪，也会连带让首选从词变回
+    // 字。可预测性优先——「这个码我排过序，就按我排的来」比「有些调整生效有些不生效」
+    // 好解释得多。不接受的用户把那条调整「恢复默认」即可。
+    //
+    // 只看置顶不看删除：删除说的是「这条别出现」，与「谁排第一」不是同一维度。判据由
+    // `apply_shadow` 一处交出（见其文档），让位侧不得自己再查规则。
+    if user_pinned {
         return false;
     }
     let n = input.chars().count();
@@ -180,8 +203,29 @@ mod tests {
     #[test]
     fn yields_full_code_top_to_the_first_word() {
         let mut c = vec![ct("路"), ct("路上"), ct("路口")];
-        assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路上", "路口", "路"], "字沉到本码所有候选之后");
+    }
+
+    /// **候选调整优先**：与 `yields_full_code_top_to_the_first_word` 逐字同参，只把
+    /// `user_pinned` 翻成 true —— 两条必须合看，单看任何一条都证明不了让路判据接进来了。
+    ///
+    /// 顺序必须**纹丝不动**（不只是「首选还是字」）：让位的两步 rotate 会把接位词之后的
+    /// 候选各前移一位，只断言首选的话，那半个失效抓不到。
+    #[test]
+    fn user_pinned_stops_the_yield_entirely() {
+        let mut c = vec![ct("路"), ct("路上"), ct("路口")];
+        assert!(
+            !apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3, true),
+            "用户调过这个码的顺序，让位须整码停手"
+        );
+        assert_eq!(texts(&c), ["路", "路上", "路口"], "顺序须纹丝不动");
     }
 
     /// 让位的字要沉到**所有**同码候选之后，包括没有简码的全码字——那些字只能在这个
@@ -189,7 +233,13 @@ mod tests {
     #[test]
     fn the_yielding_char_sinks_below_other_full_code_chars() {
         let mut c = vec![ct("路"), ct("昤"), ct("路上"), ct("路口")];
-        assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路上", "昤", "路口", "路"]);
     }
 
@@ -197,7 +247,13 @@ mod tests {
     #[test]
     fn word_is_promoted_even_when_a_rare_char_sits_between() {
         let mut c = vec![ct("路"), ct("昤"), ct("路上")];
-        assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(
             c.first().map(|c| c.text.as_str()),
             Some("路上"),
@@ -214,7 +270,7 @@ mod tests {
         let tops = tops_of(&[(2, "kh", "路"), (3, "kht", "路上")]);
         let mut c = vec![ct("路"), ct("路口")];
         assert!(
-            apply(&mut c, "khtk", &tops, 3),
+            apply(&mut c, "khtk", &tops, 3, false),
             "二简位的记录仍在，全码位应当照样让位"
         );
         assert_eq!(texts(&c), ["路口", "路"]);
@@ -224,7 +280,7 @@ mod tests {
     fn holds_when_no_record_for_this_char() {
         // 走过临时拼音等旁路时该级缺记录 —— 保守不让位。
         let mut c = vec![ct("路"), ct("路上")];
-        assert!(!apply(&mut c, "khtk", &tops_of(&[]), 3));
+        assert!(!apply(&mut c, "khtk", &tops_of(&[]), 3, false));
         assert_eq!(texts(&c), ["路", "路上"]);
     }
 
@@ -233,7 +289,13 @@ mod tests {
     fn holds_when_record_belongs_to_a_different_code() {
         let mut c = vec![ct("路"), ct("路上")];
         // 记录来自 kht，当前输入却是 kxtk。
-        assert!(!apply(&mut c, "kxtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(!apply(
+            &mut c,
+            "kxtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路", "路上"]);
     }
 
@@ -241,7 +303,13 @@ mod tests {
     fn holds_when_nobody_can_take_over() {
         // 同码只有单字，没有词可以接位。
         let mut c = vec![ct("路"), ct("昤")];
-        assert!(!apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(!apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路", "昤"]);
     }
 
@@ -251,24 +319,36 @@ mod tests {
         let tops = tops_of(&[(3, "kht", "路")]);
         let mut c = vec![ct("路"), ct("路上")];
         assert!(
-            !apply(&mut c, "khtk", &tops, 2),
+            !apply(&mut c, "khtk", &tops, 2, false),
             "三简记录在档位 2 下不算数"
         );
         // 同一份候选，档位 3 就让。
-        assert!(apply(&mut c, "khtk", &tops, 3));
+        assert!(apply(&mut c, "khtk", &tops, 3, false));
     }
 
     #[test]
     fn level_two_still_yields_for_a_second_level_shortcode() {
         let mut c = vec![ct("大"), ct("大厦")];
-        assert!(apply(&mut c, "dddd", &tops_of(&[(2, "dd", "大")]), 2));
+        assert!(apply(
+            &mut c,
+            "dddd",
+            &tops_of(&[(2, "dd", "大")]),
+            2,
+            false
+        ));
         assert_eq!(texts(&c), ["大厦", "大"]);
     }
 
     #[test]
     fn level_zero_is_a_full_stop() {
         let mut c = vec![ct("路"), ct("路上")];
-        assert!(!apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 0));
+        assert!(!apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            0,
+            false
+        ));
         assert_eq!(texts(&c), ["路", "路上"]);
     }
 
@@ -276,7 +356,13 @@ mod tests {
     #[test]
     fn shortcode_position_itself_never_yields() {
         let mut c = vec![ct("路"), ct("路上")];
-        assert!(!apply(&mut c, "kht", &tops_of(&[(2, "kh", "路")]), 3));
+        assert!(!apply(
+            &mut c,
+            "kht",
+            &tops_of(&[(2, "kh", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路", "路上"]);
     }
 
@@ -285,12 +371,18 @@ mod tests {
     fn does_not_touch_non_codetable_candidates() {
         let mut c = vec![cand("路", CandidateSource::Pinyin), ct("路上")];
         assert!(
-            !apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3),
+            !apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3, false),
             "首选不是码表来源时不让位"
         );
         // 反过来，接位者也必须是码表来源。
         let mut c2 = vec![ct("路"), cand("路上", CandidateSource::Pinyin)];
-        assert!(!apply(&mut c2, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(!apply(
+            &mut c2,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c2), ["路", "路上"]);
     }
 
@@ -300,7 +392,13 @@ mod tests {
         let mut relaxed = ct("路上");
         relaxed.is_scope_filtered = true;
         let mut c = vec![ct("路"), relaxed];
-        assert!(!apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(!apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路", "路上"]);
     }
 
@@ -311,7 +409,13 @@ mod tests {
         let mut relaxed = ct("踟");
         relaxed.is_scope_filtered = true;
         let mut c = vec![ct("路"), ct("路上"), relaxed];
-        assert!(apply(&mut c, "khtk", &tops_of(&[(3, "kht", "路")]), 3));
+        assert!(apply(
+            &mut c,
+            "khtk",
+            &tops_of(&[(3, "kht", "路")]),
+            3,
+            false
+        ));
         assert_eq!(texts(&c), ["路上", "路", "踟"]);
     }
 

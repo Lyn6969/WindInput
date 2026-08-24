@@ -929,8 +929,12 @@ impl Coordinator {
         // 是归一后的全拼码，其余恒为击键。⚠️ 与上一行的词频记账**刻意不同域**：那条链有
         // 自己的 `freq_code`（码表按输入码、拼音按候选码），两者别互相照抄。
         let shadow_code = Self::shadow_code_of(state).to_string();
-        // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
-        self.apply_shadow(&mut candidates, &shadow_code);
+        // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）。
+        //
+        // ⚠️ 「优先级最高」这句现在由**返回值**兑现，而不再靠「排在最后」：出简让全排在它
+        // 之后（那是 `apply_freq_rerank` 强加的次序，见下），若不额外让路就会反过来覆盖
+        // 用户的调整。`user_pinned` 就是那条让路判据，取值只此一处。
+        let mut user_pinned = self.apply_shadow(&mut candidates, &shadow_code);
         // ── 空码补全收口 ──────────────────────────────────────────────────────
         // 精确匹配模式下「一条候选都没有」时补一条兜底。判据必须落在**最终列表**上：码表引擎
         // 与短语层各自只看得见自己那一半，谁先跑谁就会拿子集的空当成全局的空——引擎抢先补一条，
@@ -959,7 +963,9 @@ impl Coordinator {
                 self.apply_filter(state, &mut completion_pool);
                 // 补全池必须走同一条过滤链、**同一个码**：主列表隐藏掉的词若在这里被原码
                 // 补回来，用户看到的就是「删了又冒出来」。
-                self.apply_shadow(&mut completion_pool, &shadow_code);
+                // 返回值并进 `user_pinned`：补全收口只在主列表为空时走，那时上面那次
+                // `apply_shadow` 因空列表直接返回 false，判据全在这一次里。
+                user_pinned |= self.apply_shadow(&mut completion_pool, &shadow_code);
                 completion_pool.sort_by(|a, b| {
                     candidate_display_order(a, b, ignore_weight, mixed, &input_str)
                         .then_with(|| a.text.cmp(&b.text))
@@ -974,11 +980,16 @@ impl Coordinator {
         // 判据取自本次输入沿途记录的各级简码位首选（见 `short_code_yield`），零查询——
         // 打 khtk 必然逐键经过 k/kh/kht，那时的首选已经记下了。
         let yield_level = self.engine_mgr.codetable_settings().short_code_yield_level;
+        // `user_pinned`：用户右键调过这个码的顺序就整码停手——**候选调整优先于出简让全**。
+        // 让位没法简单地挪到 `apply_shadow` 之前来表达这个优先级：它被 `apply_freq_rerank`
+        // 钉在后面（4 码位 `ProtectPolicy.fallback = 0`，先让位会被调频原样顶回去），
+        // 于是优先级只能写成判据。详见 `short_code_yield::apply` 内的论证。
         short_code_yield::apply(
             &mut candidates,
             &state.input_buffer,
             &state.shortcode_tops,
             yield_level,
+            user_pinned,
         );
         // 记在让位**之后**：记的是用户实际看到的首条，让位本身也是用户所见的一部分。
         // 简码位因此可能记到词（该级被让位了），而更短那级仍记着字——`apply` 扫全部级别，
@@ -1321,8 +1332,8 @@ impl Coordinator {
     }
 
     /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。
-    pub(crate) fn apply_shadow(&self, candidates: &mut Vec<Candidate>, code: &str) {
-        self.apply_shadow_in(None, candidates, code);
+    pub(crate) fn apply_shadow(&self, candidates: &mut Vec<Candidate>, code: &str) -> bool {
+        self.apply_shadow_in(None, candidates, code)
     }
 
     /// 同 [`Self::apply_shadow`]，但可指定**生效方案**（特殊模式用）。
@@ -1333,17 +1344,23 @@ impl Coordinator {
     /// 规则写得进去却永远读不出来；而 `max_code_length=1` + `auto_commit_at_full` 的快符
     /// 方案敲一码即上屏，浏览态是用户**唯一**能右键的时机，等于该方案完全不能调候选。
     /// 主路径不受影响：空码时候选本就为空，首行即 return，零额外开销。
+    ///
+    /// # 返回值：本码是否有置顶规则**就位**（用户对这个码的顺序表达过主张）
+    ///
+    /// 出简让全据此让路，见 `short_code_yield::apply` 的 `user_pinned`。取值只此一处——
+    /// 让位侧不得自己再查一遍规则，那把 `data_schema_id` 折叠与 `shadow_code_of` 归一
+    /// 各复制一份，失配是完全静默的。
     pub(crate) fn apply_shadow_in(
         &self,
         schema_override: Option<&str>,
         candidates: &mut Vec<Candidate>,
         code: &str,
-    ) {
+    ) -> bool {
         if candidates.is_empty() {
-            return;
+            return false;
         }
         let Some(store) = &self.store else {
-            return;
+            return false;
         };
         // 候选调整按 data_schema_id 归属（拼音族折叠共享；码表/混输各自独立）。
         let schema = self.engine_mgr.data_schema_id(
@@ -1353,7 +1370,7 @@ impl Coordinator {
         );
         let rec = match store.get_shadow_rules(&schema, code) {
             Ok(Some(r)) => r,
-            _ => return,
+            _ => return false,
         };
         // 纯重排逻辑下沉 wind_candidate（镜像结构解耦，避免该 crate 依赖 wind-store）。
         // `cand_id` 必须一并传下去：短语候选的 word 记的是写入当天的求值文本，只有 id
@@ -1367,7 +1384,7 @@ impl Coordinator {
                 position: p.position,
             })
             .collect();
-        wind_candidate::apply_shadow(candidates, &rec.deleted, &pinned);
+        wind_candidate::apply_shadow(candidates, &rec.deleted, &pinned) > 0
     }
 
     /// 简繁 1对多变体展开：s2t 开启时，对最终候选列表中的**单字**候选，紧跟其后插入

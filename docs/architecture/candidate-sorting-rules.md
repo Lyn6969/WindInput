@@ -46,6 +46,7 @@
 | 7 | **`apply_filter`** | `handle_candidate.rs` | 检索范围过滤（常用字/GB18030）；**短语恒保留**（`is_common` 已由第 4.5 步填好） |
 | 8 | **`apply_freq_rerank`** | 同上 | 开自动调频**且有词频记录**时重排（见 §7）——**首要键压过第 5 步** |
 | 9 | **`apply_shadow`** | 同上 | 用户 shadow 规则：删除 + 置顶到指定位（**最高优先级**，见 §8） |
+| 9.5 | **`short_code_yield::apply`** | `short_code_yield.rs` | 出简让全：有简码的字在更长码位上把首选让给词并沉底。**排在 shadow 之后**（第 8 步的硬约束所迫），故对「用户排过序的码」整码停手，见 §8 |
 | 10 | **自动上屏复核** | 同上 | 满码/顶码唯一自动上屏判定（不改顺序，只决定要不要上屏） |
 | 11 | **`expand_s2t_variants`** | 同上 | 简繁 1对多变体紧跟原字插入（**必须在去重/重排/shadow 之后**，见 §9） |
 
@@ -455,9 +456,22 @@
 
 ## 8. Shadow（第 9 步，最高优先级）
 
-`apply_shadow`：按用户 shadow 规则先删 `deleted`、再把 `pinned` 词移到指定位置。**在所有排序之后应用，
-优先级最高**——用户手工置顶/删除的意图压过一切算法序。按 `data_schema_id` 归属（拼音族折叠共享、
-码表/混输各自独立）。
+`apply_shadow`：按用户 shadow 规则先删 `deleted`、再把 `pinned` 词移到指定位置。**优先级最高**——
+用户手工置顶/删除的意图压过一切算法序。按 `data_schema_id` 归属（拼音族折叠共享、码表/混输各自独立）。
+
+> ⚠️ 「最高优先级」**不再由「排在最后」兑现**。出简让全（第 9.5 步）排在它之后——那是
+> `apply_freq_rerank` 强加的次序（深码位 `ProtectPolicy.fallback = 0` 不设保护，先让位会被调频原样
+> 顶回去），而 shadow 恰好夹在两者之间，没有能同时满足两个约束的位置。于是优先级改写成**判据**：
+> `apply_shadow` 返回本码是否有 `pinned` 规则就位，让位据此对整码停手。
+>
+> 判据只在 `apply_shadow` 一处取值，让位侧**不得**自己再查一次规则——`(schema, code)` 的取法有
+> `data_schema_id` 折叠与 `shadow_code_of` 归一两道，两处各取一次迟早失配且完全静默。
+>
+> 只数 `pinned` 不数 `deleted`：删除说的是「这条别出现」，与「谁排第一」不是同一维度。
+> 详见 `docs/design/codetable-short-code-yields-full.md` §6.2。
+>
+> **给后来者**：任何新的重排若排在 shadow 之后，都要回答同一个问题——它凭什么可以推翻用户手工
+> 排定的顺序。默认答案是不能，做法照抄第 9.5 步的判据。
 
 ## 9. `apply_filter` 与 `expand_s2t_variants`
 
