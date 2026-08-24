@@ -110,6 +110,40 @@ fn str_param<'a>(p: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("缺少参数 {}", key))
 }
 
+/// 按设置页点选的列给常用字列表排序。`sort_by` 为空 = 不动，保持字表原序。
+///
+/// ## 为什么 `"text"` 也要认
+///
+/// 「字」那一列复用了 `WordField::Text`（`cell_text` 取它正好得到那个字），于是设置页发来的
+/// `sortBy` 是 `"text"`，而这张表的 json 字段名是 `"char"`。两个都收下——只认一个的后果是
+/// 点了列头毫无反应，**且不报错**。
+///
+/// ## 稳定排序，不用 `reverse()`
+///
+/// 降序走 `Ordering::reverse` 而不是排完再整体反转：后者会把同值组内的顺序也倒过来，
+/// 于是按「当前」排序时，同为生僻的那一批会从字表原序变成倒序——用户看到的是一列
+/// 莫名其妙乱序的字。稳定排序则让同值组保持字表原序。
+fn sort_common_char_rows(
+    rows: &mut [wind_coordinator::handle_common_chars::CommonCharRow],
+    sort_by: &str,
+    desc: bool,
+) {
+    let key = |r: &wind_coordinator::handle_common_chars::CommonCharRow| match sort_by {
+        "text" | "char" => (r.ch as u32, false),
+        // bool 升序 = false 在前 = 生僻在前。
+        "baseCommon" => (0, r.base_common),
+        "common" => (0, r.common),
+        _ => (0, false),
+    };
+    if !matches!(sort_by, "text" | "char" | "baseCommon" | "common") {
+        return;
+    }
+    rows.sort_by(|a, b| {
+        let o = key(a).cmp(&key(b));
+        if desc { o.reverse() } else { o }
+    });
+}
+
 /// 参数里取一个**单字**。
 ///
 /// 多字符 / 空串一律拒绝，而不是取首字符：「常用」是字级属性，悄悄截取会让用户以为
@@ -2317,7 +2351,12 @@ pub trait WebDataRpc: WebDataHost {
             .get("onlyModified")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let rows = self.common_char_rows(query, only_modified);
+        let mut rows = self.common_char_rows(query, only_modified);
+        sort_common_char_rows(
+            &mut rows,
+            params.get("sortBy").and_then(|v| v.as_str()).unwrap_or(""),
+            params.get("sortOrder").and_then(|v| v.as_str()) == Some("desc"),
+        );
         let total = rows.len();
         let offset = usize_param(params, "offset", 0);
         // limit=0 视为不限（调用方不分页时直接全取）。
@@ -4500,6 +4539,70 @@ mod tests {
             common_char_rows_rpc(&c, json!({ "onlyModified": true })).1,
             0
         );
+    }
+
+    /// 列头排序：三列都要认，且**降序不能破坏同值组内的顺序**。
+    ///
+    /// 用纯函数直接验，不经 RPC：webdata 的装置没有 data_dir，默认字表为空，凑不出
+    /// 「同值多行」的样本，而那正是稳定性要考察的东西。
+    #[test]
+    fn common_chars_sorting_is_stable_and_accepts_both_char_keys() {
+        use wind_coordinator::handle_common_chars::CommonCharRow;
+        let row = |ch: char, base: bool, now: bool| CommonCharRow {
+            ch,
+            common: now,
+            base_common: base,
+            overridden: base != now,
+        };
+        // 入参顺序 = 字表原序，刻意不按码位排。
+        let seed = vec![
+            row('一', true, true),
+            row('乙', true, false),
+            row('二', true, true),
+            row('槮', false, true),
+        ];
+
+        // 不给 sortBy：原序不动。
+        let mut r = seed.clone();
+        sort_common_char_rows(&mut r, "", false);
+        assert_eq!(chars(&r), "一乙二槮", "无排序时须保持字表原序");
+
+        // 「字」那一列发来的是 `text`（复用 WordField::Text），也要认 `char`。
+        for key in ["text", "char"] {
+            let mut r = seed.clone();
+            sort_common_char_rows(&mut r, key, false);
+            let asc = chars(&r);
+            let mut expect: Vec<char> = seed.iter().map(|x| x.ch).collect();
+            expect.sort_unstable();
+            assert_eq!(
+                asc,
+                expect.iter().collect::<String>(),
+                "sortBy={key} 应按码位升序"
+            );
+        }
+
+        // 按「当前」升序：生僻(false) 在前；同值组内保持字表原序。
+        let mut r = seed.clone();
+        sort_common_char_rows(&mut r, "common", false);
+        assert_eq!(chars(&r), "乙一二槮", "生僻的「乙」提前，其余保持原序");
+
+        // 降序：整体翻面，但**同值组内仍是字表原序**（这正是不能用 reverse() 的原因）。
+        let mut r = seed.clone();
+        sort_common_char_rows(&mut r, "common", true);
+        assert_eq!(
+            chars(&r),
+            "一二槮乙",
+            "常用的那组内部仍按字表原序，不能连同值一起倒过来"
+        );
+
+        // 未知字段一律不动，别把列表搅乱。
+        let mut r = seed.clone();
+        sort_common_char_rows(&mut r, "weight", false);
+        assert_eq!(chars(&r), "一乙二槮");
+    }
+
+    fn chars(rows: &[wind_coordinator::handle_common_chars::CommonCharRow]) -> String {
+        rows.iter().map(|r| r.ch).collect()
     }
 
     fn quick_rows(c: &Coordinator) -> Vec<Value> {
