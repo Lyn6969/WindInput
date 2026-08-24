@@ -14,6 +14,7 @@
 //! 把 wind-transfer/fontdb 等重依赖挡在 Android 闭包之外。
 
 use serde_json::{Value, json};
+use wind_coordinator::handle_common_chars::CommonCharEdit;
 use wind_coordinator::handle_quick_format::QuickFormatEdit;
 /// [`WebData::apply_pinyin_entry_contract`] 的处置统计，逐项对应导入预览的三档
 /// （见 `docs/design/pinyin-entry-boundary-contract.md` §5）。
@@ -107,6 +108,22 @@ fn str_param<'a>(p: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     p.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("缺少参数 {}", key))
+}
+
+/// 参数里取一个**单字**。
+///
+/// 多字符 / 空串一律拒绝，而不是取首字符：「常用」是字级属性，悄悄截取会让用户以为
+/// 自己给整个词做了标记，而实际上只标了第一个字。
+fn char_param(p: &Value, key: &str) -> anyhow::Result<char> {
+    let s = str_param(p, key)?;
+    let mut it = s.chars();
+    let ch = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("参数 {key} 不能为空"))?;
+    if it.next().is_some() {
+        anyhow::bail!("参数 {key} 只能是一个字（收到「{s}」）");
+    }
+    Ok(ch)
 }
 
 /// 读取 `sections` 参数（字符串数组）→ 词库数据段；缺省返回 None（由调用方取引擎默认）。
@@ -368,6 +385,11 @@ pub trait WebDataRpc: WebDataHost {
             // ── quick.*（快捷输入格式表的用户调整，全局，redb 持久化）──
             // 基表（模板与出厂顺序）在 system.quick.toml，**RPC 一律不写它**：
             // 那会抢走高级用户手写文件的所有权，见 handle_quick_format 模块文档。
+            "commonChars.list" => self.web_common_chars_list(),
+            "commonChars.query" => self.web_common_chars_query(params),
+            "commonChars.set" => self.web_common_chars_set(params),
+            "commonChars.reset" => self.web_common_chars_reset(params),
+            "commonChars.clear" => self.web_common_chars_clear(),
             "quick.list" => self.web_quick_list(),
             "quick.move" => self.web_quick_move(params),
             "quick.setEnabled" => self.web_quick_set_enabled(params),
@@ -2269,6 +2291,66 @@ pub trait WebDataRpc: WebDataHost {
         let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
         let index = usize_param(params, "index", 0);
         self.quick_format_edit(kind, id, QuickFormatEdit::MoveTo(index))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    // ── 常用字表的用户覆盖（右键「设为生僻字/常用字」的设置页一侧）────────────
+    //
+    // 列表**只含用户改过的字**，不是那 8104 个出厂字：存储本就是稀疏的，界面因此天然是
+    // 一份「我的调整」。要在 8104 个字里翻页找一个字的界面根本没法用，而那也不是用户
+    // 想在这个页面里做的事。
+
+    fn web_common_chars_list(&self) -> anyhow::Result<Value> {
+        let rows: Vec<Value> = self
+            .common_char_rows()
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "char": r.ch.to_string(),
+                    "common": r.common,
+                    // 出厂判定要一起给：界面靠它显示「出厂：常用 → 现在：生僻」这层对照。
+                    // 只给 common 的话，用户看到一行「的 · 生僻」不知道自己改的是什么。
+                    "baseCommon": r.base_common,
+                })
+            })
+            .collect();
+        Ok(json!({ "items": rows }))
+    }
+
+    fn web_common_chars_query(&self, params: &Value) -> anyhow::Result<Value> {
+        let ch = char_param(params, "char")?;
+        let st = self.common_char_state(ch);
+        Ok(json!({
+            "char": ch.to_string(),
+            // false ⇒ 界面应拒绝添加：读端根本不查这类字符，存了也永不生效。
+            "governed": st.governed,
+            "baseCommon": st.base_common,
+            "override": st.over,
+            // 当前生效判定，省得前端再算一遍（算错了就是两边显示不一致）。
+            "effective": st.over.unwrap_or(st.base_common),
+        }))
+    }
+
+    fn web_common_chars_set(&self, params: &Value) -> anyhow::Result<Value> {
+        let ch = char_param(params, "char")?;
+        let common = params
+            .get("common")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| anyhow::anyhow!("缺少参数 common"))?;
+        self.common_char_edit(ch, CommonCharEdit::Set(common))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_common_chars_reset(&self, params: &Value) -> anyhow::Result<Value> {
+        let ch = char_param(params, "char")?;
+        self.common_char_edit(ch, CommonCharEdit::Reset)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_common_chars_clear(&self) -> anyhow::Result<Value> {
+        // 整表操作没有单字归属，传一个占位字符（`ClearAll` 忽略它），
+        // 与 `quick.resetKind` 传空 id 同一惯例。
+        self.common_char_edit('\0', CommonCharEdit::ClearAll)?;
         Ok(json!({ "ok": true }))
     }
 

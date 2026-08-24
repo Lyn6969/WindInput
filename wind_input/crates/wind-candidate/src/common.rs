@@ -3,19 +3,30 @@
 //! 与 Go 版本 `wind_input/internal/dict/common_chars.go` 对齐。
 //! 用于"检索范围"过滤：判定候选是否为常用字/词。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// 通用规范汉字表（8105 字：一级 3500 + 二级 3000 + 三级 1605）。
+/// 通用规范汉字表（出厂 8104 字：一级 3500 + 二级 3000 + 三级其余）+ **用户覆盖**。
+///
+/// 两层分开存是刻意的：
+/// - `base` 来自 `common_chars.txt`（含用户目录整份覆盖），跟随出厂更新；
+/// - `overrides` 是用户在候选右键 / 词库管理里一个个点出来的稀疏调整，落在 redb。
+///
+/// 合成只发生在查询那一刻（覆盖优先），**不预先 merge 成一个集合**——merge 之后就分不清
+/// 「这个字出厂就常用」还是「用户把它设成了常用」，而界面要显示的正是这个差别
+/// （「出厂：生僻 → 现在：常用」），「恢复出厂」也需要知道回退到哪一边。
 pub struct CommonChars {
-    set: HashSet<char>,
+    /// 出厂基表。
+    base: HashSet<char>,
+    /// 用户覆盖：`true` = 强制判为常用，`false` = 强制判为生僻。只含被碰过的字。
+    overrides: HashMap<char, bool>,
 }
 
 impl CommonChars {
     /// 从文件加载（一字一行，`#` 注释行跳过；仅收录汉字，见 [`is_han`]）。
     /// 失败（文件缺失）返回空集；上层应在空集时退化为"不过滤"。
     pub fn load(path: &Path) -> Self {
-        let mut set = HashSet::new();
+        let mut base = HashSet::new();
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
                 let line = line.trim();
@@ -24,22 +35,60 @@ impl CommonChars {
                 }
                 for ch in line.chars() {
                     if is_han(ch) {
-                        set.insert(ch);
+                        base.insert(ch);
                     }
                 }
             }
         }
-        Self { set }
+        Self {
+            base,
+            overrides: HashMap::new(),
+        }
     }
 
-    /// 是否未加载到任何字（数据缺失）。
+    /// 由一批字直接构造基表（测试与内存态装配用）。
+    pub fn from_base(chars: impl IntoIterator<Item = char>) -> Self {
+        Self {
+            base: chars.into_iter().collect(),
+            overrides: HashMap::new(),
+        }
+    }
+
+    /// **整体替换**用户覆盖（调用方从 store 全量读出后灌进来）。
+    ///
+    /// 刻意不做增量合并：增量语义下「撤销某字的覆盖」这个操作没有落点——被删掉的那条
+    /// 在旧集合里仍然存在，用户会看到「点了恢复出厂、重启前毫无变化」。
+    pub fn set_overrides(&mut self, it: impl IntoIterator<Item = (char, bool)>) {
+        self.overrides = it.into_iter().collect();
+    }
+
+    /// 是否未加载到任何**出厂**字（数据缺失）。
+    ///
+    /// ⚠️ 只看 `base`，不看覆盖：上层拿它决定「退化为不过滤」。若用户覆盖也算数，那么
+    /// 出厂表缺失、而用户恰好设过一两个字时本函数返回 false，过滤照常进行——此刻几乎
+    /// 所有字都查不到表、全被判成生僻，智能档会把候选滤得只剩那一两个字。
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.base.is_empty()
     }
 
-    /// 单字是否常用。PUA 等不在表内的字符一律非常用（直接查表即可，无忽略逻辑）。
+    /// 单字是否常用：**用户覆盖优先**，其次查出厂基表。
+    /// 两边都没有的字符（含 PUA）一律非常用。
     pub fn is_char_common(&self, ch: char) -> bool {
-        self.set.contains(&ch)
+        match self.overrides.get(&ch) {
+            Some(&v) => v,
+            None => self.base.contains(&ch),
+        }
+    }
+
+    /// 出厂判定（忽略用户覆盖）。供界面显示「出厂：常用 → 现在：生僻」这类对照，
+    /// 以及判断某条覆盖是否与出厂同向（同向的覆盖是冗余的，可以提示清理）。
+    pub fn is_base_common(&self, ch: char) -> bool {
+        self.base.contains(&ch)
+    }
+
+    /// 某字的用户覆盖方向；`None` = 未覆盖。
+    pub fn override_of(&self, ch: char) -> Option<bool> {
+        self.overrides.get(&ch).copied()
     }
 
     /// 字符串是否常用：其中所有「汉字」都在表内，非汉字辅助字符（标点/字母/数字/
@@ -58,13 +107,25 @@ impl CommonChars {
             return false;
         }
         for ch in text.chars() {
-            // 汉字（含被本码表当汉字用的 PUA）必须在表内；其余辅助字符忽略。
-            if (is_han(ch) || is_pua(ch)) && !self.set.contains(&ch) {
+            // 汉字（含被本码表当汉字用的 PUA）必须判为常用；其余辅助字符忽略。
+            if is_common_scope(ch) && !self.is_char_common(ch) {
                 return false;
             }
         }
         true
     }
+}
+
+/// 常用字表**管辖**哪些字符 = [`is_han`] ∪ [`is_pua`]。
+///
+/// 这是 [`CommonChars::is_string_common`] 里那道判据的公开形态，供上层做**准入**用：
+/// 候选右键的「设为生僻字 / 设为常用字」只对本域内的字符成立。
+///
+/// ★ 两处必须同源。写端放行了本域之外的字符（比如给 `、` 或 emoji 存一条覆盖），
+/// 读端会照旧忽略它 —— 表现是「设了，存进去了，毫无作用」，且完全静默：
+/// 数据库里躺着一条用户以为生效的记录，没有任何一层会报错。
+pub fn is_common_scope(ch: char) -> bool {
+    is_han(ch) || is_pua(ch)
 }
 
 /// 是否「须按通用规范汉字表判定常用性」的汉字。
@@ -174,10 +235,7 @@ mod tests {
 
     #[test]
     fn test_string_common() {
-        let mut set = HashSet::new();
-        set.insert('我');
-        set.insert('们');
-        let cc = CommonChars { set };
+        let cc = CommonChars::from_base(['我', '们']);
         assert!(cc.is_string_common("我们")); // 全部常用
         assert!(!cc.is_string_common("我鬱")); // 含生僻
         assert!(!cc.is_string_common("")); // 空串
@@ -189,10 +247,7 @@ mod tests {
         // 回归：用户词库里含中文顿号的词条在「常用字/智能」档被滤掉。
         // 根因＝判定域按 `0x2E80..=0x33FF` 整段圈定，把 CJK 符号和标点区当成必须查表的汉字，
         // 而字表里只有纯汉字。判据现按语义而非 Unicode 块邻接：符号一律忽略。
-        let mut set = HashSet::new();
-        set.insert('我');
-        set.insert('们');
-        let cc = CommonChars { set };
+        let cc = CommonChars::from_base(['我', '们']);
 
         assert!(cc.is_string_common("、")); // 顿号单条词条（本次上报的现象）
         assert!(cc.is_string_common("我、们")); // 混排：标点不再拖累整词判定
@@ -214,12 +269,87 @@ mod tests {
     fn test_pua_not_common() {
         // 回归：五笔 dwi 下 U+E831（PUA）冒充生僻字混进常用字档。PUA 被本码表当汉字用，
         // 不在规范字表内即非常用；emoji/符号等真辅助字符仍忽略。
-        let mut set = HashSet::new();
-        set.insert('仄');
-        let cc = CommonChars { set };
+        let cc = CommonChars::from_base(['仄']);
         assert!(cc.is_string_common("仄")); // 真汉字在表内
         assert!(!cc.is_string_common("\u{E831}")); // PUA 单字：非常用（正是 dwi 豆腐候选）
         assert!(!cc.is_string_common("仄\u{E831}")); // 含 PUA 的混合串亦非常用
         assert!(cc.is_string_common("仄😀")); // emoji（U+1F600）非汉字：忽略，不影响判定
+    }
+
+    /// 用户覆盖两个方向都要生效，且要能穿透到整串判定。
+    #[test]
+    fn overrides_win_over_base_in_both_directions() {
+        let mut cc = CommonChars::from_base(['我', '们']);
+        assert!(cc.is_char_common('我'));
+        assert!(!cc.is_char_common('鬱'));
+
+        cc.set_overrides([('我', false), ('鬱', true)]);
+        assert!(!cc.is_char_common('我'), "常用字降级为生僻");
+        assert!(cc.is_char_common('鬱'), "生僻字升级为常用");
+        // 整串判定走同一条路：降级后的字会拖累整个词。
+        assert!(!cc.is_string_common("我们"));
+        assert!(cc.is_string_common("鬱"));
+        // 出厂判定不受覆盖影响——界面要靠它显示「出厂 → 现在」的对照。
+        assert!(cc.is_base_common('我'));
+        assert!(!cc.is_base_common('鬱'));
+        assert_eq!(cc.override_of('我'), Some(false));
+        assert_eq!(cc.override_of('们'), None);
+    }
+
+    /// `set_overrides` 是整体替换：撤销掉的那条必须真的消失。
+    ///
+    /// 若实现成增量合并，「恢复出厂」在下次重灌前不会生效——症状是点了没反应，
+    /// 重启后才对，属于最难查的一类（[[project_runtime_mirror_state_config_sync]]）。
+    #[test]
+    fn set_overrides_replaces_rather_than_merges() {
+        let mut cc = CommonChars::from_base(['我']);
+        cc.set_overrides([('我', false), ('鬱', true)]);
+        assert!(!cc.is_char_common('我'));
+
+        // 用户撤销了「我」那条，store 全量读出来只剩「鬱」。
+        cc.set_overrides([('鬱', true)]);
+        assert!(cc.is_char_common('我'), "撤销后回到出厂判定");
+        assert!(cc.is_char_common('鬱'));
+    }
+
+    /// ⚠️ `is_empty` 只看出厂基表：它是上层「退化为不过滤」的判据。
+    ///
+    /// 把覆盖也算进去的话，出厂表缺失而用户设过一个字时它会返回 false，于是过滤照常
+    /// 进行——此刻几乎所有字都不在表里、全被判生僻，智能档会把候选滤到只剩那一个字。
+    #[test]
+    fn is_empty_ignores_overrides() {
+        let mut cc = CommonChars::from_base([]);
+        assert!(cc.is_empty());
+        cc.set_overrides([('鬱', true)]);
+        assert!(cc.is_empty(), "有覆盖也仍算数据缺失");
+    }
+
+    /// 判定域自洽：`is_common_scope` 放行的字符，正是 `is_string_common` 会去查表的那些。
+    ///
+    /// 上层拿 `is_common_scope` 做右键菜单的准入。两处一旦漂移，用户就能给一个读端
+    /// 根本不查的字符（`、`、emoji）存下覆盖，然后发现「设了完全没用」且毫无报错。
+    #[test]
+    fn common_scope_matches_string_judgement() {
+        let cc = CommonChars::from_base([]);
+        for ch in ['我', '鬱', '\u{E831}', '\u{20000}', '氵'] {
+            assert!(is_common_scope(ch), "{ch} 应在管辖域内");
+            // 域内且不在表里 ⇒ 整串判非常用。
+            assert!(!cc.is_string_common(&ch.to_string()), "{ch} 应判非常用");
+        }
+        for ch in ['、', '，', '①', '℃', 'あ', '😀', 'A', '7'] {
+            assert!(!is_common_scope(ch), "{ch} 应在管辖域外");
+            // 域外 ⇒ 被忽略，不拖累判定。
+            assert!(cc.is_string_common(&ch.to_string()), "{ch} 应被忽略");
+        }
+    }
+
+    /// 域外字符即使被强行写入覆盖也不生效——这正是准入判据必须与读端同源的原因。
+    #[test]
+    fn overrides_on_out_of_scope_chars_are_inert() {
+        let mut cc = CommonChars::from_base(['我']);
+        cc.set_overrides([('、', false), ('😀', false)]);
+        // 读端对域外字符直接跳过，覆盖形同虚设。
+        assert!(cc.is_string_common("、"));
+        assert!(cc.is_string_common("我😀"));
     }
 }

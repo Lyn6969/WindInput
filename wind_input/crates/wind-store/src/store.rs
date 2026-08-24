@@ -68,6 +68,13 @@ pub(crate) const SHADOW: TableDefinition<&str, &[u8]> = TableDefinition::new("sh
 /// 的模块文档（存错了会表现为「调整当时有效、隔天失效」）。
 /// 新表无需迁移：`init_tables` 在写事务里 `open_table` 即创建。
 pub(crate) const QUICK_FORMAT: TableDefinition<&str, &[u8]> = TableDefinition::new("quick_format");
+/// 常用字表的**用户覆盖**：key = 单个字，value = 记录 JSON。
+///
+/// **键不带方案**——「某个字常不常用」是全局字级属性，与 [`SHADOW`]（按方案 + 输入码）
+/// 刻意分开。只存用户碰过的字，出厂那 8104 字仍在 `common_chars.txt` 里；为什么不整表
+/// 进库见 [`crate::common_chars`] 的模块文档。
+/// 新表无需迁移：`init_tables` 在写事务里 `open_table` 即创建。
+pub(crate) const COMMON_CHARS: TableDefinition<&str, &[u8]> = TableDefinition::new("common_chars");
 /// 全局短语：key = "{code}\0{text}"
 pub(crate) const PHRASES: TableDefinition<&str, &[u8]> = TableDefinition::new("phrases");
 /// 每日统计：key = "YYYY-MM-DD"
@@ -159,6 +166,7 @@ impl Store {
             w.open_table(FREQ)?;
             w.open_table(SHADOW)?;
             w.open_table(QUICK_FORMAT)?;
+            w.open_table(COMMON_CHARS)?;
             w.open_table(PHRASES)?;
             w.open_table(STATS_DAILY)?;
             w.open_table(META)?;

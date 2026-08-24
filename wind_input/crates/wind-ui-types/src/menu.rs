@@ -33,6 +33,12 @@ pub enum CandidateOp {
     Delete,
     /// 恢复默认
     Reset,
+    /// 常用/生僻互切（**全局字级**，不限本方案本码）。
+    ///
+    /// 与上面五项不是一类：那些落在 shadow（键 = 方案 + 输入码），这个落在常用字覆盖表
+    /// （键 = 那个字）。菜单只给一项，文案按当前判定二选一——「设为生僻字」/「设为常用字」，
+    /// 故不需要两个变体。
+    ToggleCommon,
 }
 
 /// 功能主菜单命令（对齐 Go 统一菜单）
@@ -178,6 +184,7 @@ impl MenuKind {
                 CandidateOp::MoveDown => 12,
                 CandidateOp::Delete => 13,
                 CandidateOp::Reset => 14,
+                CandidateOp::ToggleCommon => 15,
             },
             MenuKind::Command(cmd) => match cmd {
                 MenuCmd::SchemaEnglish => 100,
@@ -234,6 +241,7 @@ impl MenuKind {
             12 => return Some(MenuKind::Op(CandidateOp::MoveDown)),
             13 => return Some(MenuKind::Op(CandidateOp::Delete)),
             14 => return Some(MenuKind::Op(CandidateOp::Reset)),
+            15 => return Some(MenuKind::Op(CandidateOp::ToggleCommon)),
             100 => MenuCmd::SchemaEnglish,
             101 => MenuCmd::TogglePunct,
             102 => MenuCmd::ToggleWidth,

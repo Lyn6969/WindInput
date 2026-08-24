@@ -1253,13 +1253,15 @@ impl Coordinator {
     /// 判定（纯计算）与过滤（按模式裁剪，见 `apply_filter`）因此拆开：判定无条件跑，
     /// 过滤仍留在原步骤、语义不变。
     pub(crate) fn mark_common(&self, candidates: &mut [Candidate]) {
-        if self.common_chars.is_empty() {
+        // 读锁在循环外取一次：逐候选取锁在这条热路径（每次按键 × 每个候选）上纯属浪费。
+        let cc = self.common_chars.read().unwrap_or_else(|e| e.into_inner());
+        if cc.is_empty() {
             return;
         }
         for c in candidates.iter_mut() {
             // 短语保留（is_phrase 已置位）；其余按常用字表判定
             if !c.is_phrase {
-                c.is_common = self.common_chars.is_string_common(&c.text);
+                c.is_common = cc.is_string_common(&c.text);
             }
         }
     }
@@ -1271,7 +1273,12 @@ impl Coordinator {
     /// `General` 模式会把候选**全部滤光**。
     pub(crate) fn apply_filter(&self, state: &State, candidates: &mut Vec<Candidate>) {
         let mode = state.filter_mode;
-        if mode == wind_candidate::FilterMode::Gb18030 || self.common_chars.is_empty() {
+        let table_missing = self
+            .common_chars
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if mode == wind_candidate::FilterMode::Gb18030 || table_missing {
             return;
         }
         let taken = std::mem::take(candidates);
@@ -3090,11 +3097,6 @@ impl Coordinator {
         if state.candidates.is_empty() {
             return;
         }
-        // 作用域即准入：拿不到落点（无词库归属的 overlay / 空码浏览态）就什么都不做，
-        // 与菜单侧「只给复制」是同一个判据的两副面孔。
-        let Some(scope) = self.candidate_op_scope(&state) else {
-            return;
-        };
         let (start, end) = self.page_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
@@ -3102,6 +3104,21 @@ impl Coordinator {
         }
         let cand = state.candidates[idx].clone();
         let word = cand.text.clone();
+
+        // 常用/生僻标记落在全局字级的覆盖表，**不需要词库落点**，故必须分派在下面那道
+        // 作用域准入之前。放在后面的话，临拼/临英/混输/空码浏览态下菜单给了入口而写端
+        // 直接 return —— 用户点得动、毫无反应、没有任何日志，是最难查的一类错配。
+        // 判据与菜单侧 `common_char_mark` 同源（都由它决定给不给这一项）。
+        if matches!(op, CandidateOp::ToggleCommon) {
+            self.toggle_common_char(&mut state, &word);
+            return;
+        }
+
+        // 作用域即准入：拿不到落点（无词库归属的 overlay / 空码浏览态）就什么都不做，
+        // 与菜单侧「只给复制」是同一个判据的两副面孔。
+        let Some(scope) = self.candidate_op_scope(&state) else {
+            return;
+        };
         let CandidateOpScope {
             schema,
             code,
@@ -3157,6 +3174,9 @@ impl Coordinator {
                 // 双拼下混用会让短语删除静默失效——写进 `hao`、读的是 `hc`。
                 CandidateOp::Delete => self.delete_candidate_by_source(&schema, &raw_code, &cand),
                 CandidateOp::Reset => store.remove_shadow_rule(&sh_schema, &code, &word, cand_id),
+                // 不可达：它在上面就 early-return 了（落点是全局常用字覆盖表，不是 shadow）。
+                // 保持不 panic —— 菜单 id 由 IPC 回传，让一个越界值把输入法打崩不值当。
+                CandidateOp::ToggleCommon => Ok(()),
             };
             if let Err(e) = r {
                 warn!("candidate op failed: {}", e);

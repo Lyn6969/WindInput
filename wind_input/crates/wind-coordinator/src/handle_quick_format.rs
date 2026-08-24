@@ -46,14 +46,21 @@ impl QuickFormatOp {
     /// 两处语义有偏移，菜单标签必须相应改写（在 `show_candidate_menu` 里）：
     /// - `Delete` 对候选是「从词库屏蔽这个词」，对格式是「不再显示这种写法」；
     /// - `Reset` 对候选是「恢复这一条」，对格式是「恢复**整类**」（停用后点不到单条）。
-    pub fn from_candidate_op(op: wind_ui_types::CandidateOp) -> Self {
+    ///
+    /// `None` = 这个动作对格式候选没有对应语义，调用方应原样忽略。
+    pub fn from_candidate_op(op: wind_ui_types::CandidateOp) -> Option<Self> {
         use wind_ui_types::CandidateOp as C;
         match op {
-            C::MoveTop => Self::MoveTop,
-            C::MoveUp => Self::MoveUp,
-            C::MoveDown => Self::MoveDown,
-            C::Delete => Self::Disable,
-            C::Reset => Self::ResetKind,
+            C::MoveTop => Some(Self::MoveTop),
+            C::MoveUp => Some(Self::MoveUp),
+            C::MoveDown => Some(Self::MoveDown),
+            C::Delete => Some(Self::Disable),
+            C::Reset => Some(Self::ResetKind),
+            // 常用/生僻标记是**字**的属性，而格式候选是求值结果（`2026年8月24日`）：
+            // 既不是单字，那串文本次日还会变。菜单侧的 quick 分支本就不给这一项，
+            // 这里返回 None 是第二道闸——返回类型逼着「新加一个 op」时必须来这儿表态，
+            // 而不是默默落进某个语义不搭的分支。
+            C::ToggleCommon => None,
         }
     }
 }
@@ -216,7 +223,12 @@ impl Coordinator {
         let Some(scope) = scope else {
             return self.candidate_op(op, page_local);
         };
-        self.apply_quick_format_op(&scope, QuickFormatOp::from_candidate_op(op));
+        // 对格式候选无语义的动作（常用/生僻标记）原样忽略：菜单侧的 quick 分支本就不给，
+        // 走到这里只可能是热键或协议回传的越界 id。
+        let Some(qop) = QuickFormatOp::from_candidate_op(op) else {
+            return;
+        };
+        self.apply_quick_format_op(&scope, qop);
         // 立即重排：不刷新的话，用户得退出重进才看得到新顺序。
         // 走 mix 路径——快捷输入的候选在 `mix_buffer` 上，主路径的 `update_candidates`
         // 读 `input_buffer`（此处恒空），用错的后果不是「不刷新」而是候选窗被清空。

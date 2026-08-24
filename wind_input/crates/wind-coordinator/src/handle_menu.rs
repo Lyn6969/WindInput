@@ -1502,11 +1502,26 @@ impl Coordinator {
             });
             return;
         }
+        // 常用/生僻标记：作用域是**全局的那个字**，与词库落点无关，故对上面那两类
+        // 「只有复制」的状态同样成立——它只需要 `cand.text` 是一个受管辖的汉字。
+        // ⚠️ 刻意不搭 `candidate_op_scope` 的便车：那个判据问的是「有没有词库落点」，
+        // 用它来管这一项，会让临拼/临英/混输/空码浏览态下的字莫名其妙标不了。
+        let common_item = self.common_char_mark(&word).map(|m| {
+            // 文案按当前判定二选一。「（全局）」不是啰嗦：它紧挨着「隐藏此候选」
+            // （仅本方案本码），不写作用域用户会两个都试一遍再困惑于表现为何不同。
+            let label = if m.common {
+                "设为生僻字（全局）"
+            } else {
+                "设为常用字（全局）"
+            };
+            M::leaf(label, op(CandidateOp::ToggleCommon), true, false)
+        });
+
         // 有词库落点才给词条操作。无落点的两类状态——没有独立词库归属的 overlay（临拼/临英/
         // 混输/网址，编码各持独立缓冲且无处落键）与空码浏览态（特殊模式 show_all_on_enter，
         // 读端 apply_shadow_in 对空码直接 return，写了也永不生效）——仅保留复制。
         // 判据与写端 `candidate_op` 同源，见 `candidate_op_scope`。
-        let items = if let Some(scope) = scope {
+        let mut items = if let Some(scope) = scope {
             let cand_id = (!cand.id.is_empty()).then_some(cand.id.as_str());
             let has_rule = self.shadow_has_rule(&scope.schema, &scope.code, &word, cand_id);
             // 拼音普通候选**只放行置顶**，前移/后移仍禁（`position=0` 位置语义稳定，
@@ -1535,11 +1550,15 @@ impl Coordinator {
                 M::leaf(delete_label, op(CandidateOp::Delete), delete_enabled, false),
                 M::leaf("恢复默认", op(CandidateOp::Reset), has_rule, false),
                 M::separator(),
-                M::leaf("复制", MenuKind::Copy, true, false),
             ]
         } else {
-            vec![M::leaf("复制", MenuKind::Copy, true, false)]
+            Vec::new()
         };
+        // 尾段两项对**两个分支都成立**，故统一在这里追加，不在各分支里各写一份：
+        // 分支里各写一份正是「加一项时漏改另一处」的经典入口，而漏改的表现是
+        // 「同一个字在临拼下右键没有这一项」——用户绝不会想到那是分支写重了。
+        items.extend(common_item);
+        items.push(M::leaf("复制", MenuKind::Copy, true, false));
         self.mark_menu_open(page_local, word);
         // 候选右键菜单在光标处向下弹出（above=false，y_bottom 不使用）。
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {

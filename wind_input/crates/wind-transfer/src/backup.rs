@@ -157,6 +157,16 @@ pub fn create_backup(
         "phrase",
         serde_json::Value::Null,
     )?;
+    // 常用字表的用户覆盖：键不带方案，故与 phrases 一样是全局段，不进上面的逐 schema 循环。
+    // 这是用户在候选上一个个点出来的数据，不备份就意味着换机重来一遍。
+    let common_chars = store.export_common_chars_jsonl()?;
+    add(
+        &mut w,
+        "userdata/common_chars.jsonl".into(),
+        common_chars.as_bytes(),
+        "common_chars",
+        serde_json::Value::Null,
+    )?;
 
     if opts.include_stats {
         let stats = store.export_stats_jsonl()?;
@@ -362,6 +372,13 @@ pub fn restore_backup(
                 store.import_user_phrases_wdict(&text())?;
                 restored.push(e.path.clone());
             }
+            "common_chars" => {
+                if replace && cleared.insert("common_chars".into()) {
+                    store.clear_common_char_overrides()?;
+                }
+                store.import_common_chars_jsonl(&text())?;
+                restored.push(e.path.clone());
+            }
             "stats" => {
                 if replace && cleared.insert("stats".into()) {
                     store.clear_stats()?;
@@ -429,6 +446,9 @@ mod tests {
         s.record_freq("wb", "a", "工").unwrap();
         s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
         s.add_phrase("bj", "北京", 0, 10).unwrap();
+        // 常用字覆盖：全局段（键不带方案），两个方向各一条。
+        s.set_common_char_override('槮', true).unwrap();
+        s.set_common_char_override('的', false).unwrap();
         s
     }
 
@@ -487,6 +507,7 @@ mod tests {
             "phrase",
             "freq",
             "shadow",
+            "common_chars",
             "stats",
             "stats_meta",
             "schema_file",
@@ -582,6 +603,10 @@ mod tests {
         assert_eq!(s2.get_freq("wb", "a", "工").unwrap().unwrap().count, 1);
         assert_eq!(s2.list_shadow_rules("wb").unwrap().len(), 1);
         assert!(s2.list_phrases().unwrap().iter().any(|p| p.code == "bj"));
+        // 常用字覆盖：两个方向都要还原（只还原一个方向的话，用户会发现「我降级过的字
+        // 回来了、升级过的还在」这种半吊子状态）。
+        assert_eq!(s2.get_common_char_override('槮').unwrap(), Some(true));
+        assert_eq!(s2.get_common_char_override('的').unwrap(), Some(false));
     }
 
     #[test]

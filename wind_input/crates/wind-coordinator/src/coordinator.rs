@@ -937,8 +937,12 @@ pub struct Coordinator {
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体由配置 features.s2t.variant 决定，
     /// 启动时加载；菜单仅提供开/关。置于 Mutex 兼容 reload 时整体替换。
     pub(crate) s2t: Mutex<Option<wind_transform::s2t::Converter>>,
-    /// 通用规范汉字表（检索范围"常用字"判定；空集时退化为不过滤）
-    pub(crate) common_chars: wind_candidate::CommonChars,
+    /// 通用规范汉字表（检索范围"常用字"判定；空集时退化为不过滤）。
+    ///
+    /// 置于 `RwLock`：出厂基表在构造期一次性加载，而**用户覆盖**（候选右键「设为生僻字 /
+    /// 设为常用字」、词库管理界面）随时可改，改完必须当场生效。若仍是不可变字段，用户
+    /// 就会撞上那类最难查的现象——「设了没反应，重启后才对」。
+    pub(crate) common_chars: std::sync::RwLock<wind_candidate::CommonChars>,
     // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
     /// 工具栏位置，按显示器 key（"workRight,workBottom"）独立记录。
     pub(crate) toolbar_positions: Mutex<std::collections::HashMap<String, (i32, i32)>>,
@@ -1759,7 +1763,9 @@ impl Coordinator {
             system_phrase_entries: std::sync::RwLock::new(system_phrase_entries),
             system_phrase_path,
             s2t: Mutex::new(s2t),
-            common_chars,
+            // 只含出厂基表：用户覆盖住在 store 里，而 store 在本结构体构造之后才可用，
+            // 故由 new() 里的 `reload_common_chars` 补灌（与 `quick_adjust` 同一套路）。
+            common_chars: std::sync::RwLock::new(common_chars),
             toolbar_positions: Mutex::new(toolbar_positions_init),
             current_toolbar_monitor: Mutex::new(None),
             reverse: std::sync::RwLock::new(reverse),
@@ -1857,6 +1863,13 @@ impl Coordinator {
                 })
                 .ok();
         }
+        // 常用字表的用户覆盖（右键「设为生僻字/常用字」）：真相在 store，构造体内只装得下
+        // 出厂基表，这里补灌运行时镜像。
+        //
+        // ⚠️ 落在 `build` 而非 `new`（对比 `reload_quick_adjust`）：`new_headless_with_store`
+        // 直接走 build、不经过 new，放在 new 里会让 headless 测试恒看不到已存在的覆盖——
+        // 那是一条真实存在但测不到的路径。
+        coordinator.reload_common_chars();
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
