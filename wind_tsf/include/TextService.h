@@ -415,7 +415,7 @@ private:
     // 加速键双处理。无候选时立即 UnregisterHotKey 让宿主使用这些热键。
     HWND  _hHotkeyWnd;                // 隐藏消息窗口，接收 WM_HOTKEY
     ATOM  _hotkeyWndClass;            // RegisterClassEx 返回的窗口类原子
-    BOOL  _hotkeysActive;             // 当前是否已 RegisterHotKey 候选热键（Ctrl+0..9 / Ctrl+Shift+0..9）
+    BOOL  _hotkeysActive;             // 当前是否已 RegisterHotKey 候选热键（组合键取自服务端 SESSION 热键表）
     // 加词热键（Ctrl+= 等）全局拦截：门卫比候选热键更严——中文模式 + 焦点在可编辑文本框 +
     // 非密码框 + 持有 thread focus 才注册，让抢占面积最小化，不干扰非文本框处的宿主快捷键。
     BOOL  _addWordHotkeysActive;      // 当前是否已 RegisterHotKey 加词热键
@@ -434,6 +434,9 @@ private:
     // 已注册的加词热键 (RegisterHotKey id, raw hash)。raw hash 高16位=KEYMOD、低16位=VK，
     // 供 UnregisterHotKey 与 WM_HOTKEY 分发反解。最多两项（add_word / open_add_word_dialog）。
     std::vector<std::pair<int, uint32_t>> _addWordHotkeyIds;
+    // 已注册的候选热键 (RegisterHotKey id, raw hash)，与 _addWordHotkeyIds 同格式同用途。
+    // 组合键不再由本层决定，一律来自服务端推来的 SESSION 热键表（CHotkeyManager::SessionHotkeys）。
+    std::vector<std::pair<int, uint32_t>> _candidateHotkeyIds;
     // 线程焦点门控：RegisterHotKey 在每个进程内对同一组合键独占。
     // 多进程 IME 实例同时尝试注册会导致 ERROR_HOTKEY_ALREADY_REGISTERED (1409)，
     // 让前台应用拿不到 WM_HOTKEY，反而让残留的后台进程吃掉。
@@ -460,7 +463,7 @@ private:
 
     BOOL _InitHotkeyWindow();         // 创建窗口类 + 隐藏窗口
     void _UninitHotkeyWindow();       // 反向清理
-    void _RegisterCandidateHotkeys(); // 注册 Ctrl+0..9 + Ctrl+Shift+0..9（候选可见时）
+    void _RegisterCandidateHotkeys(); // 候选可见时注册服务端 SESSION 热键表里的组合键
     void _UnregisterCandidateHotkeys();
     // 加词热键：Reevaluate 可从任意线程调用（内部 PostMessage 到 _hHotkeyWnd 保证在
     // 拥有该窗口的线程执行 RegisterHotKey）；_DoReevaluate/_Register/_Unregister 仅主线程。

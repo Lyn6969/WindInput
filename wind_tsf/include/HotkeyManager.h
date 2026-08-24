@@ -110,6 +110,16 @@ public:
     // 需全局拦截的热键 raw hash（GLOBAL 位命中，已剥 policy）。供 RegisterHotKey 反解 (mods,vk)。
     const std::unordered_set<uint32_t>& GlobalHotkeys() const { return _globalHotkeys; }
 
+    // SESSION 策略的 keyDown 热键 raw hash（已剥 policy）。供候选热键的 RegisterHotKey
+    // 反解 (mods, vk)——语义正好对上：SESSION ＝「只在有会话时吃」，而候选热键正是候选
+    // 可见时注册、消失时卸载（见 CTextService::NotifyCandidatesVisibilityChanged）。
+    //
+    // ★ 有了它，C++ 侧就不必再自己知道「置顶是 Ctrl+数字、删除是 Ctrl+Shift+数字」——
+    // 那两组修饰键原先在 _RegisterCandidateHotkeys 与 WM_HOTKEY 分发处各硬编码一份，
+    // 与服务端的配置值域是**第三、第四份真相源**，配置里改成别的组合后这条通路照旧只
+    // 注册老组合，新组合直接落到宿主手里（2026-08-24 Ctrl+Alt+数字 实测现场）。
+    const std::unordered_set<uint32_t>& SessionHotkeys() const { return _keyDownSession; }
+
 private:
     // Hotkey whitelist (KeyDown triggered) — 两模式都吃
     std::unordered_set<uint32_t> _keyDownHotkeys;

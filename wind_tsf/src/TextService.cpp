@@ -1502,8 +1502,14 @@ static const wchar_t* kHotkeyWndTitle     = L"WindInputHotkeyDebug";
 static const wchar_t* kHotkeyWndClassName = L"WindInputHotkeyWnd";
 static const wchar_t* kHotkeyWndTitle     = L"WindInputHotkey";
 #endif
-static constexpr int  kHotkeyIdPinBase    = 0x4000; // Pin: Ctrl+N → id = kHotkeyIdPinBase + N
-static constexpr int  kHotkeyIdDelBase    = 0x4010; // Delete: Ctrl+Shift+N → id = kHotkeyIdDelBase + N
+// 候选热键（置顶/删除）的 id 段。**id 与具体组合键之间不再有约定**：注册时按服务端
+// SESSION 热键表的迭代序顺次取 id，并把 (id, rawHash) 记进 _candidateHotkeyIds，
+// WM_HOTKEY 分发处反解——与加词热键完全同构。
+//
+// 原先是 Pin 段 0x4000+N、Delete 段 0x4010+N：id 的低 4 位是候选序号、段号是动作，
+// 于是「哪组修饰键对应哪个动作」被烧进了 id 编码，C++ 想不硬编码都做不到。
+static constexpr int  kHotkeyIdCandidateBase = 0x4000; // 候选热键，32 个槽位（0x4000..0x401F）
+static constexpr int  kHotkeyIdCandidateMax  = 32;
 static constexpr int  kHotkeyIdAddWordBase = 0x4020; // 加词热键（add_word / open_add_word_dialog），最多 16 个
 
 // 加词热键重新评估自触发消息：_ReevaluateAddWordHotkey 从任意线程 PostMessage 此消息到
@@ -1686,49 +1692,6 @@ void CTextService::_UninitHotkeyWindow()
     }
 }
 
-void CTextService::_RegisterCandidateHotkeys()
-{
-    if (_hHotkeyWnd == nullptr || _hotkeysActive) return;
-    // 没拿到 thread focus 时绝不注册 — 多进程 IME 实例竞争同一组热键会引发
-    // ERROR_HOTKEY_ALREADY_REGISTERED (1409)，让前台应用 IME 实例反而注册不上。
-    // 两个条件都要：本应用在前台（TSF 信号）**且**本进程就是前台窗口所属进程。
-    // 多进程宿主（WebView 类）下后者为假，热键该让给真正拥有前台窗口的那个进程。
-    if (!_hasThreadFocus || !_isProcessForeground) return;
-
-    int registered = 0;
-    // Ctrl+0..9 (Pin)
-    for (int n = 0; n <= 9; ++n)
-    {
-        if (RegisterHotKey(_hHotkeyWnd, kHotkeyIdPinBase + n, MOD_CONTROL | MOD_NOREPEAT, '0' + n))
-        {
-            registered++;
-        }
-    }
-    // Ctrl+Shift+0..9 (Delete)
-    for (int n = 0; n <= 9; ++n)
-    {
-        if (RegisterHotKey(_hHotkeyWnd, kHotkeyIdDelBase + n, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, '0' + n))
-        {
-            registered++;
-        }
-    }
-    _hotkeysActive = TRUE;
-    WIND_LOG_DEBUG_FMT(L"RegisterCandidateHotkeys: registered=%d/20\n", registered);
-}
-
-void CTextService::_UnregisterCandidateHotkeys()
-{
-    if (_hHotkeyWnd == nullptr || !_hotkeysActive) return;
-
-    for (int n = 0; n <= 9; ++n)
-    {
-        UnregisterHotKey(_hHotkeyWnd, kHotkeyIdPinBase + n);
-        UnregisterHotKey(_hHotkeyWnd, kHotkeyIdDelBase + n);
-    }
-    _hotkeysActive = FALSE;
-    WIND_LOG_DEBUG(L"UnregisterCandidateHotkeys\n");
-}
-
 namespace
 {
     // 内部 KEYMOD（SHIFT=1/CTRL=2/ALT=4/WIN=8）→ Win32 RegisterHotKey fsModifiers
@@ -1742,6 +1705,71 @@ namespace
         if (keymod & KEYMOD_WIN)   f |= MOD_WIN;
         return f;
     }
+}
+
+// 候选可见时把置顶/删除热键注册成系统级热键。
+//
+// ★★★ 组合键**只能**来自服务端推来的 SESSION 热键表，绝不能在本层写死。
+// 2026-08-24 现场：这里曾硬编码 Ctrl+0..9 与 Ctrl+Shift+0..9，于是用户把
+// `keys.pin_candidate` 配成 `ctrl+alt+number` 之后，服务端热键表、TSF 转发白名单、
+// 协调器判据三处**全都改对了**，唯独这条 RegisterHotKey 通路照旧只注册老组合——
+// 而它恰恰是实际生效的那条（RegisterHotKey 先于一切拿到键），新组合直接落进宿主，
+// 表现为「记事本自己把这组键执行了」。
+//
+// ⚠️ 这类缺陷不会被任何单元测试抓到：Rust 侧测的是热键表内容，而表是对的。
+// 判据：**改热键值域时，先数清「谁在按这个值域做决定」，RegisterHotKey 这条系统级
+// 通路不出现在任何 grep `pin_candidate` 的结果里。**
+void CTextService::_RegisterCandidateHotkeys()
+{
+    if (_hHotkeyWnd == nullptr || _hotkeysActive) return;
+    // 没拿到 thread focus 时绝不注册 — 多进程 IME 实例竞争同一组热键会引发
+    // ERROR_HOTKEY_ALREADY_REGISTERED (1409)，让前台应用 IME 实例反而注册不上。
+    // 两个条件都要：本应用在前台（TSF 信号）**且**本进程就是前台窗口所属进程。
+    // 多进程宿主（WebView 类）下后者为假，热键该让给真正拥有前台窗口的那个进程。
+    if (!_hasThreadFocus || !_isProcessForeground || _pHotkeyManager == nullptr) return;
+
+    const auto& session = _pHotkeyManager->SessionHotkeys();
+    // 表还没同步过来就**不要**置 _hotkeysActive：置了就等于宣称「已注册」，
+    // 而候选的显隐不会再触发一次注册，这一整段输入的候选热键就此静默失效。
+    // 留着不置位，下一次候选出现时自然重试。
+    if (session.empty())
+    {
+        WIND_LOG_DEBUG(L"RegisterCandidateHotkeys skipped: session hotkey table empty\n");
+        return;
+    }
+    int id = kHotkeyIdCandidateBase;
+    int registered = 0;
+    for (uint32_t rawHash : session)
+    {
+        if (id >= kHotkeyIdCandidateBase + kHotkeyIdCandidateMax) break; // 安全上限
+        uint32_t vk     = rawHash & 0xFFFF;
+        uint32_t keymod = rawHash >> 16;
+        UINT fsMods = _ToWin32HotkeyMods(keymod) | MOD_NOREPEAT;
+        if (RegisterHotKey(_hHotkeyWnd, id, fsMods, vk))
+        {
+            _candidateHotkeyIds.emplace_back(id, rawHash);
+            registered++;
+        }
+        id++;
+    }
+    _hotkeysActive = TRUE;
+    WIND_LOG_DEBUG_FMT(L"RegisterCandidateHotkeys: registered=%d/%d\n",
+                       registered, (int)session.size());
+}
+
+void CTextService::_UnregisterCandidateHotkeys()
+{
+    if (_hHotkeyWnd == nullptr || !_hotkeysActive) return;
+
+    // 按注册记录逐个卸载：id 与组合键的对应关系由 _candidateHotkeyIds 保存，
+    // 不能再按「Pin 段 + N / Delete 段 + N」推算——那个约定已经不存在了。
+    for (const auto& kv : _candidateHotkeyIds)
+    {
+        UnregisterHotKey(_hHotkeyWnd, kv.first);
+    }
+    _candidateHotkeyIds.clear();
+    _hotkeysActive = FALSE;
+    WIND_LOG_DEBUG(L"UnregisterCandidateHotkeys\n");
 }
 
 // 中英模式集中 setter：赋值后触发加词热键重评（模式是门卫条件）。reeval 内部 post，
@@ -1958,15 +1986,20 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
             int id = (int)wParam;
             uint32_t vk = 0;
             uint32_t mods = 0;
-            if (id >= kHotkeyIdPinBase && id < kHotkeyIdPinBase + 10)
+            if (id >= kHotkeyIdCandidateBase && id < kHotkeyIdCandidateBase + kHotkeyIdCandidateMax)
             {
-                vk = '0' + (id - kHotkeyIdPinBase);
-                mods = KEYMOD_CTRL;
-            }
-            else if (id >= kHotkeyIdDelBase && id < kHotkeyIdDelBase + 10)
-            {
-                vk = '0' + (id - kHotkeyIdDelBase);
-                mods = KEYMOD_CTRL | KEYMOD_SHIFT;
+                // 候选热键：从注册记录反解 (vk, KEYMOD)，与加词热键同法。
+                // ⚠️ 绝不能按 id 推算修饰键——组合键来自服务端配置，本层不知道也不该知道
+                // 「哪一组是置顶、哪一组是删除」；那个判断在协调器侧按 hash 做。
+                for (const auto& kv : self->_candidateHotkeyIds)
+                {
+                    if (kv.first == id)
+                    {
+                        vk = kv.second & 0xFFFF;
+                        mods = kv.second >> 16;
+                        break;
+                    }
+                }
             }
             else if (id >= kHotkeyIdAddWordBase && id < kHotkeyIdAddWordBase + 16)
             {
