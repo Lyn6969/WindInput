@@ -341,6 +341,49 @@ fn test_candidate_action_hotkey_modifier_exact_match() {
 }
 
 #[test]
+fn test_candidate_action_hotkey_ctrl_alt_number() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+    // 值域第三项 `ctrl+alt+number`。两个方向都要测：配了要命中，没配要放过。
+    let mut cfg = config_with("wubi86");
+    cfg.keys.delete_candidate = "ctrl+alt+number".into(); // pin 留出厂 ctrl+number
+    let fresh = || {
+        let c = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+        for ch in ['a', 'a', 'a', 'a'] {
+            press_letter(&c, ch);
+        }
+        c
+    };
+
+    let hit = fresh().handle_key_event(&key_event_mods(0x33, EVENT_KEY_DOWN, MOD_CTRL | MOD_ALT));
+    assert!(
+        matches!(hit, KeyAction::Consumed),
+        "配成 ctrl+alt+number 后 Ctrl+Alt+3 应被删除热键消费，实际: {:?}",
+        hit
+    );
+
+    // 出厂的 pin=ctrl+number 仍各行其是，没有被 Ctrl+Alt 那条抢走。
+    let pin = fresh().handle_key_event(&key_event_mods(0x32, EVENT_KEY_DOWN, MOD_CTRL));
+    assert!(
+        matches!(pin, KeyAction::Consumed),
+        "Ctrl+2 仍应命中置顶，实际: {:?}",
+        pin
+    );
+
+    // delete 已改配到 Ctrl+Alt，原来的 Ctrl+Shift+数字 就该彻底不认了
+    // ——否则是「新值域加上了、旧绑定没撤下」，用户以为改了其实是两个都通。
+    let stale =
+        fresh().handle_key_event(&key_event_mods(0x33, EVENT_KEY_DOWN, MOD_CTRL | MOD_SHIFT));
+    assert!(
+        matches!(stale, KeyAction::ClearComposition),
+        "delete 改配后 Ctrl+Shift+3 不该再被认领，实际: {:?}",
+        stale
+    );
+}
+
+#[test]
 fn test_overflow_number_key_ignore_default() {
     if !has_schemas() {
         return;

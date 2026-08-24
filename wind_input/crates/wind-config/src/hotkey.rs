@@ -599,6 +599,11 @@ pub fn number_template_mods(template: &str) -> Option<u32> {
     match template.trim().to_lowercase().as_str() {
         "ctrl+number" => Some(MOD_CTRL),
         "ctrl+shift+number" => Some(MOD_CTRL | MOD_SHIFT),
+        // Ctrl+Alt+数字：给「置顶」与「删除」各留一个不与出厂值冲突的备选。
+        // ⚠️ 欧洲键盘布局的 AltGr ＝ Ctrl+Alt，那些布局下本组合会与字符输入撞车；
+        // TSF 侧无法可靠区分真 Ctrl+Alt 与 AltGr。**有意不处理**——本项目是中文输入法，
+        // 目标用户是 US/CN 布局。想改主意的话，判据不在这里，在 TSF 的按键来源。
+        "ctrl+alt+number" => Some(MOD_CTRL | MOD_ALT),
         _ => None,
     }
 }
@@ -847,6 +852,10 @@ mod tests {
             Some(MOD_CTRL | MOD_SHIFT)
         );
         assert_eq!(number_template_mods(" ctrl+number "), Some(MOD_CTRL));
+        assert_eq!(
+            number_template_mods("ctrl+alt+number"),
+            Some(MOD_CTRL | MOD_ALT)
+        );
         for bad in ["none", "", "alt+number", "win+number", "ctrl+shift+e"] {
             assert_eq!(number_template_mods(bad), None, "{bad:?} 不该被接受");
         }
@@ -857,7 +866,7 @@ mod tests {
         // 回归：消费端按**相等**比较修饰位，前提是任意两项的位集合不相等。
         // （更强的性质——不存在子集关系——已不再要求：等值判据对子集免疫，
         //   这正是 `ctrl+alt+number` 能安全加进值域的原因。）
-        let all = ["ctrl+number", "ctrl+shift+number"];
+        let all = ["ctrl+number", "ctrl+shift+number", "ctrl+alt+number"];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(

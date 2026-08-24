@@ -3341,7 +3341,8 @@ impl Coordinator {
         }
     }
 
-    /// Ctrl+数字 / Ctrl+Shift+数字 置顶/删除当前页候选（对齐 Go handle_key_event 候选热键段）。
+    /// Ctrl / Ctrl+Shift / Ctrl+Alt ＋数字 置顶/删除当前页候选（对齐 Go handle_key_event
+    /// 候选热键段）。可选值域见 [`wind_config::hotkey::number_template_mods`]。
     /// 仅中文模式 + 有候选 + 有词库落点（主输入路或特殊模式，见 `candidate_op_scope`）生效；
     /// 命中即消费按键。
     /// 复用 `candidate_op`（页内序号驱动的 shadow 改写 + 重排重绘）。
