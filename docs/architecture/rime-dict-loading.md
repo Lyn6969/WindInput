@@ -210,11 +210,25 @@ DictManager（每方案一个）→ CompositeDict
        ↓                前缀取最短码且 boundary 随行）/ sort_by(better)
        ↓ better: weight↓ → base_order↑ → natural_order↑ → code → text
 
-索引类产物（与 live 查询层无关，懒构建）
+索引类产物（与 live 查询层无关，懒构建 + 后台预热）
   ├─ 反查索引 ReverseIndex（词 → 全部编码）  供悬停[编码]/编码提示/词语联想
-  └─ 单字全码表 HashMap<char,String>          供造词按 encoder.rules 组码
+  │    └─ 落盘 <cache>/{方案}/{方案id}.wridx  → 重开时 ≤3MB 常驻 / 否则 mmap
+  └─ 单字全码表 HashMap<char,String>          供造词按 encoder.rules 组码（仍纯内存）
        ↑ 两者都经 load_dicts_individually 逐库读取，**不再合成 combined.wdat**
 ```
+
+> **反查索引已落盘为 `.wridx`**（2026-08-24）。它此前是纯堆结构、随方案常驻、最多缓存
+> 两份；十万词级码表 2.4 MB 无所谓，但 feihuzj2（251 万词）是 **95.4 MB**，其中光定长
+> 条目数组就占 40 MB。落盘后由文件大小决定常驻还是 mmap，大索引的字节完全不进私有内存。
+>
+> **落盘与 mmap 是一件事的两面**：不持久化的话每次启动仍要全量重建（峰值一点没降），
+> 还多写一次上百 MB 磁盘——严格比不做更差。所以 `.wridx` 的指纹校验不是优化，是前提。
+> 复用命中时**连构建都不发生**，启动路径上少掉的是整个 1.85 秒。
+>
+> 曾评估过把反查做成 **text 为键的 `.wdat`**（双数组 trie）：实测 264 MB 磁盘 + 15 秒写入，
+> 换 95 MB 内存——**净亏，已否决**。DAT 是为「按前缀逐键检索百万条」付的钱，而反查只做
+> 精确点查 + 少量前缀顺扫。`.wridx` 因此取 `.wcmt` 的骨架（排序数组 + 二分），
+> 体积与堆结构同量级。
 
 > **`combined.wdat` 已退出索引链路**（2026-08-24）。此前两个索引构建方经
 > `load_dictionary` 的多库分支先合成一份 `combined.wdat` 再建索引；feihuzj2 方案
@@ -222,6 +236,12 @@ DictManager（每方案一个）→ CompositeDict
 > —— `ReverseIndex::build` 自身已按 `(text, code)` 去重并取权重最大值，完整覆盖了合并
 > 语义。改逐库直读后同一份索引只要 **1.85 秒**。等价性由
 > `cached.rs` 的 `union_of_dicts_equals_merged_dict_for_*` 两个测试锁定。
+>
+> ⚠️ **这条等价性起初并不成立，是补上后才成立的**：权重聚合原本发生在按 `(词, 码)` 去重
+> **之后**，于是同一个 `(词, 码)` 跨库出现且权重不同时（扩展库给同一打法配了更高词频），
+> 高权重那条被整条丢掉，逐库并集算出 10 而先合并算出 999。它能藏住是因为当时的判据是
+> 「索引总字节数相等」——**权重差异不改变体积**。判据换成逐字节比较序列化镜像后即刻暴露。
+> 教训：「两份产物等价」的判据必须是产物本身，不能是产物的某个标量摘要。
 >
 > `load_dictionary`（连同 `combined.wdat`）**现存唯一消费方是拼音引擎**——`PinyinEngine`
 > 只持有单个 `CachedDict`、无 composite 分层，故多库拼音方案必须拿到合并视图。
@@ -250,6 +270,7 @@ DictManager（每方案一个）→ CompositeDict
 | **wdat** (`datformat.rs`) | `WDAT` / **v4** | **生产链路唯一使用的词库格式**。双数组 Trie，零拷贝 mmap；v3 加 `order`，v4 加 `boundary` + 独立 `AbbrevSection` |
 | wdb (`binformat.rs`) | `WDIC` | **当前生产链路不使用**（仅测试引用）。`DictEntry::boundary` 类型定义仍被 wdat 复用 |
 | wcmt (`commentdict.rs`) | `WCMT` | 候选注释表（词 → 注释），mmap + 二分点查 |
+| wridx (`reverseidx.rs`) | `WRIX` / v1 | 反查索引（词 → 全部编码 + 最大权重），mmap 或 ≤3MB 常驻；骨架同 wcmt |
 
 > `unigram`（`WUNI`）已随语言模型移除：词图打分改用词条自身的词典权重。老用户缓存目录里
 > 残留的 `unigram.wdb` 由方案缓存清理逻辑扫走。
@@ -286,6 +307,32 @@ fingerprint(sources) =
 
 > **改动解析语义（列序、注释、权重、边界⋯⋯）必须 +1。** 历史：1 = 列序逐行按 ASCII 猜；
 > 2 = 文件级判定 + 读 `columns:` 声明。
+
+### 5.3 二级指纹：由缓存派生的缓存
+
+`.wridx` 派生自一个方案的**全部 `.wdat`**，不直接派生自 yaml。若照 §5.2 去哈希 yaml 源，
+feihuzj2 那种方案每次启动都要读满 250 MB 才能回答「缓存还能不能用」——而复用命中这条
+路径本该是零成本。
+
+于是走 `cache_digest()`：每个 `.wdat` 自己那份 `.fp` 里的 16 个十六进制字符，已经编码了
+「解析语义版本 + tag + 该 yaml 的全部内容」。哈希这些摘要，**判别力与直接读源完全相同**，
+I/O 从几百 MB 降到几百字节。
+
+```rust
+cache_digest(cache) = "fp:<hash>"            // ① 有指纹 sidecar（正常路径）
+                    | "sz:<len>:<mtime>"     // ② 无 sidecar（wdat-only 分发的投放词库）
+                    | "absent"               // ③ 读不到
+
+derived_fingerprint(digests, tag) =
+    hash( PARSE_SEMANTICS_VERSION + tag + Σ(digest + 0xff) )   // 顺序参与哈希
+```
+
+- ② 用 mtime 是安全的：mtime 在**源文件**上不可信是因为 scp/部署会刷新它，
+  而缓存产物与用户投放的二进制**只会被整体替换**，替换必然改 mtime。
+- **顺序即语义**：反查索引的内容依赖词库次序，把摘要当无序集合会让「调整扩展库顺序」
+  静默复用错误索引。
+- 任一词库处于内存模式（wdat 写失败）→ **不落盘**：它没有稳定的磁盘产物，
+  下次启动无从校验，只会复用一份来历不明的缓存。
 
 ---
 

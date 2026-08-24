@@ -336,6 +336,34 @@ const COMBINED_CACHE_TAG: &str = "combined/v1";
 /// rime_pinyin 主表+import_tables 合并缓存（`merged.wdat`）的指纹 tag。
 const MERGED_CACHE_TAG: &str = "merged/v1";
 
+/// 反查索引「小到可以直接读进内存」的上限（3 MB）。
+///
+/// 超过它就 mmap——两条路的查询行为完全相同（同一份字节布局、同一套查找代码），
+/// 故这个值**只影响性能，不影响正确性**，取错了不会有人拿到错误的反查结果。
+///
+/// # 为什么是 3 MB
+///
+/// 真实索引规模是**离散的几档**，3 MB 落在最低两档之间的空档里，两端都不敏感
+/// （2026-08-24 实测，`wind-dict` 的 `reverse_index_bench`）：
+///
+/// | 方案 | 词数 | 索引 | 重开耗时（常驻 / mmap） |
+/// |---|---|---|---|
+/// | wubi86（出厂） | 89081 | **2.3 MB** | **1.06 ms** / 9.37 ms |
+/// | pinyin（出厂） | 640842 | 23.0 MB | 7.65 ms / 9.08 ms |
+/// | feihuzj2（用户） | 2519693 | 88.2 MB | 29.3 ms / **9.73 ms** |
+///
+/// 小索引常驻明显更快——2.3 MB 顺序读只要 1 ms，而 mmap 的建映射开销近乎恒定 ~9 ms，
+/// 在这个尺寸上纯属亏本。大索引则相反：常驻要多付 88 MB 私有内存，换来的**点查速度
+/// 完全相同**（两者都是 0.25 µs/次，页缓存热了之后 mmap 只是普通内存读）。
+///
+/// # 为什么不做成配置键
+///
+/// `docs/architecture/config-design-rules.md` §R1：「差异可由程序判定 → 走自动判定，
+/// 不加用户键」。索引大小是程序自己就知道的量，且两侧都正确——这个旋钮**只影响性能**。
+/// 后续若要给高级用户开口子，走独立的调试用配置文件，不进 `config.toml`
+/// （那会拖上 R6 五道闸门 + 文档站两页，为一个没人调得动的值）。
+pub const REVERSE_INDEX_RESIDENT_MAX: usize = 3 * 1024 * 1024;
+
 /// 单字全码表缓存项：`(方案 id, 汉字 → 全码)`。见 `EngineManager::single_char_codes`。
 type SingleCharCodeCache = (String, Arc<HashMap<char, String>>);
 
@@ -395,7 +423,7 @@ fn purge_cache_files(dir: &Path, removed: &mut usize, failed: &mut usize) {
         let is_cache = p
             .extension()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb"));
+            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb" | "wridx"));
         if !is_cache {
             continue;
         }
@@ -882,7 +910,69 @@ impl EngineManager {
             .clone()
     }
 
+    /// 反查索引缓存路径：`<cache>/<方案目录>/<方案 id>.wridx`。
+    ///
+    /// # 为什么键是方案 id 而不是主词库路径
+    ///
+    /// 索引内容取决于该方案启用的**整组**词库，而「两个方案共用同一个主库、各挂不同扩展」
+    /// 是常态。`combined.wdat` 当年正是按主库命名的，其代码注释里就写着这挡不住
+    /// 「两个方案指向同一个 combined」——那会让两个方案反复顶掉对方的缓存。
+    ///
+    /// 方案 id 会成为文件名，故只保留 ASCII 字母/数字/`-`/`_`，其余一律换成 `_`：
+    /// 目录部分沿用 `cache_path` 已经算好的方案目录，这里只换文件名，不引入新的路径拼接。
+    ///
+    /// **无缓存根时返回 `None` = 本次不落盘**。刻意不像 `cache_path` 那样回退到「源文件旁」
+    /// ——词库源常在只读的安装目录，而反查索引是个上百 MB 的产物，落错地方比不落更糟。
+    fn reverse_index_cache_path(schema_id: &str, first_dict: &Path) -> Option<std::path::PathBuf> {
+        CACHE_DIR.get()?.as_ref()?;
+        let safe: String = schema_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if safe.is_empty() {
+            return None;
+        }
+        Some(cache_path(first_dict, "wridx").with_file_name(format!("{safe}.wridx")))
+    }
+
+    /// 各词库缓存产物的摘要列表，用作 `.wridx` 的二级指纹源（顺序即语义）。
+    ///
+    /// 任一词库处于内存模式（`source_file() == None`，即它的 wdat 写失败了）就返回 `None`
+    /// ——那意味着这份词库**没有稳定的磁盘产物**，以它为源的索引不该落盘：下次启动
+    /// 无从校验，只会复用一份来历不明的缓存。
+    fn reverse_index_source_digests(dicts: &[CachedDict]) -> Option<Vec<String>> {
+        dicts
+            .iter()
+            .map(|d| {
+                d.source_file().map(|p| {
+                    // 路径一并入哈希：换了词库文件但新文件恰好同摘要（如都取到 absent）时，
+                    // 只哈希摘要会认不出来。
+                    format!("{}|{}", p.display(), wind_dict::cache_fp::cache_digest(p))
+                })
+            })
+            .collect()
+    }
+
     /// 按方案全量构建反查索引(汉字/词 → 全部编码,码长升序)。失败返回空表。
+    ///
+    /// # 为什么要落盘成 `.wridx`
+    ///
+    /// 索引在大词库上是**长尾灾难**：feihuzj2 方案 251 万词 → 95.4 MB 常驻，且最多缓存两份。
+    /// 落盘后由 [`ReverseIndex::open`] 决定常驻还是 mmap（阈值
+    /// [`REVERSE_INDEX_RESIDENT_MAX`]），大索引的字节因此完全不进程私有内存。
+    ///
+    /// **落盘与 mmap 是一件事的两面**：不持久化的话每次启动仍要全量重建（峰值一点没降），
+    /// 还平白多写一次上百 MB 磁盘——严格比不做更差。所以这里的指纹校验不是优化，是前提。
+    ///
+    /// 指纹走「二级」通道（[`wind_dict::cache_fp::cache_digest`]）：源是各词库的 `.wdat`
+    /// **摘要**而非 yaml 内容。照一级指纹读满 250 MB yaml 才能回答「缓存还能不能用」，
+    /// 会把复用命中这条本该零成本的路径变成每次启动的固定开销。
     fn build_reverse_index_for(&self, schema_id: &str) -> ReverseIndex {
         let Some(data_dir) = self.data_dir.as_deref() else {
             return ReverseIndex::default();
@@ -899,15 +989,85 @@ impl EngineManager {
         }
         // 顺手清掉旧版留下的合并缓存（本方案已不再需要它）。
         Self::purge_legacy_combined(&schema, &schemas);
+
+        let cache = dicts
+            .first()
+            .and_then(|d| d.source_file())
+            .and_then(|p| Self::reverse_index_cache_path(schema_id, p));
+        let digests = Self::reverse_index_source_digests(&dicts);
+
+        // ① 复用：词库一个没变就直接开盘上的那份，连构建都不发生。
+        if let (Some(c), Some(dg)) = (cache.as_deref(), digests.as_deref())
+            && wind_dict::cache_fp::derived_cache_is_fresh(
+                c,
+                dg,
+                wind_dict::cache_fp::REVERSE_INDEX_TAG,
+            )
+        {
+            match ReverseIndex::open(c, REVERSE_INDEX_RESIDENT_MAX) {
+                Ok(idx) => {
+                    info!(
+                        "Reused reverse index cache: {} ({} texts, {} dicts, {:.1} MB, 常驻 {:.1} MB)",
+                        schema_id,
+                        idx.len(),
+                        dicts.len(),
+                        idx.data_bytes() as f64 / 1024.0 / 1024.0,
+                        idx.resident_bytes() as f64 / 1024.0 / 1024.0,
+                    );
+                    return idx;
+                }
+                // 指纹说新鲜但打不开＝文件被截断/损坏。落到下面重建即可，但要留痕：
+                // 静默重建会让「每次启动都慢」这类故障失去唯一的外部线索。
+                Err(e) => warn!("反查索引缓存 {} 打不开（{e}），重建", c.display()),
+            }
+        }
+
+        // ② 重建。
         let t0 = std::time::Instant::now();
-        let idx = wind_dict::cached::build_reverse_index_from(&dicts);
+        let image = wind_dict::cached::serialize_reverse_index_from(&dicts);
+        let built = t0.elapsed();
+
+        // ③ 落盘后**从盘上重新打开**——这一步才真正把索引字节移出进程私有内存。
+        //    任一环失败都只是退回「常驻内存」这个旧行为，不影响正确性。
+        if let (Some(c), Some(dg)) = (cache.as_deref(), digests.as_deref()) {
+            match wind_dict::reverseidx::write_wridx(c, &image) {
+                Ok(()) => {
+                    wind_dict::cache_fp::write_derived_cache_fp(
+                        c,
+                        dg,
+                        wind_dict::cache_fp::REVERSE_INDEX_TAG,
+                    );
+                    match ReverseIndex::open(c, REVERSE_INDEX_RESIDENT_MAX) {
+                        Ok(idx) => {
+                            info!(
+                                "Built reverse index: {} ({} texts, {} dicts, {:.1} MB, 常驻 {:.1} MB, {:?})",
+                                schema_id,
+                                idx.len(),
+                                dicts.len(),
+                                idx.data_bytes() as f64 / 1024.0 / 1024.0,
+                                idx.resident_bytes() as f64 / 1024.0 / 1024.0,
+                                built
+                            );
+                            return idx;
+                        }
+                        Err(e) => warn!("刚写好的反查索引 {} 打不开（{e}）", c.display()),
+                    }
+                }
+                // Windows 上最常见的原因是旧文件仍被本进程映射着（rename 会 Access Denied）。
+                Err(e) => warn!(
+                    "反查索引写盘失败 {}（{e}）——本次退化为常驻内存，下次启动仍需重建",
+                    c.display()
+                ),
+            }
+        }
+        let idx = ReverseIndex::from_bytes(image);
         info!(
-            "Built code-hint reverse index: {} ({} texts, {} dicts, {:.1} MB, {:?})",
+            "Built reverse index (未落盘，常驻内存): {} ({} texts, {} dicts, {:.1} MB, {:?})",
             schema_id,
             idx.len(),
             dicts.len(),
-            idx.heap_bytes() as f64 / 1024.0 / 1024.0,
-            t0.elapsed()
+            idx.data_bytes() as f64 / 1024.0 / 1024.0,
+            built
         );
         idx
     }
