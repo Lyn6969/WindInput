@@ -96,6 +96,18 @@ pub struct Candidate {
     pub natural_order: i32,
     pub comment: String,
     pub is_common: bool,
+    /// 用户**显式**把这个字标成了生僻（词库管理 / 候选右键），不是出厂字表里就没有它。
+    ///
+    /// ## 为什么不能只看 `is_common == false`
+    ///
+    /// 两者强弱不同：出厂没收录只是「字表里查不到」，而这一位是用户亲口说的「我不要它」。
+    /// 智能档的「孤儿码位」规则（同码位一个常用字都没有时全部放行）本意是别让人打不出字，
+    /// 但对用户亲手降级的字，那条保底会把它原样放回**而且还在第一位**——用户看到的是
+    /// 「设了完全没反应」。故这一位让它**不吃那条保底**（见 `filter_smart`）。
+    ///
+    /// 滤掉不等于打不出：被滤的候选进 `FilterOutcome::filtered`，末页再按一次翻页键即可
+    /// 放宽调出（`is_scope_filtered` 那条通路）。
+    pub user_rare: bool,
     /// 该候选**按当前检索范围本应被滤掉**，是因用户按翻页键**临时放宽**才留在列表里
     /// （设计见 `docs/design/smart-filter-scope-relax.md`）。
     ///
@@ -376,6 +388,7 @@ impl Default for Candidate {
             natural_order: 0,
             comment: String::new(),
             is_common: false,
+            user_rare: false,
             is_scope_filtered: false,
             is_phrase: false,
             is_command: false,

@@ -114,6 +114,17 @@ fn build_has_common(
 fn filter_smart(candidates: Vec<Candidate>) -> FilterOutcome {
     let has_common = build_has_common(&candidates);
     let (kept, filtered) = candidates.into_iter().partition(|c| {
+        // 用户**亲手**标成生僻的字：无条件滤掉，不吃下面那条「孤儿编码」保底。
+        //
+        // 那条保底本意是别让人打不出字，但它对用户显式降级的字会起反作用：把同码位唯一的
+        // 常用字降级后，这一组就变成「一个常用字都没有」，保底于是把它原样放回、还留在
+        // 第一位——用户看到的是「设了完全没反应」，而这正是智能档**独有**的现象
+        // （常用字档直接滤掉、全部字符档本就不过滤）。
+        //
+        // 滤掉不等于打不出：它落进 `filtered`，末页再按一次翻页键就能放宽调出。
+        if c.user_rare {
+            return false;
+        }
         let common_exists = has_common
             .get(&(c.source, c.code.clone()))
             .copied()
@@ -127,6 +138,69 @@ fn filter_smart(candidates: Vec<Candidate>) -> FilterOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用户亲手标成生僻的字**不吃孤儿码位保底**：哪怕同码位一个常用字都没有，它也照滤。
+    ///
+    /// 这是智能档独有的现象：把同码位唯一的常用字降级后，这一组变成「没有常用字」，
+    /// 保底会把它原样放回、还留在第一位——用户看到「设了完全没反应」。
+    #[test]
+    fn user_rare_ignores_orphan_code_fallback() {
+        let mut demoted = cand("档", "sivg", CandidateSource::CodeTable, false);
+        demoted.user_rare = true;
+        let rare = cand("桜", "sivg", CandidateSource::CodeTable, false);
+
+        // 前置：不带 user_rare 时，这一组无常用字 ⇒ 孤儿码位保底放行全部。
+        let baseline = filter_candidates(
+            vec![
+                cand("档", "sivg", CandidateSource::CodeTable, false),
+                rare.clone(),
+            ],
+            FilterMode::Smart,
+        );
+        assert_eq!(baseline.kept.len(), 2, "无 user_rare 时保底放行全部");
+
+        // 带上 user_rare：那一条被滤掉，另一条仍靠保底留下（不能连累它）。
+        let out = filter_candidates(vec![demoted, rare], FilterMode::Smart);
+        assert_eq!(
+            out.kept.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["桜"],
+            "用户降级的字应被滤掉，同组其余候选照旧"
+        );
+        assert_eq!(
+            out.filtered
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["档"],
+            "被滤的要落进 filtered——末页翻页放宽靠它把字调回来，不是真的打不出"
+        );
+    }
+
+    /// 组里**只剩**一个被降级的字时也照滤（候选可以为空）。
+    ///
+    /// 空了不等于打不出：`try_relax_scope_on_page_end` 的触发条件只要求「有输入」，
+    /// 不要求「有候选」，故空列表按翻页键仍能放宽把它调出来。
+    #[test]
+    fn user_rare_may_empty_the_group() {
+        let mut only = cand("档", "sivg", CandidateSource::CodeTable, false);
+        only.user_rare = true;
+        let out = filter_candidates(vec![only], FilterMode::Smart);
+        assert!(out.kept.is_empty());
+        assert_eq!(out.filtered.len(), 1);
+    }
+
+    /// 同码位**还有**常用字时，行为与降级前一致（这条路径本来就滤，不该因新判据变样）。
+    #[test]
+    fn user_rare_unchanged_when_group_still_has_common() {
+        let mut demoted = cand("桜", "sivg", CandidateSource::CodeTable, false);
+        demoted.user_rare = true;
+        let common = cand("档", "sivg", CandidateSource::CodeTable, true);
+        let out = filter_candidates(vec![common, demoted], FilterMode::Smart);
+        assert_eq!(
+            out.kept.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["档"]
+        );
+    }
 
     fn cand(text: &str, code: &str, source: CandidateSource, is_common: bool) -> Candidate {
         Candidate {

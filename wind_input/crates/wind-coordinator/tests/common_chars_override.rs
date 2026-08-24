@@ -16,6 +16,9 @@ use wind_coordinator::Coordinator;
 use wind_ipc::protocol::EVENT_KEY_DOWN;
 use wind_ui_types::CandidateOp;
 
+/// PageDown，默认翻页键组 "pageupdown"（末页再按一次即触发检索范围临时放宽）。
+const VK_NEXT: u32 = 0x22;
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
 }
@@ -86,12 +89,16 @@ fn index_of(list: &[String], text: &str) -> Option<usize> {
     list.iter().position(|t| t == text)
 }
 
-/// ★ 核心链路：把同码位唯一的常用字标成生僻，被它压着的生僻字当场露出来。
+/// ★ 核心链路：把一个字标成生僻，它**当场从候选里消失**，被它压着的生僻字露出来。
 ///
 /// 走完整条路：写 redb → 回灌内存镜像 → 重建候选 → 智能过滤重算。任何一步断掉，
-/// 「桜」都不会出现。
+/// 屏幕上就毫无变化——那正是用户报的「设了没反应」。
+///
+/// ⚠️ 这里钉的是**用户显式降级不吃「孤儿码位」保底**（`Candidate::user_rare`）。
+/// 不加那一位的话：「档」降级后 sivg 组变成「没有常用字」，保底把它原样放回、还在
+/// 第一位——智能档因此成了三档里唯一「设了看不出」的一档。
 #[test]
-fn marking_the_common_char_rare_releases_the_suppressed_one() {
+fn marking_a_char_rare_removes_it_from_candidates() {
     let d = data_dir();
     if !dict_ready(&d) {
         eprintln!("跳过：build_dev/data 缺失");
@@ -109,7 +116,7 @@ fn marking_the_common_char_rare_releases_the_suppressed_one() {
         "前置不成立：智能档本应压住生僻的「桜」，实际 {before:?}"
     );
 
-    // 对着「档」点右键 →「设为生僻字（全局）」。
+    // 对着「档」点右键 →「设为生僻字」。
     let idx = index_of(&before, "档").expect("「档」应在候选里");
     assert_eq!(
         c.debug_common_char_mark(idx),
@@ -120,15 +127,44 @@ fn marking_the_common_char_rare_releases_the_suppressed_one() {
 
     let after = cands(&c);
     assert!(
-        after.contains(&"桜".to_string()),
-        "「档」降级后 sivg 再无常用字，生僻的「桜」应按孤儿码放行，实际 {after:?}"
+        !after.contains(&"档".to_string()),
+        "降级的字应当场消失，实际 {after:?}"
     );
-    // 菜单文案的取值随之翻面。
-    let idx2 = index_of(&after, "档").expect("「档」自身仍在（降级不等于隐藏）");
+    assert!(
+        after.contains(&"桜".to_string()),
+        "「档」让开后，本被它压着的「桜」应露出来，实际 {after:?}"
+    );
+}
+
+/// 滤掉**不等于**打不出：末页再按一次翻页键，放宽就能把它调回来。
+///
+/// 这是「直接滤掉」这个设计成立的前提（2026-08-24 用户拍板时点明的那条出路）。
+/// 缺了它，把某码位唯一的字降级就等于把那个字永久锁死——而用户当时只是想让它别挡路。
+#[test]
+fn demoted_char_comes_back_via_scope_relax() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：build_dev/data 缺失");
+        return;
+    }
+    let c = coord("relax");
+
+    let before = cands_of(&c, "sivg");
+    let idx = index_of(&before, "档").expect("sivg 应有「档」");
+    c.debug_candidate_op(CandidateOp::ToggleCommon, idx);
+    assert!(!cands(&c).contains(&"档".to_string()), "先确认它已被滤掉");
+
+    // 末页再按一次向后翻页键 → 临时放宽，被滤的候选追加到末尾。
+    c.handle_key_event_policed(&key_event(VK_NEXT));
+    let relaxed = cands(&c);
+    assert!(
+        relaxed.contains(&"档".to_string()),
+        "放宽后应能把降级的字调回来，实际 {relaxed:?}"
+    );
     assert_eq!(
-        c.debug_common_char_mark(idx2),
-        Some(('档', false)),
-        "再次右键应给「设为常用字」"
+        relaxed.last().map(String::as_str),
+        Some("档"),
+        "放宽的候选追加在**末尾**，原有顺序纹丝不动，实际 {relaxed:?}"
     );
 }
 
@@ -149,14 +185,15 @@ fn override_applies_across_codes() {
     let idx = index_of(&full, "档").expect("sivg 应有「档」");
     c.debug_candidate_op(CandidateOp::ToggleCommon, idx);
 
-    // 换到简码 siv 上再看：同一个字，判定必须已经是生僻。
+    // 换到简码 siv 上再看：同一个字，判定跟着走 ⇒ 这里也该被滤掉。
     let short = cands_of(&c, "siv");
-    let idx2 = index_of(&short, "档").expect("siv 也应有「档」");
-    assert_eq!(
-        c.debug_common_char_mark(idx2),
-        Some(('档', false)),
-        "覆盖不带输入码，换个码打同一个字判定应一致，实际候选 {short:?}"
+    assert!(
+        !short.contains(&"档".to_string()),
+        "覆盖不带输入码，换个码打同一个字也该降级（这正是它与 shadow 的分界），实际 {short:?}"
     );
+    // 放宽后仍能调出来——降级是全局的，出路也是全局的。
+    c.handle_key_event_policed(&key_event(VK_NEXT));
+    assert!(cands(&c).contains(&"档".to_string()));
 }
 
 /// 点回出厂方向 = **删掉覆盖**，而不是写一条同向记录。
@@ -188,9 +225,11 @@ fn toggling_back_removes_the_row_instead_of_writing_a_redundant_one() {
         "第一次点击应写下一条与出厂相反的覆盖"
     );
 
-    // 再点一次：目标方向（常用）恰好等于出厂判定 ⇒ 删覆盖，而不是存 true。
+    // 再切回来。降级后它已从候选里消失，右键点不到——**得先放宽把它调出来**，
+    // 这正是「滤掉但留一条出路」那个设计在用户手上的实际走法。
+    c.handle_key_event_policed(&key_event(VK_NEXT));
     let list2 = cands(&c);
-    let idx2 = index_of(&list2, "档").expect("「档」仍在");
+    let idx2 = index_of(&list2, "档").expect("放宽后「档」应回到列表末尾");
     c.debug_candidate_op(CandidateOp::ToggleCommon, idx2);
     assert_eq!(
         st.get_common_char_override('档').unwrap(),

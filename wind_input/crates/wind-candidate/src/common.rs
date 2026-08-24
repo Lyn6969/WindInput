@@ -140,6 +140,17 @@ impl CommonChars {
         self.overrides.get(&ch).copied()
     }
 
+    /// 这串文本里**有没有**用户亲手标成生僻的字。
+    ///
+    /// 与 [`Self::is_string_common`] 的区别是强弱：那个答「按当前字表算不算常用」，
+    /// 这个答「用户是不是明确说过不要它」。智能档的孤儿码位保底对后者不适用——
+    /// 详见 [`crate::Candidate::user_rare`]。
+    ///
+    /// 词组里只要有一个字被降级就算——那个词整体也就不该再冒到前面来。
+    pub fn has_user_rare(&self, text: &str) -> bool {
+        text.chars().any(|ch| self.override_of(ch) == Some(false))
+    }
+
     /// 字符串是否常用：其中所有「汉字」都在表内，非汉字辅助字符（标点/字母/数字/
     /// emoji/符号）忽略。空串视为非常用。
     ///
