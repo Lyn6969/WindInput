@@ -677,6 +677,20 @@ pub fn validate_format_text(kind: FormatKind, text: &str) -> Result<(), String> 
         }
         return Ok(());
     }
+    // 纯字面模板（既无 `$` 变量也无 `{}` 表达式）：渲染结果与所输内容无关，恒定输出
+    // 这段文字。快捷输入的候选是对**本次输入**的加工，恒定文本该配成短语而非格式。
+    //
+    // 拦在这里的真正理由是**漏花括号**：文档的函数表列的是 `amt()`，写进模板却必须是
+    // `{amt()}`，照着表抄极易漏掉外层那对。漏了之后一路绿灯——校验过、保存成功、候选
+    // 照出，只是出的是源码本身（`amt(zheng='false')`），用户只能在打字时才发现。
+    if !crate::template::has_variable(text) {
+        return Err(if text.contains('(') && text.contains(')') {
+            // 把用户写的原样包一层回显，比讲语法快
+            format!("函数要包在花括号里，写成 {{{}}}", text.trim())
+        } else {
+            "模板里没有任何变量或函数，这条候选会恒定输出这段文字".into()
+        });
+    }
     // RefCell 而非 &mut：`expand` 收的是 `Fn`（渲染期要能重复调用），闭包不能可变捕获。
     let bad: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
     let ok = crate::template::expand(text, |name| {
@@ -875,6 +889,34 @@ text = "{no_such_func()}"
 
         assert!(validate_format_text(FormatKind::Date, "${Y}年{month()}月").is_err());
         assert!(validate_format_text(FormatKind::Date, "$Y年{month()}月").is_err());
+    }
+
+    /// ★ 漏掉外层花括号必须在**保存时**就报错。
+    ///
+    /// 这是真实用户反馈：照着文档的函数表（列的是 `amt()`）拼出 `amt(zheng='false')`
+    /// 填进模板框，一路绿灯到打字时才发现候选出的是这段源码本身。
+    /// 成因是它恰好是一条合法的**纯字面模板**——没有 `$` 变量要解析、没有裸 `{`
+    /// 要求值，`expand` 原样返回、校验自然通过。
+    #[test]
+    fn function_without_braces_is_rejected_with_a_pointed_hint() {
+        let err = validate_format_text(FormatKind::Number, "amt(zheng='false')").unwrap_err();
+        assert!(
+            err.contains("{amt(zheng='false')}"),
+            "提示要把正确写法回显出来，实际: {err}"
+        );
+        // 反向对照：包上花括号后照常通过——拦的是漏括号，不是这个函数
+        assert!(validate_format_text(FormatKind::Number, "{amt(zheng='false')}").is_ok());
+    }
+
+    /// 不含括号的纯字面模板同样拒绝：一条与所输内容无关、恒定出同一段文字的「格式」
+    /// 在快捷输入里没有用途（那是短语的活）。`$$` 转义后也是字面量，同样不放行。
+    #[test]
+    fn literal_only_templates_are_rejected() {
+        assert!(validate_format_text(FormatKind::Number, "人民币").is_err());
+        assert!(validate_format_text(FormatKind::Date, "$$Y").is_err());
+        // 反向对照：只要有一个真变量就放行，字面量可以照常混在里面
+        assert!(validate_format_text(FormatKind::Date, "农历$LMD").is_ok());
+        assert!(validate_format_text(FormatKind::Date, "$$$Y").is_ok());
     }
 
     #[test]
