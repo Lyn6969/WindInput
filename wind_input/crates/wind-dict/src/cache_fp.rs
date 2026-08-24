@@ -37,7 +37,7 @@ fn fp_sidecar(cache: &Path) -> PathBuf {
 ///   （`$CC(..., open("D:\\notes"))` 不再被本层与 cmdbar lexer 各吃一个反斜杠）
 const PARSE_SEMANTICS_VERSION: u32 = 4;
 
-/// 计算源文件集合的内容指纹：混入解析语义版本 + 调用方 tag + 每个源的 文件名/长度/内容。
+/// 计算源文件集合的内容指纹：混入解析语义版本 + 调用方 tag + 每个源的 文件名/存在性/长度/内容。
 ///
 /// `tag` 用于区分「同一份源文件、但解析方式不同」的缓存。**没有它就会出现这种静默错误**：
 /// 把某词库的 `dict_type` 在 english ↔ 非 english 之间切换，只改变 `lowercase_code`
@@ -45,19 +45,44 @@ const PARSE_SEMANTICS_VERSION: u32 = 4;
 /// 同理，不同种类的缓存（词库 / 注释库）也应各自持 tag，免得共用一个语义版本号
 /// 却各改各的、谁也没动机去 +1。
 ///
-/// 任一源不可读 → None（视为需重建）。
+/// # 源文件缺失 ≠ 指纹失败（2026-08-24 修）
+///
+/// **「缺一个源」是用户可达的日常状态**——方案声明了 `default_enabled` 的扩展词库、
+/// 而用户没装那个文件；此时该词库对构建产物的贡献就是「什么都没有」，是个**确定且稳定**
+/// 的事实，理应可以缓存。
+///
+/// 此前实现是 `std::fs::read(p).ok()?`：任一源读不到 → 整份指纹 `None` →
+/// `write_cache_fp` 什么都不写、`cache_is_fresh` 恒 false → 调用方**每次全量重建**。
+/// 真机现场（feihuzj2 方案，11 个词库里 `feihuzj2_extra_gr.dict.yaml` 不存在）
+/// 因此每次引擎重建都要重算 30 秒的 `combined.wdat`，且磁盘上从来没有过它的 `.fp`
+/// ——那正是本故障唯一的外部指纹。
+///
+/// 现在把**存在性本身**编进哈希：缺失记 `0`、存在记 `1` + 长度 + 内容。于是
+/// 「一直缺」指纹稳定可复用，而「后来补上了」指纹随之改变、缓存正确失效。
+///
+/// ⚠️ 只有 `NotFound` 按「稳定地不存在」处理。**其余 IO 错误（权限、磁盘故障）仍返回
+/// `None`**：那是「读不出来」而非「不存在」，把一次瞬时故障固化进指纹，会让故障恢复后
+/// 继续复用错误缓存。
 fn fingerprint(sources: &[&Path], tag: &str) -> Option<String> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write_u32(PARSE_SEMANTICS_VERSION);
     h.write(tag.as_bytes());
     h.write_u8(0xfe); // tag 与源内容之间的分隔
     for p in sources {
-        let data = std::fs::read(p).ok()?;
         if let Some(name) = p.file_name() {
             h.write(name.to_string_lossy().as_bytes());
         }
-        h.write_u64(data.len() as u64);
-        h.write(&data);
+        match std::fs::read(p) {
+            Ok(data) => {
+                h.write_u8(1); // 存在
+                h.write_u64(data.len() as u64);
+                h.write(&data);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                h.write_u8(0); // 稳定地不存在——参与哈希，不再毒化整份指纹
+            }
+            Err(_) => return None, // 权限/IO 故障：无法判定，强制重建
+        }
         h.write_u8(0xff); // 分隔，避免相邻源内容拼接歧义
     }
     Some(format!("{:016x}", h.finish()))
@@ -75,10 +100,26 @@ pub fn cache_is_fresh(cache: &Path, sources: &[&Path], tag: &str) -> bool {
     matches!(std::fs::read_to_string(fp_sidecar(cache)), Ok(s) if s.trim() == fp)
 }
 
-/// 缓存构建成功后调用：写入指纹 sidecar（best-effort，失败仅影响下次会多重建一次）。
+/// 缓存构建成功后调用：写入指纹 sidecar。
+///
+/// 单次失败只是「下次多重建一次」，但**持续失败就是持续重建**——大词库上那是几十秒的
+/// 同步卡顿，而此前这里是 `let _ = ...` 完全静默，故障只能靠「磁盘上没有 .fp」这种
+/// 极隐蔽的方式被发现（真机上正是如此）。两条失败路径都留痕。
 pub fn write_cache_fp(cache: &Path, sources: &[&Path], tag: &str) {
-    if let Some(fp) = fingerprint(sources, tag) {
-        let _ = std::fs::write(fp_sidecar(cache), fp);
+    let Some(fp) = fingerprint(sources, tag) else {
+        tracing::warn!(
+            "无法为 {} 计算源指纹（有源文件读取失败），本次不写 .fp —— \
+             该缓存下次仍会全量重建。",
+            cache.display()
+        );
+        return;
+    };
+    if let Err(e) = std::fs::write(fp_sidecar(cache), fp) {
+        tracing::warn!(
+            "写入指纹 sidecar 失败 {}: {} —— 缓存已建好但下次仍会全量重建（大词库为数十秒）。",
+            fp_sidecar(cache).display(),
+            e
+        );
     }
 }
 
@@ -169,6 +210,59 @@ mod tests {
         // 写指纹后 → 新鲜
         write_cache_fp(&cache, &[&src], "t");
         assert!(cache_is_fresh(&cache, &[&src], "t"));
+    }
+
+    /// ⚠️ 回归：**源文件稳定缺失时，缓存必须照常可复用**。
+    ///
+    /// 真机现场（2026-08-24，feihuzj2 方案）：11 个词库里 `feihuzj2_extra_gr.dict.yaml`
+    /// 不存在（用户/安装目录均无），而它 `default_enabled = true` 故仍进 `sources`。
+    /// 旧实现 `std::fs::read(p).ok()?` 让整份指纹变 `None` ⇒ `.fp` 永不写、
+    /// `cache_is_fresh` 恒 false ⇒ `combined.wdat` **每次引擎重建都要重算 30 秒**。
+    /// 磁盘上「其余词库 `.fp` 都在、唯独 combined 没有」是该故障唯一的外部指纹。
+    ///
+    /// 三条断言对应三种状态迁移，缺一条这个 bug 都可能以另一种形态回来。
+    #[test]
+    fn absent_source_is_hashable_and_reappearing_invalidates() {
+        let present = tmp("absent_src_present.txt", b"hello");
+        let absent = std::env::temp_dir().join("wind_fp_test_absent_then_added");
+        let _ = std::fs::remove_file(&absent);
+
+        // ① 缺失不再毒化指纹——能算出来，才谈得上缓存。
+        let fp_absent =
+            fingerprint(&[&present, &absent], "t").expect("源稳定缺失应能算出指纹，而不是整份失败");
+
+        // ② 端到端：一直缺 → 指纹稳定 → 缓存可复用（这是修复的核心收益）。
+        let cache = tmp("absent_src.cache", b"<built>");
+        write_cache_fp(&cache, &[&present, &absent], "t");
+        assert!(
+            cache_is_fresh(&cache, &[&present, &absent], "t"),
+            "源稳定缺失时缓存必须可复用，否则就是那个 30 秒重建的 bug"
+        );
+
+        // ③ 缺失的文件后来被补上 → 指纹必须改变，否则新词库静默不生效。
+        //    （这正是「直接把缺失源剔除出指纹输入」那种修法会漏掉的一面。）
+        std::fs::write(&absent, b"now i exist").unwrap();
+        let fp_present = fingerprint(&[&present, &absent], "t").unwrap();
+        assert_ne!(
+            fp_absent, fp_present,
+            "文件从无到有必须让指纹改变，缓存才会正确失效"
+        );
+        assert!(!cache_is_fresh(&cache, &[&present, &absent], "t"));
+
+        let _ = std::fs::remove_file(&absent);
+    }
+
+    /// 非 NotFound 的 IO 错误仍须强制重建：那是「读不出来」，不是「不存在」。
+    /// 用目录冒充文件来制造一个稳定的非 NotFound 错误（读目录必失败，且跨平台可复现）。
+    #[test]
+    fn unreadable_non_missing_source_still_forces_rebuild() {
+        let dir_as_src = std::env::temp_dir().join("wind_fp_test_dir_as_source");
+        std::fs::create_dir_all(&dir_as_src).unwrap();
+        assert!(
+            fingerprint(&[&dir_as_src], "t").is_none(),
+            "读取失败（非 NotFound）必须让指纹失败，不能固化进哈希"
+        );
+        let _ = std::fs::remove_dir_all(&dir_as_src);
     }
 
     #[test]
