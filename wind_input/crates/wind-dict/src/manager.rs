@@ -58,6 +58,12 @@ impl DictManager {
         self.composite.has_longer_code(prefix)
     }
 
+    /// 全量枚举各启用层的 `(code, text, weight)`，供离线索引构建。
+    /// ⚠️ O(全表)，只在索引构建这类一次性场合调用，绝不能进按键链路。
+    pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
+        self.composite.for_each_entry(f);
+    }
+
     pub fn composite(&self) -> &CompositeDict {
         &self.composite
     }
@@ -216,6 +222,14 @@ impl DictLayer for SystemDictLayer {
 
     fn base_order(&self) -> i32 {
         self.base_order
+    }
+
+    /// 委托给底层 `CachedDict`，并按本层的 `default_weight` / `weight_norm` 换算权重
+    /// ——与 [`Self::search`] 同域（见 trait 文档）。
+    fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
+        self.dict.for_each_entry(&mut |code, text, weight| {
+            f(code, text, self.effective_weight(weight));
+        });
     }
 
     fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {

@@ -235,7 +235,7 @@ pub struct AuxCodeSpec {
     ///
     /// ★ **为什么需要方案级覆盖**：全拼与双拼在这个功能上不是「偏好不同」而是
     /// **键位预算不同**——双拼把韵母塞进字母键、符号键全空闲；全拼的音节边界要靠
-    /// 符号表达，反引号出厂即被 `pinyin_separator_key` 占用。故「双拼开、全拼关」
+    /// 符号表达，反引号出厂即被 `manual_separator_key` 占用。故「双拼开、全拼关」
     /// 是常态需求，一个全局开关表达不了。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -281,6 +281,17 @@ pub struct CodeTableSpec {
     /// 选词/透传，若它同时是首码，用户就永远选不了「第 1 个候选」也拿不回原生数字输入。
     #[serde(default)]
     pub leading_chars: String,
+    /// 整句输入：超过 `max_code_length` 的串自动切分成多个编码单元并组句。
+    /// 设计与判据见 `docs/design/codetable-sentence-input.md`。
+    ///
+    /// **引擎固定参数而非行为 tri-state**：一张码表能不能整句取决于它的编码结构
+    /// （定长与否、简码体系多深），是方案属性，不是「用户偏好」——故不设全局回落，
+    /// 由方案作者在 `.schema.toml` 里声明。出厂 `false`。
+    ///
+    /// ⚠️ 开启后 `top_code_commit` 自动让位：两者抢同一个区间（超码长），
+    /// 而顶码是自动上屏、一触发用户就看不到整句候选（见 `CodeTableEngine::handle_top_code`）。
+    #[serde(default)]
+    pub sentence_input: bool,
 
     // ── 方案内联行为覆盖（None=回落全局 schema.codetable；Some=覆盖）──
     /// 顶码上屏（超满码长取前 N 码首选上屏）。

@@ -635,6 +635,9 @@ impl Coordinator {
         state.preedit_fp_body = result.preedit_fullpinyin.clone();
         // 简拼分段形态（双拼下按简拼的切法，`wbwn` → `w'b'w'n`），同上按高亮候选切换。
         state.preedit_abbrev_body = result.preedit_abbrev.clone();
+        // 码表整句的编码单元切分（`aawt'aawt`）。同上按高亮候选切换，见
+        // `effective_preedit_body`。非码表 / 未开整句 / 本次无整句解 → 空串。
+        state.preedit_codetable_body = result.preedit_codetable.clone();
         // 候选调整（shadow）的归一编码。双拼下 = 全拼码（`hc`→`hao`），使双拼与全拼共享
         // 同一条规则；全拼/码表/混输恒空串 = 落回击键，行为不变。见 `State::shadow_code`。
         state.shadow_code = result.shadow_code.clone();
@@ -1447,6 +1450,7 @@ impl Coordinator {
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
         state.preedit_abbrev_body.clear();
+        state.preedit_codetable_body.clear();
         state.shadow_code.clear();
         if state.input_buffer.is_empty() {
             state.has_more = false;
@@ -1699,11 +1703,14 @@ impl Coordinator {
         )
     }
 
-    /// 拼音手动音节分隔符判定的单一入口：`key_code` 是否应作为分隔符 `'` 压入缓冲。
+    /// 手动分隔符判定的单一入口：`key_code` 是否应作为分隔符 `'` 压入缓冲。
     ///
     /// 每次按键实时求值（不缓存），使 `separator` 或 `select_key_groups` 热更新即时生效。
     /// 规则（对齐 Go `pinyin_mode_shared.go` 真 `auto` 语义）：
-    /// - 非拼音引擎 / 双拼方案 → 恒 false（双拼 buffer 会与 preedit 发散）。
+    /// - **码表整句**方案同样放行：分隔符是整句的消歧手段（二简「旬 qj」与一简
+    ///   「我 q」+「是 j」的击键串完全同形，打分无从区分），且键位判定与拼音**完全共用**
+    ///   —— 用户不该为两个方案记两套键。
+    /// - 其余非拼音引擎 / 双拼方案 → 恒 false（双拼 buffer 会与 preedit 发散）。
     /// - `none` → false；`quote` → 仅引号键(VK_QUOTE)；`backtick` → 仅反引号键(VK_BACKTICK)。
     ///   显式模式尊重用户指定值，不做动态判定（显式 quote 即用户自选覆盖选键行为）。
     /// - `auto`（默认/未知值）→ 动态避让候选选择键：若 `'`(VK_QUOTE) 当前展开为候选选择键
@@ -1711,9 +1718,11 @@ impl Coordinator {
     ///   改用反引号键作分隔符；否则 `'` 空闲，作分隔符（此时反引号不作分隔符）。
     ///
     /// 缓冲是否为空由调用方判定（空缓冲维持标点路径）。
-    pub(crate) fn pinyin_separator_key(&self, key_code: u32) -> bool {
+    pub(crate) fn manual_separator_key(&self, key_code: u32) -> bool {
         use wind_keys::keymap::{VK_BACKTICK, VK_QUOTE};
-        if !self.engine_mgr.is_pinyin() || self.engine_mgr.pinyin_is_shuangpin() {
+        // 码表整句与拼音共用下面那套键位判定；两者都不成立时该键维持原本语义。
+        let pinyin_ok = self.engine_mgr.is_pinyin() && !self.engine_mgr.pinyin_is_shuangpin();
+        if !pinyin_ok && !self.engine_mgr.sentence_input_enabled() {
             return false;
         }
         match self.engine_mgr.pinyin_separator_mode().as_str() {
@@ -1764,6 +1773,17 @@ impl Coordinator {
     /// - 高亮候选为拼音来源 → 音节拆分串（preedit_split_body，如 baoan 的拼音 / saaa 的 sa'a'a）。
     /// - 高亮候选为码表/五笔（或短语等非拼音）→ 原始码（input_buffer，如 saaa 选「模式」时不拆）。
     fn effective_preedit_body<'a>(&self, state: &'a State) -> &'a str {
+        // 码表整句：高亮到整句候选时按**编码单元**切分显示（`aawt'aawt`）。
+        //
+        // ★ 必须排在 `preedit_split_body.is_empty()` 那道守卫**之前**：码表方案下拼音
+        // 拆分形态恒空，守卫会直接 return 原始码，后面的分支一条都走不到。
+        // （混输方案下两者可能同时非空 —— 那时正是靠下面各分支按高亮候选各选各的。）
+        if wants_codetable_split(
+            &state.preedit_codetable_body,
+            state.candidates.get(self.highlighted_global_index(state)),
+        ) {
+            return &state.preedit_codetable_body;
+        }
         if state.preedit_split_body.is_empty() {
             return &state.input_buffer;
         }
@@ -4301,6 +4321,18 @@ mod finalize_candidates_tests {
     }
 }
 
+/// 组合区是否该显示**码表整句的编码单元切分**。
+///
+/// 判据两条都要：有切分串（本次确实解出了整句），且**当前高亮的就是那条整句候选**。
+/// 后者不能省——用户翻到别的候选时，屏幕上留着一个不对应它的切法比不切更糊涂。
+///
+/// 抽成自由函数是为了可测：`effective_preedit_body` 收 `&self`，要构造整个 Coordinator
+/// 才测得到，而这里真正要锁的只是这两条判据。
+fn wants_codetable_split(body: &str, cand: Option<&Candidate>) -> bool {
+    !body.is_empty()
+        && cand.is_some_and(|c| c.is_sentence && c.source == CandidateSource::CodeTable)
+}
+
 #[cfg(test)]
 mod clear_recheck_tests {
     //! 满码空码清空的**第三道门**（`clear_blocked_by_candidates`）。
@@ -4327,6 +4359,39 @@ mod clear_recheck_tests {
             consumed_length: 0,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn codetable_split_shows_only_on_highlighted_sentence() {
+        let sentence = Candidate {
+            text: "工作工作".into(),
+            source: CandidateSource::CodeTable,
+            is_sentence: true,
+            ..Default::default()
+        };
+        let plain = codetable("工作");
+
+        assert!(
+            wants_codetable_split("aawt'aawt", Some(&sentence)),
+            "高亮整句候选时应显示切分"
+        );
+        assert!(
+            !wants_codetable_split("aawt'aawt", Some(&plain)),
+            "高亮普通码表候选时不得显示切分——那个切法不对应它"
+        );
+        assert!(
+            !wants_codetable_split("", Some(&sentence)),
+            "没有切分串时不显示"
+        );
+        assert!(!wants_codetable_split("aawt'aawt", None), "无候选时不显示");
+        // 拼音整句不走这条：它有自己的音节拆分形态。
+        let pinyin_sentence = Candidate {
+            text: "工作".into(),
+            source: CandidateSource::Pinyin,
+            is_sentence: true,
+            ..Default::default()
+        };
+        assert!(!wants_codetable_split("aawt'aawt", Some(&pinyin_sentence)));
     }
 
     #[test]

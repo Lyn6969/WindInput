@@ -137,13 +137,43 @@ impl Default for FreqSettings {
 /// 把它整串当拼音解读会抢走码表候选的首位。这类判据不能从全局配置读（纯拼音方案不该
 /// 受影响），只能由调用方按语境注入，故设为 `build_engine` 的参数而非配置字段。
 ///
-/// `Option<MixPinyinOpts>` 的 `None`/`Some` **本身就是判据**（是不是混输辅助），
-/// 字段则承载具体取值。此前这里是个裸 `Option<bool>`（只有简拼开关），语境判据与取值
-/// 挤在一个布尔里，加第二个收敛项时无处安放。
+/// 字段承载具体取值，「是不是混输辅助」由 [`MixedRole`] 表达。此前这里是个裸
+/// `Option<bool>`（只有简拼开关），语境判据与取值挤在一个布尔里，加第二个收敛项时无处安放。
 #[derive(Clone, Copy)]
 struct MixPinyinOpts {
     /// `schema.mix.enable_pinyin_abbrev`：是否产出简拼候选。
     abbrev: bool,
+}
+
+/// 码表引擎的整句开关最终取值。
+///
+/// 作为混输主引擎构建时取**混输方案自己**的声明，否则取本方案的。抽成纯函数是为了让
+/// 「混输不继承 primary_schema 的整句声明」这条语义可以直接单测——它埋在
+/// `build_engine` 里的话，要跑通整个引擎构建才验得到。
+fn resolve_sentence_input(role: Option<MixedRole>, own: bool) -> bool {
+    match role {
+        Some(MixedRole::Primary { sentence_input }) => sentence_input,
+        _ => own,
+    }
+}
+
+/// 递归构建混输子引擎时，告诉被构建方「你在给谁当零件」。`None` = 独立方案。
+///
+/// 此前这个位置是裸的 `Option<MixPinyinOpts>`——`None`/`Some` 兼作「是不是混输辅助拼音」
+/// 的判据。主引擎那一侧也需要按语境收敛（见 [`Self::Primary`]）之后，那个二值判据就不够用了：
+/// 它表达不了「是混输的**主**引擎」这第三种情形。
+#[derive(Clone, Copy)]
+enum MixedRole {
+    /// 混输主（码表）。
+    ///
+    /// `sentence_input` 由**混输方案自己**的 `[engine.codetable]` 决定，**不继承
+    /// primary_schema 的取值**：`wubi86` 开了整句不代表 `wubi86_pinyin` 也该开——
+    /// 后者的超码长区间已经归拼音管（`MixedEngine::convert` 超码长直接走
+    /// `convert_overflow`，根本不经过主引擎），继承过来只会得到一个「配置开着却不生效」
+    /// 的状态，那是最难排查的一种。
+    Primary { sentence_input: bool },
+    /// 混输次（拼音），携带拼音侧的语境收敛。
+    Secondary(MixPinyinOpts),
 }
 
 /// 一个待注册的码表词库层（[`EngineManager::load_codetable_layers`] 的产出）。
@@ -528,6 +558,13 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .show_code_hint
+    }
+
+    /// 当前活跃引擎是否开启整句输入（当前只有码表引擎会返回 true）。
+    /// 供协调器判定手动分隔符键是否放行，见 `Engine::sentence_input_enabled`。
+    pub fn sentence_input_enabled(&self) -> bool {
+        self.active_engine()
+            .is_some_and(|e| e.sentence_input_enabled())
     }
 
     /// 拼音分隔符模式（auto/quote/backtick/none）的原始配置值。
@@ -3073,7 +3110,7 @@ impl EngineManager {
 
     /// 为指定 schema 构建引擎
     ///
-    /// `mix_pinyin`：见 [`MixPinyinOpts`]。`None` = 不是混输辅助拼音，走引擎默认。
+    /// `mixed_role`：见 [`MixedRole`]。`None` = 独立方案（非混输成员），走各引擎默认。
     #[allow(clippy::too_many_arguments)]
     fn build_engine(
         schema_id: &str,
@@ -3083,7 +3120,7 @@ impl EngineManager {
         mix_cfg: &wind_config::MixGlobal,
         override_dir: Option<&Path>,
         pinyin_cfg: &wind_config::config::PinyinGlobalConfig,
-        mix_pinyin: Option<MixPinyinOpts>,
+        mixed_role: Option<MixedRole>,
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
@@ -3104,8 +3141,20 @@ impl EngineManager {
                 mix_cfg,
                 override_dir,
                 pinyin_cfg,
-                None,
+                Some(MixedRole::Primary {
+                    // 取**混输方案自己**声明的值，不继承 primary_schema 的（见 MixedRole::Primary）。
+                    sentence_input: schema.engine.codetable.sentence_input,
+                }),
             )?;
+            // 「声明了整句、却配着拼音子引擎」是个不会生效的组合：超码长区间归拼音
+            // （`MixedEngine::convert` 直接走 `convert_overflow`，不经主引擎），而整句的
+            // 门槛正是超码长。明说一句，别让人对着一个没反应的配置项干瞪眼。
+            if schema.engine.codetable.sentence_input && !m.secondary_schema.is_empty() {
+                warn!(
+                    "混输方案 {} 声明了 [engine.codetable] sentence_input，但它配有拼音子引擎                      {}：超码长输入由拼音接管，码表整句不会触发。混输下的整句尚未接线。",
+                    schema_id, m.secondary_schema
+                );
+            }
             // secondary（拼音）是**唯一**注入 [`MixPinyinOpts`] 的地方：这些收敛只约束
             // 「作为混输辅助的拼音」，纯拼音方案走 build_engine 时仍传 None（行为不变）。
             let secondary = if m.secondary_schema.is_empty() {
@@ -3119,9 +3168,9 @@ impl EngineManager {
                     mix_cfg,
                     override_dir,
                     pinyin_cfg,
-                    Some(MixPinyinOpts {
+                    Some(MixedRole::Secondary(MixPinyinOpts {
                         abbrev: mix_cfg.enable_pinyin_abbrev,
-                    }),
+                    })),
                 )
             };
             // 融合策略走全局 schema.mix（无方案级 override）。
@@ -3229,6 +3278,12 @@ impl EngineManager {
             )));
         }
 
+        // 拼音分支只关心「是不是混输辅助拼音」这一面，先解出来，下面三处判据照旧。
+        let mix_secondary = match mixed_role {
+            Some(MixedRole::Secondary(o)) => Some(o),
+            _ => None,
+        };
+
         if schema.is_pinyin() {
             let dict = match Self::load_dictionary(&schema, &schemas) {
                 Some(d) => d,
@@ -3261,11 +3316,11 @@ impl EngineManager {
                 show_code_hint: pg.show_code_hint,
                 use_smart_compose: pg.use_smart_compose,
                 // 无覆盖（纯拼音方案）时保持历史行为：简拼开。
-                enable_abbrev: mix_pinyin.map(|o| o.abbrev).unwrap_or(true),
+                enable_abbrev: mix_secondary.map(|o| o.abbrev).unwrap_or(true),
                 // 残码整句只在**非混输**下启用，理由见 `PinyinConfig::enable_partial_final`。
                 // ⚠️ 判据是「是不是混输辅助」本身，不是 `abbrev` 的取值——两个开关恰好都
                 // 「混输时关掉」，但语义正交，串用会在其中一个被单独调整时静默错配。
-                enable_partial_final: mix_pinyin.is_none(),
+                enable_partial_final: mix_secondary.is_none(),
                 // ⚠️ 补全这两项**不按 `mix_pinyin` 分流**，与上面三项刻意不同：它们约束的是
                 // 「引擎敢预测多少你没打的音节」，这个偏好与「当前是不是混输」无关，是用户
                 // 对候选面的统一取舍。分流会让同一个设置在两种方案下表现不一致。
@@ -3279,7 +3334,7 @@ impl EngineManager {
                 //
                 // 非双拼方案下本项即便为 true 也不生效——引擎侧判据是它与 `shuangpin.is_some()`
                 // 取与（见 `PinyinConfig::allow_full_pinyin`）。
-                allow_full_pinyin: pg.shuangpin.allow_full_pinyin && mix_pinyin.is_none(),
+                allow_full_pinyin: pg.shuangpin.allow_full_pinyin && mix_secondary.is_none(),
             };
             let mut engine = PinyinEngine::new(pcfg, dict).with_fuzzy(fuzzy.clone());
             // 上下文语言模型：**两个开关都得显式打开才启用**——
@@ -3382,6 +3437,14 @@ impl EngineManager {
                 single_code_complete: eff.single_code_complete,
                 // 基础排序：[engine.codetable].base_sort（"natural" → 纯出现序、忽略权重；默认 weight）。
                 base_sort: crate::codetable::BaseSort::parse(&schema.engine.codetable.base_sort),
+                // 整句：方案级引擎固定参数（同 max_code_length / base_sort），不走
+                // `eff` 的行为折叠——它是「这张码表能不能整句」，不是用户偏好。
+                //
+                // 作为混输主引擎构建时**改取混输方案自己的声明**，理由见 `MixedRole::Primary`。
+                sentence_input: resolve_sentence_input(
+                    mixed_role,
+                    schema.engine.codetable.sentence_input,
+                ),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -3428,9 +3491,11 @@ impl EngineManager {
                     charset.leading_chars().into_iter().collect::<String>()
                 );
             }
-            Some(Box::new(
+            Some(Box::new(Self::attach_sentence_freq(
                 CodeTableEngine::new(mcl, commit_opts, Arc::new(dm)).with_charset(charset),
-            ))
+                commit_opts.sentence_input,
+                &schemas,
+            )))
         }
     }
 
@@ -3927,6 +3992,40 @@ impl EngineManager {
     }
 
     /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdat）
+    /// 给开启整句的码表引擎指明**词频来源目录**（见 `codetable::sentence::SentenceFreq`）。
+    ///
+    /// 词库走约定路径 `pinyin/rime_frost.dict.yaml`（= 内置拼音方案的主词库），而不是去读
+    /// 拼音方案的 schema：整句要的只是「一份带真实词频的中文词表」，与用户把拼音方案配成
+    /// 什么样无关；读 schema 反而会让码表方案的行为随另一个方案的配置漂移。
+    ///
+    /// ⚠️ 只交路径、**不在这里同步加载**：构建期加载会让两类用不上它的场景白付代价——
+    /// 混输主引擎（整句永远调不到）、以及压根没开整句的方案。加载还可能现场构建
+    /// `merged.wdat`（数秒），同步做就直接体现为「切到五笔卡住」。
+    ///
+    /// 但**懒到按键线程上同样不行**：实测首次解码要 ~660 ms（见 `sentence::LazyTables`），
+    /// 恰好落在用户敲下第 5 个码那一刻。故这里在交完路径后立刻 `prewarm_sentence()`，
+    /// 把两张表推给后台线程——开了整句才付、且不占按键线程。
+    fn attach_sentence_freq(
+        engine: CodeTableEngine,
+        sentence_on: bool,
+        schemas_dir: &Path,
+    ) -> CodeTableEngine {
+        if !sentence_on {
+            return engine;
+        }
+        let engine = engine.with_sentence_schemas_dir(schemas_dir.to_path_buf());
+        engine.prewarm_sentence();
+        engine
+    }
+
+    /// 加载整句词频用的拼音词库。由 `codetable::sentence` 的懒加载在首次解码时调用。
+    pub(crate) fn load_sentence_freq_dict(schemas_dir: &Path) -> Option<CachedDict> {
+        let path = schemas_dir.join("pinyin/rime_frost.dict.yaml");
+        let d = Self::load_rime_pinyin_dict(&path)?;
+        info!("码表整句：已接入拼音词库作为词频来源 {}", path.display());
+        Some(d)
+    }
+
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
         // wdat-only：拼音是独立于 CachedDict::load_at_with 的第二条链路（要读 yaml 头展开
         // import_tables 再并行解析正文），源缺失时那两步全废，故须在此单独拦截。
@@ -4157,6 +4256,37 @@ impl EngineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 混输主引擎的整句开关**不继承** `primary_schema` 的声明。
+    ///
+    /// 用户在 `wubi86.schema.toml` 里开了整句，不代表 `wubi86_pinyin` 也该开——后者的
+    /// 超码长区间已经归拼音管（`MixedEngine::convert` 直接走 `convert_overflow`，
+    /// 不经主引擎），继承过来只会得到「配置开着却不生效」这种最难排查的状态。
+    #[test]
+    fn mixed_primary_does_not_inherit_sentence_input() {
+        // 独立方案：用自己的声明。
+        assert!(resolve_sentence_input(None, true));
+        assert!(!resolve_sentence_input(None, false));
+
+        // ★ 混输主：`own=true`（primary_schema 开着）也要被压成混输方案自己的取值。
+        assert!(!resolve_sentence_input(
+            Some(MixedRole::Primary {
+                sentence_input: false
+            }),
+            true
+        ));
+        // 混输方案自己声明了 ⇒ 开（当前只在没配拼音子引擎的退化混输下真正生效）。
+        assert!(resolve_sentence_input(
+            Some(MixedRole::Primary {
+                sentence_input: true
+            }),
+            false
+        ));
+
+        // 混输次（拼音）走不到码表分支，取值等同独立方案即可。
+        let sec = Some(MixedRole::Secondary(MixPinyinOpts { abbrev: true }));
+        assert!(resolve_sentence_input(sec, true));
+    }
 
     // ───────────────────────── overlay 方案注册表 ─────────────────────────
 
