@@ -7160,7 +7160,11 @@ smart_method = "delete_replace"
     /// 0.119 一度让 wubi86 自带 `short_code_yield_level = 3`，当天撤回。判据是
     /// **用户在全局页做的事必须能作用到出厂方案上**：方案级的 `Some(_)` 恒覆盖全局，
     /// 内置方案给自己配特例，等于把全局页那一项对它变成了摆设——而用户并不知道，
-    /// 「方案自带」那个标记藏在方案级码表配置里。理由详见 `wubi86.schema.toml` 同处注释。
+    /// 「方案自带」那个标记藏在方案级码表配置里。
+    ///
+    /// 完整论证在 `docs/design/codetable-short-code-yields-full.md` §6.3。**方案文件里
+    /// 刻意不留这段说明**：它随安装包发布，读者是用户与第三方方案作者，决策档案对他们
+    /// 没有用处，只会让人误以为那是一条可以照抄的配置。
     ///
     /// 断言走**真实的反序列化**而不是文本匹配：`CodeTableSpec` 的字段是 `Option` +
     /// `serde(default)`，于是「真的删掉」「注释掉」「键名写错」三者在这里等价，都是
@@ -7182,8 +7186,8 @@ smart_method = "delete_replace"
             toml::from_str(&text).expect("wubi86.schema.toml 应能解析成 Schema");
         assert!(
             schema.engine.codetable.short_code_yield_level.is_none(),
-            "出厂方案不该自带出简让全档位（实际 {:?}）——它会让全局页那一项对五笔失效，\
-             理由见 wubi86.schema.toml 里同处的注释",
+            "出厂方案不该自带出简让全档位（实际 {:?}）——它会让全局页那一项对五笔失效。\
+             理由见 docs/design/codetable-short-code-yields-full.md §6.3",
             schema.engine.codetable.short_code_yield_level
         );
     }
