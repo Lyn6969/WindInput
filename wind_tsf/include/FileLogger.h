@@ -107,6 +107,13 @@ public:
     void SetLevel(LogLevel level) { _level = level; }
     void SetMode(LogMode mode) { _mode = mode; }
 
+    // 重新读取配置文件（mode/level）。
+    //
+    // 提供这个入口是因为 DLL 在宿主进程内常驻、构造函数只跑一次：没有它，改完
+    // 日志配置必须完全退出宿主才生效，而取证时这是最高频的操作。
+    // 唯一调用点是 Ctrl+Shift+F12（见 KeyEventSink::OnKeyDown）。
+    void ReloadConfig() { _ReadConfig(); }
+
 private:
     CFileLogger();
     ~CFileLogger();

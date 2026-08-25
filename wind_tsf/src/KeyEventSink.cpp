@@ -819,7 +819,16 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         && (GetKeyState(VK_SHIFT) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000))
     {
         *pfEaten = TRUE;
-        std::wstring logs = CFileLogger::Instance().DumpRingBuffer();
+        CFileLogger& lg = CFileLogger::Instance();
+
+        // 顺带重读配置文件。DLL 在宿主进程内常驻、构造函数只跑一次 ⇒ 没有这一步，
+        // 改完 mode/level 必须完全退出宿主才生效，而那是取证时最高频的操作。
+        lg.ReloadConfig();
+
+        // 环形缓冲为空时**不碰剪贴板**（否则会把用户原有内容清成空串），但提示照给：
+        // 这个热键现在同时承担「重读配置」，没有反馈就分不清是没生效还是没日志。
+        std::wstring logs = lg.DumpRingBuffer();
+        const wchar_t* notice = L"[WindInput 配置已重读 · 环形缓冲为空]";
         if (!logs.empty() && OpenClipboard(nullptr))
         {
             EmptyClipboard();
@@ -833,12 +842,13 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
                     memcpy(pDst, logs.c_str(), cbSize);
                     GlobalUnlock(hMem);
                     SetClipboardData(CF_UNICODETEXT, hMem);
+                    notice = L"[WindInput 配置已重读 · 日志已复制]";
                 }
             }
             CloseClipboard();
-            // Brief notification via SendInput so user knows it worked
-            _pTextService->InsertText(L"[WindInput TSF Log to clipboard]");
         }
+        // Brief notification via SendInput so user knows it worked
+        _pTextService->InsertText(notice);
         return S_OK;
     }
 
