@@ -14,11 +14,17 @@ db_path = "wubi86/wubi86_chaizi.txt"
 font_path = "wubi86/HeiTiZiGen.ttf"
 font_family = "黑体字根"
 
-# 仅引擎固定参数；行为/调频/造词/临时拼音等用户可配项已上移至全局 [schema.codetable]
+# 引擎固定参数；行为/调频/造词/临时拼音等用户可配项已上移至全局 [schema.codetable]
 # 与 schema_overrides（见 docs/redesign/schema-config-layering.md）。
+# 例外是下面的 short_code_yield_level：它是**方案作者基线**（这张码表适不适合出简让全），
+# 不是用户偏好，故留在方案文件里；用户仍可在设置页的方案级码表配置里改写它。
 [engine.codetable]
 max_code_length = 4
 base_sort = "weight"
+# 出简让全：全局基线出厂是关（第三方码表的短码首选未必是简码，让位会破坏作者排序），
+# 极点五笔是标准的前缀式简码体系（kht 是「路」的三简），故本方案单独开到 3（全部简码）。
+# 值域：0 关闭 / 2 一二级简码置后 / 3 全部简码置后。
+short_code_yield_level = 3
 
 [[dictionaries]]
 id = "wubi86_main"

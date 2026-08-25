@@ -1168,9 +1168,9 @@ pub struct CodetableGlobal {
     /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
     /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
     ///
-    /// - `0` 关闭，候选顺序完全按词库原序
+    /// - `0` 关闭（**全局出厂值**），候选顺序完全按词库原序
     /// - `2` 一二级简码置后
-    /// - `3` 全部简码置后（默认）
+    /// - `3` 全部简码置后
     ///
     /// 判据是「当前码长 > 本值」而不是「当前码长 == 全码长」——后者要知道方案有几码，
     /// 换到非四码方案就错位。
@@ -1187,10 +1187,18 @@ pub struct CodetableGlobal {
     pub auto_phrase: AutoPhraseConfig,
 }
 
-/// 出简让全默认开到三级（全部简码置后）——与它取代的 `gen_dict` `[demotion]`
-/// 同量级（实测 239 vs 205 个码），升级后手感延续。
+/// 出简让全的**全局**出厂值是关。
+///
+/// 0.118 曾默认开到三级（理由是与它取代的 `gen_dict` `[demotion]` 同量级，实测 239 vs
+/// 205 个码，升级后手感延续）。但全局基线是**所有码表方案**共用的，而「短码首选 = 简码」
+/// 这个前提只对五笔这类前缀式简码成立——第三方码表（词频码、二三重码表等）里短码首选
+/// 往往就是作者精心排定的常用字，让位纯属破坏。全局默认开会静默改掉这些方案的候选顺序，
+/// 而用户根本不知道有这么一项。
+///
+/// 故改为：**全局关，由方案自己在 `[engine.codetable]` 里声明**（内置 wubi86 已声明 3）。
+/// 这与 `z_key_action` 是同一个模式——「这张码表适不适合」只有方案作者知道。
 fn default_short_code_yield_level() -> usize {
-    3
+    0
 }
 
 impl Default for CodetableGlobal {
@@ -7038,6 +7046,83 @@ smart_method = "delete_replace"
             l2,
             MixGlobal::default().enable_pinyin_abbrev,
             "L1 与 L2 的简拼默认值漂移了"
+        );
+    }
+
+    /// 取值守门：出简让全的**全局**出厂值是关。
+    ///
+    /// 0.118 曾是 3（全部简码置后）。全局基线是所有码表方案共用的，而「短码首选 = 简码」
+    /// 只对五笔这类前缀式简码成立，第三方码表被它静默改了候选顺序。0.119 起改为全局关、
+    /// 由方案在 `[engine.codetable]` 里自己声明（见 `wubi86_schema_declares_short_code_yield`）。
+    ///
+    /// 只翻这个值不会有任何别的测试变红——它是产品决策，本条是它唯一的钉子。
+    #[test]
+    fn short_code_yield_defaults_off_globally() {
+        assert_eq!(
+            CodetableGlobal::default().short_code_yield_level,
+            0,
+            "出简让全的全局出厂应为关；要改先读 default_short_code_yield_level 的注释"
+        );
+    }
+
+    /// 同源守门：L1（`CodetableGlobal::default()`）与 L2（`data/config.toml`）必须一致。
+    /// 漂移的后果同上面那条简拼守门：引擎单测跑在现实中不存在的配置下，且
+    /// `preset_for_pruning` 会开始把用户显式设的值误判成默认而删掉。
+    /// 缺 `data/` 时静默跳过（全仓惯例）。
+    #[test]
+    fn short_code_yield_l1_and_l2_agree() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data")
+            .join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "跳过 short_code_yield_l1_and_l2_agree：{} 不存在",
+                path.display()
+            );
+            return;
+        };
+        let v: toml::Value = toml::from_str(&text).expect("data/config.toml 应能解析");
+        let l2 = v
+            .get("schema")
+            .and_then(|s| s.get("codetable"))
+            .and_then(|c| c.get("short_code_yield_level"))
+            .and_then(toml::Value::as_integer)
+            .expect("data/config.toml 应显式写出 schema.codetable.short_code_yield_level");
+        assert_eq!(
+            l2 as usize,
+            CodetableGlobal::default().short_code_yield_level,
+            "出简让全的 L1 与 L2 默认值漂移了"
+        );
+    }
+
+    /// 出厂方案守门：wubi86 在自己的方案文件里把出简让全开到 3。
+    ///
+    /// 全局关掉之后，五笔用户的这项行为**只由这一行维持**。它容易在两种情形下静默消失：
+    /// 有人整理方案文件时把它当成「已上移到全局」的遗留删掉（文件顶部的注释正是这么写的，
+    /// 例外说明就在那里），或键名写错——`CodeTableSpec` 的字段都是 `Option` + `serde(default)`，
+    /// 写错的键会被静默忽略成 `None`，方案照常能用，只是让位没了。
+    ///
+    /// 故断言走**真实的反序列化**而不是文本匹配：它同时验证了「这个键能被 `CodeTableSpec`
+    /// 接住」。行为层的对应用例是 wind-coordinator 的
+    /// `factory_wubi86_yields_without_any_user_config`（需要词库，CI 上跳过）。
+    #[test]
+    fn wubi86_schema_declares_short_code_yield() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas")
+            .join("wubi86.schema.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "跳过 wubi86_schema_declares_short_code_yield：{} 不存在",
+                path.display()
+            );
+            return;
+        };
+        let schema: crate::schema::Schema =
+            toml::from_str(&text).expect("wubi86.schema.toml 应能解析成 Schema");
+        assert_eq!(
+            schema.engine.codetable.short_code_yield_level,
+            Some(3),
+            "wubi86 须自带出简让全（全局出厂已关，五笔的这项行为只靠方案文件这一行）"
         );
     }
 

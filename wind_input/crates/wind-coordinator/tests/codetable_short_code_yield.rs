@@ -4,6 +4,14 @@
 //! 上真的打得出来**——记录沿途累积、判据在真实候选链上成立、让位作用在显示序上。
 //! 本仓的教训是这两层必须分开测：引擎/纯函数全绿而用户打不出，是反复出现过的形态。
 //!
+//! ## ⚠️ 档位从 0.119 起走**方案级 override**，不再是全局配置
+//!
+//! 全局出厂已改成 0（关，理由见 `data/config.toml` 同名项），wubi86 则在自己的方案文件里
+//! 声明 3。方案级 `Some(_)` 恒覆盖全局 ⇒ 用 `cfg.schema.codetable.short_code_yield_level`
+//! 设档位从此无效，本文件统一走 `override_with_level`（见该函数注释）。
+//! `factory_wubi86_yields_without_any_user_config` 是唯一不压方案值的用例，它守的正是
+//! 「方案文件里那行真的被读到」。
+//!
 //! ## ⚠️ 三条用例必须合看，缺一即可能假绿
 //!
 //! - `full_code_yields_to_word`：主用例，`wqiy` 首选从「你」变「仰泳」；
@@ -68,13 +76,37 @@ fn press(coord: &Coordinator, code: &str) {
     }
 }
 
-fn wubi_config(level: usize) -> Config {
+/// 全局配置**不设档位**——出厂全局是 0（关），档位由方案侧给出。
+fn wubi_config() -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into()];
     cfg.schema.active = "wubi86".into();
     cfg.input.default.chinese_mode = true;
-    cfg.schema.codetable.short_code_yield_level = level;
     cfg
+}
+
+/// 把档位写进**方案级 override**（`schema_overrides/wubi86.toml`），而不是全局配置。
+///
+/// ⚠️ 老写法 `cfg.schema.codetable.short_code_yield_level = level` 从 0.119 起测不出东西：
+/// 全局出厂改为 0（关）后，wubi86 在自己的方案文件里声明了 3，而方案级 `Some(_)` 恒覆盖
+/// 全局 ⇒ 档位 0 的两条反向对照会拿到 3 而变红，档位 2 的边界用例则会**假绿**（它期望
+/// 让位，3 也让位）。override 层深合并在方案文件之后，是唯一压得住它的落点。
+///
+/// 每个用例一个目录（内容虽同，但并发写同一文件会撕裂），返回值直接喂
+/// `new_headless_with_override`。
+fn override_with_level(tag: &str, level: usize) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wind_scy_ov_{tag}"));
+    std::fs::create_dir_all(&dir).expect("建 override 目录失败");
+    std::fs::write(
+        dir.join("wubi86.toml"),
+        format!(
+            "[engine.codetable]
+short_code_yield_level = {level}
+"
+        ),
+    )
+    .expect("写 override 失败");
+    dir
 }
 
 fn candidates_for(level: usize, code: &str) -> Option<Vec<String>> {
@@ -83,9 +115,35 @@ fn candidates_for(level: usize, code: &str) -> Option<Vec<String>> {
         eprintln!("跳过：五笔词库不存在");
         return None;
     }
-    let coord = Coordinator::new_headless(wubi_config(level), Some(&d));
+    let ov = override_with_level(&format!("{level}_{code}"), level);
+    let coord = Coordinator::new_headless_with_override(wubi_config(), Some(&d), Some(ov));
     press(&coord, code);
     Some(coord.debug_all_candidate_texts())
+}
+
+/// 出厂守门：**什么都不配**（全局出厂 0 + 无 override）时，wubi86 照样让位。
+///
+/// 这条测的是「方案文件里那行 `short_code_yield_level = 3` 真的被读到了」，也是本功能
+/// 唯一不经 override 的用例——上面所有用例都用 override 压掉了方案值，若只有它们，把
+/// `data/schemas/wubi86.schema.toml` 那行删掉不会有任何测试变红。
+///
+/// 同时它证明方案级 `Some(3)` 压过了全局的 0：`wubi_config()` 用的是 `Config::default()`。
+#[test]
+fn factory_wubi86_yields_without_any_user_config() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless_with_override(wubi_config(), Some(&d), None);
+    press(&coord, "wqiy");
+    let all = coord.debug_all_candidate_texts();
+    let head: Vec<&str> = all.iter().take(6).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("仰泳"),
+        "wubi86 方案文件已声明 short_code_yield_level = 3，出厂即应让位，实际候选: {head:?}"
+    );
 }
 
 /// 主用例：「你」的二简是 `wq`，故全码 `wqiy` 的首选让给词。
@@ -228,6 +286,7 @@ fn fresh_store(name: &str) -> (Arc<wind_store::Store>, PathBuf) {
 /// 同 [`candidates_for`]，但带 store —— shadow 规则存在 store 里，`new_headless` 的 store
 /// 是 `None`，用它写候选调整相关的断言等于什么也没测（本仓栽过的形态）。
 fn candidates_with_store(
+    tag: &str,
     level: usize,
     code: &str,
     store: Arc<wind_store::Store>,
@@ -237,7 +296,9 @@ fn candidates_with_store(
         eprintln!("跳过：五笔词库不存在");
         return None;
     }
-    let coord = Coordinator::new_headless_with_store(wubi_config(level), Some(&d), store);
+    let ov = override_with_level(tag, level);
+    let coord =
+        Coordinator::new_headless_with_store_override(wubi_config(), Some(&d), store, Some(ov));
     press(&coord, code);
     Some(coord.debug_all_candidate_texts())
 }
@@ -251,7 +312,7 @@ fn pinned_char_keeps_the_full_code_top() {
     store
         .pin_shadow("wubi86", "wqiy", "你", None, 0)
         .expect("pin_shadow 失败");
-    let Some(all) = candidates_with_store(3, "wqiy", store) else {
+    let Some(all) = candidates_with_store("shadow_pinned", 3, "wqiy", store) else {
         return;
     };
     let head: Vec<&str> = all.iter().take(6).map(|s| s.as_str()).collect();
@@ -270,7 +331,7 @@ fn pinned_char_keeps_the_full_code_top() {
 #[test]
 fn store_without_pin_still_yields() {
     let (store, path) = fresh_store("wind_scy_shadow_nopin.redb");
-    let Some(all) = candidates_with_store(3, "wqiy", store) else {
+    let Some(all) = candidates_with_store("shadow_nopin", 3, "wqiy", store) else {
         return;
     };
     let head: Vec<&str> = all.iter().take(6).map(|s| s.as_str()).collect();
@@ -293,7 +354,7 @@ fn pinning_another_candidate_stops_the_yield_for_the_whole_code() {
     store
         .pin_shadow("wubi86", "dddd", "硕大", None, 1)
         .expect("pin_shadow 失败");
-    let Some(all) = candidates_with_store(3, "dddd", store) else {
+    let Some(all) = candidates_with_store("shadow_other", 3, "dddd", store) else {
         return;
     };
     let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();
@@ -320,7 +381,7 @@ fn hiding_a_candidate_is_not_a_reorder() {
     store
         .delete_shadow("wubi86", "dddd", "硕大")
         .expect("delete_shadow 失败");
-    let Some(all) = candidates_with_store(3, "dddd", store) else {
+    let Some(all) = candidates_with_store("shadow_deleted", 3, "dddd", store) else {
         return;
     };
     let head: Vec<&str> = all.iter().take(8).map(|s| s.as_str()).collect();

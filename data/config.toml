@@ -58,7 +58,10 @@ single_code_complete = true
 # 出简让全：有简码的字，在更长的码位上把首选让给词语。
 # 「路」的三简是 kht，用户已能 3 键打出它，那么 khtk 的首选就给「路上」之类。
 # 值 = 参与让位的简码级别上限：0 关闭 / 2 一二级简码置后 / 3 全部简码置后。
-short_code_yield_level = 3
+# ⚠️ 全局基线出厂**关**：这里是所有码表方案的公共基线，而「短码首选 = 简码」只对五笔
+# 这类前缀式简码成立，第三方码表的短码首选常是作者排定的常用字，让位纯属破坏。
+# 适合的方案在自己的 .schema.toml 的 [engine.codetable] 里声明（内置 wubi86 已写 3）。
+short_code_yield_level = 0
 z_key_repeat = true
 # z 键功能：空缓冲按 z、且 z 在本方案是死码（无以 z 开头的编码）时，进哪个模式。
 # 值域：""/none（作正常编码字母）/ temp_pinyin / temp_english / mix:<id> / special:<id>。
