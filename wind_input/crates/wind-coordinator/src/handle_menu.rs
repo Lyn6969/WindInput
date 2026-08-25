@@ -1796,25 +1796,22 @@ impl Coordinator {
         }
         let (chinese_mode, caps_lock) = (s.chinese_mode, s.caps_lock);
         drop(s);
-        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese）。
-        let effective_chinese = chinese_mode && !caps_lock;
-        let icon_label = if effective_chinese {
-            let id = self.engine_mgr.active_schema_id();
-            let lbl = self.engine_mgr.schema_icon_label(&id);
-            if lbl.is_empty() {
-                "中".to_string()
-            } else {
-                lbl
-            }
-        } else if caps_lock {
-            "A".to_string()
-        } else {
-            "英".to_string()
-        };
         // ⚠ **必须在取 state 锁之前算**：effective_input_block() 内部要读 state，
         // 而 std::sync::Mutex 不可重入——写在下面的初始化式里就是当场自死锁
         // （工具栏一显示就走到这里，表现为输入法整个卡住）。
         let input_blocked = self.effective_input_block().shows_english();
+        // 不可输入（密码框 / 无编辑上下文 / 系统禁用）时模式格显英文标签：此刻键已全部
+        // 透传给宿主，与英文半角态干的是同一件事，故**共用同一个标签、不另设配置键**。
+        //
+        // 在协调器算而不是留给 wind-ui 覆盖：wind-ui 读不到配置，它自己兜底就只能写死
+        // 一个字面量——那正是这处硬编码的由来。ToolbarState 不下发 TSF，没有
+        // `_inputTypeLabel` 那种持久值顾虑，可以直接改 icon_label 本身；语言栏图标那条
+        // 路**不行**，只能在 spec 上覆盖（见 publish_langbar_icon 的 label 一行）。
+        let icon_label = if input_blocked {
+            self.rt().config.ui.labels.english_label()
+        } else {
+            self.mode_icon_label(chinese_mode, caps_lock)
+        };
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let tb = ToolbarState {
             chinese_mode,

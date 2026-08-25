@@ -869,6 +869,13 @@ punct_color_cn = "#2288E0"
 punct_color_en = "#EE9922"
 full_width_color = "#E0447A"
 
+# 非中文态显示的主字，同时作用于语言栏图标、工具栏模式格、状态气泡。
+# 中文态的主字不在这里——那是方案的属性，配在方案文件的 [schema] icon_label。
+# 最多 2 个字符（两个字母的宽度约等于一个汉字）；留空则用括号里的内置默认值。
+[ui.labels]
+english = "英"   # 英文半角：左/右 Shift 切出的英文态，按键原样透传
+caps_lock = "A"  # 大写锁定
+
 [stats]
 enabled = true
 track_english = true

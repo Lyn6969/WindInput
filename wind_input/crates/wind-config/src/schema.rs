@@ -173,6 +173,47 @@ pub struct SchemaInfo {
     pub hidden: bool,
 }
 
+/// 图标主字的字符数上限。
+///
+/// 定在 2 的两条依据，**缺一都不足以定案**：
+/// ① 渲染：语言栏图标画布只有 16px（DPI 缩放后 20/24/32），字号写死 `size - 2`。
+///    两个 ASCII 字母（`En`）宽度约等于一个汉字，是"还认得出"的上限；再多即使
+///    自适应缩字号也糊成一团。
+/// ② 安全：C++ 侧 `CLangBarItemButton::_inputTypeLabel` 是 `wchar_t[4]`，赋值走
+///    `wcscpy_s`——**超长不是静默截断，是触发 invalid parameter handler 终止进程**，
+///    而那段代码跑在 Word / QQ 等宿主进程里。卡在 2 是给它留 1 个 wchar 余量。
+///
+/// ⚠️ 改这个值之前先读上面第 ②：往上调必须同步扩 C++ 侧那个缓冲，否则是在给
+/// 用户配置留一条崩宿主进程的路。
+pub const ICON_LABEL_MAX_CHARS: usize = 2;
+
+/// 图标主字的**统一截断口径**：去首尾空白后取前 [`ICON_LABEL_MAX_CHARS`] 个字符。
+/// 未配置 / 全空白返回空串，由调用方决定回落成什么。
+///
+/// ## 为什么必须是共享函数
+///
+/// 这条口径有三个调用点（方案标签 `schema_icon_label`、特殊模式 `overlay_modes`、
+/// 非中文态 [`crate::config::LabelsConfig`]）。此前前两处各写了一份 `.chars().next()`，
+/// 其中一处的注释还写着"与 schema_icon_label 同口径"——**一个自我声明的耦合，
+/// 编译器不管**。只改一处的表现是"方案切换显 `Wb`、进特殊模式显 `符`"这种局部
+/// 不一致，且没有任何测试会发现。
+pub fn icon_label_trunc(raw: &str) -> String {
+    raw.trim().chars().take(ICON_LABEL_MAX_CHARS).collect()
+}
+
+/// 同 [`icon_label_trunc`]，但截断结果为空时回落 `fallback`。
+///
+/// ⚠️ 回落**不能省**：空标签会让语言栏图标画出一个没有主字的空白方块，
+/// 用户既看不出当前模式、也无从理解发生了什么。
+pub fn icon_label_or(raw: &str, fallback: &str) -> String {
+    let s = icon_label_trunc(raw);
+    if s.is_empty() {
+        fallback.to_string()
+    } else {
+        s
+    }
+}
+
 /// 引擎配置（[engine]）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineSpec {
@@ -725,5 +766,54 @@ layout = "xiaohe"
         let spec: PinyinSpec = toml::from_str(toml_str).unwrap();
         assert_eq!(spec.scheme, "shuangpin");
         assert_eq!(spec.shuangpin.layout, "xiaohe");
+    }
+
+    /// 截断的两个方向都要成立：**该截的截、不该截的别动**。
+    ///
+    /// 只测"长的被截短"会让一个恒返回首字符的实现也绿——那正是本次要改掉的旧行为，
+    /// 它的表现是用户配了 `En` 只显示 `E`，而单看截断断言完全正常。
+    #[test]
+    fn icon_label_truncates_only_beyond_limit() {
+        assert_eq!(icon_label_trunc("英"), "英", "一个字符原样");
+        assert_eq!(icon_label_trunc("En"), "En", "恰好等于上限，不许动");
+        assert_eq!(icon_label_trunc("English"), "En", "超出上限截到前两个");
+        assert_eq!(icon_label_trunc("符号表"), "符号", "CJK 同一口径");
+    }
+
+    /// 首尾空白必须吃掉：设置页输入框里带出来的空格若原样落进标签，
+    /// 会挤掉本就只有 16px 的绘制宽度，且用户在界面上看不出多了个空格。
+    #[test]
+    fn icon_label_trims_whitespace() {
+        assert_eq!(icon_label_trunc("  En  "), "En");
+        assert_eq!(icon_label_trunc("   "), "", "全空白视同未配置");
+        assert_eq!(icon_label_trunc(""), "");
+    }
+
+    /// 回落方向：空 → fallback，非空 → 不许被 fallback 顶掉。
+    ///
+    /// 后半条是反向对照。缺了它，一个"永远返回 fallback"的实现能让前半条全绿，
+    /// 而那种缺陷的表现是用户怎么配都不生效。
+    #[test]
+    fn icon_label_or_falls_back_only_when_empty() {
+        assert_eq!(icon_label_or("", "英"), "英");
+        assert_eq!(icon_label_or("   ", "英"), "英");
+        assert_eq!(icon_label_or("En", "英"), "En", "配了就用配的");
+        assert_eq!(icon_label_or("English", "英"), "En", "截断后仍是配的");
+    }
+
+    /// 上限的单位是 **Unicode 标量值**，不是 UTF-16 code unit、也不是字节。
+    ///
+    /// 这条约束 C++ 侧的缓冲容量：一个 emoji 是 1 个标量值但占 2 个 wchar，
+    /// 故 2 个字符最坏是 4 wchar + NUL = 5，`_inputTypeLabel` 必须 ≥ 5
+    /// （已改为 8）。若哪天这条断言被改成"按 UTF-16 长度截断"，那个缓冲要跟着重算。
+    #[test]
+    fn icon_label_limit_counts_scalar_values() {
+        let two_emoji = icon_label_trunc("🙂🙃🙂");
+        assert_eq!(two_emoji.chars().count(), 2, "按标量值计数");
+        assert_eq!(
+            two_emoji.encode_utf16().count(),
+            4,
+            "两个标量值可占四个 wchar——C++ 侧缓冲按这个上限取容量"
+        );
     }
 }

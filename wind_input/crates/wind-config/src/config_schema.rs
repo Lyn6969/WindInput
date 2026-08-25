@@ -454,6 +454,12 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.langbar.punct_color_cn", Str),
     f("ui.langbar.punct_color_en", Str),
     f("ui.langbar.full_width_color", Str),
+    // -- ui.labels（非中文态的图标主字；中文态在方案文件的 [schema] icon_label）--
+    // 类型是 Str 而非 Enum：值域是"任意 ≤2 字符"，不是一组枚举值。上限由
+    // `wind_config::schema::icon_label_trunc` 在读取侧统一截断，不在这里表达——
+    // 注册表只描述类型，长度约束若也写一份就成了第二个真相源。
+    f("ui.labels.english", Str),
+    f("ui.labels.caps_lock", Str),
     // -- stats（统计，原 features.stats 升顶级）--
     f("stats.enabled", Bool),
     f("stats.track_english", Bool),

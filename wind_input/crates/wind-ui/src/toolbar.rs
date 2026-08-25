@@ -358,13 +358,12 @@ impl Toolbar {
         // 会与实际行为相反。⚠ 这是纯呈现判断，输入闸在 coordinator 的 password_suppress
         // 分支，两者各管各的，勿把本行的结论回灌给任何状态。
         let effective_chinese = state.chinese_mode && !state.caps_lock && !state.input_blocked;
-        // 显示标签由协调器预计算存入 icon_label；此处直接使用。
-        // 密码框例外：覆盖为 "英"，与该状态下的实际输入行为一致（见 password_suppress 注释）。
-        let mode_text: &str = if state.input_blocked {
-            "英"
-        } else {
-            &state.icon_label
-        };
+        // 显示标签**完全**由协调器预计算存入 icon_label，此处直接使用、不再有任何例外。
+        //
+        // 不可输入（密码框等）时曾在这里覆盖成字面量 "英"。标签可配（`[ui.labels]`）之后
+        // 那条覆盖必须撤掉：本 crate 读不到配置，留着它的唯一结果是"用户把英文标签改成
+        // En，一进密码框又变回英"。判据归协调器、取值也归协调器，这里只负责画。
+        let mode_text: &str = &state.icon_label;
 
         let mut cells = vec![
             Cell {

@@ -1334,7 +1334,12 @@ void CLangBarItemButton::UpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth, BO
     {
         if (wcscmp(_inputTypeLabel, iconLabel) != 0)
         {
-            wcscpy_s(_inputTypeLabel, iconLabel);
+            // _TRUNCATE 而非 wcscpy_s：后者遇超长**不是截断而是调用 invalid parameter
+            // handler**，默认行为是终止进程——而这段代码跑在 Word / QQ 等宿主进程里。
+            // Rust 侧已把标签卡在 2 个字符（wind_config::ICON_LABEL_MAX_CHARS），这条路
+            // 本不该触发；留着它是防将来某条新路径绕过那道截断，把"显示被截断"和
+            // "宿主进程崩溃"这两种后果的差距抹平。
+            wcsncpy_s(_inputTypeLabel, iconLabel, _TRUNCATE);
             labelChanged = TRUE;
         }
     }
@@ -1387,7 +1392,8 @@ void CLangBarItemButton::PostUpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth
     // Copy icon label
     if (iconLabel != nullptr && iconLabel[0] != L'\0')
     {
-        wcscpy_s(pData->iconLabel, iconLabel);
+        // 同 UpdateFullStatus：_TRUNCATE 把"超长即终止进程"降级成"超长即截断"。
+        wcsncpy_s(pData->iconLabel, iconLabel, _TRUNCATE);
     }
     else
     {
@@ -1650,7 +1656,9 @@ void CLangBarItemButton::SetInputTypeLabel(const wchar_t* label)
     if (label == nullptr)
         return;
 
-    wcscpy_s(_inputTypeLabel, label);
+    // 同 UpdateFullStatus：本方法收外部传入的任意长度字符串，wcscpy_s 遇超长会终止
+    // 宿主进程。_TRUNCATE 把它降级成截断。
+    wcsncpy_s(_inputTypeLabel, label, _TRUNCATE);
 
     // Refresh icon to show the new label
     if (_pLangBarItemSink != nullptr)
