@@ -2609,7 +2609,7 @@ pub trait WebDataRpc: WebDataHost {
         let recent = Self::daily_with_today_mem(store, &recent_from, &today, &today_stat);
         let (mut max_day_chars, mut max_day_date) = (0u32, String::new());
         let (mut cl_sum, mut cl_cnt, mut first_sel, mut cand_sel) = (0u64, 0u64, 0u64, 0u64);
-        let (mut sp_chars, mut sp_active) = (0u64, 0u64);
+        let (mut sp_chars, mut sp_millis) = (0u64, 0u64);
         for (d, r) in &recent {
             let t = r.total();
             if t > max_day_chars {
@@ -2620,8 +2620,11 @@ pub trait WebDataRpc: WebDataHost {
             cl_cnt += r.code_len_count as u64;
             first_sel += r.cand_pos_dist[0] as u64;
             cand_sel += r.cand_pos_dist.iter().map(|&v| v as u64).sum::<u64>();
-            sp_chars += t as u64;
-            sp_active += r.active_seconds as u64;
+            // 区间速度：两个分量分别累加后再除一次。逐日算速度再平均是错的——
+            // 那会给只打了几十字的日子和整天码字的日子同样的权重。
+            let (c, ms) = r.speed_parts();
+            sp_chars += c as u64;
+            sp_millis += ms;
         }
         let avg_code_len = if cl_cnt > 0 {
             cl_sum as f64 / cl_cnt as f64
@@ -2633,12 +2636,13 @@ pub trait WebDataRpc: WebDataHost {
         } else {
             0.0
         };
+        // 系数取自采集器而非配置：`max_speed` 是采集器在 flush 时算好落库的成品值，
+        // 两处若各读各的，热改配置后「历史最快」与「今日速度」会差出一个恒定倍数。
+        let factor = collector.speed_factor();
+        let (today_sp_chars, today_sp_ms) = today_stat.speed_parts();
         let today_speed =
-            wind_store::stats::speed_per_minute(today_total, today_stat.active_seconds);
-        let overall_speed = wind_store::stats::speed_per_minute(
-            sp_chars.min(u32::MAX as u64) as u32,
-            sp_active.min(u32::MAX as u64) as u32,
-        );
+            wind_store::stats::speed_per_minute_ms(today_sp_chars as u64, today_sp_ms, factor);
+        let overall_speed = wind_store::stats::speed_per_minute_ms(sp_chars, sp_millis, factor);
 
         Ok(json!({
             "today_chars": today_total,
@@ -2724,10 +2728,11 @@ pub trait WebDataRpc: WebDataHost {
         // 重建元数据（剔除已删历史）并让采集器重载：先 flush 今日落库，recalc 后 resume。
         if let Some(c) = self.stat_collector() {
             c.flush();
-            store.recalculate_stats_meta()?;
+            store.recalculate_stats_meta(c.speed_factor())?;
             c.resume();
         } else {
-            store.recalculate_stats_meta()?;
+            // 无采集器时没有系数可读，按 1.0 重算：这条分支只在无 store 的测试壳里走得到。
+            store.recalculate_stats_meta(1.0)?;
         }
         Ok(json!({ "pruned": n }))
     }
@@ -2755,6 +2760,7 @@ pub trait WebDataRpc: WebDataHost {
 
     /// 组装前端 DailyStatItem JSON（紧凑字段名，含按方案 bs / 按来源 src）。
     fn daily_item_json(date: &str, r: &wind_store::stats::DailyStats) -> Value {
+        let (sp_chars, sp_millis) = r.speed_parts();
         let bs: serde_json::Map<String, Value> = r
             .by_schema
             .iter()
@@ -2785,6 +2791,9 @@ pub trait WebDataRpc: WebDataHost {
             "cld": r.code_len_dist,
             "cpd": r.cand_pos_dist,
             "as": r.active_seconds,
+            // 速度专用分子/分母（v2 模型）：与 tc/as 分开，前端画速度曲线用这两个。
+            "sc": sp_chars,
+            "am": sp_millis,
             "bs": bs,
             "src": r.by_source,
         })

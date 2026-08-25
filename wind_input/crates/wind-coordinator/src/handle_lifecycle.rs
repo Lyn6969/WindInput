@@ -62,6 +62,11 @@ impl Coordinator {
         // 没回灌）。内部自带"无变化则不重发"，故白调一次的成本是零。
         #[cfg(all(feature = "desktop-ui", windows))]
         self.apply_langbar_config();
+        // 速度修正系数也是运行时镜像态：采集器在 flush 时用它算 `max_speed` 并落库，
+        // 不回灌就会出现「改了配置、当日速度变了而历史最快还按旧系数」的两套口径。
+        if let Some(c) = self.stat_collector.as_ref() {
+            c.set_speed_factor(self.rt().config.stats.speed_factor);
+        }
         // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }
 

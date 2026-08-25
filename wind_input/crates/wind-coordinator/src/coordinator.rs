@@ -1682,7 +1682,9 @@ impl Coordinator {
         let hide_candidate_window_init = config.ui.candidate.hide_window;
 
         // 统计采集器：与 store 共享 Arc，内存聚合 + 后台定时 flush。
-        let stat_collector = store.clone().map(StatCollector::new);
+        let stat_collector = store
+            .clone()
+            .map(|s| StatCollector::new(s, config.stats.speed_factor));
         // 启动初始状态：remember_last_state=true 时从 state.toml 恢复上次三态，否则用配置默认。
         let d = &config.input.default;
         let (init_chinese, init_full, init_punct) = if d.remember_last_state {
@@ -5563,6 +5565,21 @@ impl Coordinator {
         candidate_pos: i32,
         source: CommitSource,
     ) {
+        // 绝大多数路径的击键数就是码长（打 n 键、选一次词）。「一键出一串」的路径
+        // 码长恰恰是 0，必须走 `record_commit_ks` 显式传 1，否则速度封顶盖不住它们。
+        self.record_commit_ks(text, code_len, code_len, candidate_pos, source);
+    }
+
+    /// 同 [`Self::record_commit`]，但显式给出击键数（仅影响速度分子封顶，见
+    /// `wind_store::stats::speed_chars_of`）。实际字数统计与本参数无关。
+    pub(crate) fn record_commit_ks(
+        &self,
+        text: &str,
+        code_len: u32,
+        keystrokes: u32,
+        candidate_pos: i32,
+        source: CommitSource,
+    ) {
         if text.is_empty() {
             return;
         }
@@ -5582,6 +5599,7 @@ impl Coordinator {
             other,
             code_len,
             candidate_pos,
+            keystrokes,
             schema_id: self.active_schema_id(),
             source,
         });

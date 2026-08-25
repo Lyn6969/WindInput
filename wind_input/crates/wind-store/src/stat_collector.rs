@@ -3,20 +3,24 @@
 //! 对齐 Go `wind_input/internal/store/stat_collector.go`：
 //! - `record()` 把单次上屏事件聚合进当日内存 `DailyStats`，跨天自动 flush 旧日并开新日；
 //! - 后台线程每 30s flush 一次；`Drop`（对齐 Go `Close`）停线程并最终 flush；
-//! - 活跃时间：两次上屏间隔 < 15s 视为持续输入，累加秒数（用于速度统计）。
+//! - 活跃时间：两次上屏间隔 < 15s 视为持续输入，累加毫秒（用于速度统计）。
+//!
+//! 速度模型（分子分母口径必须对称）见 `stats.rs` 模块文档的「速度模型」一节。
 
 use crate::stats::{
-    CommitSource, DailyStats, StatsMeta, qualifies_for_max_speed, speed_per_minute,
+    CommitSource, DailyStats, StatsMeta, qualifies_for_max_speed, speed_chars_of,
+    speed_per_minute_ms,
 };
 use crate::store::Store;
 use chrono::{DateTime, Local, NaiveDate, Timelike};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracing::warn;
 
-/// 活跃输入判定阈值（秒）：两次上屏间隔小于此值视为持续输入。
-const ACTIVE_THRESHOLD_SECS: i64 = 15;
+/// 活跃输入判定阈值（毫秒）：两次上屏间隔小于此值视为持续输入。
+const ACTIVE_THRESHOLD_MS: i64 = 15_000;
 /// 后台 flush 周期（秒）。
 const FLUSH_INTERVAL_SECS: u64 = 30;
 
@@ -30,6 +34,11 @@ pub struct StatEvent {
     pub other: u32,
     pub code_len: u32,      // 编码长度（0 = 标点/直接输入）
     pub candidate_pos: i32, // 候选位置：0=首选 … -1=非候选
+    /// 本次上屏耗用的击键数，**0 = 未知**。仅用于速度分子封顶（见 `speed_chars_of`），
+    /// 不进任何实际字数统计。多数路径等于 `code_len`；「一键出一串」的路径
+    /// （重复上屏 / 快捷指令 / 网址上屏）须显式传 1，否则封顶规则盖不住它们——
+    /// 那些路径的 `code_len` 恰恰是 0。
+    pub keystrokes: u32,
     pub schema_id: String,
     pub source: CommitSource,
 }
@@ -54,9 +63,23 @@ impl Default for StatEvent {
             other: 0,
             code_len: 0,
             candidate_pos: -1,
+            keystrokes: 0,
             schema_id: String::new(),
             source: CommitSource::default(),
         }
+    }
+}
+
+/// 把 v1 记录就地折算成 v2 口径。
+///
+/// 当天中途升级的场景：早上用旧版打了 3000 字（只有 `active_seconds`），下午换新版继续打。
+/// 不折算的话新版会从 `active_millis = 0` 起累加，而 `active_seconds` 那半天的时间还在，
+/// 两个分母各说各话；折算后当天的旧半段按旧口径入账、新半段按新口径增量，语义自洽。
+fn migrate_to_speed_v2(d: &mut DailyStats) {
+    if !d.speed_v2 {
+        d.active_millis = d.active_seconds as u64 * 1000;
+        d.speed_chars = d.total();
+        d.speed_v2 = true;
     }
 }
 
@@ -73,6 +96,15 @@ struct Inner {
 struct Shared {
     store: Arc<Store>,
     inner: Mutex<Inner>,
+    /// 速度修正系数的 `f32::to_bits`。`max_speed` 在 flush 时就地算出并落库，
+    /// 必须与展示端用同一个系数，故系数得跟着采集器走而不是只留在展示层。
+    speed_factor: AtomicU32,
+}
+
+impl Shared {
+    fn speed_factor(&self) -> f32 {
+        f32::from_bits(self.speed_factor.load(Ordering::Relaxed))
+    }
 }
 
 /// 输入统计采集器。
@@ -88,10 +120,15 @@ fn today_string() -> String {
 
 impl StatCollector {
     /// 创建采集器：加载当日数据与元数据，启动后台定时 flush 线程。
-    pub fn new(store: Arc<Store>) -> Self {
+    ///
+    /// `speed_factor` 见 `stats::speed_per_minute_ms`。做成必填参数而非「先建后设」，
+    /// 是为了让漏接线在编译期就暴露：默认值的真相源在 `wind-config`，本 crate 不该有第二份。
+    pub fn new(store: Arc<Store>, speed_factor: f32) -> Self {
         let today = today_string();
+        let mut today_stat = store.get_daily_stat(&today).unwrap_or_default();
+        migrate_to_speed_v2(&mut today_stat);
         let mut inner = Inner {
-            today: store.get_daily_stat(&today).unwrap_or_default(),
+            today: today_stat,
             today_date: today.clone(),
             meta: store.get_stats_meta().unwrap_or_default(),
             dirty: false,
@@ -103,6 +140,7 @@ impl StatCollector {
         let shared = Arc::new(Shared {
             store,
             inner: Mutex::new(inner),
+            speed_factor: AtomicU32::new(speed_factor.to_bits()),
         });
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let handle = {
@@ -120,6 +158,18 @@ impl StatCollector {
     /// 记录一次上屏事件。
     pub fn record(&self, event: StatEvent) {
         self.shared.record(event);
+    }
+
+    /// 更新速度修正系数（配置热更新时调用）。
+    pub fn set_speed_factor(&self, factor: f32) {
+        self.shared
+            .speed_factor
+            .store(factor.to_bits(), Ordering::Relaxed);
+    }
+
+    /// 当前速度修正系数（展示端取此值，保证与 `max_speed` 落库口径一致）。
+    pub fn speed_factor(&self) -> f32 {
+        self.shared.speed_factor()
     }
 
     /// 将内存数据持久化（线程安全）。
@@ -173,6 +223,7 @@ impl StatCollector {
         let mut inner = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         let today = today_string();
         inner.today = self.shared.store.get_daily_stat(&today).unwrap_or_default();
+        migrate_to_speed_v2(&mut inner.today);
         inner.today_date = today.clone();
         inner.meta = self.shared.store.get_stats_meta().unwrap_or_default();
         if inner.meta.first_day.is_empty() {
@@ -256,13 +307,32 @@ impl Shared {
             d.by_source[si] = d.by_source[si].saturating_add(rune);
         }
 
-        // 活跃时间：与上次上屏间隔 < 阈值则累加
-        if let Some(last) = inner.last_commit {
-            let dt = (event.timestamp - last).num_seconds();
-            if (0..ACTIVE_THRESHOLD_SECS).contains(&dt) {
-                inner.today.active_seconds = inner.today.active_seconds.saturating_add(dt as u32);
+        // ── 活跃时间与速度分子（两者口径必须对称）──
+        //
+        // 只有「能测到耗时」的那次上屏，其字符才计入速度分子：当天首次上屏、以及发呆
+        // 超阈值后重新开打的那一次，前面花了多久无从得知，把它的字数算进分子而时间算 0，
+        // 正是 v1 速度虚高的主因之一。字数照样进 `today.chinese/...`（用户看的产出不变），
+        // 只是不进 `speed_chars`。
+        //
+        // 间隔取**毫秒**：`num_seconds()` 向零截断，0.8s 的间隔会被记成 0s，手越快分母
+        // 被砍得越狠，且方向恒为「速度偏高」。
+        let counted_ms = match inner.last_commit {
+            Some(last) => {
+                let ms = (event.timestamp - last).num_milliseconds();
+                (0..ACTIVE_THRESHOLD_MS).contains(&ms).then_some(ms as u64)
             }
+            None => None,
+        };
+        if let Some(ms) = counted_ms {
+            let d = &mut inner.today;
+            d.active_millis = d.active_millis.saturating_add(ms);
+            // 旧字段仍被日曲线与历史数据消费，由毫秒总量派生（比逐次截断再相加更准）。
+            d.active_seconds = (d.active_millis / 1000).min(u32::MAX as u64) as u32;
+            d.speed_chars = d
+                .speed_chars
+                .saturating_add(speed_chars_of(rune, event.keystrokes));
         }
+        inner.today.speed_v2 = true;
         inner.last_commit = Some(event.timestamp);
         inner.meta.total_chars = inner.meta.total_chars.saturating_add(rune as u64);
         inner.dirty = true;
@@ -282,11 +352,11 @@ impl Shared {
             return;
         }
         update_streak(&mut inner.meta, &inner.today_date);
-        // flush 每 30 秒一次，当天开头几次的活跃秒数还是个位数——不设门槛就会把
+        // flush 每 30 秒一次，当天开头几次的活跃时间还是几秒——不设门槛就会把
         // 外推出来的上千字/分永久写进历史最快（见 qualifies_for_max_speed）。
-        let (total, active) = (inner.today.total(), inner.today.active_seconds);
-        if qualifies_for_max_speed(total, active) {
-            let sp = speed_per_minute(total, active);
+        let (sp_chars, sp_ms) = inner.today.speed_parts();
+        if qualifies_for_max_speed(sp_chars, sp_ms) {
+            let sp = speed_per_minute_ms(sp_chars as u64, sp_ms, self.speed_factor());
             if sp > inner.meta.max_speed {
                 inner.meta.max_speed = sp;
             }
@@ -364,7 +434,7 @@ mod tests {
 
     #[test]
     fn test_record_aggregates_all_dimensions() {
-        let sc = StatCollector::new(mem_store());
+        let sc = StatCollector::new(mem_store(), 1.0);
         sc.record(StatEvent {
             chinese: 5,
             code_len: 2,
@@ -390,7 +460,7 @@ mod tests {
     #[test]
     fn test_cross_day_flushes_old_and_starts_new() {
         let store = mem_store();
-        let sc = StatCollector::new(store.clone());
+        let sc = StatCollector::new(store.clone(), 1.0);
         {
             let mut inner = sc.shared.inner.lock().unwrap();
             inner.today_date = "2026-01-01".into();
@@ -416,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_active_time_within_threshold() {
-        let sc = StatCollector::new(mem_store());
+        let sc = StatCollector::new(mem_store(), 1.0);
         let base = Local::now();
         sc.record(StatEvent {
             timestamp: base,
@@ -443,9 +513,141 @@ mod tests {
         );
     }
 
+    /// 亚秒间隔必须累进分母。
+    ///
+    /// ★ v1 用 `num_seconds()` 向零截断，这 4 次 900ms 的间隔全被记成 0 秒 ⇒ 分母恒 0、
+    /// 分子照涨，速度被外推。**手越快，被砍掉的比例越大**——偏差方向恒为「显示得更快」，
+    /// 恰好发生在最想看这个数字的用户身上。
+    #[test]
+    fn sub_second_gaps_accumulate_in_millis() {
+        let sc = StatCollector::new(mem_store(), 1.0);
+        let base = Local::now();
+        for i in 0..5 {
+            sc.record(StatEvent {
+                timestamp: base + chrono::Duration::milliseconds(900 * i),
+                chinese: 2,
+                code_len: 4,
+                source: CommitSource::Candidate,
+                ..Default::default()
+            });
+        }
+        let d = sc.get_today_stat();
+        assert_eq!(d.active_millis, 3_600, "4 个 900ms 间隔");
+        assert_eq!(d.active_seconds, 3, "旧字段由毫秒总量派生");
+        assert_eq!(d.total(), 10, "实际字数不受速度模型影响");
+    }
+
+    /// 段首（当天首次 / 发呆超阈值后重开）的字符不进速度分子——它的耗时无从测量。
+    ///
+    /// ★ 这是 v1 速度虚高的第二个来源：那次上屏的**时间被丢弃而字数被保留**，
+    /// 分子分母口径不对称。分段越碎（写代码时夹杂中文就是这样），虚高越离谱。
+    #[test]
+    fn segment_start_chars_stay_out_of_speed_numerator() {
+        let sc = StatCollector::new(mem_store(), 1.0);
+        let base = Local::now();
+        // 段首：5 字，无前序间隔。
+        sc.record(StatEvent {
+            timestamp: base,
+            chinese: 5,
+            code_len: 9,
+            source: CommitSource::Candidate,
+            ..Default::default()
+        });
+        // 段内：2 秒后 3 字 —— 这一次才算得出耗时。
+        sc.record(StatEvent {
+            timestamp: base + chrono::Duration::seconds(2),
+            chinese: 3,
+            code_len: 9,
+            source: CommitSource::Candidate,
+            ..Default::default()
+        });
+        // 发呆 60 秒后重开：又是段首，4 字不进分子。
+        sc.record(StatEvent {
+            timestamp: base + chrono::Duration::seconds(62),
+            chinese: 4,
+            code_len: 9,
+            source: CommitSource::Candidate,
+            ..Default::default()
+        });
+        let d = sc.get_today_stat();
+        assert_eq!(d.total(), 12, "实际字数如实计全部 12 字");
+        assert_eq!(d.speed_chars, 3, "只有能测到耗时的那 3 字进分子");
+        assert_eq!(d.active_millis, 2_000);
+    }
+
+    /// 短码出长词按击键数封顶，实际字数不受影响。
+    #[test]
+    fn short_code_long_word_caps_speed_numerator_only() {
+        let sc = StatCollector::new(mem_store(), 1.0);
+        let base = Local::now();
+        sc.record(StatEvent {
+            timestamp: base,
+            chinese: 1,
+            code_len: 4,
+            keystrokes: 4,
+            source: CommitSource::Candidate,
+            ..Default::default()
+        });
+        // 4 键出「中华人民共和国」7 字：速度只认 4。
+        sc.record(StatEvent {
+            timestamp: base + chrono::Duration::seconds(1),
+            chinese: 7,
+            code_len: 4,
+            keystrokes: 4,
+            source: CommitSource::Candidate,
+            ..Default::default()
+        });
+        // 1 键触发快捷指令出 20 字：同样只认 4。
+        sc.record(StatEvent {
+            timestamp: base + chrono::Duration::seconds(2),
+            chinese: 20,
+            keystrokes: 1,
+            source: CommitSource::Mix,
+            ..Default::default()
+        });
+        // 12 键打出的 12 字整句：不封顶。
+        sc.record(StatEvent {
+            timestamp: base + chrono::Duration::seconds(3),
+            chinese: 12,
+            code_len: 12,
+            keystrokes: 12,
+            source: CommitSource::Candidate,
+            ..Default::default()
+        });
+        let d = sc.get_today_stat();
+        assert_eq!(d.total(), 40, "实际字数一个不少");
+        assert_eq!(
+            d.speed_chars,
+            4 + 4 + 12,
+            "段首那 1 字不计，其余按封顶后累加"
+        );
+    }
+
+    /// 当天中途从 v1 升级：旧半段按旧口径折算入账，不能凭空清零。
+    #[test]
+    fn resume_migrates_v1_record_of_the_same_day() {
+        let store = mem_store();
+        // 模拟旧版本落库的当日数据（无 speed_v2 字段）。
+        store
+            .put_daily_stat(
+                &today_string(),
+                &DailyStats {
+                    chinese: 300,
+                    active_seconds: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let sc = StatCollector::new(store, 1.0);
+        let d = sc.get_today_stat();
+        assert!(d.speed_v2);
+        assert_eq!(d.speed_chars, 300, "旧半段按旧口径折算");
+        assert_eq!(d.active_millis, 120_000);
+    }
+
     #[test]
     fn test_streak_increment_and_reset() {
-        let sc = StatCollector::new(mem_store());
+        let sc = StatCollector::new(mem_store(), 1.0);
 
         let flush_day = |date: &str| {
             let mut inner = sc.shared.inner.lock().unwrap();
@@ -475,7 +677,7 @@ mod tests {
     fn test_drop_flushes_pending() {
         let store = mem_store();
         {
-            let sc = StatCollector::new(store.clone());
+            let sc = StatCollector::new(store.clone(), 1.0);
             sc.record(StatEvent {
                 chinese: 7,
                 source: CommitSource::Candidate,

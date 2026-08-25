@@ -8,6 +8,21 @@
 //!   旧库只含 `{chinese, english}`，新增字段全部 `#[serde(default)]`，向后兼容无需迁移脚本。
 //! - 元数据：存入现有 `META` 表的 `stats_meta` 键（不新增表定义）。
 //! - `date` 是 redb 的 key，不进 `DailyStats` 结构（对齐 Go 用 bucket key）。
+//!
+//! # 速度模型（v2）
+//!
+//! 速度 = `speed_chars × 60000 / active_millis × speed_factor`，**四个量都与实际字数统计
+//! 分开**。v1 用「全部字符 / 整秒活跃时间」，四条单向正偏差叠乘，实测偏高一倍以上：
+//!
+//! | 偏差 | 成因 | v2 的对策 |
+//! |---|---|---|
+//! | ① 整秒截断 | `num_seconds()` 向零截断，0.8s 的间隔记 0s；手越快砍得越狠 | 分母改毫秒（`active_millis`） |
+//! | ② 口径不对称 | 间隔 ≥ 阈值时**时间丢弃、字数照计** | 段首事件的字数也不进分子 |
+//! | ③ 一次上屏 = 一个时间点 | 4 键出 7 字、1 键出一整条快捷指令 | [`speed_chars_of`] 按击键数封顶 |
+//! | ④ 打错字无从感知 | 退格重打的字符计两遍、耗时算一遍 | `speed_factor` 经验修正 |
+//!
+//! ①②③ 是结构性的，必须在采集期修；只有 ④ 无法从输入法内部观测，才交给系数。
+//! **不要指望系数能替代 ①②③** —— 那等于用一个魔法数去掩盖三个可以精确修掉的量。
 
 use crate::store::{META, STATS_DAILY, Store};
 use chrono::{Duration, NaiveDate};
@@ -92,6 +107,20 @@ pub struct DailyStats {
     // 活跃输入时间（秒），连续输入间隔 < 阈值视为活跃
     #[serde(default)]
     pub active_seconds: u32,
+    // ── 速度统计专用量（v2 模型，见模块文档「速度模型」）──
+    // 速度分子：与 `total()` **刻意分开**。上屏字数要如实计（用户看的是产出），
+    // 而速度分子要扣掉「短码打长词/一键出一串」这类字符（见 `speed_chars_of`），
+    // 以及段首那些无法测量耗时的字符。两个量纲不同，共用一个累加器必错。
+    #[serde(default)]
+    pub speed_chars: u32,
+    // 速度分母（毫秒）。`active_seconds` 用 `num_seconds()` 整秒截断，间隔 0.8s 记 0s，
+    // 打得越快分母被砍得越狠（单向偏差），故速度另存毫秒。
+    #[serde(default)]
+    pub active_millis: u64,
+    // 本记录是否由 v2 速度模型写过。旧库记录没有上面两个量，读回时要回退到旧口径；
+    // 不能用「speed_chars == 0」判断——新模型下它合法地可以是 0（当天全是段首上屏）。
+    #[serde(default)]
+    pub speed_v2: bool,
     // 按方案分类
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub by_schema: HashMap<String, SchemaStats>,
@@ -107,6 +136,19 @@ impl DailyStats {
             .saturating_add(self.english)
             .saturating_add(self.punct)
             .saturating_add(self.other)
+    }
+
+    /// 速度的 (分子字符数, 分母毫秒)。区间速度把多天的两个分量分别累加后再除。
+    ///
+    /// v2 之前的记录没有这两个量，只能按旧口径（全部字符 / 整秒活跃时间）回退——
+    /// 那个口径系统性偏高，故历史曲线与新数据之间会有一道台阶，这是无法回补的：
+    /// 逐次上屏的击键数与毫秒间隔当时就没存下来。
+    pub fn speed_parts(&self) -> (u32, u64) {
+        if self.speed_v2 {
+            (self.speed_chars, self.active_millis)
+        } else {
+            (self.total(), self.active_seconds as u64 * 1000)
+        }
     }
 }
 
@@ -137,32 +179,66 @@ pub struct StatsSummary {
     pub streak: u32,
 }
 
-/// 每分钟字数：活跃时间设 5 秒下限（对齐 Go `SpeedPerMinute`）。
+/// 触发单次上屏封顶的击键数上限：击键数 ≤ 此值即视为「短码出长词」。
+pub const SPEED_SHORT_KEYSTROKES: u32 = 4;
+/// 触发封顶时单次上屏最多计入速度分子的字符数。
+pub const SPEED_SHORT_CHAR_CAP: u32 = 4;
+
+/// 单次上屏计入**速度分子**的字符数（实际字数统计不走这里，如实计全部）。
 ///
-/// 分母小时结果是**外推值**而非实测速度（`speed_per_minute(252, 6) == 2520`），
-/// 用于展示当日/区间速度尚可（分母通常够大），但绝不可直接拿去刷新历史最快——
-/// 那个是永久记录，见 [`qualifies_for_max_speed`]。
-pub fn speed_per_minute(chars: u32, active_seconds: u32) -> u32 {
-    if chars == 0 || active_seconds == 0 {
-        return 0;
+/// 一次上屏在时间轴上只占一个间隔，可产出的字符数却不封顶：4 键出「中华人民共和国」、
+/// 1 键触发快捷指令出二十几个字符——这些字符全额进分子会把速度顶到荒谬的值。
+/// 故击键数 ≤ [`SPEED_SHORT_KEYSTROKES`] 时按 [`SPEED_SHORT_CHAR_CAP`] 封顶。
+///
+/// `keystrokes == 0` 表示**未知**（该上屏路径没有编码可依据），此时不封顶：
+/// 宁可漏封（速度偏高一点）也不能误伤——TSF 英文批量上报一次就是几十个 1:1 击键的字符，
+/// 误判成「一键出一串」会把英文速度直接砍到 4。
+pub fn speed_chars_of(rune_count: u32, keystrokes: u32) -> u32 {
+    if keystrokes > 0 && keystrokes <= SPEED_SHORT_KEYSTROKES {
+        rune_count.min(SPEED_SHORT_CHAR_CAP)
+    } else {
+        rune_count
     }
-    let secs = active_seconds.max(5);
-    chars.saturating_mul(60) / secs
 }
 
-/// 计入「历史最快」所需的最小活跃时长（秒）。
-const MIN_SPEED_SAMPLE_SECS: u32 = 60;
+/// 速度分母下限（毫秒）：分母再小也按此值算，否则外推出天文数字。
+const MIN_SPEED_WINDOW_MS: u64 = 5_000;
+
+/// 每分钟字数 = 分子 × 60000 / 分母(ms) × 修正系数。
+///
+/// `factor` 是经验修正（见 `StatsConfig::speed_factor`）：输入法无从知道用户打错了没有，
+/// 打错后退格重打的字符会被计两遍、耗时却只算一遍，方向恒为正偏差，故出厂取 < 1。
+/// 非有限值或 ≤ 0 一律当 1.0 处理（配置写坏不该把速度清零）。
+///
+/// 分母小时结果仍是**外推值**而非实测速度，展示当日/区间速度尚可（分母通常够大），
+/// 但绝不可直接拿去刷新历史最快——那个是永久记录，见 [`qualifies_for_max_speed`]。
+pub fn speed_per_minute_ms(chars: u64, active_millis: u64, factor: f32) -> u32 {
+    if chars == 0 || active_millis == 0 {
+        return 0;
+    }
+    let ms = active_millis.max(MIN_SPEED_WINDOW_MS);
+    let f = if factor.is_finite() && factor > 0.0 {
+        factor as f64
+    } else {
+        1.0
+    };
+    let v = (chars as f64) * 60_000.0 * f / (ms as f64);
+    v.round().clamp(0.0, u32::MAX as f64) as u32
+}
+
+/// 计入「历史最快」所需的最小活跃时长（毫秒）。
+const MIN_SPEED_SAMPLE_MS: u64 = 60_000;
 /// 计入「历史最快」所需的最小字数。
 const MIN_SPEED_SAMPLE_CHARS: u32 = 100;
 
 /// 该样本是否够格刷新「历史最快」。
 ///
-/// 活跃秒数只累加**相邻两次上屏的间隔**，当天第一次上屏不计时（见 `StatCollector::record`），
-/// 于是每天开头必然出现「字数已有几十上百、活跃秒数还是个位数」的窗口；
-/// 此时 `speed_per_minute` 会外推出上千字/分。而 `max_speed` 是永久记录，
+/// 活跃时间只累加**相邻两次上屏的间隔**，段首那次不计时（见 `StatCollector::record`），
+/// 于是每天开头必然出现「字数已有几十上百、活跃时间还是几秒」的窗口；
+/// 此时 [`speed_per_minute_ms`] 会外推出上千字/分。而 `max_speed` 是永久记录，
 /// 一旦被这种样本污染就再也降不回来（除非重算），故这里要求样本量足够才参与比较。
-pub fn qualifies_for_max_speed(chars: u32, active_seconds: u32) -> bool {
-    active_seconds >= MIN_SPEED_SAMPLE_SECS && chars >= MIN_SPEED_SAMPLE_CHARS
+pub fn qualifies_for_max_speed(chars: u32, active_millis: u64) -> bool {
+    active_millis >= MIN_SPEED_SAMPLE_MS && chars >= MIN_SPEED_SAMPLE_CHARS
 }
 
 impl Store {
@@ -336,7 +412,10 @@ impl Store {
     }
 
     /// 从现存每日数据重建全局元数据（prune 后/meta 缺失时调用，对齐 Go `RecalculateStatsMeta`）。
-    pub fn recalculate_stats_meta(&self) -> anyhow::Result<StatsMeta> {
+    ///
+    /// `speed_factor` 见 [`speed_per_minute_ms`]：`max_speed` 是落库的成品值，重算时必须
+    /// 与展示端用同一个系数，否则「历史最快」会比当日速度高出一个恒定倍数。
+    pub fn recalculate_stats_meta(&self, speed_factor: f32) -> anyhow::Result<StatsMeta> {
         let all = self.all_daily_stats()?;
         let mut meta = StatsMeta::default();
         let mut dates = Vec::with_capacity(all.len());
@@ -347,8 +426,9 @@ impl Store {
             meta.total_chars += stat.total() as u64;
             // 样本太小的日子不参与历史最快（见 qualifies_for_max_speed）；
             // 本函数从零重算，故也是修正历史污染值的入口。
-            if qualifies_for_max_speed(stat.total(), stat.active_seconds) {
-                let sp = speed_per_minute(stat.total(), stat.active_seconds);
+            let (sp_chars, sp_ms) = stat.speed_parts();
+            if qualifies_for_max_speed(sp_chars, sp_ms) {
+                let sp = speed_per_minute_ms(sp_chars as u64, sp_ms, speed_factor);
                 if sp > meta.max_speed {
                     meta.max_speed = sp;
                 }
@@ -633,12 +713,80 @@ mod tests {
     // ── Stage 1 新增 ──
 
     #[test]
-    fn test_speed_per_minute() {
-        assert_eq!(speed_per_minute(252, 6), 2520);
-        assert_eq!(speed_per_minute(252, 120), 126);
-        assert_eq!(speed_per_minute(60, 3), 720, "极短时间触发 5s 下限");
-        assert_eq!(speed_per_minute(0, 60), 0);
-        assert_eq!(speed_per_minute(100, 0), 0);
+    fn test_speed_per_minute_ms() {
+        assert_eq!(speed_per_minute_ms(252, 6_000, 1.0), 2520);
+        assert_eq!(speed_per_minute_ms(252, 120_000, 1.0), 126);
+        assert_eq!(
+            speed_per_minute_ms(60, 3_000, 1.0),
+            720,
+            "极短时间触发 5s 下限"
+        );
+        assert_eq!(speed_per_minute_ms(0, 60_000, 1.0), 0);
+        assert_eq!(speed_per_minute_ms(100, 0, 1.0), 0);
+        // 亚秒间隔不再被截断成 0：v1 的 `num_seconds()` 会把这 900ms 记成 0 秒，
+        // 于是分母凭空消失、速度被外推——这正是 v1 偏高的头号来源。
+        assert_eq!(speed_per_minute_ms(2, 900, 1.0), 24, "分母走 5s 下限");
+    }
+
+    /// 修正系数直接乘在结果上，且写坏的值不得把速度清零。
+    #[test]
+    fn speed_factor_scales_result_and_tolerates_garbage() {
+        assert_eq!(speed_per_minute_ms(300, 60_000, 1.0), 300);
+        assert_eq!(speed_per_minute_ms(300, 60_000, 0.85), 255);
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                speed_per_minute_ms(300, 60_000, bad),
+                300,
+                "非法系数 {bad} 应按 1.0 处理而非清零"
+            );
+        }
+    }
+
+    /// 短码出长词/一键出一串：速度分子封顶，**实际字数不受影响**（那由调用方另计）。
+    #[test]
+    fn speed_chars_capped_only_for_short_keystrokes() {
+        // 4 键出 7 字（「中华人民共和国」）→ 只计 4。
+        assert_eq!(speed_chars_of(7, 4), 4);
+        // 1 键触发快捷指令出 30 字 → 只计 4。
+        assert_eq!(speed_chars_of(30, 1), 4);
+        // 击键数超过阈值 → 不封顶（正常整句输入不该被削）。
+        assert_eq!(speed_chars_of(12, 5), 12);
+        // 封顶只取下限，不会把短内容拔高。
+        assert_eq!(speed_chars_of(1, 1), 1);
+        assert_eq!(speed_chars_of(2, 3), 2);
+        // 击键数未知（0）一律不封顶：宁可漏封也不误伤 TSF 英文那种批量 1:1 上报。
+        assert_eq!(speed_chars_of(30, 0), 30);
+    }
+
+    /// v1 记录没有速度专用量，须回退到旧口径而不是当成「0 字符」。
+    #[test]
+    fn speed_parts_falls_back_for_v1_records() {
+        let v1 = DailyStats {
+            chinese: 240,
+            active_seconds: 120,
+            ..Default::default()
+        };
+        assert_eq!(v1.speed_parts(), (240, 120_000));
+
+        // v2 记录即使分子为 0（当天全是段首上屏）也不能回退——那会读成 240。
+        let v2 = DailyStats {
+            chinese: 240,
+            active_seconds: 120,
+            speed_v2: true,
+            speed_chars: 0,
+            active_millis: 0,
+            ..Default::default()
+        };
+        assert_eq!(v2.speed_parts(), (0, 0));
+
+        let v2b = DailyStats {
+            chinese: 240,
+            speed_v2: true,
+            speed_chars: 180,
+            active_millis: 90_500,
+            ..Default::default()
+        };
+        assert_eq!(v2b.speed_parts(), (180, 90_500));
     }
 
     /// 守护：小样本不得刷新「历史最快」。
@@ -650,17 +798,17 @@ mod tests {
     fn small_samples_never_qualify_for_max_speed() {
         // 典型污染场景：当天开头，第一次上屏的字不计时间，第二次上屏才攒出几秒。
         assert!(
-            !qualifies_for_max_speed(125, 5),
+            !qualifies_for_max_speed(125, 5_000),
             "125字/5秒 外推 1500，须挡掉"
         );
-        assert!(!qualifies_for_max_speed(252, 6));
+        assert!(!qualifies_for_max_speed(252, 6_000));
         // 时长够但字数太少 → 仍不算（几十个字的偶发爆发不代表稳定速度）。
-        assert!(!qualifies_for_max_speed(50, 300));
+        assert!(!qualifies_for_max_speed(50, 300_000));
         // 字数够但时长太短 → 不算。
-        assert!(!qualifies_for_max_speed(5000, 30));
+        assert!(!qualifies_for_max_speed(5000, 30_000));
         // 两者都够 → 计入。
-        assert!(qualifies_for_max_speed(100, 60));
-        assert!(qualifies_for_max_speed(6000, 600));
+        assert!(qualifies_for_max_speed(100, 60_000));
+        assert!(qualifies_for_max_speed(6000, 600_000));
     }
 
     #[test]
@@ -799,7 +947,7 @@ mod tests {
         }
 
         assert_eq!(s.prune_stats_before("2026-04-21").unwrap(), 1);
-        let meta = s.recalculate_stats_meta().unwrap();
+        let meta = s.recalculate_stats_meta(1.0).unwrap();
         assert_eq!(meta.total_chars, 500);
         assert_eq!(meta.first_day, "2026-04-21");
         assert_eq!(meta.streak_current, 1);
@@ -834,7 +982,7 @@ mod tests {
         })
         .unwrap();
 
-        let meta = s.recalculate_stats_meta().unwrap();
+        let meta = s.recalculate_stats_meta(1.0).unwrap();
         assert_eq!(
             meta.max_speed, 120,
             "小样本那天应被忽略，且旧的污染值 1500 被重算覆盖"

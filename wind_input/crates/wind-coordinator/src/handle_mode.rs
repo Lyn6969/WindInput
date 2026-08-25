@@ -1798,7 +1798,9 @@ impl Coordinator {
                 // 重复上屏：整体上屏上次内容，不记选词/不造词（该候选无对应编码）。
                 if state.mix_repeat && !state.candidates.is_empty() {
                     let text = state.candidates[0].text.clone();
-                    self.record_commit(&text, 0, 0, wind_store::stats::CommitSource::Mix);
+                    // 一个空格重出上次全部内容：字数如实计，但速度分子按「1 击键」封顶，
+                    // 否则一键几十字会把速度顶穿（本路径 code_len 恒 0，不显式传就漏封）。
+                    self.record_commit_ks(&text, 0, 1, 0, wind_store::stats::CommitSource::Mix);
                     // 重复上屏本身也入历史：连按两次仍重复同一内容（而非取到更早的一条）。
                     self.push_commit_history(&text);
                     let out = self.maybe_s2t(state, &text);

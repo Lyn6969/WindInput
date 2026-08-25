@@ -383,6 +383,10 @@ impl MessageHandler for Coordinator {
         if chars == 0 && digits == 0 && puncts == 0 && spaces == 0 {
             return;
         }
+        let total = chars
+            .saturating_add(digits)
+            .saturating_add(puncts)
+            .saturating_add(spaces);
         collector.record(StatEvent {
             timestamp: chrono::Local::now(),
             chinese: 0,
@@ -391,6 +395,9 @@ impl MessageHandler for Coordinator {
             other: digits.saturating_add(spaces),
             code_len: 0,
             candidate_pos: -1,
+            // 英文直输是 1 字符 1 击键。这里必须显式给出，否则一批 ≤4 字符的上报会被
+            // 「短码出长词」规则误判封顶——那规则针对的是中文短码，与英文无关。
+            keystrokes: total,
             schema_id: self.active_schema_id(),
             source: CommitSource::TsfDirect,
         });

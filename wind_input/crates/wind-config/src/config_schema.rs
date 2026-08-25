@@ -457,6 +457,7 @@ static REGISTRY: &[ConfigField] = &[
     // -- stats（统计，原 features.stats 升顶级）--
     f("stats.enabled", Bool),
     f("stats.track_english", Bool),
+    f("stats.speed_factor", Float),
     // -- debug（调试）--
     f(
         "debug.log_level",

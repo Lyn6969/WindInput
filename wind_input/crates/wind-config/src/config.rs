@@ -3852,6 +3852,21 @@ pub struct StatsConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub track_english: bool,
+    /// 打字速度的修正系数（只作用于**速度展示**，不影响任何字数统计）。
+    ///
+    /// 采集期已经修掉三条结构性偏差（毫秒分母 / 段首口径对称 / 短码长词封顶，见
+    /// `wind_store::stats` 的「速度模型」），剩下这一条修不掉：**输入法无从知道用户
+    /// 打错了没有**——打错后退格重打，字符被计两遍而耗时只算一遍，方向恒为正偏差。
+    /// 故出厂取 < 1 做经验折价。
+    ///
+    /// ⚠️ 这不是「速度不好看就调大」的旋钮：把 ≥ 1 的值填进来只会让显示值重新偏离真实
+    /// 手速。暂不进设置页（无 GUI 入口），需要时改配置文件。
+    #[serde(default = "default_speed_factor")]
+    pub speed_factor: f32,
+}
+
+fn default_speed_factor() -> f32 {
+    0.85
 }
 
 impl Default for StatsConfig {
@@ -3859,6 +3874,7 @@ impl Default for StatsConfig {
         Self {
             enabled: true,
             track_english: true,
+            speed_factor: default_speed_factor(),
         }
     }
 }
