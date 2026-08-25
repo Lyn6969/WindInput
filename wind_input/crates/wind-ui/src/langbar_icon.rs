@@ -493,14 +493,18 @@ impl IconRenderer {
     /// 这里既是"看着更好"，也是"与用户习惯的旧图标一致"。
     const FONT_WEIGHT: i32 = 300;
 
-    /// 纯拉丁标签的字重（`[ui.labels]` 可把非中文态配成 "En" / "A"）。
+    /// **被回缩过的**拉丁标签的字重（如 `[ui.labels]` 把英文态配成 `"En"`）。
     ///
     /// [`Self::FONT_WEIGHT`] 那个 300 是**为汉字定的**（见其文档：常规字重下 16px
-    /// 的汉字笔画会挤在一起）。字母笔画少、不存在那个问题，300 落到它身上只剩发虚——
-    /// 真机实测 "En" 的 E 明显比周围文字细。这里回到常规字重。
+    /// 的汉字笔画会挤在一起）。字母笔画少、没有那个问题，300 叠加回缩后的小字号
+    /// 只剩发虚——真机实测 `"En"` 的 E 明显比周围文字细。
     ///
-    /// ⚠️ 分档依据是**标签自身的字符集**，不是运行时状态：「英」恒走 300、"En" 恒走
-    /// 400，各自稳定。与本文件翻过两次车的"按 has_badge 分档"不是一回事。
+    /// ⚠️ **判据是"有没有真的被缩小"，不是"是不是字母"。** 这两条判据只在多字符标签上
+    /// 一致，单字符会分道扬镳：`"A"` 行盒不到 8px、根本不进回缩，字号仍是满格的
+    /// `s - FONT_SIZE_INSET`，给它加粗只会比改动前突兀（首版按字符集分档，真机实测被否）。
+    ///
+    /// ⚠️ 分档依据是标签自身，不是运行时状态：`"A"` 恒走 300、`"En"` 恒走 400，各自
+    /// 稳定不跳。与本文件翻过两次车的"按 has_badge 分档"不是一回事。
     const FONT_WEIGHT_LATIN: i32 = 400;
 
     /// 纯拉丁标签的边缘留白（像素）。
@@ -755,16 +759,8 @@ impl IconRenderer {
         // 每次中英切换字号肉眼可见地跳。图标统共一个字，它的尺寸就是基线本身。
         let font_size = s - Self::FONT_SIZE_INSET;
         let mut fs = font_size;
-        // ★ 字重也按是否含汉字分档。`FONT_WEIGHT`（300 / Light）是**为汉字定的**——
-        // 见其文档：16px 下常规字重的汉字笔画会挤在一起。拉丁字母笔画本来就少，
-        // 根本没有"挤在一起"的问题，300 落在它身上只剩发虚。真机实测 `"En"` 的 E
-        // 明显比周围文字细，就是拿汉字那档去套字母的结果。
-        let weight = if Self::has_cjk(&spec.label) {
-            Self::FONT_WEIGHT
-        } else {
-            Self::FONT_WEIGHT_LATIN
-        };
-        let mut style = crate::text::dwrite::TextStyle::new(font_size).with_weight(weight);
+        let mut style =
+            crate::text::dwrite::TextStyle::new(font_size).with_weight(Self::FONT_WEIGHT);
 
         // 第一遍按行盒粗定位。测量必须与绘制同一个 TextStyle——字重影响字宽，
         // 用 measure_text_sized（不带字重）测出来的宽度会与实际绘制不符。
@@ -798,6 +794,22 @@ impl IconRenderer {
         // 实测仍会触边——**行盒不含墨迹的 overhang，抗锯齿也会向外糊出半个像素**。
         let target = avail * Self::WIDE_LABEL_SAFETY;
         let min_size = font_size * Self::MIN_FONT_SCALE;
+
+        // ★ 字重补偿**只给真的被缩小了的拉丁标签**，判据是 `m.width > target`
+        // （下面那个循环的进入条件）。
+        //
+        // 补偿的理由是**字号回缩带来的变细**，不是"字母天生该更粗"：`"En"` 缩到
+        // 12px 上下，配 300（Light）就发虚。而单字符的 `"A"` 行盒不到 8px、根本不进
+        // 回缩，字号仍是满格的 `s - INSET`——给它加粗只会比改动前突兀，真机实测被否。
+        //
+        // ⇒ 装得下的标签（「英」「五」`"A"`）走的是与本功能上线前**逐像素相同**的路径。
+        let weight = Self::label_weight(&spec.label, m.width, target);
+        // 字重影响字宽，换了就必须重测——否则下面的收敛判据用的是另一种字重的宽度。
+        if weight != Self::FONT_WEIGHT {
+            style = crate::text::dwrite::TextStyle::new(font_size).with_weight(weight);
+            m = self.text.measure(&spec.label, &style);
+        }
+
         // ★ 必须**循环收敛**，一次比例换算不够：排版引擎把字号吸附到整像素，算出的
         // 6.58px 实际按 7px 排版，两个汉字的宽度仍是满格的 14 —— 比例算法在吸附值上
         // 原地打转，画出来还是被裁掉右缘。每轮至少降 1px 才能真正走出那一档。
@@ -843,6 +855,22 @@ impl IconRenderer {
             Self::draw_size_marks(&mut mask, size_px);
         }
         mask
+    }
+
+    /// 该给这个标签用哪个字重。
+    ///
+    /// `base_width` 是基线字号 + 基线字重下的行盒宽，`target` 是回缩目标宽度——
+    /// 两者一比就知道这个标签**会不会被缩小**，而那正是要不要补偿字重的唯一依据。
+    /// 详见 [`Self::FONT_WEIGHT_LATIN`]。
+    ///
+    /// 抽成纯函数是为了能直接断言判据本身：走渲染结果去反推字重，会被居中校正的
+    /// 亚像素位移搅进来，判据变成在测抗锯齿噪声。
+    fn label_weight(label: &str, base_width: f32, target: f32) -> i32 {
+        if base_width > target && !Self::has_cjk(label) {
+            Self::FONT_WEIGHT_LATIN
+        } else {
+            Self::FONT_WEIGHT
+        }
     }
 
     /// 标签里是否含汉字。字重与可用宽度都按它分档——两处必须用**同一个**判据，
@@ -1809,6 +1837,87 @@ mod tests {
             !IconRenderer::has_cjk("Ｅｎ"),
             "全角字母仍是字母，判据不能用 is_ascii"
         );
+    }
+
+    /// 字重补偿的判据：**只给真的被缩小了的拉丁标签**。
+    ///
+    /// 首版按"是不是字母"分档，于是单字符 `"A"` 也被加粗——它行盒不到 8px、根本不进
+    /// 回缩，字号仍是满格的，加粗后比改动前突兀，真机实测被否。
+    ///
+    /// ★ 前两条与后两条**必须同时成立**才说明判据对：只测 `"En"` 要加粗，一个"凡字母
+    /// 都加粗"的实现照样全绿，而那正是被否掉的那一版。
+    #[test]
+    fn weight_compensation_only_for_shrunk_latin() {
+        let w =
+            |label: &str, base: f32, target: f32| IconRenderer::label_weight(label, base, target);
+        // 16px 下拉丁档的 target ≈ 14.1
+        assert_eq!(
+            w("En", 15.65, 14.1),
+            IconRenderer::FONT_WEIGHT_LATIN,
+            "被缩小的字母要补偿"
+        );
+        assert_eq!(
+            w("A", 7.7, 14.1),
+            IconRenderer::FONT_WEIGHT,
+            "装得下的字母不补偿——真机否掉的就是这一档"
+        );
+        // 16px 下汉字档的 target ≈ 13.16
+        assert_eq!(
+            w("英", 14.0, 13.16),
+            IconRenderer::FONT_WEIGHT,
+            "汉字恒用基线字重"
+        );
+        assert_eq!(
+            w("符号", 28.0, 13.16),
+            IconRenderer::FONT_WEIGHT,
+            "汉字即使被缩小也不补偿：300 本就是为汉字笔画密度定的"
+        );
+    }
+
+    /// 装得下的标签不得被回缩。真机回归。
+    ///
+    /// 判据取墨迹**跨度**而不是逐像素相等：`render_glyph_mask` 末尾有居中校正循环，
+    /// 会按墨迹重心迭代微调位置，逐像素比对等于在测那个循环的收敛细节。跨度只受
+    /// 字号影响、不受位移影响，正好对上"有没有被缩小"这个问题。
+    #[cfg(windows)]
+    #[test]
+    fn labels_that_fit_are_not_shrunk() {
+        let r = IconRenderer::new(BadgeShape::CornerTriangle).expect("renderer");
+        for label in ["A", "英", "五"] {
+            for &size in &wind_ipc::protocol::ICON_SIZES {
+                let mask = r.render_glyph_mask(
+                    size,
+                    &IconSpec {
+                        label: label.to_string(),
+                        ..spec(PunctBadge::None)
+                    },
+                );
+                let n = mask.n;
+                let has = |x: usize, y: usize| mask.v[y * n + x] > 0.05;
+                let lo = (0..n)
+                    .find(|&x| (0..n).any(|y| has(x, y)))
+                    .expect("没画出主字");
+                let hi = (0..n)
+                    .rev()
+                    .find(|&x| (0..n).any(|y| has(x, y)))
+                    .expect("没画出主字");
+                let span = hi - lo + 1;
+
+                // 基线字号下这个标签本来有多宽（不回缩、不补偿）。
+                let s = size as f32;
+                let style = crate::text::dwrite::TextStyle::new(s - IconRenderer::FONT_SIZE_INSET)
+                    .with_weight(IconRenderer::FONT_WEIGHT);
+                let base_w = r.text.measure(label, &style).width;
+
+                // 墨迹跨度必然 ≤ 行盒宽（advance 含边距）；被回缩过则会明显小一圈。
+                // 阈值放在 0.7 是留给"墨迹本就窄于 advance"的量，字号真被缩过时
+                // （最小档 0.4~0.5 倍）跨度掉得远比这多。
+                assert!(
+                    span as f32 >= base_w * 0.7,
+                    "「{label}」在 {size}px 下墨迹只跨 {span}px，基线行盒 {base_w:.1}px：被回缩了"
+                );
+            }
+        }
     }
 
     /// 拉丁标签不得被**白缩**。真机回归。
