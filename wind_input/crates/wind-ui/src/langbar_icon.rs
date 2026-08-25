@@ -493,6 +493,23 @@ impl IconRenderer {
     /// 这里既是"看着更好"，也是"与用户习惯的旧图标一致"。
     const FONT_WEIGHT: i32 = 300;
 
+    /// 纯拉丁标签的字重（`[ui.labels]` 可把非中文态配成 "En" / "A"）。
+    ///
+    /// [`Self::FONT_WEIGHT`] 那个 300 是**为汉字定的**（见其文档：常规字重下 16px
+    /// 的汉字笔画会挤在一起）。字母笔画少、不存在那个问题，300 落到它身上只剩发虚——
+    /// 真机实测 "En" 的 E 明显比周围文字细。这里回到常规字重。
+    ///
+    /// ⚠️ 分档依据是**标签自身的字符集**，不是运行时状态：「英」恒走 300、"En" 恒走
+    /// 400，各自稳定。与本文件翻过两次车的"按 has_badge 分档"不是一回事。
+    const FONT_WEIGHT_LATIN: i32 = 400;
+
+    /// 纯拉丁标签的边缘留白（像素）。
+    ///
+    /// 汉字那档用 [`Self::FONT_SIZE_INSET`]，因为汉字墨迹几乎填满 advance；拉丁字母的
+    /// advance 里天然含左右边距，只需留住描边与抗锯齿。用汉字那档去套字母，`"En"`
+    /// （行盒 15.65，16px 画布本就差不多装得下）会被白缩掉两三个像素。
+    const LATIN_EDGE_INSET: f32 = 1.0;
+
     /// 主字字号 = 图标边长 − 本值，与旧 C++ 实现的 `fontSizeDIP = iconSize - 2` 一致。
     ///
     /// **这是基线，不为新表现让步。** 角标是新增的东西，它的代价由角标自己承担
@@ -738,8 +755,16 @@ impl IconRenderer {
         // 每次中英切换字号肉眼可见地跳。图标统共一个字，它的尺寸就是基线本身。
         let font_size = s - Self::FONT_SIZE_INSET;
         let mut fs = font_size;
-        let mut style =
-            crate::text::dwrite::TextStyle::new(font_size).with_weight(Self::FONT_WEIGHT);
+        // ★ 字重也按是否含汉字分档。`FONT_WEIGHT`（300 / Light）是**为汉字定的**——
+        // 见其文档：16px 下常规字重的汉字笔画会挤在一起。拉丁字母笔画本来就少，
+        // 根本没有"挤在一起"的问题，300 落在它身上只剩发虚。真机实测 `"En"` 的 E
+        // 明显比周围文字细，就是拿汉字那档去套字母的结果。
+        let weight = if Self::has_cjk(&spec.label) {
+            Self::FONT_WEIGHT
+        } else {
+            Self::FONT_WEIGHT_LATIN
+        };
+        let mut style = crate::text::dwrite::TextStyle::new(font_size).with_weight(weight);
 
         // 第一遍按行盒粗定位。测量必须与绘制同一个 TextStyle——字重影响字宽，
         // 用 measure_text_sized（不带字重）测出来的宽度会与实际绘制不符。
@@ -758,11 +783,19 @@ impl IconRenderer {
         // 的宽度，「五」恒 1 字符、"En" 恒 2 字符，各自字号稳定不跳，切换时大小不同
         // 是因为**字数本来就不同**。别照着那条注释把这段删掉。
         //
-        // 可用宽度取 `s - FONT_SIZE_INSET` 而非整个 `s`：与单字符时字号的内缩量同源，
-        // 这样一字标签与两字标签的左右边距一致，不会出现"两个字母贴着边框"。
+        // ★ 可用宽度按**是否含汉字**分两档，同一个数值套不了两者：
+        //
+        // 汉字的墨迹几乎填满 advance，行盒宽等于可用宽时就已经漏出边缘，必须留足；
+        // 拉丁字母的 advance 里天然含左右边距，墨迹远窄于行盒，占满画布也不会触边。
+        // 拿汉字那档去套字母，`"En"`（行盒 15.65，本就差不多装得下）会被缩到 11px
+        // 上下——真机实测「E 发虚」，正是这么来的。
+        let avail = if Self::has_cjk(&spec.label) {
+            s - Self::FONT_SIZE_INSET
+        } else {
+            s - Self::LATIN_EDGE_INSET
+        };
         // 目标宽度比可用宽再收一点（`WIDE_LABEL_SAFETY`）：缩到"行盒宽恰好等于可用宽"
         // 实测仍会触边——**行盒不含墨迹的 overhang，抗锯齿也会向外糊出半个像素**。
-        let avail = s - Self::FONT_SIZE_INSET;
         let target = avail * Self::WIDE_LABEL_SAFETY;
         let min_size = font_size * Self::MIN_FONT_SCALE;
         // ★ 必须**循环收敛**，一次比例换算不够：排版引擎把字号吸附到整像素，算出的
@@ -773,7 +806,7 @@ impl IconRenderer {
         // 收底。实测最多两轮（「符号」14 → 7 → 6）。
         while m.width > target && m.width > 0.0 && fs > min_size {
             fs = (fs * target / m.width).min(fs - 1.0).max(min_size);
-            style = crate::text::dwrite::TextStyle::new(fs).with_weight(Self::FONT_WEIGHT);
+            style = crate::text::dwrite::TextStyle::new(fs).with_weight(weight);
             m = self.text.measure(&spec.label, &style);
         }
         let x0 = ((s - m.width) * 0.5).max(0.0);
@@ -810,6 +843,22 @@ impl IconRenderer {
             Self::draw_size_marks(&mut mask, size_px);
         }
         mask
+    }
+
+    /// 标签里是否含汉字。字重与可用宽度都按它分档——两处必须用**同一个**判据，
+    /// 否则会出现"按字母留白、却按汉字上字重"这种半档状态。
+    ///
+    /// 只判 CJK 表意文字三段，不判"是否 ASCII"：全角「Ｅｎ」不是 ASCII 却是字母，
+    /// 用 ASCII 判据会把它错分到汉字档、白缩一截。私用区（拆字字根）也不在此列，
+    /// 它们不会出现在模式主字里。
+    fn has_cjk(label: &str) -> bool {
+        label.chars().any(|c| {
+            matches!(c as u32,
+                0x4E00..=0x9FFF   // CJK 统一表意文字
+                | 0x3400..=0x4DBF // 扩展 A
+                | 0xF900..=0xFAFF // 兼容表意文字
+            )
+        })
     }
 
     /// 在指定原点画一次主字，返回覆盖度蒙版。
@@ -1744,6 +1793,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 字重与留白的分档判据本身。
+    ///
+    /// 最后一条是这条测试存在的主要理由：判据**不能**写成 `is_ascii`。全角「Ｅｎ」
+    /// 不是 ASCII 却是字母，用 ASCII 判据会把它错分到汉字档、白缩一截。
+    #[test]
+    fn cjk_detection_splits_latin_from_han() {
+        assert!(IconRenderer::has_cjk("英"));
+        assert!(IconRenderer::has_cjk("符号"));
+        assert!(!IconRenderer::has_cjk("En"));
+        assert!(!IconRenderer::has_cjk("A"));
+        assert!(
+            !IconRenderer::has_cjk("Ｅｎ"),
+            "全角字母仍是字母，判据不能用 is_ascii"
+        );
+    }
+
+    /// 拉丁标签不得被**白缩**。真机回归。
+    ///
+    /// `"En"` 在 16px 下行盒 15.65，本就差不多装得下。早先可用宽度不分档、一律按
+    /// 汉字那档取（`s - FONT_SIZE_INSET` = 14），把它缩到 11px 上下，真机反馈
+    /// 「E 有些细」——小字号叠加为汉字定的 Light 字重。
+    ///
+    /// 判据取**墨迹跨度**而不是字号：字号只是手段，用户看到的是墨迹占了多少地方。
+    #[cfg(windows)]
+    #[test]
+    fn latin_label_is_not_shrunk_needlessly() {
+        let r = IconRenderer::new(BadgeShape::CornerTriangle).expect("renderer");
+        let mask = r.render_glyph_mask(
+            16,
+            &IconSpec {
+                label: "En".to_string(),
+                ..spec(PunctBadge::None)
+            },
+        );
+        let n = mask.n;
+        let col_has_ink = |x: usize| (0..n).any(|y| mask.v[y * n + x] > 0.05);
+        let lo = (0..n).find(|&x| col_has_ink(x)).expect("没画出主字");
+        let hi = (0..n).rev().find(|&x| col_has_ink(x)).expect("没画出主字");
+        let span = hi - lo + 1;
+        assert!(
+            span >= 12,
+            "\"En\" 在 16px 画布下墨迹只跨了 {span}px，被白缩了（列范围 {lo}..={hi}）"
+        );
     }
 
     /// 两字符标签必须**完整**落在画布内。
