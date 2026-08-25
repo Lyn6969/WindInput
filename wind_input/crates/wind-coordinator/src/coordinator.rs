@@ -47,9 +47,9 @@ use wind_store::stats::CommitSource;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui_types::CandidateItem;
-use wind_ui_types::ToolbarState;
 use wind_ui_types::{GlobalHotkeyEntry, UiCommand, UiEvent};
 use wind_ui_types::{ToastKind, ToastPosition};
+use wind_ui_types::{ToolbarItem, ToolbarState};
 
 /// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素——宿主上报的
 /// caret rect 本就是物理像素，此处刻意不做 dp 换算，与 `caret_offset_*` 不是同一件事：
@@ -849,6 +849,48 @@ pub(crate) fn should_reapply_initial(
     out_of_scope: bool,
 ) -> bool {
     !out_of_scope && crossed && (per_app || old_has_rule || new_has_rule)
+}
+
+/// `ui.toolbar.items` → 渲染项序列（`SetToolbarLayout` 的载荷）。
+///
+/// **数组顺序即渲染顺序**，故本函数保序、不去重排序。
+///
+/// # 三条判据
+///
+/// - **未知键跳过 + 告警**：拼错一个词只让那一格消失，其余照常——比整条回落默认更接近
+///   用户意图，且日志里查得到。
+/// - **重复项保留**：同一个键写两次就画两格。不特殊处理是因为它无害且无歧义，而"静默
+///   去重"会让用户以为自己没写对。
+/// - **结果为空则回落全集**：只在「写了但全是非法项」时可达（合法的"全部隐藏"表达是
+///   `visible = false`，见 `ToolbarConfig::items` 文档）。留着它是因为**空工具栏是一条
+///   看着像 bug 的路**——只剩一个拖动柄，而用户多半不知道那是自己配出来的。
+///
+/// 抽成模块级纯函数而非 `Coordinator` 方法：它不碰任何状态，单测无需构造协调器。
+pub(crate) fn parse_toolbar_items(items: &[String]) -> Vec<ToolbarItem> {
+    // 留空 = 全部显示（旧配置无此键时行为不变）。与「写了但全非法」分开处理：
+    // 那条要告警，这条是正常默认，不该刷日志。
+    if items.is_empty() {
+        return wind_ui_types::DEFAULT_TOOLBAR_ITEMS.to_vec();
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for raw in items {
+        match raw.trim() {
+            "mode" => out.push(ToolbarItem::Mode),
+            "punct" => out.push(ToolbarItem::Punct),
+            "full_width" => out.push(ToolbarItem::FullWidth),
+            "s2t" => out.push(ToolbarItem::S2t),
+            "settings" => out.push(ToolbarItem::Settings),
+            "" => {}
+            other => warn!("ui.toolbar.items: 未知条目 {other:?}，已跳过"),
+        }
+    }
+    if out.is_empty() {
+        warn!(
+            "ui.toolbar.items 无任何合法条目，回落为全部显示；整条不要请用 ui.toolbar.visible = false"
+        );
+        return wind_ui_types::DEFAULT_TOOLBAR_ITEMS.to_vec();
+    }
+    out
 }
 
 /// 上一次推给 UI 的工具栏指令（供 `notify_toolbar` 去重）。
@@ -3295,6 +3337,11 @@ impl Coordinator {
             delay_ms: u64::from(tb.auto_hide_delay.max(1)) * 1000,
         });
         let _ = self.ui_tx.send(UiCommand::SetToolbarVertical(tb.vertical));
+        // 工具栏格的显隐与顺序（ui.toolbar.items）。解析（含非法项告警、留空回落全集）
+        // 在此侧完成，渲染端只收一份「照这个顺序画」的声明——它读不到配置。
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetToolbarLayout(parse_toolbar_items(&tb.items)));
     }
 
     /// 当前活跃方案 ID（测试/诊断用）
@@ -9339,5 +9386,124 @@ mod mode_icon_label_tests {
         let c = coord_with("English", "CapsLock");
         assert_eq!(c.mode_icon_label(false, false), "En");
         assert_eq!(c.mode_icon_label(false, true), "Ca");
+    }
+}
+
+#[cfg(test)]
+mod toolbar_items_tests {
+    //! `ui.toolbar.items` → 渲染项序列的解析（纯函数，不构造协调器）。
+
+    use super::parse_toolbar_items;
+    use wind_ui_types::{DEFAULT_TOOLBAR_ITEMS, ToolbarItem};
+
+    fn parse(items: &[&str]) -> Vec<ToolbarItem> {
+        let owned: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        parse_toolbar_items(&owned)
+    }
+
+    /// ★ **P1 的回归基线**：留空必须渲染出与本功能落地前**逐格相同**的序列。
+    ///
+    /// 这条红了就意味着给所有老用户改了工具栏外观——那是本次改动最不能有的后果。
+    /// 断言写死字面序列而不是拿 `DEFAULT_TOOLBAR_ITEMS` 对拍：后者跟着实现一起改，
+    /// 对拍恒绿，钉不住"和改动前一样"这件事。
+    #[test]
+    fn empty_falls_back_to_legacy_order() {
+        assert_eq!(
+            parse(&[]),
+            vec![
+                ToolbarItem::Mode,
+                ToolbarItem::Punct,
+                ToolbarItem::FullWidth,
+                ToolbarItem::S2t,
+                ToolbarItem::Settings,
+            ]
+        );
+    }
+
+    /// 数组顺序即渲染顺序——这正是本键与 `ui.status.items`（顺序无语义）的分界。
+    #[test]
+    fn order_is_preserved() {
+        assert_eq!(
+            parse(&["settings", "s2t", "mode"]),
+            vec![ToolbarItem::Settings, ToolbarItem::S2t, ToolbarItem::Mode]
+        );
+    }
+
+    /// 子集：没写的项不渲染。
+    #[test]
+    fn subset_drops_unlisted_items() {
+        assert_eq!(
+            parse(&["mode", "settings"]),
+            vec![ToolbarItem::Mode, ToolbarItem::Settings]
+        );
+    }
+
+    /// 未知项只丢它自己，其余照常——比整条回落默认更接近用户意图。
+    #[test]
+    fn unknown_key_is_skipped_not_fatal() {
+        assert_eq!(
+            parse(&["mode", "punkt", "settings"]),
+            vec![ToolbarItem::Mode, ToolbarItem::Settings]
+        );
+    }
+
+    /// 全非法 → 回落全集（而不是渲染出一条只剩拖动柄的空条）。
+    #[test]
+    fn all_invalid_falls_back_to_full_set() {
+        assert_eq!(parse(&["nope", "nada"]), DEFAULT_TOOLBAR_ITEMS.to_vec());
+    }
+
+    /// 重复项保留：写两次就画两格。不静默去重——那会让用户以为自己没写对。
+    #[test]
+    fn duplicates_are_kept() {
+        assert_eq!(
+            parse(&["mode", "mode"]),
+            vec![ToolbarItem::Mode, ToolbarItem::Mode]
+        );
+    }
+
+    /// 前后空白容错（手写 TOML 常见），但空串不算非法项、不刷告警。
+    #[test]
+    fn whitespace_is_tolerated_and_blanks_are_silent() {
+        assert_eq!(
+            parse(&[" mode ", "", "settings"]),
+            vec![ToolbarItem::Mode, ToolbarItem::Settings]
+        );
+    }
+
+    /// L1（`Config::default()`）写死的那一行必须与「留空」等价——否则「配置里显式写出
+    /// 全部条目」与「不写这个键」会渲染出不同的工具栏。
+    ///
+    /// ⚠️ 这条**只管 L1**。它读的是 Rust 侧默认值，全程不碰 `data/config.toml`；
+    /// L1↔L2 一致由 wind-config 侧的 `data_config_toml_*` 那组守门负责（只有那里读得到 L2）。
+    #[test]
+    fn l1_default_items_match_empty_fallback() {
+        let factory = wind_config::Config::default().ui.toolbar.items;
+        assert_eq!(parse_toolbar_items(&factory), parse(&[]));
+    }
+
+    /// 条目的值域散在四处：`TOOLBAR_ITEM_KEYS`（配置层键名）、本函数的 match 臂、
+    /// `DEFAULT_TOOLBAR_ITEMS`（协议层项）、`data/config.toml` 那一行。
+    ///
+    /// 这条钉住前三者：**`TOOLBAR_ITEM_KEYS` 里的每个键都必须被解析认识**，且认全之后
+    /// 得到的正是默认项序列。加第六个条目时若只改了常量没改 match，这条立刻红——否则
+    /// 那个新键会被当成"未知条目"静默跳过，表现为"配了没反应"。
+    #[test]
+    fn every_registered_key_is_parsable_and_matches_default_order() {
+        let keys: Vec<String> = wind_config::TOOLBAR_ITEM_KEYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_toolbar_items(&keys);
+        assert_eq!(
+            parsed.len(),
+            keys.len(),
+            "TOOLBAR_ITEM_KEYS 里有 parse_toolbar_items 不认识的键（被静默跳过了）：{keys:?} → {parsed:?}"
+        );
+        assert_eq!(
+            parsed,
+            DEFAULT_TOOLBAR_ITEMS.to_vec(),
+            "键名的声明顺序必须与协议层默认项序列一致"
+        );
     }
 }

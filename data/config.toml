@@ -844,6 +844,11 @@ auto_hide = false
 auto_hide_delay = 5
 # 纵向排列：竖着摆放工具栏（默认横条）。几何仍取主题 [toolbar]，条宽=height、每格高=button_width。
 vertical = false
+# 显示哪些格、按什么顺序（数组顺序即从左到右 / 从上到下的顺序）；留空 = 全部显示。
+# 可选：mode（中英/方案）/punct（标点）/full_width（全半角）/s2t（简繁）/settings（设置）
+# 注意 s2t 格只在简繁转换**当前开着**时才出现（关掉即消失），本项只决定"允许它出现"。
+# 整条工具栏都不想要请用 visible = false，不要把本项配成空数组。
+items = ["mode", "punct", "full_width", "s2t", "settings"]
 
 # 语言栏图标 = Windows 任务栏上那个「中/英/拼/五」的输入指示器（仅 Windows）。
 # 这里配的是叠在主字上的两个状态标记：右下角=标点中英，右上角=全角。

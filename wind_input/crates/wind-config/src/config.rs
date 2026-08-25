@@ -3230,6 +3230,26 @@ pub struct ToolbarConfig {
     /// 属用户偏好而非视觉设计，所以落在此处而非主题。
     #[serde(default)]
     pub vertical: bool,
+    /// 显示哪些条目、按什么顺序。**数组顺序即渲染顺序**，合法项见 [`TOOLBAR_ITEM_KEYS`]。
+    ///
+    /// **留空 = 全部显示**：既是「未配置」的合理默认，也让旧配置文件（无此键）行为不变。
+    /// 想整条不要的正确表达是 `visible = false`——那才是「不要工具栏」这个意图的落点，
+    /// 于是「空列表」这个取值有了唯一语义，不需要额外的自锁兜底。
+    ///
+    /// ⚠️ 顺序是有语义的，故设置页必须用**列表编辑器**（拖拽排序）而非 `checkbox_group`
+    /// ——后者恒按声明顺序写回，会静默改写用户手排的顺序（`config-design-rules.md` §R3）。
+    #[serde(default = "default_toolbar_items")]
+    pub items: Vec<String>,
+}
+
+/// 工具栏条目键的全集，同时也是默认值（全部显示）与**默认顺序**。
+///
+/// 与 [`STATUS_ITEM_KEYS`] 的差别：那份的顺序无语义（状态气泡的渲染顺序固定在代码里），
+/// 这份的顺序**就是**渲染顺序。
+pub const TOOLBAR_ITEM_KEYS: [&str; 5] = ["mode", "punct", "full_width", "s2t", "settings"];
+
+fn default_toolbar_items() -> Vec<String> {
+    TOOLBAR_ITEM_KEYS.iter().map(|s| s.to_string()).collect()
 }
 
 impl Default for ToolbarConfig {
@@ -3240,6 +3260,7 @@ impl Default for ToolbarConfig {
             auto_hide: false,
             auto_hide_delay: 5,
             vertical: false,
+            items: default_toolbar_items(),
         }
     }
 }

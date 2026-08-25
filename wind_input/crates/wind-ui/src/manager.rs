@@ -867,6 +867,12 @@ impl UiManager {
                             t.set_vertical(v);
                         }
                     }
+                    UiCommand::SetToolbarLayout(items) => {
+                        debug!("UI: SetToolbarLayout n={}", items.len());
+                        if let Some(t) = &mut toolbar {
+                            t.set_layout(items);
+                        }
+                    }
                     UiCommand::SetTheme(theme) => {
                         debug!("UI: SetTheme (dark={})", theme.is_dark);
                         let t = *theme;

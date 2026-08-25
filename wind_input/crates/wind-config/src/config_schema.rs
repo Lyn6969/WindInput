@@ -432,6 +432,10 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.toolbar.auto_hide", Bool),
     f("ui.toolbar.auto_hide_delay", Int),
     f("ui.toolbar.vertical", Bool),
+    // items 的**顺序即渲染顺序**（不同于 ui.status.items 的顺序无语义）。StrList 不带值域
+    // 校验，非法项由协调器的 `parse_toolbar_items` 跳过并告警——那里同时要处理顺序，
+    // 值域与顺序在一处判定才不会各说各话。
+    f("ui.toolbar.items", StrList),
     // -- ui.langbar（Windows 任务栏输入指示器图标）--
     // punct_badge 用 Enum 而非 Str：写错一个词只会静默回落默认形状，而"配了没反应"
     // 是最难自查的一类；登记成员后 `config set` 与设置页都能先一步挡下。
@@ -722,6 +726,37 @@ mod tests {
         // 反向对照：小数形式当然也要能读，否则上面那条可能只是「两边都坏」。
         let ct2: CodetableFrequency = toml::from_str("half_life = 4.5").unwrap();
         assert_eq!(ct2.half_life, 4.5);
+    }
+
+    /// L1↔L2 同源：`ui.toolbar.items` 的出厂值在 Rust 默认值与 `data/config.toml` 里
+    /// 必须逐项相同（`config-design-rules.md` §R4）。
+    ///
+    /// 这个键的顺序**有语义**（数组顺序即工具栏渲染顺序），所以不能只比集合。两侧任一
+    /// 处改了顺序或成员而另一处没跟，新装用户与老用户看到的工具栏就不一样——而这种
+    /// 差异不会有任何其它测试报出来。
+    ///
+    /// 放在本 crate 是因为**只有这里读得到 L2**（`data_config_toml()`）；协调器侧那条
+    /// 同名意图的测试只能覆盖 L1，两条不重复。
+    #[test]
+    fn toolbar_items_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.toolbar.items;
+        let l2: Vec<String> = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("toolbar"))
+            .and_then(|t| t.get("items"))
+            .and_then(|v| v.as_array())
+            .expect("data/config.toml 缺少 ui.toolbar.items")
+            .iter()
+            .map(|v| v.as_str().expect("items 元素须为字符串").to_string())
+            .collect();
+        assert_eq!(l1, l2, "ui.toolbar.items 的 L1 默认值与 L2 出厂文件不一致");
+        // 两侧都必须是登记过的键，否则出厂配置里就躺着一个会被解析跳过的条目。
+        for k in &l2 {
+            assert!(
+                crate::TOOLBAR_ITEM_KEYS.contains(&k.as_str()),
+                "出厂 items 含未登记条目 {k:?}"
+            );
+        }
     }
 
     /// 解析仓库内系统预置 `data/config.toml`。

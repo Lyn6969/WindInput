@@ -1,5 +1,46 @@
 //! 工具栏状态数据（由协调器推送，渲染端呈现）。
 
+/// 工具栏的一个渲染项（`SetToolbarLayout` 的载荷元素，顺序即渲染顺序）。
+///
+/// # 为什么下发的是「项」而不是配置字符串
+///
+/// `ui.toolbar.items` 的取值（`"mode"` / `"punct"` / …）是**配置层的词汇**。渲染端读不到
+/// 配置，让它去认这些字符串等于把配置语义复制一份到 UI 侧——非法值怎么办、留空是什么
+/// 意思，两边各答一次就迟早不同步。协调器解析完再下发，UI 侧收到的已经是一份「照这个
+/// 顺序画这些东西」的声明。
+///
+/// 同一条原则刚在 `wind-ui/src/toolbar.rs` 的 `mode_text` 上应用过（`[ui.labels]` 那次）：
+/// 判据归协调器、取值也归协调器，渲染端只负责画。
+///
+/// 不带 `Custom` 变体是有意的：自定义按钮属 P2，届时加变体即可，此刻不预留空壳。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarItem {
+    /// 中英状态（含方案标签），高亮表示有效中文。
+    Mode,
+    /// 中/英标点。
+    Punct,
+    /// 全/半角。
+    FullWidth,
+    /// 简/繁。⚠️ 与 [`ToolbarState::s2t_shown`] 是**合取**：本项只表示「用户允许它出现」，
+    /// 简繁转换当前关着时照样不画。
+    S2t,
+    /// 设置（齿轮图标，点击弹主菜单）。
+    Settings,
+}
+
+/// 默认渲染顺序：`ui.toolbar.items` 留空 / 解析后为空时用它。
+///
+/// 与 `wind_config::TOOLBAR_ITEM_KEYS` 逐项对应，但**刻意各存一份**：那份是配置层的键名
+/// （字符串），这份是协议层的项（枚举）。让 wind-ui-types 去依赖 wind-config 只为共享
+/// 五个常量，会把配置 crate 拖进 headless / Android 的依赖图里。
+pub const DEFAULT_TOOLBAR_ITEMS: [ToolbarItem; 5] = [
+    ToolbarItem::Mode,
+    ToolbarItem::Punct,
+    ToolbarItem::FullWidth,
+    ToolbarItem::S2t,
+    ToolbarItem::Settings,
+];
+
 /// 工具栏状态（由协调器推送）
 ///
 /// `PartialEq` 供协调器做**推送去重**（见 `notify_toolbar`）：宿主焦点抖动时同一份状态

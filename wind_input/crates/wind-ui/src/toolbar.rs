@@ -23,7 +23,7 @@ use wind_theme::schema::Dim;
 
 /// 状态数据类型已下沉至 wind-ui-types；再导出保持 `wind_ui::toolbar::ToolbarState`
 /// 原路径成立。
-pub use wind_ui_types::ToolbarState;
+pub use wind_ui_types::{ToolbarItem, ToolbarState};
 
 /// 一个单元格：文本 + 高亮(激活态，如中文/简繁开) + 淡显(次要状态，如半角/简) + 点击动作
 struct Cell {
@@ -81,6 +81,12 @@ pub struct Toolbar {
     tb_border_width: Option<Dim>,
     /// 纵向排列（ui.toolbar.vertical，非主题——见 `bar_layout`）。
     vertical: bool,
+    /// 显示哪些格、按什么顺序（`ui.toolbar.items`，经 `SetToolbarLayout` 下发）。
+    ///
+    /// 初值取全集而非空：`SetToolbarLayout` 在 `apply_ui_config` 里下发，而工具栏可能在
+    /// 那之前就被 `UpdateToolbar` 拉起来渲染一帧——初值为空的话那一帧是条只剩拖动柄的
+    /// 空条，随后才"长出"各格，视觉上是一次凭空抖动。
+    layout: Vec<ToolbarItem>,
     /// 待落的「某显示器右下角」请求：`(工作区右边界, 下边界)`，由 `render` 消费。
     ///
     /// 存边界而不是直接算坐标，是因为落点要减去工具栏自身尺寸，而**尺寸在 `render` 之前
@@ -228,6 +234,7 @@ impl Toolbar {
             tb_border_radius: None,
             tb_border_width: None,
             vertical: false,
+            layout: wind_ui_types::DEFAULT_TOOLBAR_ITEMS.to_vec(),
             pending_corner: None,
         })
     }
@@ -350,9 +357,66 @@ impl Toolbar {
         }
     }
 
-    /// 根据状态构建单元格序列。
-    /// 布局：拖动条 | 中英状态（含方案名）| 符号 | 全半角 | [简繁] | 设置图标
-    fn cells(state: &ToolbarState) -> Vec<Cell> {
+    /// 配置显示哪些格、按什么顺序（`ui.toolbar.items`，经 SetToolbarLayout 下发）。
+    ///
+    /// 格数变化会改窗口尺寸，故可见时立即用缓存状态重绘——否则要等下一次状态推送
+    /// （切中英等）才生效，设置页里改完看着像没生效。同 `set_vertical` 的理由。
+    ///
+    /// ⚠️ 重绘必须受 `visible` 门控：`repaint`→`render` 末尾无条件 `show`，对隐藏中的
+    /// 工具栏调用会把它显形，绕过 `toolbar_gate` 的显示迟滞（同 `set_vertical` 的约束）。
+    pub fn set_layout(&mut self, items: Vec<ToolbarItem>) {
+        if self.layout == items {
+            return;
+        }
+        self.layout = items;
+        if self.visible {
+            self.repaint();
+        }
+    }
+
+    /// 根据配置的项序列 + 当前状态构建单元格。
+    /// 布局：拖动条 | 各项按 `self.layout` 的顺序展开
+    ///
+    /// 项序列来自配置（`self.layout`），而本 crate 读不到配置，只消费协调器解析好的结果。
+    /// 同 `mode_text` 那处的分工——判据与取值都归协调器。
+    ///
+    /// 真正的展开逻辑在自由函数 [`expand_cells`]，本方法只是取 `self.layout` 转发：
+    /// 构造 `Toolbar` 需要真窗口（非 Windows 上是 mock），挂在它上面的逻辑测不到。
+    /// 同 `bar_layout` 被抽成自由函数的理由。
+    fn cells(&self, state: &ToolbarState) -> Vec<Cell> {
+        expand_cells(&self.layout, state)
+    }
+}
+
+/// 把配置的项序列 + 当前状态展开成单元格序列。
+///
+/// # 空结果必须回落，且这道闸门只能装在这里
+///
+/// 协调器的 `parse_toolbar_items` 已保证**项序列**非空，但那挡不住这条路：`S2t` 是
+/// **运行时合取**（还要 `state.s2t_shown`），配 `items = ["s2t"]` 而简繁没开，项序列非空、
+/// 展开结果却是空的——工具栏渲染成一条只剩 12dp 拖动柄的窄条，看着像 bug 而用户无从
+/// 自查（设置页里只勾「简繁」一项就能走到，不必手写 TOML）。
+///
+/// 判据：**兜底要装在产出最终结果的那一环**。装在解析层只能保证「配置里写了东西」，
+/// 而决定画几格的是这里。同一形态在本仓反复出现（闸门装上游、判据在下游）。
+///
+/// 不 panic 也不返回空：`bar_layout` 在 n=0 下数学上安全（无除法），但「安全」不等于
+/// 「可接受」——回落全量条至少是个能用的工具栏，且与 `visible=false` 那条真正的
+/// 「不要工具栏」路径不冲突。
+fn expand_cells(layout: &[ToolbarItem], state: &ToolbarState) -> Vec<Cell> {
+    let cells = expand_cells_raw(layout, state);
+    if !cells.is_empty() {
+        return cells;
+    }
+    // 回落全集再展开一次（而不是直接返回全集的 Cell）：全集里的 S2t 同样要过
+    // s2t_shown 那道合取，直接构造会画出一个简繁没开却存在的「简」格。
+    expand_cells_raw(&wind_ui_types::DEFAULT_TOOLBAR_ITEMS, state)
+}
+
+/// [`expand_cells`] 的无兜底内核。单独一层是为了让兜底自身可测——否则「回落」与
+/// 「本来就该有格」两种结果长得一样，测不出兜底有没有生效。
+fn expand_cells_raw(layout: &[ToolbarItem], state: &ToolbarState) -> Vec<Cell> {
+    {
         // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
         // 密码框强制英文时同样不算「有效中文」——此刻键已全部透传给宿主，高亮着中文格
         // 会与实际行为相反。⚠ 这是纯呈现判断，输入闸在 coordinator 的 password_suppress
@@ -365,50 +429,59 @@ impl Toolbar {
         // En，一进密码框又变回英"。判据归协调器、取值也归协调器，这里只负责画。
         let mode_text: &str = &state.icon_label;
 
-        let mut cells = vec![
-            Cell {
-                text: mode_text.to_string(),
-                highlight: effective_chinese,
-                dim: false,
-                action: ToolbarAction::ToggleMode,
-            },
-            // 标点格：文本留空，渲染时按全/半角矢量绘制句号+逗号（不依赖字体字形定位）。
-            Cell {
-                text: String::new(),
-                highlight: false,
-                dim: false,
-                action: ToolbarAction::TogglePunct,
-            },
-            // 全/半角格：文本留空，渲染时按状态画月亮 SVG（满月=全角 / 弯月=半角，对齐微软五笔）。
-            Cell {
-                text: String::new(),
-                highlight: false,
-                dim: false,
-                action: ToolbarAction::ToggleWidth,
-            },
-        ];
-
-        // 简繁格：默认不显示（s2t_shown=false），用户开启简繁功能后显示。
-        if state.s2t_shown {
-            cells.push(Cell {
-                text: if state.s2t_enabled { "繁" } else { "简" }.to_string(),
-                highlight: state.s2t_enabled,
-                dim: !state.s2t_enabled,
-                action: ToolbarAction::ToggleS2t,
-            });
+        let mut cells = Vec::with_capacity(layout.len());
+        for item in layout {
+            match item {
+                ToolbarItem::Mode => cells.push(Cell {
+                    text: mode_text.to_string(),
+                    highlight: effective_chinese,
+                    dim: false,
+                    action: ToolbarAction::ToggleMode,
+                }),
+                // 标点格：文本留空，渲染时按全/半角矢量绘制句号+逗号（不依赖字体字形定位）。
+                ToolbarItem::Punct => cells.push(Cell {
+                    text: String::new(),
+                    highlight: false,
+                    dim: false,
+                    action: ToolbarAction::TogglePunct,
+                }),
+                // 全/半角格：文本留空，渲染时按状态画月亮 SVG（满月=全角 / 弯月=半角，对齐微软五笔）。
+                ToolbarItem::FullWidth => cells.push(Cell {
+                    text: String::new(),
+                    highlight: false,
+                    dim: false,
+                    action: ToolbarAction::ToggleWidth,
+                }),
+                // 简繁格与配置是**合取**：配置允许显示（本项在 layout 里）且简繁转换当前
+                // 开着（s2t_shown）。少一边都不画——用户没开简繁却常驻一个"简"格，点它
+                // 才发现是开关，那不是状态指示器该干的事。
+                ToolbarItem::S2t => {
+                    if state.s2t_shown {
+                        cells.push(Cell {
+                            text: if state.s2t_enabled { "繁" } else { "简" }.to_string(),
+                            highlight: state.s2t_enabled,
+                            dim: !state.s2t_enabled,
+                            action: ToolbarAction::ToggleS2t,
+                        });
+                    }
+                }
+                // 设置格：文本留空，渲染时画矢量齿轮（不依赖字体字形）。
+                // 位置随配置，不再固定末尾；隐藏它也不会锁死用户——右键工具栏任意位置
+                // 同样弹主菜单（见 `ToolbarMouse::on_message` 的 WM_RBUTTONDOWN）。
+                ToolbarItem::Settings => cells.push(Cell {
+                    text: String::new(),
+                    highlight: false,
+                    dim: false,
+                    action: ToolbarAction::OpenSettings,
+                }),
+            }
         }
-
-        // 设置（始终显示在末尾）：文本留空，渲染时画矢量齿轮（不依赖字体字形）。
-        cells.push(Cell {
-            text: String::new(),
-            highlight: false,
-            dim: false,
-            action: ToolbarAction::OpenSettings,
-        });
 
         cells
     }
+}
 
+impl Toolbar {
     /// DPI 动态化：按工具栏当前位置所在显示器实时取缩放（拖到别的显示器后自动适配）。
     /// 工具栏仅颜色随主题、几何随 scale 现算，故只需更新 scale 与字号。
     ///
@@ -456,7 +529,7 @@ impl Toolbar {
         let thickness = dim(self.tb_height, Self::HEIGHT).ceil();
         let grip_len = dim(self.tb_grip_width, Self::GRIP_W).ceil();
 
-        let cells = Self::cells(state);
+        let cells = self.cells(state);
         // 英文模式下标点固定显示半角，无需看 chinese_punct。
         let effective_chinese = state.chinese_mode && !state.caps_lock;
 
@@ -509,11 +582,25 @@ impl Toolbar {
         for (i, c) in cells.iter().enumerate() {
             let r = layout.cells[i];
             hits.push((c.action, r));
-            // 分隔线：仅「拖动柄之后」(首格前) 与「设置图标之前」绘制（对齐设计稿，状态格之间不画）。
+            // 分隔线：仅「拖动柄之后」(首格前) 与「齿轮的边界」绘制（对齐设计稿，状态格之间不画）。
+            //
+            // 齿轮的边界是**哪一边**取决于它在哪：默认排末尾时画它的起始边；`ui.toolbar.items`
+            // 允许把它排到首位后，那条线与首格前的线重合成同一条，齿轮反而没了边界——
+            // 于是这种情况改画**下一格**的起始边（= 齿轮的结束边），齿轮自成一区的意图两种
+            // 排列下都成立。齿轮既在首位又是唯一一格时不画（没有"下一格"，也无需分区）。
             let is_settings = matches!(c.action, ToolbarAction::OpenSettings);
-            if i == 0 || is_settings {
+            let sep_at = if i == 0 && is_settings {
+                layout
+                    .cells
+                    .get(1)
+                    .map(|n| if self.vertical { n.y } else { n.x })
+            } else if i == 0 || is_settings {
                 // 画在格的**起始边**上：横条取左缘 x、纵条取上缘 y。
-                let pos = if self.vertical { r.y } else { r.x };
+                Some(if self.vertical { r.y } else { r.x })
+            } else {
+                None
+            };
+            if let Some(pos) = sep_at {
                 draw_sep(
                     self.window.buffer_mut(),
                     w,
@@ -1268,6 +1355,104 @@ mod tests {
             last.y + last.h,
             five.h
         );
+    }
+
+    /// n=1（`items` 只留一格）与 n=0 的排布。
+    ///
+    /// 两者本次才**从不可达变成可达**（`ui.toolbar.items` 之前，格数恒在 4~5）。n=0 已由
+    /// `expand_cells` 的兜底挡住，仍钉一条：`bar_layout` 全程无除法，这里断言的是"就算
+    /// 哪天兜底被绕过也不会 panic / 不会算出负尺寸"。
+    #[test]
+    fn layout_handles_one_and_zero_cells() {
+        let one = bar_layout(false, THICK, GRIP, CELL, 1);
+        assert_eq!(one.w, GRIP + CELL);
+        assert_eq!(one.cells.len(), 1);
+        assert_eq!(one.cells[0].x, GRIP);
+
+        let zero = bar_layout(false, THICK, GRIP, CELL, 0);
+        assert!(zero.cells.is_empty());
+        // 只剩拖动柄：尺寸仍为正（负尺寸会让 resize/缓冲区计算炸掉）。
+        assert_eq!(zero.w, GRIP);
+        assert!(zero.w > 0.0 && zero.h > 0.0);
+    }
+
+    fn tb_state(s2t_shown: bool) -> ToolbarState {
+        ToolbarState {
+            icon_label: "拼".to_string(),
+            s2t_shown,
+            ..Default::default()
+        }
+    }
+
+    fn actions(cells: &[Cell]) -> Vec<ToolbarAction> {
+        cells.iter().map(|c| c.action).collect()
+    }
+
+    /// 回归基线：默认项序列展开出的格，必须与本功能落地前**逐格相同**。
+    #[test]
+    fn default_layout_expands_to_legacy_cells() {
+        let cells = expand_cells(&wind_ui_types::DEFAULT_TOOLBAR_ITEMS, &tb_state(true));
+        assert_eq!(
+            actions(&cells),
+            vec![
+                ToolbarAction::ToggleMode,
+                ToolbarAction::TogglePunct,
+                ToolbarAction::ToggleWidth,
+                ToolbarAction::ToggleS2t,
+                ToolbarAction::OpenSettings,
+            ]
+        );
+        // 简繁未开时那一格消失，其余不变（旧行为同此）。
+        let cells = expand_cells(&wind_ui_types::DEFAULT_TOOLBAR_ITEMS, &tb_state(false));
+        assert_eq!(
+            actions(&cells),
+            vec![
+                ToolbarAction::ToggleMode,
+                ToolbarAction::TogglePunct,
+                ToolbarAction::ToggleWidth,
+                ToolbarAction::OpenSettings,
+            ]
+        );
+    }
+
+    /// 顺序照配置走，没配的项不出现。
+    #[test]
+    fn expand_follows_configured_order_and_subset() {
+        let layout = [ToolbarItem::Settings, ToolbarItem::Mode];
+        assert_eq!(
+            actions(&expand_cells(&layout, &tb_state(true))),
+            vec![ToolbarAction::OpenSettings, ToolbarAction::ToggleMode]
+        );
+    }
+
+    /// ★ 本次修的那条：`items` 只留 `s2t` 而简繁没开 → 展开为空 → 必须回落全量条，
+    /// 而不是渲染出一条只剩拖动柄的空窄条。
+    ///
+    /// 兜底装在展开层而非解析层：解析层只保证「项序列非空」，`S2t` 却是运行时合取，
+    /// 决定画几格的是这里。
+    #[test]
+    fn empty_expansion_falls_back_instead_of_rendering_nothing() {
+        let only_s2t = [ToolbarItem::S2t];
+        // 简繁开着：正常只画一格，不触发兜底。
+        assert_eq!(
+            actions(&expand_cells(&only_s2t, &tb_state(true))),
+            vec![ToolbarAction::ToggleS2t]
+        );
+        // 简繁没开：展开为空 → 回落全量条。
+        let cells = expand_cells(&only_s2t, &tb_state(false));
+        assert!(!cells.is_empty(), "空展开必须回落，否则工具栏只剩拖动柄");
+        assert_eq!(
+            actions(&cells),
+            vec![
+                ToolbarAction::ToggleMode,
+                ToolbarAction::TogglePunct,
+                ToolbarAction::ToggleWidth,
+                ToolbarAction::OpenSettings,
+            ],
+            "回落后仍须尊重 s2t 合取：不能凭空画出一个简繁没开的「简」格"
+        );
+        // 内核（无兜底）确实会给出空——证明上面那条断言测的是兜底本身，不是恒真。
+        assert!(expand_cells_raw(&only_s2t, &tb_state(false)).is_empty());
     }
 
     /// 缩放只改绝对值、不改结构：dp→设备像素由调用方（render 的 dim 闭包）算好再传入。

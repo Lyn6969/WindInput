@@ -4,7 +4,7 @@ use crate::candidate::CandidateItem;
 use crate::diag::InputDiagView;
 use crate::menu::{MenuAnchor, MenuItemSpec};
 use crate::toast::{ToastKind, ToastPosition};
-use crate::toolbar::ToolbarState;
+use crate::toolbar::{ToolbarItem, ToolbarState};
 
 /// UI 命令
 #[derive(Debug)]
@@ -94,6 +94,13 @@ pub enum UiCommand {
     /// 工具栏纵向排列（true=竖条）。来自 ui.toolbar.vertical，
     /// 协调器 apply_ui_config（启动 + 配置重载）下发。
     SetToolbarVertical(bool),
+    /// 工具栏显示哪些格、按什么顺序（顺序即渲染顺序）。来自 ui.toolbar.items，
+    /// 协调器 apply_ui_config（启动 + 配置重载）下发，解析与告警都在那侧。
+    ///
+    /// **不并进 `UpdateToolbar`**：那条是随按键高频推送的动态状态、靠 `PartialEq` 去重，
+    /// 把这份配置塞进去等于每次切中英都 clone 一遍列表再深比较——去重反成开销。
+    /// 同 `SetToolbarVertical` / `SetToolbarAutoHide` 的分界。
+    SetToolbarLayout(Vec<ToolbarItem>),
     /// 应用主题（协调器加载解析后下发）
     SetTheme(Box<wind_theme::Resolved>),
     /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。

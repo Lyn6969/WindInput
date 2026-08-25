@@ -22,14 +22,16 @@ Win 的 `m2`=核心 exe ↔ mac 的 `m2`=Rust 服务）。
 ### 与 Windows 的功能差距（待补）
 
 Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益；差距集中在**宿主层**。
-`wind-ui` 的 `UiCommand` 有 42 个变体，`manager_macos.rs` 的 Forwarder 目前接了 29 个。
+`wind-ui` 的 `UiCommand` 有 46 个变体，`manager_macos.rs` 的 Forwarder 目前接了 32 个
+（数字随 core 加变体而变，改动时顺手核一下：
+`awk '/^pub enum UiCommand/,/^}/' wind-ui-types/src/command.rs | grep -cE '^    [A-Z]'`）。
 未接的：
 
 | UiCommand | 影响 | 备注 |
 |---|---|---|
 | `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md`。**菜单入口已按平台摘掉**（`build_main_menu_items` 的 `advanced_children`）——留一个点了没反应的项比没有更糟 |
 | `ShowCandidateMenu` / `HideMenu` / `MenuKey` | N/A（**不是缺失**） | macOS 弹的是原生 NSMenu，方向键/回车/Esc 由 AppKit 自己消费。协调器**刻意不转发**菜单键（见 `handle_key_event` 里那段 `cfg(not(target_os = "macos"))`）：一旦吞键而 `menu_open` 没复位就会永久卡死输入 |
-| `SetToolbarPos` / `SetToolbarAutoHide` / `SetToolbarVertical` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
+| `SetToolbarPos` / `SetToolbarAutoHide` / `SetToolbarVertical` / `SetToolbarLayout` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地"。`SetToolbarLayout`（`ui.toolbar.items`，格的显隐与顺序）同理——菜单栏指示器只有一个主字，没有"哪几格" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
 
 非 `UiCommand` 的一项差距，同样待补：
