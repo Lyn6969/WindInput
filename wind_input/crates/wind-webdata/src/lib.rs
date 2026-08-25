@@ -1121,8 +1121,28 @@ pub trait WebDataRpc: WebDataHost {
                 // 合并成一份会让「跟随基线」与「显式等于基线值」无从区分。
                 if etype == "codetable" {
                     let eff = self.engine_mgr().effective_codetable(id);
+                    // 「取消覆盖后会变成什么」——设置页每一项的三态控件未勾选时显示它。
+                    let followed = self.engine_mgr().followed_codetable(id);
+                    // 「哪些项是用户自己改的」。判勾选状态**只能**问 override 层：上面那份
+                    // `engine.codetable` 是方案文件 ⊕ override 的合并结果，里面一个
+                    // `Some(3)` 既可能是方案作者写的、也可能是用户改的，合并值答不了这个问题。
+                    let ov = self
+                        .engine_mgr()
+                        .get_schema_override(id)
+                        .and_then(|t| {
+                            t.get("engine")
+                                .and_then(|e| e.get("codetable"))
+                                .map(|c| serde_json::to_value(c.clone()))
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| json!({}));
                     if let Some(obj) = v.as_object_mut() {
                         obj.insert("effectiveCodetable".to_string(), serde_json::to_value(eff)?);
+                        obj.insert(
+                            "followedCodetable".to_string(),
+                            serde_json::to_value(followed)?,
+                        );
+                        obj.insert("codetableOverride".to_string(), ov);
                     }
                 }
                 // 首码集里的符号键（键名形式）。给设置页判「按键功能表绑的这个键，是不是
@@ -3206,8 +3226,16 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
 /// 它再无影响，而用户根本没动过这些项。
 ///
 /// 在服务端剥而不是要求调用方自觉：这是契约边界，任何客户端都该受保护。
-pub const READONLY_SIDECAR_FIELDS: &[&str] =
-    &["effectiveCodetable", "leadingCodeKeys", "keysOverview"];
+pub const READONLY_SIDECAR_FIELDS: &[&str] = &[
+    "effectiveCodetable",
+    // 取消覆盖后的回落值 + override 层原文。前者若不剥会把一整份实值快照写进 override
+    // （＝上面说的冻结），后者若不剥会在 override 里多出一段 `[codetableOverride]`——
+    // 方案照常能用，但那一段从此谁也不读、也没人会想到去删。
+    "followedCodetable",
+    "codetableOverride",
+    "leadingCodeKeys",
+    "keysOverview",
+];
 
 /// 按键总览：这个方案下每个绑过的键**当前**干什么、来自哪一层。
 ///
@@ -6060,6 +6088,198 @@ moved = [{ id = 'date.lunar', position = 0 }]
         assert_eq!(e.name, "往返", "override 未提及的字段仍来自方案文件");
 
         let _ = std::fs::remove_file(&store_path);
+    }
+
+    /// 三态控件的读侧契约：`getConfig` 必须让设置页分得清「作者写的」与「用户改的」。
+    ///
+    /// 场景是本仓的真实形态——wubi86 在方案文件里声明 `short_code_yield_level`（作者基线），
+    /// 用户又在设置页把它改成别的值（override 层）。三份数据各答一个问题：
+    ///
+    /// | 字段 | 回答的问题 | 本例取值 |
+    /// | --- | --- | --- |
+    /// | `engine.codetable`（合并值） | 现在按什么跑 | 2 |
+    /// | `followedCodetable` | 取消覆盖后变成什么 | 3（作者值） |
+    /// | `codetableOverride` | 这一项是不是用户改的 | 有 ⇒ 是 |
+    ///
+    /// ⚠️ 缺了 `followedCodetable` 就只能拿合并值当回落值，于是「取消覆盖」在界面上
+    /// 什么都不变（仍显示 2），用户以为没生效；缺了 `codetableOverride` 则分不清作者值
+    /// 与用户值，方案自带的那一项会被显示成「用户已改」。
+    #[test]
+    fn schema_get_config_separates_author_baseline_from_user_override() {
+        let dir = std::env::temp_dir().join("wind_webdata_ct_tristate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 方案作者基线：出简让全 3；顶码那一项作者没写 ⇒ 该跟随全局。
+        std::fs::write(
+            schemas.join("zz_ct.schema.toml"),
+            "[schema]
+id = \"zz_ct\"
+name = \"三态\"
+             [engine]
+type = \"codetable\"
+             [engine.codetable]
+max_code_length = 4
+short_code_yield_level = 3
+",
+        )
+        .unwrap();
+        // 用户覆盖层：把它改成 2。
+        let ov_dir = dir.join("overrides");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        std::fs::write(
+            ov_dir.join("zz_ct.toml"),
+            "[engine.codetable]
+short_code_yield_level = 2
+",
+        )
+        .unwrap();
+
+        let mut cfg = wind_config::Config::default();
+        // 全局基线给顶码一个与结构体零值不同的取值，好让「跟随全局」这一路可被断言。
+        cfg.schema.codetable.top_code_commit = true;
+        let c = Coordinator::new_headless_with_override(cfg, Some(&dir), Some(ov_dir.clone()));
+        let got = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_ct" }))
+            .unwrap();
+
+        assert_eq!(
+            got.pointer("/engine/codetable/short_code_yield_level"),
+            Some(&json!(2)),
+            "合并值应是用户改后的那个，实际 {got}"
+        );
+        assert_eq!(
+            got.pointer("/effectiveCodetable/short_code_yield_level"),
+            Some(&json!(2)),
+            "当前生效值同上"
+        );
+        assert_eq!(
+            got.pointer("/followedCodetable/short_code_yield_level"),
+            Some(&json!(3)),
+            "回落值必须是**作者基线**，不含 override 层"
+        );
+        assert_eq!(
+            got.pointer("/codetableOverride/short_code_yield_level"),
+            Some(&json!(2)),
+            "override 层原文要原样给出（判某项是不是用户改的）"
+        );
+
+        // 作者没写、用户也没改的那一项：回落值来自全局，且不在 override 层里。
+        assert_eq!(
+            got.pointer("/followedCodetable/top_code_commit"),
+            Some(&json!(true)),
+            "作者没写时回落值取全局基线"
+        );
+        assert!(
+            got.pointer("/codetableOverride/top_code_commit").is_none(),
+            "没改过的项不该出现在 override 层，实际 {}",
+            got.pointer("/codetableOverride").unwrap()
+        );
+
+        // 反向对照：没有 override 文件时，回落值与生效值一致（否则上面的差异可能来自
+        // 别的原因，而不是「剥掉了 override 层」）。
+        std::fs::remove_file(ov_dir.join("zz_ct.toml")).unwrap();
+        c.engine_mgr().invalidate_schema("zz_ct");
+        let got2 = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_ct" }))
+            .unwrap();
+        assert_eq!(
+            got2.pointer("/effectiveCodetable/short_code_yield_level"),
+            Some(&json!(3)),
+            "删掉 override 后生效值回到作者值"
+        );
+        assert_eq!(
+            got2.pointer("/followedCodetable/short_code_yield_level"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            got2.pointer("/codetableOverride"),
+            Some(&json!({})),
+            "无 override 文件时给空对象而不是缺字段——UI 少一次 null 分支"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写侧：回传 `null` 就是「取消覆盖」——该键从 override 里消失，该项回到方案作者的值。
+    ///
+    /// 这条链**不需要 core 添任何东西**：`json_to_toml` 跳过 null，而 `saveConfig` 是拿
+    /// **方案文件基线**（不含 override）做 diff，两条既有性质合起来正好是三态要的语义。
+    /// 正因为它是「两个无关性质凑出来的」，改任一侧都会静默破坏它，故必须端到端钉住。
+    ///
+    /// 同时验稀疏性：同一次保存里另一项照常写入，不因为有人被取消而受牵连。
+    #[test]
+    fn save_config_null_cancels_one_override_and_keeps_the_others() {
+        let dir = std::env::temp_dir().join("wind_webdata_ct_cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(
+            schemas.join("zz_cx.schema.toml"),
+            "[schema]\nid = \"zz_cx\"\nname = \"取消\"\n\
+             [engine]\ntype = \"codetable\"\n\
+             [engine.codetable]\nmax_code_length = 4\nshort_code_yield_level = 3\n",
+        )
+        .unwrap();
+        let ov_dir = dir.join("overrides");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        std::fs::write(
+            ov_dir.join("zz_cx.toml"),
+            "[engine.codetable]\nshort_code_yield_level = 2\npunct_commit = false\n",
+        )
+        .unwrap();
+
+        let c = Coordinator::new_headless_with_override(
+            wind_config::Config::default(),
+            Some(&dir),
+            Some(ov_dir.clone()),
+        );
+        let mut cfg = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_cx" }))
+            .unwrap();
+
+        // 设置页动作：取消「出简让全」的覆盖（写 null），另一项照旧勾着（写实值）。
+        let ct = cfg
+            .pointer_mut("/engine/codetable")
+            .and_then(|v| v.as_object_mut())
+            .expect("码表段应在");
+        ct.insert("short_code_yield_level".to_string(), Value::Null);
+        ct.insert("punct_commit".to_string(), json!(false));
+        c.web_data_rpc("schema.saveConfig", &json!({ "id": "zz_cx", "cfg": cfg }))
+            .unwrap();
+
+        let written = std::fs::read_to_string(ov_dir.join("zz_cx.toml")).unwrap();
+        assert!(
+            !written.contains("short_code_yield_level"),
+            "取消覆盖的键必须从 override 里消失，实际:\n{written}"
+        );
+        assert!(
+            written.contains("punct_commit"),
+            "同一次保存里仍勾着的项不该被牵连，实际:\n{written}"
+        );
+
+        // 生效面：该项回到**方案作者**的 3（不是全局的默认值），另一项仍是用户的 false。
+        c.engine_mgr().invalidate_schema("zz_cx");
+        let got = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_cx" }))
+            .unwrap();
+        assert_eq!(
+            got.pointer("/effectiveCodetable/short_code_yield_level"),
+            Some(&json!(3)),
+            "取消覆盖后应回到方案作者写的值"
+        );
+        assert!(
+            got.pointer("/codetableOverride/short_code_yield_level")
+                .is_none(),
+            "override 层不该再有它（否则设置页下次打开仍显示为已勾选）"
+        );
+        assert_eq!(
+            got.pointer("/codetableOverride/punct_commit"),
+            Some(&json!(false)),
+            "另一项的覆盖要原样留着"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

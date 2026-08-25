@@ -2666,6 +2666,26 @@ impl EngineManager {
         )
     }
 
+    /// 某方案**不含 override 层**的码表配置：全局基线 ⊕ 方案文件内联，折叠后的全实值。
+    ///
+    /// 这是设置页三态控件的「跟随值」——用户把某一项的覆盖取消掉之后，它会回到这个值。
+    /// 与 [`Self::effective_codetable`] 只差一个 `override_dir`：那个含用户覆盖（＝当前
+    /// 实际在跑的值），这个不含（＝取消覆盖后会变成的值）。两者都要给设置页，因为
+    /// **已覆盖的项**在两份里取值不同，而 UI 要同时显示「现在是什么」和「取消后是什么」。
+    ///
+    /// ⚠️ 别想着让 UI 拿 `effective` 减去 override 自己算：折叠的基线分普通/特殊两种
+    /// （见 [`Self::codetable_baseline`]），UI 侧算不出来——这正是 `effective_codetable`
+    /// 当初存在的理由，同一条在这里再次成立。
+    pub fn followed_codetable(&self, schema_id: &str) -> wind_config::CodetableGlobal {
+        let global = self
+            .codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // override_dir 传 None ＝ `read_schema` 不合并 override 层。
+        Self::resolve_codetable(schema_id, self.data_dir.as_deref(), &global, None)
+    }
+
     /// 解析某方案的有效码表配置：全局基线 + 方案 `[engine.codetable]` 行为（内联 + override
     /// 已在 `read_schema` 经 `merge_toml` 合并）逐字段折叠。读不到方案时原样返回全局基线。
     fn resolve_codetable(
