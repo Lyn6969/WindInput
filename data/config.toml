@@ -850,6 +850,27 @@ vertical = false
 # 整条工具栏都不想要请用 visible = false，不要把本项配成空数组。
 items = ["mode", "punct", "full_width", "s2t", "settings"]
 
+# 自定义按钮（高级功能，出厂无）。定义在 [[ui.toolbar.buttons]]，**要显示还得在上面的
+# items 里写一条 custom:<id>**——items 是「显示哪些、排第几」的唯一真相源，光定义不显示。
+# 本段刻意不在此文件写出数组表：写一行空数组没有信息量，却会把它冻结成预置值，
+# 之后用户增删按钮要与整表覆盖语义纠缠。照下面的样子写进你自己的 config.toml 即可。
+#
+#   [ui.toolbar]
+#   items = ["mode", "punct", "full_width", "custom:sym", "settings"]
+#
+#   [[ui.toolbar.buttons]]
+#   id = "sym"                          # 稳定标识，被 items 里的 custom:sym 引用
+#   label = "符"                        # 格内文字：一个汉字，或两个字母（超出自动截断）
+#   action = 'proc.run("charmap.exe")'  # 点击执行，语法同短语/命令栏的动作
+#   enabled = true                      # 关掉即不显示，items 里那条留着记住位置
+#
+# action 可用的写法与短语里一样，常用几种：
+#   open("https://www.zdic.net")            打开网址 / 文件 / 程序（跟双击一样的效果）
+#   proc.run("notepad.exe")                 启动程序，可带参数与 cwd=/verb=/show=
+#   wind.cli("schema switch wubi86")        调用本输入法的命令，如一键切方案
+#   key.tap("Ctrl+Shift+P")                 模拟一次按键组合
+# 注意 action 要用单引号包起来（里面有双引号）。
+
 # 语言栏图标 = Windows 任务栏上那个「中/英/拼/五」的输入指示器（仅 Windows）。
 # 这里配的是叠在主字上的两个状态标记：右下角=标点中英，右上角=全角。
 # 两者默认都关——它们是加在系统图标上的新东西，默认改变所有人的任务栏是过界的。

@@ -474,6 +474,14 @@ fn expand_cells_raw(layout: &[ToolbarItem], state: &ToolbarState) -> Vec<Cell> {
                     dim: false,
                     action: ToolbarAction::OpenSettings,
                 }),
+                // 自定义按钮：label 已由协调器按显示宽度截好（本 crate 读不到配置，
+                // 也就不该在这里判断"多宽算宽"）。无状态可言，故不高亮不淡显。
+                ToolbarItem::Custom { index, label, .. } => cells.push(Cell {
+                    text: label.clone(),
+                    highlight: false,
+                    dim: false,
+                    action: ToolbarAction::Custom(*index),
+                }),
             }
         }
 

@@ -1692,6 +1692,10 @@ impl Coordinator {
                 self.notify_toolbar();
                 return;
             }
+            ToolbarAction::Custom(i) => {
+                self.run_toolbar_button(i);
+                return;
+            }
             _ => {}
         }
         let cmd = match action {
@@ -1699,10 +1703,43 @@ impl Coordinator {
             ToolbarAction::SwitchEngine => "switch_engine",
             ToolbarAction::TogglePunct => "toggle_punct",
             ToolbarAction::ToggleWidth => "toggle_width",
-            ToolbarAction::ToggleS2t | ToolbarAction::OpenSettings => unreachable!(),
+            // 上面那个 match 已 return 掉的三支。**加 ToolbarAction 变体时必须一并处理
+            // 上面那个 match**——漏了就落到这里当场 panic，而不是静默不响应。
+            ToolbarAction::ToggleS2t | ToolbarAction::OpenSettings | ToolbarAction::Custom(_) => {
+                unreachable!()
+            }
         };
         self.handle_menu_command(cmd);
         self.notify_toolbar();
+    }
+
+    /// 执行自定义按钮的动作（`ui.toolbar.buttons[i].action`，cmdbar 表达式）。
+    ///
+    /// 复用短语动作那条链（`run_command_candidate`），故 `open` / `proc.run` /
+    /// `key.tap` / `wind.cli` 等全部可用，且求值失败会弹 toast 而不是哑失败。
+    ///
+    /// ⚠️ 经 `spawn_command` 起独立线程：`run_command_candidate` 的文档要求「未持
+    /// state 锁时调用」，动作链上的控制器会回调自锁的 coordinator 方法。
+    ///
+    /// 下标取不到就忽略：UI 侧的 spec 与本侧配置之间有一瞬可能错开（配置刚重载、
+    /// 新的 SetToolbarLayout 还没到 UI），越界不是异常。
+    fn run_toolbar_button(&self, index: u8) {
+        let btn = {
+            let cfg = self.rt();
+            match cfg.config.ui.toolbar.buttons.get(index as usize) {
+                Some(b) => b.clone(),
+                None => {
+                    tracing::warn!("工具栏自定义按钮下标 {index} 越界（配置刚变？），已忽略");
+                    return;
+                }
+            }
+        };
+        if btn.action.trim().is_empty() {
+            // 配了按钮却没配动作：点了没反应是最难自查的一类，给一条日志。
+            tracing::warn!("工具栏自定义按钮 {:?} 未配置 action", btn.id);
+            return;
+        }
+        self.spawn_command(btn.action, String::new());
     }
 
     /// 焦点/激活切换路径专用：先用缓存值立即同步通知（无阻塞），

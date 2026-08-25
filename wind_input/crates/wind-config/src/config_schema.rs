@@ -436,6 +436,10 @@ static REGISTRY: &[ConfigField] = &[
     // 校验，非法项由协调器的 `parse_toolbar_items` 跳过并告警——那里同时要处理顺序，
     // 值域与顺序在一处判定才不会各说各话。
     f("ui.toolbar.items", StrList),
+    // 自定义按钮：结构体数组，整体作不透明叶子（同 ui.comment_dicts / schema.mix_modes）。
+    // 出厂空，且**不写进 data/config.toml**——写出一行 `buttons = []` 没有任何信息量，
+    // 却会把空数组冻结成 L2 值。已在豁免名单登记，理由同 ui.comment_dicts。
+    f("ui.toolbar.buttons", StructList),
     // -- ui.langbar（Windows 任务栏输入指示器图标）--
     // punct_badge 用 Enum 而非 Str：写错一个词只会静默回落默认形状，而"配了没反应"
     // 是最难自查的一类；登记成员后 `config set` 与设置页都能先一步挡下。
@@ -862,6 +866,11 @@ mod tests {
         // 而它一旦以数组表形态出现，用户增删条目就会与预置层的整表覆盖语义纠缠。
         // 格式与示例在文档站 customize/candidate-comment。
         "ui.comment_dicts",
+        // 工具栏自定义按钮：同上，**出厂为空数组**。写出一行 `buttons = []` 没有信息量，
+        // 却会把空数组冻结成 L2 值；而它一旦以数组表形态出现，用户增删按钮就要与预置层
+        // 的整表覆盖语义纠缠。格式与示例写在 `[ui.toolbar]` 段的注释里（不是数组表，
+        // 只是注释），用户照抄即可。
+        "ui.toolbar.buttons",
     ];
 
     /// `data/config.toml` 必须显式列出注册表里的每一个键（豁免名单除外）。

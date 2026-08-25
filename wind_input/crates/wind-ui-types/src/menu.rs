@@ -18,6 +18,15 @@ pub enum ToolbarAction {
     ToggleS2t,
     /// 打开设置
     OpenSettings,
+    /// 自定义按钮：执行 `ui.toolbar.buttons[i]` 的 cmdbar 表达式。
+    ///
+    /// 载荷是**下标**而不是 id 字符串，因为 `ToolbarAction` 必须保持 `Copy`——
+    /// `Toolbar` 的命中表 `Vec<(ToolbarAction, Rect)>` 与 `cell_at` / `hover_at`
+    /// 全建立在这个前提上，带 `String` 会让整条命中链路改签名。
+    ///
+    /// 下标失配（配置重载与 UI 侧 spec 之间的一瞬）最坏是执行了相邻按钮的动作，
+    /// 非破坏性；协调器侧按下标取不到就忽略。
+    Custom(u8),
 }
 
 /// 候选词条操作（右键菜单）；复制由 UI 侧直接处理，不在此列。

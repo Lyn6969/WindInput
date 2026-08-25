@@ -12,8 +12,7 @@
 /// 同一条原则刚在 `wind-ui/src/toolbar.rs` 的 `mode_text` 上应用过（`[ui.labels]` 那次）：
 /// 判据归协调器、取值也归协调器，渲染端只负责画。
 ///
-/// 不带 `Custom` 变体是有意的：自定义按钮属 P2，届时加变体即可，此刻不预留空壳。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolbarItem {
     /// 中英状态（含方案标签），高亮表示有效中文。
     Mode,
@@ -26,6 +25,16 @@ pub enum ToolbarItem {
     S2t,
     /// 设置（齿轮图标，点击弹主菜单）。
     Settings,
+    /// 自定义按钮（`[[ui.toolbar.buttons]]` 的一项，经 `items` 里的 `custom:<id>` 引用）。
+    ///
+    /// 携带 `label` 而不是让 UI 侧再去查一份按钮表：渲染端读不到配置，下发的这一份
+    /// 就是它需要的全部。`index` 只用于**点击时回指**——见 [`crate::ToolbarAction::Custom`]。
+    Custom {
+        /// 该按钮在 `ui.toolbar.buttons` 里的下标。
+        index: u8,
+        /// 已按显示宽度截断过的格内文字（协调器截好再下发）。
+        label: String,
+    },
 }
 
 /// 默认渲染顺序：`ui.toolbar.items` 留空 / 解析后为空时用它。

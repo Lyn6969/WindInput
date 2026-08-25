@@ -865,10 +865,21 @@ pub(crate) fn should_reapply_initial(
 ///   `visible = false`，见 `ToolbarConfig::items` 文档）。留着它是因为**空工具栏是一条
 ///   看着像 bug 的路**——只剩一个拖动柄，而用户多半不知道那是自己配出来的。
 ///
+/// `custom:<id>` 条目里 `id` 的最大下标——`ToolbarAction::Custom` 的载荷是 `u8`
+/// （为保住 `Copy`，见其文档），故第 256 个及以后的按钮无法回指，解析时即拒绝。
+const MAX_CUSTOM_BUTTONS: usize = u8::MAX as usize + 1;
+
 /// 抽成模块级纯函数而非 `Coordinator` 方法：它不碰任何状态，单测无需构造协调器。
-pub(crate) fn parse_toolbar_items(items: &[String]) -> Vec<ToolbarItem> {
+pub(crate) fn parse_toolbar_items(
+    items: &[String],
+    buttons: &[wind_config::ToolbarButtonSpec],
+) -> Vec<ToolbarItem> {
     // 留空 = 全部显示（旧配置无此键时行为不变）。与「写了但全非法」分开处理：
     // 那条要告警，这条是正常默认，不该刷日志。
+    //
+    // ⚠️ 留空**不含**自定义按钮：`items` 是显示与顺序的唯一真相源，光在
+    // `[[ui.toolbar.buttons]]` 里定义一个按钮不等于要显示它（否则用户没法"先定义、
+    // 暂时不放上去"）。要显示就得在 items 里写一条 `custom:<id>`——设置页会代劳。
     if items.is_empty() {
         return wind_ui_types::DEFAULT_TOOLBAR_ITEMS.to_vec();
     }
@@ -881,7 +892,11 @@ pub(crate) fn parse_toolbar_items(items: &[String]) -> Vec<ToolbarItem> {
             "s2t" => out.push(ToolbarItem::S2t),
             "settings" => out.push(ToolbarItem::Settings),
             "" => {}
-            other => warn!("ui.toolbar.items: 未知条目 {other:?}，已跳过"),
+            other => match other.strip_prefix("custom:") {
+                Some(id) => push_custom_item(&mut out, id, buttons),
+                // 前缀写错（如 `custom-sym`）落到这里，与拼错内置键同样处置。
+                None => warn!("ui.toolbar.items: 未知条目 {other:?}，已跳过"),
+            },
         }
     }
     if out.is_empty() {
@@ -891,6 +906,44 @@ pub(crate) fn parse_toolbar_items(items: &[String]) -> Vec<ToolbarItem> {
         return wind_ui_types::DEFAULT_TOOLBAR_ITEMS.to_vec();
     }
     out
+}
+
+/// 把一条 `custom:<id>` 解析成渲染项，逐条判非法情形并告警。
+///
+/// 每一种「配了不出现」的情形都要说清是哪一种：这条链上有 4 个位置能让按钮消失
+/// （id 找不到 / 被 enabled 关掉 / label 为空 / 超出可回指范围），而用户看到的都是
+/// 「我配的按钮没了」。日志里不分辨，就只能靠猜。
+fn push_custom_item(
+    out: &mut Vec<ToolbarItem>,
+    id: &str,
+    buttons: &[wind_config::ToolbarButtonSpec],
+) {
+    let Some(idx) = buttons.iter().position(|b| b.id == id) else {
+        warn!("ui.toolbar.items: custom:{id} 没有对应的 [[ui.toolbar.buttons]] 定义，已跳过");
+        return;
+    };
+    let btn = &buttons[idx];
+    if !btn.enabled {
+        // 不是错误：设置页关掉某个按钮时，items 里那条 `custom:<id>` 要留着记住位置。
+        return;
+    }
+    if idx >= MAX_CUSTOM_BUTTONS {
+        warn!("ui.toolbar.items: custom:{id} 的下标 {idx} 超出上限，已跳过");
+        return;
+    }
+    let label = wind_config::toolbar_label_trunc(&btn.label);
+    if label.is_empty() {
+        // 空 label 会画出一个看不见的按钮——用户点得到却不知道点的是什么，比不显示更糟。
+        warn!("ui.toolbar.items: custom:{id} 的 label 为空，已跳过");
+        return;
+    }
+    if label.chars().count() != btn.label.trim().chars().count() {
+        warn!("ui.toolbar.buttons[{id}].label 超出一格宽度（一个汉字或两个 ASCII），已截断显示");
+    }
+    out.push(ToolbarItem::Custom {
+        index: idx as u8,
+        label,
+    });
 }
 
 /// 上一次推给 UI 的工具栏指令（供 `notify_toolbar` 去重）。
@@ -3341,7 +3394,10 @@ impl Coordinator {
         // 在此侧完成，渲染端只收一份「照这个顺序画」的声明——它读不到配置。
         let _ = self
             .ui_tx
-            .send(UiCommand::SetToolbarLayout(parse_toolbar_items(&tb.items)));
+            .send(UiCommand::SetToolbarLayout(parse_toolbar_items(
+                &tb.items,
+                &tb.buttons,
+            )));
     }
 
     /// 当前活跃方案 ID（测试/诊断用）
@@ -9394,11 +9450,26 @@ mod toolbar_items_tests {
     //! `ui.toolbar.items` → 渲染项序列的解析（纯函数，不构造协调器）。
 
     use super::parse_toolbar_items;
+    use wind_config::ToolbarButtonSpec;
     use wind_ui_types::{DEFAULT_TOOLBAR_ITEMS, ToolbarItem};
 
     fn parse(items: &[&str]) -> Vec<ToolbarItem> {
+        parse_with(items, &[])
+    }
+
+    fn parse_with(items: &[&str], buttons: &[ToolbarButtonSpec]) -> Vec<ToolbarItem> {
         let owned: Vec<String> = items.iter().map(|s| s.to_string()).collect();
-        parse_toolbar_items(&owned)
+        parse_toolbar_items(&owned, buttons)
+    }
+
+    /// 一个可用的自定义按钮（各字段可按需覆盖）。
+    fn btn(id: &str, label: &str) -> ToolbarButtonSpec {
+        ToolbarButtonSpec {
+            id: id.to_string(),
+            label: label.to_string(),
+            action: "proc.run(\"charmap.exe\")".to_string(),
+            enabled: true,
+        }
     }
 
     /// ★ **P1 的回归基线**：留空必须渲染出与本功能落地前**逐格相同**的序列。
@@ -9479,7 +9550,7 @@ mod toolbar_items_tests {
     #[test]
     fn l1_default_items_match_empty_fallback() {
         let factory = wind_config::Config::default().ui.toolbar.items;
-        assert_eq!(parse_toolbar_items(&factory), parse(&[]));
+        assert_eq!(parse_toolbar_items(&factory, &[]), parse(&[]));
     }
 
     /// 条目的值域散在四处：`TOOLBAR_ITEM_KEYS`（配置层键名）、本函数的 match 臂、
@@ -9494,7 +9565,7 @@ mod toolbar_items_tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let parsed = parse_toolbar_items(&keys);
+        let parsed = parse_toolbar_items(&keys, &[]);
         assert_eq!(
             parsed.len(),
             keys.len(),
@@ -9505,5 +9576,107 @@ mod toolbar_items_tests {
             DEFAULT_TOOLBAR_ITEMS.to_vec(),
             "键名的声明顺序必须与协议层默认项序列一致"
         );
+    }
+
+    // ── 自定义按钮 ──────────────────────────────────────────────
+
+    /// `custom:<id>` 按 id 找到定义，可排在内置项中间。
+    #[test]
+    fn custom_button_resolves_by_id_at_any_position() {
+        let buttons = [btn("sym", "符")];
+        assert_eq!(
+            parse_with(&["mode", "custom:sym", "settings"], &buttons),
+            vec![
+                ToolbarItem::Mode,
+                ToolbarItem::Custom {
+                    index: 0,
+                    label: "符".to_string(),
+                },
+                ToolbarItem::Settings,
+            ]
+        );
+    }
+
+    /// index 是**在 buttons 数组里的下标**，不是在 items 里的位置——点击回指靠它。
+    #[test]
+    fn custom_index_points_into_buttons_array() {
+        let buttons = [btn("a", "甲"), btn("b", "乙")];
+        let got = parse_with(&["custom:b", "custom:a"], &buttons);
+        let idx: Vec<u8> = got
+            .iter()
+            .filter_map(|i| match i {
+                ToolbarItem::Custom { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idx, vec![1, 0], "下标须指向 buttons，与 items 里的顺序无关");
+    }
+
+    /// ★ 四种「配了不出现」必须各自可分辨（都只表现为"我的按钮没了"）：
+    /// 悬空引用 / 被 enabled 关掉 / label 为空 / 前缀写错。
+    #[test]
+    fn custom_button_vanishes_only_for_these_reasons() {
+        let buttons = [
+            btn("ok", "符"),
+            ToolbarButtonSpec {
+                enabled: false,
+                ..btn("off", "关")
+            },
+            btn("blank", "   "),
+        ];
+        // 每种非法情形都只丢它自己，其余照常。
+        let got = parse_with(
+            &[
+                "custom:ghost", // 没有对应定义
+                "custom:off",   // enabled = false
+                "custom:blank", // label 全空白
+                "custom-ok",    // 前缀写错（连字符）
+                "custom:ok",    // 唯一合法的
+            ],
+            &buttons,
+        );
+        assert_eq!(
+            got,
+            vec![ToolbarItem::Custom {
+                index: 0,
+                label: "符".to_string(),
+            }]
+        );
+    }
+
+    /// label 按**显示宽度**截断：一个汉字或两个 ASCII。
+    ///
+    /// 这与 `icon_label_trunc` 的「字符数 ≤ 2」口径不同——「符号」在那边放行、在这里
+    /// 截成「符」。分野的理由见 `toolbar_label_trunc` 的文档。
+    #[test]
+    fn custom_label_truncates_by_display_width() {
+        let cases = [
+            ("符", "符"),   // 1 个汉字，宽 2
+            ("符号", "符"), // 2 个汉字，宽 4 → 截
+            ("En", "En"),   // 2 个 ASCII，宽 2
+            ("Eng", "En"),  // 3 个 ASCII，宽 3 → 截
+            (" 符 ", "符"), // 首尾空白先去掉
+            ("符A", "符"),  // 混排：汉字已占满 2
+            ("A符", "A"),   // 混排：A 占 1，再加汉字就超
+        ];
+        for (raw, want) in cases {
+            let buttons = [btn("x", raw)];
+            let got = parse_with(&["custom:x"], &buttons);
+            let label = match got.first() {
+                Some(ToolbarItem::Custom { label, .. }) => label.clone(),
+                other => panic!("{raw:?} 未解析出自定义项：{other:?}"),
+            };
+            assert_eq!(label, want, "label {raw:?} 应截成 {want:?}");
+        }
+    }
+
+    /// 光在 `buttons` 里定义不等于要显示：`items` 是显示与顺序的唯一真相源。
+    ///
+    /// 反过来说，`items` 留空时回落的是**内置全集**，不含任何自定义按钮——否则用户
+    /// 没法"先定义好、暂时不放上去"。
+    #[test]
+    fn defining_a_button_does_not_show_it() {
+        let buttons = [btn("sym", "符")];
+        assert_eq!(parse_with(&[], &buttons), DEFAULT_TOOLBAR_ITEMS.to_vec());
     }
 }

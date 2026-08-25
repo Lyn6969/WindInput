@@ -3240,6 +3240,92 @@ pub struct ToolbarConfig {
     /// ——后者恒按声明顺序写回，会静默改写用户手排的顺序（`config-design-rules.md` §R3）。
     #[serde(default = "default_toolbar_items")]
     pub items: Vec<String>,
+    /// 自定义按钮定义（`[[ui.toolbar.buttons]]`）。**定义在此，显不显示 / 排第几由
+    /// [`Self::items`] 里的 `custom:<id>` 决定**——两者是引用关系，不是同一语义的两张表。
+    ///
+    /// 出厂空。这是 expert 档配置：动作是 cmdbar 表达式，设置页不提供编辑器
+    /// （`config-design-rules.md` §R5）。
+    #[serde(default)]
+    pub buttons: Vec<ToolbarButtonSpec>,
+}
+
+/// 工具栏上的一个自定义按钮。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolbarButtonSpec {
+    /// 稳定标识，被 `items` 里的 `custom:<id>` 引用。空 id 的按钮无法被引用（等于禁用）。
+    #[serde(default)]
+    pub id: String,
+    /// 格内显示的文字。见 [`toolbar_label_trunc`] 的宽度口径。
+    ///
+    /// ⚠️ **刻意没有 tooltip 字段**：工具栏至今没有悬停提示机制（`wind-ui` 的 tooltip
+    /// 窗口绑在候选窗上，是编码反查用的）。加一个渲染端消费不了的字段，等于给用户一个
+    /// 配了永远没反应的旋钮——比没有更糟。要做提示得先给工具栏做悬停窗口，那是独立的
+    /// 一件事，不该顺带塞进按钮定义里。
+    #[serde(default)]
+    pub label: String,
+    /// 点击执行的 cmdbar 表达式，如 `proc.run("charmap.exe")` / `open("https://…")`。
+    ///
+    /// 值域就是命令栏 / 短语动作那一套（`wind-cmdbar`），故 `web.search(…)`、
+    /// `wind.cli("schema switch wubi86")`、`key.tap("Ctrl+Shift+P")` 同样可用。
+    #[serde(default)]
+    pub action: String,
+    /// 关掉即不渲染（`items` 里那条 `custom:<id>` 留着，供设置页记住位置）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// 工具栏按钮 label 的宽度上限，按**显示宽度**计（CJK 记 2、其余记 1）。
+pub const TOOLBAR_LABEL_MAX_WIDTH: usize = 2;
+
+/// 工具栏按钮 label 的截断口径：去首尾空白后，取显示宽度不超过
+/// [`TOOLBAR_LABEL_MAX_WIDTH`] 的前缀。即「一个汉字」或「两个 ASCII 字符」。
+///
+/// # 为什么不复用 `schema::icon_label_trunc`
+///
+/// 那条口径是**字符数** ≤ 2（语言栏 16×16 图标的既有尺度），这条是**显示宽度** ≤ 2。
+/// 对「符号」两者判断相反：前者放行（2 个字符），后者截成「符」（宽度 4 超限）。
+///
+/// 分野在于两处要保证的东西不同：语言栏图标是独立的一张位图，画 2 个 CJK 只是挤；
+/// 工具栏格是**等宽方格排成的一条**，一格画得比别格宽就破了整条的节奏——用户要的
+/// 正是「和其它格长宽比一致」。改 `icon_label_trunc` 去迁就这里会连带改掉方案标签
+/// 与语言栏图标的既有行为（「符号」这类 2 字标签现在是显示得出的）。
+///
+/// ⚠️ 因此这**不是**漏掉的复用。若日后要合并两条口径，得先确认语言栏那三个调用点
+/// 接受「符号」被截成「符」。
+pub fn toolbar_label_trunc(raw: &str) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in raw.trim().chars() {
+        let cw = if is_wide_char(c) { 2 } else { 1 };
+        if w + cw > TOOLBAR_LABEL_MAX_WIDTH {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// 是否按双宽字符计。粗口径够用：这里只为决定「一格能放几个」，不是排版引擎。
+///
+/// 覆盖 CJK 统一表意文字及扩展 A、兼容表意文字、假名、全角/半角形式区、CJK 符号与标点、
+/// 注音符号、谚文——即用户会拿来当按钮标签的那些。其余（拉丁、数字、常用符号）记 1。
+fn is_wide_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F      // 谚文字母
+        | 0x2E80..=0x303E    // CJK 部首补充 / 康熙部首 / CJK 符号与标点
+        | 0x3041..=0x33FF    // 假名 / 注音 / 谚文兼容 / CJK 兼容
+        | 0x3400..=0x4DBF    // CJK 扩展 A
+        | 0x4E00..=0x9FFF    // CJK 统一表意文字
+        | 0xA000..=0xA4CF    // 彝文
+        | 0xAC00..=0xD7A3    // 谚文音节
+        | 0xF900..=0xFAFF    // CJK 兼容表意文字
+        | 0xFE30..=0xFE6F    // CJK 兼容形式 / 小型变体
+        | 0xFF00..=0xFF60    // 全角形式
+        | 0xFFE0..=0xFFE6    // 全角符号
+        | 0x20000..=0x2FFFD  // CJK 扩展 B~F
+        | 0x30000..=0x3FFFD  // CJK 扩展 G+
+    )
 }
 
 /// 工具栏条目键的全集，同时也是默认值（全部显示）与**默认顺序**。
@@ -3261,6 +3347,7 @@ impl Default for ToolbarConfig {
             auto_hide_delay: 5,
             vertical: false,
             items: default_toolbar_items(),
+            buttons: Vec::new(),
         }
     }
 }
