@@ -409,7 +409,13 @@ fn expand_cells(layout: &[ToolbarItem], state: &ToolbarState) -> Vec<Cell> {
         return cells;
     }
     // 回落全集再展开一次（而不是直接返回全集的 Cell）：全集里的 S2t 同样要过
-    // s2t_shown 那道合取，直接构造会画出一个简繁没开却存在的「简」格。
+    // s2t_shown 那道合取，直接构造会画出一个简繁没开却存在的「简」格——那是用一个
+    // 新 bug 换掉旧 bug。
+    //
+    // ⚠️ **这一步不可能再空，不必加第二层兜底**：全集里 Mode / Punct / FullWidth /
+    // Settings 四项在 `expand_cells_raw` 里都是无条件 push，只有 S2t 带运行时条件，
+    // 故结果最少 4 格。若日后给别的内置项也加运行时条件，这条论证就失效了——
+    // 那时要么改这里，要么保证至少一项恒存。
     expand_cells_raw(&wind_ui_types::DEFAULT_TOOLBAR_ITEMS, state)
 }
 
