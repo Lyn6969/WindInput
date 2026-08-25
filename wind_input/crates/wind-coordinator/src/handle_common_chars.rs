@@ -316,6 +316,230 @@ impl crate::Coordinator {
     }
 }
 
+// ───────── 导入导出（设置页「词库管理 · 常用字」的导入/导出按钮）─────────
+//
+// 与整份备份（`wind-transfer` 的 `userdata/common_chars.jsonl` 段）分工不同：那条是
+// 换机还原，整份配置一起走；这条是**单独分发一份「我的常用字判断」**——同一个人的第二
+// 台机器、或者把自己整理的一批生僻字给同行。故格式要人看得懂、手改得动。
+
+/// 导出文件的格式标记键。
+///
+/// 导入端靠它认出「这是一份常用字调整文件」，不带标记的 TOML 一律拒绝。没有标记的话，
+/// 用户误选了快捷输入的导出文件时解析照样通过、两个段都读不到，界面只会说一句
+/// 「已导入 0 条」——他会以为是文件坏了，而不是选错了。
+const COMMON_CHARS_FILE_TAG: &str = "wind_common_chars";
+
+/// 解析结果：字与目标判定，加上跳过的条目及原因。
+struct ParsedCommonChars {
+    entries: Vec<(char, bool)>,
+    skipped: Vec<String>,
+}
+
+/// 导入预览（只读，不写库）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommonCharsImportPreview {
+    /// 文件里「设为常用」的字数。
+    pub common: usize,
+    /// 文件里「设为生僻」的字数。
+    pub rare: usize,
+    /// 解析期跳过的条目及原因（非汉字、多字符、坏行……）。
+    pub skipped: Vec<String>,
+}
+
+/// 导入结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommonCharsImportOutcome {
+    /// 真正落库的覆盖条数。
+    pub imported: usize,
+    /// 与本机默认判定**同向**、因而不需要覆盖的字数。
+    ///
+    /// 单独报出来而不并进 `imported`：两台机器的默认字表可能不同版本，用户在 A 机上
+    /// 亲手设过的字到了 B 机可能本就是默认，此时库里不留记录才是对的（见
+    /// [`crate::Coordinator::apply_common_target`]）。但「导入 100 条却只写了 30 条」
+    /// 若不解释，看起来就像丢了数据。
+    pub same_as_default: usize,
+    /// 跳过的条目及原因。
+    pub skipped: Vec<String>,
+}
+
+/// 把一串字按 TOML 字符串字面量输出（汉字里不会有引号/反斜杠，但不自己拼引号）。
+fn toml_string_literal(s: &str) -> String {
+    toml::Value::String(s.to_string()).to_string()
+}
+
+/// 解析导入文件。TOML 为主格式，JSONL 是备份包里那一段的原始形态。
+///
+/// **兼容 JSONL 是有实际出路的**：用户从备份包里掏出 `userdata/common_chars.jsonl`
+/// 想单独导进来时，那份文件是现成的，认不出它就只能让他手工转换。识别成本也低——
+/// 首个有效行以 `{` 开头即是。
+fn parse_common_chars_file(content: &str) -> anyhow::Result<ParsedCommonChars> {
+    let first = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'));
+    if first.is_some_and(|l| l.starts_with('{')) {
+        return Ok(parse_common_chars_jsonl(content));
+    }
+
+    let table: toml::Table = toml::from_str(content)
+        .map_err(|e| anyhow::anyhow!("不是一份有效的常用字调整文件: {e}"))?;
+    if !table.contains_key(COMMON_CHARS_FILE_TAG) {
+        anyhow::bail!("不是一份常用字调整文件（缺少 {COMMON_CHARS_FILE_TAG} 标记）");
+    }
+    let mut out = ParsedCommonChars {
+        entries: Vec::new(),
+        skipped: Vec::new(),
+    };
+    // 两段分别是两个方向。段缺失是合法的（用户只降级过、没升级过）。
+    for (key, common) in [("common", true), ("rare", false)] {
+        let Some(v) = table.get(key) else { continue };
+        let Some(s) = v.as_str() else {
+            out.skipped.push(format!("{key}：应为字符串，已跳过整段"));
+            continue;
+        };
+        for ch in s.chars() {
+            push_common_char_entry(&mut out, ch, common);
+        }
+    }
+    Ok(out)
+}
+
+/// JSONL：每行 `{"ch":"槮","common":true}`。坏行跳过而非整份失败——与
+/// [`wind_store::Store::import_common_chars_jsonl`] 同一条纪律。
+fn parse_common_chars_jsonl(content: &str) -> ParsedCommonChars {
+    let mut out = ParsedCommonChars {
+        entries: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for (i, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match serde_json::from_str::<wind_store::common_chars::CommonCharOverride>(line) {
+            Ok(o) => push_common_char_entry(&mut out, o.ch, o.common),
+            Err(e) => out.skipped.push(format!("第 {} 行：{e}", i + 1)),
+        }
+    }
+    out
+}
+
+/// 收一条，域外字符如实报告。
+///
+/// ⚠️ 准入必须是 [`wind_candidate::is_common_scope`]，与右键写端同源：放行域外字符
+/// （中文标点、emoji、字母数字）会存下一条读端永不查询的死记录，且全程无报错。
+fn push_common_char_entry(out: &mut ParsedCommonChars, ch: char, common: bool) {
+    if wind_candidate::is_common_scope(ch) {
+        out.entries.push((ch, common));
+    } else {
+        out.skipped
+            .push(format!("「{ch}」不受常用字表管辖，已跳过"));
+    }
+}
+
+impl crate::Coordinator {
+    /// 导出用户调整为 TOML 文本。
+    ///
+    /// 数据取自 **store**（真相源）而不是运行时镜像，与 `export_quick_format` 同一条判据：
+    /// 镜像是热路径读缓存，万一某次回灌漏了，从它导出就会写出一份与实际不符的文件，
+    /// 而这种偏差要等导到另一台机器才看得出来。
+    ///
+    /// 导出的是**稀疏调整**而非 8104 字全表：全表快照到了对方机器上，会把「对方默认表里
+    /// 本来就有的字」也钉成显式覆盖，从此脱离默认表升版；而且文件里根本分不出哪几个字
+    /// 是这个人真正表达过的意见。
+    pub fn export_common_chars(&self) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let (mut common, mut rare) = (String::new(), String::new());
+        for o in store.list_common_char_overrides()? {
+            if o.common {
+                common.push(o.ch);
+            } else {
+                rare.push(o.ch);
+            }
+        }
+        Ok(format!(
+            "# 清风输入法 · 常用字调整（只记录与默认不同的字）\n\
+             # common = 判为常用；rare = 判为生僻\n\
+             {COMMON_CHARS_FILE_TAG} = 1\n\
+             common = {}\n\
+             rare = {}\n",
+            toml_string_literal(&common),
+            toml_string_literal(&rare),
+        ))
+    }
+
+    /// 导入预览：只解析与计数，**不写任何东西**。
+    pub fn preview_common_chars_import(
+        &self,
+        content: &str,
+    ) -> anyhow::Result<CommonCharsImportPreview> {
+        let parsed = parse_common_chars_file(content)?;
+        Ok(CommonCharsImportPreview {
+            common: parsed.entries.iter().filter(|(_, c)| *c).count(),
+            rare: parsed.entries.iter().filter(|(_, c)| !*c).count(),
+            skipped: parsed.skipped,
+        })
+    }
+
+    /// 导入用户调整。`replace` 为真时先清空现有全部调整。
+    ///
+    /// ## ★ 与默认同向的字**不写记录**
+    ///
+    /// 逐条走的是 [`Self::apply_common_target`] 的同一条判据（这里为省掉每条一次的整表
+    /// 回灌而内联，见下）：目标方向等于本机默认时删覆盖、不写同向记录。两台机器的默认
+    /// 字表可能是不同版本，照单全收会把对方默认里本就有的字钉死在当前判定上，从此拿不到
+    /// 默认表升版——而这件事导入时毫无异样，几个版本之后才会有人发现某个字一直不对。
+    ///
+    /// 回灌只在最后做一次（镜像是整表替换），与 `import_quick_format` 同。
+    pub fn import_common_chars(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> anyhow::Result<CommonCharsImportOutcome> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let parsed = parse_common_chars_file(content)?;
+
+        if replace {
+            // replace 的语义是「用文件里的状态覆盖现状」：留着旧覆盖会得到
+            // 「文件里的 + 我原有的」。
+            store.clear_common_char_overrides()?;
+        }
+
+        let mut outcome = CommonCharsImportOutcome {
+            skipped: parsed.skipped,
+            ..Default::default()
+        };
+        {
+            // 读锁在循环外取一次：base 判定不随本次写入变化（覆盖不影响基表），
+            // 逐条取锁纯属白付。回灌要写锁，故这一段单独作用域。
+            let cc = self.common_chars.read().unwrap_or_else(|e| e.into_inner());
+            for (ch, common) in parsed.entries {
+                if common == cc.is_base_common(ch) {
+                    store.remove_common_char_override(ch)?;
+                    outcome.same_as_default += 1;
+                } else {
+                    store.set_common_char_override(ch, common)?;
+                    outcome.imported += 1;
+                }
+            }
+        }
+        self.reload_common_chars();
+        debug!(
+            "常用字导入: 写入 {} 条，同默认 {} 条，跳过 {} 条（replace={replace}）",
+            outcome.imported,
+            outcome.same_as_default,
+            outcome.skipped.len()
+        );
+        Ok(outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::common_char_of;

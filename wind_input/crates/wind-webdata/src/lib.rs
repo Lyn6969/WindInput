@@ -1,4 +1,4 @@
-//! Web 设置数据 RPC：schema/dict/temp/freq/shadow/stats/theme/phrase 命名空间。
+//! Web 设置数据 RPC：schema/dict/temp/freq/shadow/stats/theme/phrase/quick/commonChars 命名空间。
 //!
 //! 经 wind-rpc 的 `CoreRpc::data_rpc` 转发到此（service 的 RpcCore 适配）。
 //! 方法名与前端 `contract.ts` 1:1 一致。
@@ -10,7 +10,7 @@
 //!   无 store/themes 时各方法返回合法空集（降级，不报错）。
 //!
 //! 本 crate 由 wind-coordinator 的 webdata 模块独立而来：它只经
-//! [`WebDataHost`] 窄面（定义在 wind-coordinator::web_host，16 方法）触宿主，
+//! [`WebDataHost`] 窄面（定义在 wind-coordinator::web_host）触宿主，
 //! 把 wind-transfer/fontdb 等重依赖挡在 Android 闭包之外。
 
 use serde_json::{Value, json};
@@ -424,6 +424,9 @@ pub trait WebDataRpc: WebDataHost {
             "commonChars.set" => self.web_common_chars_set(params),
             "commonChars.reset" => self.web_common_chars_reset(params),
             "commonChars.clear" => self.web_common_chars_clear(),
+            "commonChars.export" => self.web_common_chars_export(),
+            "commonChars.previewImport" => self.web_common_chars_preview_import(params),
+            "commonChars.import" => self.web_common_chars_import(params),
             "quick.list" => self.web_quick_list(),
             "quick.move" => self.web_quick_move(params),
             "quick.setEnabled" => self.web_quick_set_enabled(params),
@@ -2418,6 +2421,38 @@ pub trait WebDataRpc: WebDataHost {
         // 与 `quick.resetKind` 传空 id 同一惯例。
         self.common_char_edit('\0', CommonCharEdit::ClearAll)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// 导出用户调整为 TOML 文本。与 `quick.export` 同形（`{content}`），设置页那一路
+    /// 写文件的代码因此可以照抄。
+    fn web_common_chars_export(&self) -> anyhow::Result<Value> {
+        Ok(json!({ "content": self.common_chars_export()? }))
+    }
+
+    fn web_common_chars_preview_import(&self, params: &Value) -> anyhow::Result<Value> {
+        let p = self.common_chars_preview_import(str_param(params, "content")?)?;
+        Ok(json!({
+            "common": p.common,
+            "rare": p.rare,
+            "skipped": p.skipped,
+        }))
+    }
+
+    fn web_common_chars_import(&self, params: &Value) -> anyhow::Result<Value> {
+        let content = str_param(params, "content")?;
+        // 与词库/短语/快捷输入导入同一套参数名：`strategy = "replace"` 先清空，其余为合并。
+        let replace = params
+            .get("strategy")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("replace"));
+        let o = self.common_chars_import(content, replace)?;
+        Ok(json!({
+            "imported": o.imported,
+            // 与默认同向、无需落库的字。设置页文案必须把它说出来：否则「导入 100 条
+            // 只写了 30 条」看起来就像丢了数据。
+            "sameAsDefault": o.same_as_default,
+            "skipped": o.skipped,
+        }))
     }
 
     fn web_quick_set_enabled(&self, params: &Value) -> anyhow::Result<Value> {
@@ -4538,6 +4573,98 @@ mod tests {
         assert_eq!(
             common_char_rows_rpc(&c, json!({ "onlyModified": true })).1,
             0
+        );
+    }
+
+    /// `commonChars.export` / `previewImport` / `import` 的往返契约。
+    ///
+    /// ⚠️ 本装置没有 data_dir ⇒ 默认字表为空 ⇒ **任何字的默认判定都是「生僻」**。
+    /// 这恰好把导入的两条分支都摆到了台面上：`common` 段的字与默认相反、真的落库；
+    /// `rare` 段的字与默认同向、按设计**删覆盖而不写记录**（`sameAsDefault`）。
+    /// 后者若被误实现成照单全收，这个装置下 `total` 会多出两行来。
+    #[test]
+    fn common_chars_import_export_roundtrip() {
+        let c = coord("commonchars_io");
+        for ch in ["槮", "鬱"] {
+            c.web_data_rpc("commonChars.set", &json!({ "char": ch, "common": true }))
+                .unwrap();
+        }
+
+        let text = c
+            .web_data_rpc("commonChars.export", &json!({}))
+            .unwrap()
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("wind_common_chars = 1"),
+            "导出必须带格式标记，导入端靠它认出选错了文件：{text}"
+        );
+        assert!(text.contains('槮') && text.contains('鬱'), "{text}");
+
+        // 导到第二台「机器」（另一份 store）。
+        let c2 = coord("commonchars_io2");
+        let p = c2
+            .web_data_rpc("commonChars.previewImport", &json!({ "content": text }))
+            .unwrap();
+        assert_eq!(p["common"], json!(2));
+        assert_eq!(p["rare"], json!(0));
+        assert_eq!(
+            common_char_rows_rpc(&c2, json!({})).1,
+            0,
+            "预览不能写库——用户还没点确认"
+        );
+
+        let o = c2
+            .web_data_rpc("commonChars.import", &json!({ "content": text }))
+            .unwrap();
+        assert_eq!(o["imported"], json!(2));
+        assert_eq!(common_char_rows_rpc(&c2, json!({})).1, 2);
+
+        // 手写文件：rare 段与本装置的默认同向 ⇒ 不写记录；域外字符如实报告而不是静默吞掉。
+        let hand = "wind_common_chars = 1\ncommon = \"玥\"\nrare = \"畢、\"\n";
+        let o2 = c2
+            .web_data_rpc("commonChars.import", &json!({ "content": hand }))
+            .unwrap();
+        assert_eq!(o2["imported"], json!(1), "只有 common 段那个字与默认相反");
+        assert_eq!(
+            o2["sameAsDefault"],
+            json!(1),
+            "与默认同向的字不该留记录——照单全收会把它钉死在当前判定上"
+        );
+        assert_eq!(
+            o2["skipped"].as_array().unwrap().len(),
+            1,
+            "「、」不受常用字表管辖，必须报出来"
+        );
+        assert_eq!(common_char_rows_rpc(&c2, json!({})).1, 3);
+
+        // JSONL（备份包 `userdata/common_chars.jsonl` 那一段的原始形态）也认。
+        let c3 = coord("commonchars_io3");
+        let jsonl = "{\"ch\":\"槮\",\"common\":true}\n不是 json\n";
+        let o3 = c3
+            .web_data_rpc("commonChars.import", &json!({ "content": jsonl }))
+            .unwrap();
+        assert_eq!(o3["imported"], json!(1));
+        assert_eq!(o3["skipped"].as_array().unwrap().len(), 1, "坏行如实上报");
+
+        // replace：用文件里的状态覆盖现状，而不是「文件里的 + 我原有的」。
+        let only_yue = "wind_common_chars = 1\ncommon = \"玥\"\n";
+        c2.web_data_rpc(
+            "commonChars.import",
+            &json!({ "content": only_yue, "strategy": "replace" }),
+        )
+        .unwrap();
+        assert_eq!(common_char_rows_rpc(&c2, json!({})).1, 1);
+
+        // 选错文件：缺标记直接拒绝，而不是「已导入 0 条」那种让人以为文件坏了的回话。
+        assert!(
+            c2.web_data_rpc(
+                "commonChars.import",
+                &json!({ "content": "[quick]\nfoo = 1\n" })
+            )
+            .is_err()
         );
     }
 

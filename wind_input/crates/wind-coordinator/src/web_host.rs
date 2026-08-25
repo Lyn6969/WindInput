@@ -65,6 +65,22 @@ pub trait WebDataHost {
         edit: crate::handle_common_chars::CommonCharEdit,
     ) -> anyhow::Result<()>;
 
+    /// 导出用户的常用字调整为 TOML 文本（只含与默认不同的字）。
+    fn common_chars_export(&self) -> anyhow::Result<String>;
+
+    /// 导入预览：只解析与计数，不写库。
+    fn common_chars_preview_import(
+        &self,
+        content: &str,
+    ) -> anyhow::Result<crate::handle_common_chars::CommonCharsImportPreview>;
+
+    /// 导入常用字调整；`replace` 为真时先清空现有调整。
+    fn common_chars_import(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> anyhow::Result<crate::handle_common_chars::CommonCharsImportOutcome>;
+
     /// 设置页对一条格式的编辑：**写库 + 回灌运行时镜像**一并完成。
     ///
     /// `kind` 收字符串而不是 `FormatKind`：它从 RPC 的 JSON 来，本就是字符串，在这里解析
@@ -187,6 +203,22 @@ impl WebDataHost for Coordinator {
         edit: crate::handle_common_chars::CommonCharEdit,
     ) -> anyhow::Result<()> {
         Coordinator::common_char_edit(self, ch, edit)
+    }
+    fn common_chars_export(&self) -> anyhow::Result<String> {
+        Coordinator::export_common_chars(self)
+    }
+    fn common_chars_preview_import(
+        &self,
+        content: &str,
+    ) -> anyhow::Result<crate::handle_common_chars::CommonCharsImportPreview> {
+        Coordinator::preview_common_chars_import(self, content)
+    }
+    fn common_chars_import(
+        &self,
+        content: &str,
+        replace: bool,
+    ) -> anyhow::Result<crate::handle_common_chars::CommonCharsImportOutcome> {
+        Coordinator::import_common_chars(self, content, replace)
     }
     fn quick_format_edit(
         &self,
