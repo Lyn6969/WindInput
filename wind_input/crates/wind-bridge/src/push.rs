@@ -303,6 +303,12 @@ impl PushServer {
     /// 注意：此方法使用 CMD_ACTIVATION_STATUS_PUSH 命令码（0x020C），
     /// 与 CMD_STATUS_UPDATE（0x0202）不同。C++ 端对两者有不同处理路径。
     pub fn push_activation_status(&self, chinese_mode: bool) {
+        // ⚠️ 这两个字面量**刻意不接 `[ui.labels]`**：本方法既拿不到 Config，当前也
+        // 没有任何调用点——生产路径是协调器那个同名方法（`push_config.rs`），它推的是
+        // `build_status` 算好的 `icon_label`，用户配置在那条路上生效。
+        //
+        // 若哪天要启用本方法，label 必须改成由调用方传入：否则用户把英文态配成 "En"
+        // 后，握手瞬间会先闪一下 "英" 再被正式推送改掉。
         let label = if chinese_mode { "中" } else { "英" };
         let resp = wind_ipc::codec::encode_activation_status_push(
             chinese_mode,

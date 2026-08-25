@@ -97,7 +97,8 @@ pub struct CandidateFrame {
 #[derive(Debug, Clone)]
 pub struct InputStatus {
     pub chinese_mode: bool,
-    /// 方案短称：中文态取方案 icon_label（"五"/"拼"），英文态为 "英"/大写锁定 "A"
+    /// 模式主字，最多 2 个字符。中文态取方案的 `[schema] icon_label`（"五"/"拼"），
+    /// 非中文态取 `[ui.labels]`（出厂 "英"/"A"，**用户可配**）。
     pub icon_label: String,
     pub full_width: bool,
     pub chinese_punct: bool,

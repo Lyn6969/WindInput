@@ -500,6 +500,24 @@ impl IconRenderer {
     /// 真机对比比旧图标明显小一圈。
     const FONT_SIZE_INSET: f32 = 2.0;
 
+    /// 宽标签回缩字号时的下限（相对基线字号的比例）。
+    ///
+    /// ⚠️ 这是**防御性下限，不是设计档位**：正常路径上 `avail / m.width` 这个比例
+    /// 本身就保证装得下，用不着它。它只兜 measure 返回异常大宽度的情形（字体缺失、
+    /// 后端异常），避免把字号算成 0 而画出一片空白。
+    ///
+    /// 定 0.4 是因为最宽的合法标签——两个全角字符（「符号」/「Ｅｎ」）——自然缩到
+    /// 0.5 左右。下限若定在那之上就会**反过来生效**，把本可以装下的两字标签顶出
+    /// 画布右缘，那正是这段代码要修的毛病。
+    const MIN_FONT_SCALE: f32 = 0.4;
+
+    /// 宽标签回缩后占可用宽度的比例。
+    ///
+    /// 不取满 1.0 的原因是 measure 给的是**行盒**：它既不含字形的 overhang，也不含
+    /// 抗锯齿向外糊出的那半个像素。按行盒缩到"恰好等于可用宽"，实测「符号」在 16px
+    /// 下仍会点亮最右一列。0.94 是留给这两项的余量。
+    const WIDE_LABEL_SAFETY: f32 = 0.94;
+
     /// 角标周围挖空的间隙，按图标边长取比例（16px 下约 1.1px）。
     ///
     /// 没有它，角标与主字笔画会糊成一团——第一轮原型的「满格主字 + 角标直接叠加」
@@ -719,11 +737,45 @@ impl IconRenderer {
         // 又因为按 has_badge 分档，导致英文态（无角标）走满格、中文态走 78%，
         // 每次中英切换字号肉眼可见地跳。图标统共一个字，它的尺寸就是基线本身。
         let font_size = s - Self::FONT_SIZE_INSET;
-        let style = crate::text::dwrite::TextStyle::new(font_size).with_weight(Self::FONT_WEIGHT);
+        let mut fs = font_size;
+        let mut style =
+            crate::text::dwrite::TextStyle::new(font_size).with_weight(Self::FONT_WEIGHT);
 
         // 第一遍按行盒粗定位。测量必须与绘制同一个 TextStyle——字重影响字宽，
         // 用 measure_text_sized（不带字重）测出来的宽度会与实际绘制不符。
-        let m = self.text.measure(&spec.label, &style);
+        let mut m = self.text.measure(&spec.label, &style);
+
+        // 装不下就按**实测宽度**回缩字号。标签自 `[ui.labels]` 起可配成两个字符
+        // （英文态 "En"），而画布只有 16px、字号写死 `s - INSET`：`"En"` 在该字号下
+        // 宽约 15.7px，下面 x0 的 `.max(0.0)` 会把它钳到左对齐，右半个字母直接画到
+        // 画布外被裁掉——用户看到的是 `E` 加半个 `n`。
+        //
+        // ★ 判据必须是 measure 的实测宽度，**不能按字符数分档**：用户可以配全角
+        // 「Ｅｎ」，那是 2 个 char 却有 2 个汉字宽，字符数判断兜不住，measure 兜得住。
+        //
+        // ⚠️ 这**不是**上面注释里翻过两次车的那种"字号分档"。那次的依据是运行时状态
+        // （有无角标），于是同一个「中」字会随中英切换忽大忽小；这里的依据是标签自身
+        // 的宽度，「五」恒 1 字符、"En" 恒 2 字符，各自字号稳定不跳，切换时大小不同
+        // 是因为**字数本来就不同**。别照着那条注释把这段删掉。
+        //
+        // 可用宽度取 `s - FONT_SIZE_INSET` 而非整个 `s`：与单字符时字号的内缩量同源，
+        // 这样一字标签与两字标签的左右边距一致，不会出现"两个字母贴着边框"。
+        // 目标宽度比可用宽再收一点（`WIDE_LABEL_SAFETY`）：缩到"行盒宽恰好等于可用宽"
+        // 实测仍会触边——**行盒不含墨迹的 overhang，抗锯齿也会向外糊出半个像素**。
+        let avail = s - Self::FONT_SIZE_INSET;
+        let target = avail * Self::WIDE_LABEL_SAFETY;
+        let min_size = font_size * Self::MIN_FONT_SCALE;
+        // ★ 必须**循环收敛**，一次比例换算不够：排版引擎把字号吸附到整像素，算出的
+        // 6.58px 实际按 7px 排版，两个汉字的宽度仍是满格的 14 —— 比例算法在吸附值上
+        // 原地打转，画出来还是被裁掉右缘。每轮至少降 1px 才能真正走出那一档。
+        //
+        // 循环必然终止：`fs` 每轮严格减小（`min(by_ratio, fs - 1.0)`），且以 `min_size`
+        // 收底。实测最多两轮（「符号」14 → 7 → 6）。
+        while m.width > target && m.width > 0.0 && fs > min_size {
+            fs = (fs * target / m.width).min(fs - 1.0).max(min_size);
+            style = crate::text::dwrite::TextStyle::new(fs).with_weight(Self::FONT_WEIGHT);
+            m = self.text.measure(&spec.label, &style);
+        }
         let x0 = ((s - m.width) * 0.5).max(0.0);
         let y0 = ((s - m.height) * 0.5).max(0.0);
         let mut mask = self.draw_glyph_at(size_px, &style, &spec.label, x0, y0);
@@ -1689,6 +1741,43 @@ mod tests {
                 assert!(
                     dx.abs() <= 0.75 && dy.abs() <= 0.75,
                     "「{label}」在 {size}px 下未居中：残余位移 ({dx:.2}, {dy:.2})"
+                );
+            }
+        }
+    }
+
+    /// 两字符标签必须**完整**落在画布内。
+    ///
+    /// `[ui.labels]` 允许把英文态配成 `En`。字号写死 `size - 2` 时 `"En"` 宽约 15px、
+    /// 画布 16px，`x0` 的 `.max(0.0)` 会把它钳成左对齐，右半个字母直接画到画布外——
+    /// 用户看到的是 `E` 加半个 `n`。回归的就是那一档。
+    ///
+    /// 判据取「最外一圈像素无墨迹」而不是比较宽度数值：**行盒宽不等于墨迹宽**，
+    /// 拿 measure 的结果断言等于在测度量约定，量真实输出才是在测用户看到的东西。
+    ///
+    /// 三个标签各代表一类宽度：`En` 半角（临界）、`Ｅｎ`/`符号` 全角（最宽的合法输入，
+    /// 必然触发回缩）。少了全角那两个，一个"只在半角时缩"的实现也能全绿。
+    #[cfg(windows)]
+    #[test]
+    fn two_char_label_fits_canvas() {
+        let r = IconRenderer::new(BadgeShape::CornerTriangle).expect("renderer");
+        for label in ["En", "Ｅｎ", "符号"] {
+            for &size in &wind_ipc::protocol::ICON_SIZES {
+                let mask = r.render_glyph_mask(
+                    size,
+                    &IconSpec {
+                        label: label.to_string(),
+                        ..spec(PunctBadge::None)
+                    },
+                );
+                let n = mask.n;
+                let col_has_ink = |x: usize| (0..n).any(|y| mask.v[y * n + x] > 0.05);
+                let lo = (0..n).find(|&x| col_has_ink(x));
+                let hi = (0..n).rev().find(|&x| col_has_ink(x));
+                let last = n - 1;
+                assert!(
+                    !col_has_ink(0) && !col_has_ink(last),
+                    "「{label}」在 {size}px 下触到画布左/右边缘：墨迹列范围 {lo:?}..={hi:?}，画布 0..={last}"
                 );
             }
         }

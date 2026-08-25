@@ -3100,11 +3100,71 @@ pub struct UiConfig {
     /// 语言栏图标（Windows 任务栏输入指示器）的呈现参数。
     #[serde(default)]
     pub langbar: LangBarConfig,
+    /// 非中文态在语言栏图标 / 工具栏模式格 / 状态气泡上显示的主字。
+    #[serde(default)]
+    pub labels: LabelsConfig,
     /// 注释词库挂载列表（`[[ui.comment_dicts]]`），供候选注释模板的 `${dict}` 变量查询。
     ///
     /// **数组顺序即优先级**：同一个词在多个库里都有注释时，取靠前那个库的。
     #[serde(default)]
     pub comment_dicts: Vec<CommentDictSpec>,
+}
+
+/// 非中文态的图标主字（`[ui.labels]`）。
+///
+/// ## 这里为什么**没有**中文态
+///
+/// 中文态的主字是**方案的属性**，配在方案文件的 `[schema] icon_label`（「五」「拼」）。
+/// 把它也搬来这里就成了两个来源争同一个显示位，切方案时该听谁的没有答案。
+///
+/// ## 为什么是全局段而不是下沉到方案
+///
+/// 英文半角是 `chinese_mode` 这个**全局运行时状态**，与当前是哪个方案无关。下沉到
+/// 方案文件后，同一个英文态会随方案切换而改标签（五笔下显 `E`、拼音下显 `En`），
+/// 而用户按 Shift 切出去的是同一个状态。
+///
+/// ## 为什么不复用 `english.schema.toml` 的 `icon_label`
+///
+/// 「英文半角」与「英文方案」是本仓明确区分的两件事：前者按键原样透传、不出候选；
+/// 后者是 active 方案切换、走常规候选路径。而且英文方案可以被用户从方案列表里禁用，
+/// 复用它的标签等于让一个可禁用对象持有全局状态的呈现。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LabelsConfig {
+    /// 英文半角态（左/右 Shift 切出）的主字。空 = 回落内置「英」。
+    pub english: String,
+    /// 大写锁定态的主字。空 = 回落内置「A」。
+    pub caps_lock: String,
+}
+
+impl Default for LabelsConfig {
+    fn default() -> Self {
+        Self {
+            english: DEFAULT_LABEL_ENGLISH.to_string(),
+            caps_lock: DEFAULT_LABEL_CAPS.to_string(),
+        }
+    }
+}
+
+/// 英文半角态的内置主字。
+pub const DEFAULT_LABEL_ENGLISH: &str = "英";
+/// 大写锁定态的内置主字。
+pub const DEFAULT_LABEL_CAPS: &str = "A";
+
+impl LabelsConfig {
+    /// 英文半角态该显示的主字（已截断 + 已回落，可直接送渲染）。
+    ///
+    /// ⚠️ **截断与回落封在这里，不能留给调用方各做一遍**——这个值有四个消费面
+    /// （语言栏图标 / 工具栏 / 状态气泡 / 移动端），其中语言栏那条路会把标签写进
+    /// C++ 侧一个 `wchar_t[4]` 的缓冲，漏掉截断的后果不是显示错乱而是宿主进程崩溃。
+    pub fn english_label(&self) -> String {
+        crate::schema::icon_label_or(&self.english, DEFAULT_LABEL_ENGLISH)
+    }
+
+    /// 大写锁定态该显示的主字（已截断 + 已回落）。
+    pub fn caps_label(&self) -> String {
+        crate::schema::icon_label_or(&self.caps_lock, DEFAULT_LABEL_CAPS)
+    }
 }
 
 /// 一个注释词库（`[[ui.comment_dicts]]`）。

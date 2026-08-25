@@ -1563,15 +1563,10 @@ impl EngineManager {
                 } else {
                     s.schema.name
                 };
-                // 与 `schema_icon_label` 同口径只取首字符：第三方方案可能配多字符 label，
-                // 在单字符宽度的工具栏格内会触发换行/截断。
-                let icon_label = s
-                    .schema
-                    .icon_label
-                    .chars()
-                    .next()
-                    .map(|c| c.to_string())
-                    .unwrap_or_default();
+                // 与 `schema_icon_label` 走**同一个函数**而不只是"同口径"：这两处从前各写
+                // 了一份 `.chars().next()`，靠注释声明彼此一致，编译器不管——改一处漏一处的
+                // 表现是"方案切换显 `Wb`、进特殊模式显 `符`"，且没有测试会发现。
+                let icon_label = wind_config::icon_label_trunc(&s.schema.icon_label);
                 Some(OverlayEntry {
                     schema_id: id,
                     name,
@@ -1710,25 +1705,18 @@ impl EngineManager {
         name
     }
 
-    /// 指定方案的图标短称（schema.icon_label 的首字符）；未配置返回空串。
-    /// 用于状态气泡/工具栏 short 模式（对齐 Go GetSchemaDisplayInfo 的 iconLabel）。
+    /// 指定方案的图标短称（`schema.icon_label` 截断到 [`wind_config::ICON_LABEL_MAX_CHARS`]）；
+    /// 未配置返回空串。用于状态气泡/工具栏 short 模式（对齐 Go GetSchemaDisplayInfo 的 iconLabel）。
     ///
-    /// 只取第一个字符：第三方方案可能配置多字符 label，在单字符宽度的工具栏格内
-    /// 会触发换行/截断，影响渲染。此处统一截断，保证显示稳定。
+    /// 截断口径见 [`wind_config::icon_label_trunc`]——上限由渲染宽度与 C++ 侧缓冲共同决定，
+    /// 与"是不是方案"无关，故与非中文态标签（`[ui.labels]`）共用同一个函数。
     pub fn schema_icon_label(&self, schema_id: &str) -> String {
         Self::read_schema(
             schema_id,
             self.data_dir.as_deref(),
             self.override_dir.as_deref(),
         )
-        .map(|s| s.schema.icon_label)
-        .map(|label| {
-            label
-                .chars()
-                .next()
-                .map(|c| c.to_string())
-                .unwrap_or_default()
-        })
+        .map(|s| wind_config::icon_label_trunc(&s.schema.icon_label))
         .unwrap_or_default()
     }
 
@@ -4408,7 +4396,10 @@ mod tests {
         let modes = mgr.overlay_modes();
         let kf = modes.iter().find(|e| e.schema_id == "zz_kf").unwrap();
         assert_eq!(kf.name, "快符");
-        assert_eq!(kf.icon_label, "符", "多字符 label 只取首字符");
+        // 上限 2（`wind_config::ICON_LABEL_MAX_CHARS`）：`"符号"` 恰好等于上限、原样保留。
+        // ⚠️ 这条断言**测不到截断**——它验证的是"没被多截"。截断本身由
+        // `wind_config::schema` 的单元测试覆盖，别在这里加长标签的 fixture 来重复测。
+        assert_eq!(kf.icon_label, "符号", "两字符 label 在上限内，不截断");
         assert!(kf.spec.show_all_on_enter);
         assert_eq!(
             kf.spec.candidate_layout,

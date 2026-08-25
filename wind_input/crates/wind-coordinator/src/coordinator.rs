@@ -4758,6 +4758,36 @@ impl Coordinator {
         }
     }
 
+    /// 当前状态该显示的图标主字。**这是这个标签的唯一产地。**
+    ///
+    /// 从前 `build_status`（语言栏图标 + IPC）、`handle_menu`（工具栏）、
+    /// `status_indicator_text`（状态气泡）各抄了一份
+    /// `effective_chinese ? schema : caps ? "A" : "英"`。三份字面量意味着任何一次
+    /// "让标签可配"的改动都得记得改三处，漏一处的表现是"设置里改了，某个面还是旧字"。
+    ///
+    /// ⚠️ 状态气泡**刻意没有**改成调用本函数：它比这里多一个维度——`ui.status.items`
+    /// 的内容段过滤（关掉 `caps` 段时大写锁定不顶替、落回中英显示）。硬套进来会静默
+    /// 丢掉那个维度。它只共享 `[ui.labels]` 的**取值**，不共享分支结构。
+    ///
+    /// 中文态回落的「中」不可配：那一档是"方案没配 `icon_label`"的兜底，属于方案侧
+    /// 的缺省而非一个用户会想改的状态标签。
+    pub(crate) fn mode_icon_label(&self, chinese_mode: bool, caps_lock: bool) -> String {
+        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
+        if chinese_mode && !caps_lock {
+            let id = self.engine_mgr.active_schema_id();
+            let lbl = self.engine_mgr.schema_icon_label(&id);
+            if lbl.is_empty() {
+                "中".to_string()
+            } else {
+                lbl
+            }
+        } else if caps_lock {
+            self.rt().config.ui.labels.caps_label()
+        } else {
+            self.rt().config.ui.labels.english_label()
+        }
+    }
+
     pub(crate) fn build_status(&self) -> StatusUpdateData {
         let (chinese_mode, full_width, chinese_punct, toolbar_visible, caps_lock) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -4769,21 +4799,7 @@ impl Coordinator {
                 s.caps_lock,
             )
         };
-        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
-        let effective_chinese = chinese_mode && !caps_lock;
-        let icon_label = if effective_chinese {
-            let id = self.engine_mgr.active_schema_id();
-            let lbl = self.engine_mgr.schema_icon_label(&id);
-            if lbl.is_empty() {
-                "中".to_string()
-            } else {
-                lbl
-            }
-        } else if caps_lock {
-            "A".to_string()
-        } else {
-            "英".to_string()
-        };
+        let icon_label = self.mode_icon_label(chinese_mode, caps_lock);
         StatusUpdateData {
             chinese_mode,
             full_width,
@@ -5061,12 +5077,14 @@ impl Coordinator {
         let mut parts: Vec<String> = Vec::new();
         // 方案 / 中英 / 大写锁定。三者共用首个槽位：关掉 caps 段时大写锁定不再顶替，
         // 落回正常的中英/方案显示。
+        // 标签取值与语言栏图标 / 工具栏同源（`[ui.labels]`），但**分支结构是本函数独有的**：
+        // 下面这三档比 `mode_icon_label` 多了 `show()` 内容段过滤，不能合并过去。
         if caps && show("caps") {
-            parts.push("A".into());
+            parts.push(self.rt().config.ui.labels.caps_label());
         } else if !show("schema") {
             // 方案段关闭：首槽整体略过（含英文态标记）
         } else if !chinese {
-            parts.push("英".into());
+            parts.push(self.rt().config.ui.labels.english_label());
         } else {
             let id = self.engine_mgr.active_schema_id();
             // short 样式优先图标短称(icon_label)，无则回退全名；对齐 Go schema_name_style。
@@ -9246,5 +9264,80 @@ mod caret_for_ui_tests {
     fn no_history_reports_invalid() {
         let c = coord();
         assert_eq!(c.resolve_caret_for_ui(0, 0, 20), (0, 0, 20, false));
+    }
+}
+
+/// `[ui.labels]` → 图标主字的产地测试。
+///
+/// 这些断言覆盖的是 `mode_icon_label` 这个**单点**；语言栏图标、工具栏、状态气泡
+/// 三个消费面都从它取值（气泡共享取值、不共享分支结构），故不必逐面重复断言。
+#[cfg(test)]
+mod mode_icon_label_tests {
+    use crate::coordinator::Coordinator;
+    use std::sync::Arc;
+    use wind_config::Config;
+
+    fn coord_with(english: &str, caps: &str) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.ui.labels.english = english.to_string();
+        cfg.ui.labels.caps_lock = caps.to_string();
+        Coordinator::new_headless(cfg, None)
+    }
+
+    /// 配了就用配的。
+    #[test]
+    fn configured_labels_take_effect() {
+        let c = coord_with("En", "Cp");
+        assert_eq!(c.mode_icon_label(false, false), "En", "英文半角");
+        assert_eq!(c.mode_icon_label(false, true), "Cp", "大写锁定");
+        assert_eq!(
+            c.mode_icon_label(true, true),
+            "Cp",
+            "中文 + 大写锁定：大写锁定优先（对齐 effective_chinese）"
+        );
+    }
+
+    /// 留空回落内置默认，**不是回落空**——空标签会让语言栏图标画出一个没有主字的
+    /// 空白方块，用户既看不出模式也无从理解。
+    #[test]
+    fn empty_falls_back_to_builtin() {
+        let c = coord_with("", "");
+        assert_eq!(c.mode_icon_label(false, false), "英");
+        assert_eq!(c.mode_icon_label(false, true), "A");
+    }
+
+    /// 出厂配置必须与本次改造前的字面量逐字一致：老用户升级后不该看到任何变化。
+    #[test]
+    fn default_config_preserves_legacy_labels() {
+        let c = Coordinator::new_headless(Config::default(), None);
+        assert_eq!(c.mode_icon_label(false, false), "英");
+        assert_eq!(c.mode_icon_label(false, true), "A");
+    }
+
+    /// ★ 反向对照：英文标签**不得**渗进中文态。
+    ///
+    /// 缺了这条，一个"所有分支都返回 english_label"的错误实现能让上面的断言全绿，
+    /// 而它在真机上的表现是打中文时图标也显 `En`。无方案数据时中文态回落「中」，
+    /// 正好不需要任何 fixture 就能把这个方向钉死。
+    #[test]
+    fn english_label_does_not_leak_into_chinese() {
+        let c = coord_with("En", "Cp");
+        assert_eq!(
+            c.mode_icon_label(true, false),
+            "中",
+            "中文态取方案侧 icon_label，与 [ui.labels] 无关"
+        );
+    }
+
+    /// 超长配置在这一层就被截断。
+    ///
+    /// ⚠️ 这是 C++ 侧 `_inputTypeLabel` 缓冲的**第一道**防线（第二道是那边的
+    /// `_TRUNCATE`）。这条断言挂了意味着超长标签能一路走到 `wcsncpy_s`，
+    /// 别把它当成"显示不好看"的测试。
+    #[test]
+    fn overlong_label_truncated_before_leaving_coordinator() {
+        let c = coord_with("English", "CapsLock");
+        assert_eq!(c.mode_icon_label(false, false), "En");
+        assert_eq!(c.mode_icon_label(false, true), "Ca");
     }
 }

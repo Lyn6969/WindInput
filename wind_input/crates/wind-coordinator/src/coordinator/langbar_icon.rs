@@ -334,6 +334,9 @@ impl Coordinator {
         // 再去拿别的锁就是给自己留一条反向持有序。同类事故刚在 notify_toolbar 里发生过
         // （在 state 锁内调它 → Mutex 不可重入 → 当场卡死）。
         let block = self.effective_input_block();
+        // ⚠ 与 `block` 同一条纪律：必须在取发布器锁**之前**算。`rt()` 要取运行时配置的
+        // 读锁，持着发布器锁再去拿别的锁就是给自己留一条反向持有序。
+        let english_label = self.rt().config.ui.labels.english_label();
 
         let Ok(mut guard) = cell.lock() else {
             return false;
@@ -343,11 +346,14 @@ impl Coordinator {
         };
 
         let spec = IconSpec {
-            // 覆盖成「英」而**不动 `icon_label` 本身**：后者是「当前方案标签」的单一语义，
+            // 覆盖成英文标签而**不动 `icon_label` 本身**：后者是「当前方案标签」的单一语义，
             // 且会经 StatusUpdate 下发写进 TSF 的 `_inputTypeLabel`（持久值）。把这种随焦点
             // 来去的临时态烧进标签，离开时就得指望下一次状态推送改回来，漏一次即长期卡「英」。
+            //
+            // ⚠️ 这是本状态与工具栏那侧**处理方式不同**的原因：工具栏直接改 `icon_label`
+            // （ToolbarState 不下发 TSF、无持久值），这里只能覆盖 spec。别把两边"统一"了。
             label: if block.shows_english() {
-                "英".to_string()
+                english_label
             } else {
                 s.icon_label.clone()
             },

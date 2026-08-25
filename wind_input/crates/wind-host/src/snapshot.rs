@@ -7,7 +7,11 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModeFlags {
     pub chinese_mode: bool,
-    /// 方案短称（"五"/"拼"），英文态为 "英"、大写锁定为 "A"
+    /// 模式主字，最多 2 个字符。中文态取方案的 `[schema] icon_label`（"五"/"拼"），
+    /// 非中文态取 `[ui.labels]`（出厂 "英"/"A"，**用户可配**）。
+    ///
+    /// ⚠️ 宿主不得对取值做任何假设（"是不是英"、"长度是不是 1"）：它由核心单点
+    /// 计算下发，判据和取值都在 `Coordinator::mode_icon_label`。
     pub icon_label: String,
     pub full_width: bool,
     pub chinese_punct: bool,

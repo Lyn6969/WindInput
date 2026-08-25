@@ -186,9 +186,14 @@ private:
     BOOL _bKeyboardDisabled;   // Keyboard disabled by system (线程级 compartment)
     BOOL _bDarkMode;           // System dark mode state (cached, updated on status change)
 
-    // Input method type label for Chinese mode display
-    // Default: "中", future values: "拼"(Pinyin), "五"(Wubi), "双"(Shuangpin)
-    wchar_t _inputTypeLabel[4];
+    // 模式主字。中文态取方案的 icon_label（"中"/"拼"/"五"/"双"），非中文态取
+    // [ui.labels]（默认 "英"/"A"，用户可配，最多 2 个字符）。
+    //
+    // ⚠️ 容量不是"2 个字符 = 2 个 wchar + NUL = 3"那么算的：Rust 侧的上限是 2 个
+    // **Unicode 标量值**，而一个标量值在 UTF-16 里可能占 2 个 wchar（surrogate pair，
+    // 如 emoji）。最坏情况 2 char = 4 wchar + NUL = 5，原来的 [4] 装不下。
+    // 取 8 与 STATUS_UPDATE_DATA::iconLabel 对齐，两个缓冲同进同出。
+    wchar_t _inputTypeLabel[8];
 
     // 服务端预渲染图标的读端。取不到时 GetIcon 退回本地 DirectWrite 绘制，
     // 故本对象不可用**不是**错误状态（服务未启动时就是这样）。
