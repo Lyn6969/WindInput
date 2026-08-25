@@ -384,6 +384,8 @@ pub trait WebDataRpc: WebDataHost {
 
             // ── temp.*（临时词，redb）─────────────────────────────
             "temp.list" => self.web_temp_list(params),
+            // 分页版（设置页列表走这条；`temp.list` 保留给导出等全量取用方）。
+            "temp.listPaged" => self.web_temp_list_paged(params),
             "temp.promote" => self.web_temp_promote(params),
             "temp.remove" => self.web_temp_remove(params),
             "temp.promoteAll" => self.web_temp_promote_all(params),
@@ -396,6 +398,11 @@ pub trait WebDataRpc: WebDataHost {
 
             // ── shadow.*（影子规则，redb 持久化）─────────────────
             "shadow.list" => self.web_shadow_list(params),
+            // 分页版（设置页列表走这条；`shadow.list` 保留给全量取用方）。
+            "shadow.listPaged" => self.web_shadow_list_paged(params),
+            // 整表撤销。此前设置端靠「逐条 remove_rule」凑出清空，分页之后它手上
+            // 只剩当前页，那条路会静默只清一页。
+            "shadow.clear" => self.web_shadow_clear(params),
             "shadow.pin" => self.web_shadow_pin(params),
             "shadow.delete" => self.web_shadow_delete(params),
             "shadow.removeRule" => self.web_shadow_remove_rule(params),
@@ -1789,11 +1796,19 @@ pub trait WebDataRpc: WebDataHost {
     fn web_shadow_list(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        Ok(json!(self.shadow_rows(&schema)?))
+    }
+
+    /// 影子规则的展平行集：一条 `ShadowRecord` 里的每个 pinned / deleted 各占一行。
+    ///
+    /// [`Self::web_shadow_list`] 与 [`Self::web_shadow_list_paged`] 共用同一份展平——
+    /// 两处各写一遍的话，加字段时必漏一边，而症状是「不分页时看得到、分页后这一列空着」。
+    fn shadow_rows(&self, schema: &str) -> anyhow::Result<Vec<Value>> {
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let mut out = Vec::new();
-        for (code, rec) in store.list_shadow_rules(&schema)? {
+        for (code, rec) in store.list_shadow_rules(schema)? {
             for p in rec.pinned {
                 out.push(json!({
                     "code": code,
@@ -1812,7 +1827,77 @@ pub trait WebDataRpc: WebDataHost {
                 }));
             }
         }
-        Ok(json!(out))
+        Ok(out)
+    }
+
+    /// 影子规则分页列表（`{items,total}`，与 dict/freq 同形）。
+    ///
+    /// 规则数随使用量单调增长且没有上限，一次全取要把整份 json 推过 IPC，设置端再把
+    /// 每条都建成表格行 widget（那张表不做虚拟化），条目上万时开页即卡。
+    ///
+    /// 搜索/排序都在切片**之前**做，故是跨页全局的——只对当页那几十条排序毫无意义。
+    fn web_shadow_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let query = params
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("query").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let offset = usize_param(params, "offset", 0);
+        let limit = usize_param(params, "limit", 50);
+        let mut all = self.shadow_rows(&schema)?;
+        // 「词」这一列显示的是 candId 里的模板原文而非 `word`（见 [`shadow_display_text`]），
+        // 故搜索与排序都得按显示文本来：不然用户照着屏幕上的 `{time("HH:mm")}` 去搜，
+        // 一条也搜不到。
+        if !query.is_empty() {
+            let q = query.to_lowercase();
+            all.retain(|r| {
+                let f = |k: &str| {
+                    r.get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase()
+                };
+                f("code").contains(&q)
+                    || f("word").contains(&q)
+                    || shadow_display_text(r).to_lowercase().contains(&q)
+            });
+        }
+        let total = all.len();
+        // `text` 是设置端列模型里「词」列的字段名（各类别统一叫 text），此处落到 word 上。
+        if let Some((by, desc)) = parse_sort(params, &["code", "word", "text", "type", "position"])
+        {
+            all.sort_by(|a, b| {
+                let ord = match by {
+                    // delete 类规则不带 position，缺字段按 0 排（与设置端 from_json 的回落一致）。
+                    "position" => {
+                        let n = |v: &Value| v.get("position").and_then(|x| x.as_i64()).unwrap_or(0);
+                        n(a).cmp(&n(b))
+                    }
+                    "word" | "text" => shadow_display_text(a).cmp(&shadow_display_text(b)),
+                    k => {
+                        let g = |v: &'_ Value| {
+                            v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+                        };
+                        g(a).cmp(&g(b))
+                    }
+                };
+                if desc { ord.reverse() } else { ord }
+            });
+        }
+        let items: Vec<Value> = all.into_iter().skip(offset).take(limit).collect();
+        Ok(json!({ "items": items, "total": total }))
+    }
+
+    /// 撤销该方案下的全部影子规则，返回撤销条数。
+    fn web_shadow_clear(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let store = self
+            .user_store()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        Ok(json!(store.clear_shadow(&schema)?))
     }
 
     fn web_shadow_pin(&self, params: &Value) -> anyhow::Result<Value> {
@@ -1908,6 +1993,70 @@ pub trait WebDataRpc: WebDataHost {
             })
             .collect();
         Ok(json!(items))
+    }
+
+    /// 临时词分页列表（`{items,total}`，与 dict/freq 同形）。
+    ///
+    /// 临时词是打字过程中自动攒下的，只增不减直到用户转正或清空，量级与用户词库同级，
+    /// 一次全取同样会把整份 json 推过 IPC 并让设置端建出上万个表格行 widget。
+    ///
+    /// 搜索语义与 [`Self::web_dict_list_paged`] 对齐（编码前缀 ∪ 编码中段 ∪ 词条内容），
+    /// 排序同样在切片前做，故跨页全局有效。
+    fn web_temp_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let prefix = params
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("query").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let offset = usize_param(params, "offset", 0);
+        let limit = usize_param(params, "limit", 50);
+        let store = self
+            .user_store()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        // 列表显示的是带音节空格的码（见 web_temp_list），用户很可能照着搜；key 是扁平的。
+        let (code_prefix, _) = wind_store::wdict::split_spaced_code(prefix);
+        let mut all = store.search_temp_words_prefix(&schema, &code_prefix, 0)?;
+        // 并入两类补充命中（与编码前缀取并集，去重），与 web_dict_list_paged 同款：
+        //   ① 词条内容包含搜索词；② 编码**中段**包含搜索词——前缀扫描只能命中开头，
+        // 而用户并不知道搜索框只认前缀。仅在有搜索词时才付出这次全量扫描。
+        if !prefix.is_empty() {
+            let q = prefix.to_lowercase();
+            let code_q = code_prefix.to_lowercase();
+            let seen: std::collections::HashSet<(String, String)> = all
+                .iter()
+                .map(|w| (w.code.clone(), w.text.clone()))
+                .collect();
+            for w in store.search_temp_words_prefix(&schema, "", 0)? {
+                let hit = w.text.to_lowercase().contains(&q)
+                    || (!code_q.is_empty() && w.code.to_lowercase().contains(&code_q));
+                if hit && !seen.contains(&(w.code.clone(), w.text.clone())) {
+                    all.push(w);
+                }
+            }
+        }
+        let total = all.len();
+        if let Some((by, desc)) = parse_sort(params, &["code", "text", "count"]) {
+            all.sort_by(|a, b| {
+                let ord = match by {
+                    "count" => a.count.cmp(&b.count),
+                    "text" => a.text.cmp(&b.text),
+                    _ => a.code.cmp(&b.code),
+                };
+                if desc { ord.reverse() } else { ord }
+            });
+        }
+        let items: Vec<Value> = all
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|r| {
+                let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
+                json!({ "code": code, "text": ui_text(&r.text), "count": r.count })
+            })
+            .collect();
+        Ok(json!({ "items": items, "total": total }))
     }
 
     fn web_temp_promote(&self, params: &Value) -> anyhow::Result<Value> {
@@ -2995,6 +3144,25 @@ fn ui_text(s: &str) -> String {
     wind_store::wdict::escape_text_field(s)
 }
 
+/// 影子规则行的**显示文本**：`candId` 形如 `phrase:{code}:{模板}` 时取模板原文，否则回落 `word`。
+///
+/// 与设置端 `pages::dict::spec::WordRow::display_text` 同一判据——那边决定列表显示什么，
+/// 这边决定搜索/排序按什么算，两者一旦漂移就成了「看得见却搜不着、点了排序顺序对不上」。
+///
+/// ⚠️ 取的是**第二个冒号之后的全部内容**，不能按冒号切三段取第三段：模板自身常含冒号
+/// （`{time("HH:mm:ss")}`），按段取会把它截断成 `{time("HH`。
+fn shadow_display_text(row: &Value) -> String {
+    let word = row.get("word").and_then(|v| v.as_str()).unwrap_or("");
+    row.get("candId")
+        .and_then(|v| v.as_str())
+        .and_then(|id| id.strip_prefix("phrase:"))
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(_code, tpl)| tpl)
+        .filter(|tpl| !tpl.is_empty())
+        .unwrap_or(word)
+        .to_string()
+}
+
 /// 疑似笔误 → JSON。`kind` 供 UI 判定，`message` 是给人看的一句话。
 fn hint_json(h: &wind_cmdbar::Hint) -> Value {
     use wind_cmdbar::Hint as H;
@@ -3386,6 +3554,176 @@ mod tests {
                 .is_empty(),
             "remove 收到带空格的码须先拆再删"
         );
+    }
+
+    /// 临时词分页：切片、跨页 total、服务端搜索（含编码中段命中）、跨页排序。
+    ///
+    /// 分页之前设置端是「一次全取 + 客户端过滤」，条目上万时开页即卡；搬到服务端后
+    /// 这四件事都得由 core 兑现，缺一样的症状分别是：翻页翻不动 / 页数算错 /
+    /// 搜索搜不全 / 排序只排当页那几十条。
+    #[test]
+    fn temp_list_paged_slices_searches_and_sorts() {
+        let c = coord("temp_paged");
+        let store = c.user_store().expect("有 store");
+        // hao|ya → 起始字节位 {0,3}；另两条用于凑够三条好切片。
+        store
+            .learn_temp_word("pinyin", "haoya", "好呀", 500, 0b1001)
+            .unwrap();
+        store
+            .learn_temp_word("pinyin", "nihao", "你好", 500, 0b101)
+            .unwrap();
+        store
+            .learn_temp_word("pinyin", "women", "我们", 500, 0)
+            .unwrap();
+
+        let call = |params: Value| c.web_data_rpc("temp.listPaged", &params).unwrap();
+        let codes = |v: &Value| -> Vec<String> {
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|it| it["code"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+
+        // ① 切片：total 是全集大小而非当页长度，否则设置端算出来的页数恒是 1。
+        let page1 = call(json!({ "schemaId": "pinyin", "offset": 0, "limit": 2 }));
+        assert_eq!(page1["total"], json!(3));
+        assert_eq!(codes(&page1).len(), 2);
+        let page2 = call(json!({ "schemaId": "pinyin", "offset": 2, "limit": 2 }));
+        assert_eq!(page2["total"], json!(3), "翻页不改变总数");
+        assert_eq!(codes(&page2).len(), 1, "末页只剩一条");
+
+        // ② 编码仍带音节空格（与 temp.list 同形，remove/promote 那两个入口靠它往返）。
+        let all = call(json!({ "schemaId": "pinyin", "offset": 0, "limit": 100 }));
+        assert!(
+            codes(&all).contains(&"hao ya".to_string()),
+            "分页版也得显示带空格的音节码，实际 {:?}",
+            codes(&all)
+        );
+
+        // ③ 搜索：编码**中段**命中。前缀扫描找不到 `haoya` 里的 `ya`，而用户并不知道
+        //    搜索框只认前缀。
+        let mid = call(json!({ "schemaId": "pinyin", "prefix": "ya", "offset": 0, "limit": 100 }));
+        assert_eq!(mid["total"], json!(1), "中段命中要算进 total");
+        assert_eq!(codes(&mid), vec!["hao ya".to_string()]);
+
+        // ④ 搜索：词条内容命中（拿汉字搜）。
+        let by_text =
+            call(json!({ "schemaId": "pinyin", "prefix": "我们", "offset": 0, "limit": 100 }));
+        assert_eq!(by_text["total"], json!(1));
+
+        // ⑤ 排序在切片**之前**做，故第一页拿到的是全局最大者，不是当页最大者。
+        let desc = call(json!({
+            "schemaId": "pinyin", "offset": 0, "limit": 1,
+            "sortBy": "code", "sortOrder": "desc"
+        }));
+        // `women` 那条 boundary 传的是 0（无切分信息），故显示码不插空格。
+        assert_eq!(codes(&desc), vec!["women".to_string()], "全局倒序的头一条");
+    }
+
+    /// 影子规则分页：切片 + total，以及**按显示文本搜索/排序**。
+    ///
+    /// ★ 要害在显示文本：设置页「词」那一列显示的是 `candId` 里的模板原文，而 `word`
+    /// 存的是最后一次调整时的候选文本（`date`/`time` 这类求值型短语次日即过期）。
+    /// core 若只按 `word` 匹配，用户照着屏幕上的模板去搜会一条也搜不到——列表里明明
+    /// 就摆着那一行。
+    #[test]
+    fn shadow_list_paged_searches_by_display_text() {
+        let c = coord("shadow_paged");
+        let store = c.user_store().expect("有 store");
+        // 短语规则：word 是**过期的**候选文本，模板原文只存在于 candId 里。
+        store
+            .pin_shadow(
+                "pinyin",
+                "sj",
+                "2026-07-30",
+                Some("phrase:sj:{time(\"HH:mm:ss\")}"),
+                0,
+            )
+            .unwrap();
+        store.pin_shadow("pinyin", "nh", "你好", None, 1).unwrap();
+        store.delete_shadow("pinyin", "wm", "我们").unwrap();
+        // ★ 这一条是排序断言的支点：它的 word（`zzz`）与显示文本（模板 `阿`）在排序里
+        //   落在相反的两端。少了它，两种排法的头尾恰好重合，断言就成了摆设。
+        store
+            .pin_shadow("pinyin", "zz", "zzz", Some("phrase:zz:阿"), 0)
+            .unwrap();
+
+        let call = |params: Value| c.web_data_rpc("shadow.listPaged", &params).unwrap();
+        let words = |v: &Value| -> Vec<String> {
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|it| it["word"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+
+        // ① 切片与 total（pin + delete 展平后共四行）。
+        let page1 = call(json!({ "schemaId": "pinyin", "offset": 0, "limit": 3 }));
+        assert_eq!(page1["total"], json!(4), "total 是全集大小，不是当页长度");
+        assert_eq!(words(&page1).len(), 3);
+        let page2 = call(json!({ "schemaId": "pinyin", "offset": 3, "limit": 3 }));
+        assert_eq!(page2["total"], json!(4), "翻页不改变总数");
+        assert_eq!(words(&page2).len(), 1, "末页只剩一条");
+
+        // ② 按模板原文搜（用户照着屏幕上看到的那串搜）。
+        let by_tpl =
+            call(json!({ "schemaId": "pinyin", "prefix": "HH:mm", "offset": 0, "limit": 9 }));
+        assert_eq!(
+            by_tpl["total"],
+            json!(1),
+            "模板原文必须可搜——它才是列表显示的东西"
+        );
+        assert_eq!(words(&by_tpl), vec!["2026-07-30".to_string()]);
+
+        // ③ 按 word 搜仍然命中（两条路都留着）。
+        let by_word =
+            call(json!({ "schemaId": "pinyin", "prefix": "你好", "offset": 0, "limit": 9 }));
+        assert_eq!(by_word["total"], json!(1));
+
+        // ④ 按编码搜。
+        let by_code =
+            call(json!({ "schemaId": "pinyin", "prefix": "wm", "offset": 0, "limit": 9 }));
+        assert_eq!(by_code["total"], json!(1));
+        assert_eq!(by_code["items"][0]["type"], json!("delete"));
+
+        // ⑤ 排序：`text` 是设置端列模型里「词」列的字段名，落到**显示文本**上。
+        //    `zz` 那条的 word 是 `zzz`、显示文本是模板 `阿`(U+963F)——按显示文本升序它
+        //    排在最后，按 word 升序它排在 `你好` 之前。断言取末位即可分辨两种实现。
+        let sorted = call(json!({
+            "schemaId": "pinyin", "offset": 0, "limit": 9,
+            "sortBy": "text", "sortOrder": "asc"
+        }));
+        assert_eq!(
+            words(&sorted).last().map(String::as_str),
+            Some("zzz"),
+            "按显示文本排序：比的是 candId 里的模板，不是 word"
+        );
+    }
+
+    /// 整表撤销。设置端此前靠「逐条 remove_rule」凑出清空，改服务端分页后它手上只剩
+    /// 当前页，那条路会**静默只清一页**——故 clear 必须是 core 侧的一次调用。
+    #[test]
+    fn shadow_clear_removes_every_rule() {
+        let c = coord("shadow_clear");
+        let store = c.user_store().expect("有 store");
+        for i in 0..3 {
+            store
+                .pin_shadow("pinyin", &format!("c{i}"), "词", None, 0)
+                .unwrap();
+        }
+        store.delete_shadow("pinyin", "d0", "词").unwrap();
+
+        let n = c
+            .web_data_rpc("shadow.clear", &json!({ "schemaId": "pinyin" }))
+            .unwrap();
+        assert!(n.as_u64().unwrap_or(0) > 0, "返回撤销条数");
+        let left = c
+            .web_data_rpc("shadow.listPaged", &json!({ "schemaId": "pinyin" }))
+            .unwrap();
+        assert_eq!(left["total"], json!(0), "一条不剩");
     }
 
     /// 词频列表的编码显示带音节空格 —— 边界靠**反查**，因为词频表自己不存 boundary。
