@@ -78,6 +78,44 @@ pub struct PatchEntry {
     /// 校验错误（未知配置键 / 类型或取值不合法）；`None` = 本条可应用。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 风险提示：本条**可以应用**，但导入界面须显著提示后果。`None` = 无需提示。
+    ///
+    /// 与 [`Self::error`] 是两回事：那个说「这条写错了、不会应用」，这个说
+    /// 「这条没问题、但你得知道它意味着什么」。二者可同时为 `None`（常态），
+    /// 也可只有本项（合法但有风险）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// 应用后会让**配置本身获得执行外部程序的能力**的键，及给用户看的提示语。
+///
+/// # 这张表为什么存在
+///
+/// 配置片段的门是本仓最开放的一档（`package-format.md` §5：「片段仅能改登记键」），
+/// 而这个前提原本由一件事担保——**`config.toml` 里没有任何可执行内容**。能执行程序的
+/// 短语属于用户数据，只进备份包、永不进分发包，风险从格式层面就被挡住了。
+///
+/// `ui.toolbar.buttons`（0.119）第一次打破了这个担保：它的 `action` 是 cmdbar 表达式，
+/// 而 `StructList` 键在片段里是**整值覆盖**。于是「导入片段 → 工具栏多了个按钮 →
+/// 用户点一下」就是一条无提示的任意程序执行路径。
+///
+/// 本表的处置是**提示而非阻断**：用户自己写这类配置是正当需求，拦掉等于把功能废掉；
+/// 真正缺的是「你正在从别人那里接受这个」这一句话。
+///
+/// ⚠️ **日后再加能执行程序 / 改写启动项一类的配置键时，必须登记到这里。**
+/// 判据不是「这个键危不危险」，而是「一份陌生片段写了它之后，用户的某次寻常操作
+/// 会不会变成执行对方给的代码」。
+const RISKY_KEYS: &[(&str, &str)] = &[(
+    "ui.toolbar.buttons",
+    "该片段会在工具栏上添加按钮，按钮可启动程序或打开网址——点击即执行。请确认来源可信。",
+)];
+
+/// 取某个键的风险提示（无风险返回 `None`）。
+fn risk_warning(key: &str) -> Option<String> {
+    RISKY_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, msg)| (*msg).to_string())
 }
 
 /// 片段里唯一的保留顶层段名（见模块文档）。展平时整段跳过，说明元信息由
@@ -233,6 +271,12 @@ pub fn preview(fragment: &toml::Value, current: &toml::Value) -> Vec<PatchEntry>
     let mut entries = Vec::new();
     flatten("", fragment, &mut entries);
     for e in &mut entries {
+        // 风险提示在**这个单点**补，而不是在 flatten 的三个 PatchEntry 构造处各填一次
+        // ——那样加第四个构造点时必然漏，而漏的表现是「提示没出现」，无人会发现。
+        //
+        // 放在 error 判断之前：一条写错了的危险键**照样要提示**。用户看到「这条有错」
+        // 往往会去改对它再导入一次，那时提示就该已经说过。
+        e.warning = risk_warning(&e.key);
         // 未知键在展平期已定性，无当前值可取。
         if e.error.is_some() {
             continue;
@@ -294,6 +338,8 @@ fn flatten(prefix: &str, value: &toml::Value, out: &mut Vec<PatchEntry>) {
                     current: None,
                     next: v.clone(),
                     error: None,
+                    // 三个构造点一律置 None，由 `preview` 单点按键补——见那里的注释。
+                    warning: None,
                 });
             }
             return;
@@ -304,6 +350,7 @@ fn flatten(prefix: &str, value: &toml::Value, out: &mut Vec<PatchEntry>) {
             current: None,
             next: value.clone(),
             error: None,
+            warning: None,
         });
         return;
     }
@@ -329,6 +376,7 @@ fn flatten(prefix: &str, value: &toml::Value, out: &mut Vec<PatchEntry>) {
             current: None,
             next: value.clone(),
             error: Some("未知配置键".to_string()),
+            warning: None,
         }),
     }
 }
@@ -955,6 +1003,68 @@ mod tests {
                 Some("样例"),
                 "{key} 写入后未能原值读回——名单里可能是不存在的键"
             );
+        }
+    }
+
+    // ── 风险提示（RISKY_KEYS）────────────────────────────────────
+
+    /// 危险键在预览里必须带提示，且**照常可应用**（提示不是阻断）。
+    #[test]
+    fn risky_key_is_flagged_but_still_applicable() {
+        let frag: toml::Value = toml::from_str(
+            r#"
+            [[ui.toolbar.buttons]]
+            id = "x"
+            label = "符"
+            action = 'proc.run("evil.exe")'
+            "#,
+        )
+        .unwrap();
+        let cur = toml::Value::try_from(Config::default()).unwrap();
+        let entries = preview(&frag, &cur);
+        let e = entries
+            .iter()
+            .find(|e| e.key == "ui.toolbar.buttons")
+            .expect("应产出该键的条目");
+        assert!(e.error.is_none(), "合法片段不该报错：{:?}", e.error);
+        let w = e.warning.as_deref().expect("危险键必须带提示");
+        assert!(w.contains("启动程序"), "提示要说清后果，实际：{w}");
+    }
+
+    /// 寻常键不带提示——否则提示遍地都是，等于没有提示。
+    #[test]
+    fn ordinary_key_has_no_warning() {
+        let frag: toml::Value = toml::from_str("[ui.candidate]\nper_page = 9\n").unwrap();
+        let cur = toml::Value::try_from(Config::default()).unwrap();
+        let entries = preview(&frag, &cur);
+        assert!(entries.iter().all(|e| e.warning.is_none()));
+    }
+
+    /// 写错了的危险键**照样提示**：用户多半会改对再导入一次，那时提示就该已经说过。
+    #[test]
+    fn risky_key_warns_even_when_invalid() {
+        // StructList 键给了标量 → 类型不合法。
+        let frag: toml::Value = toml::from_str(r#"ui.toolbar.buttons = 5"#).unwrap();
+        let cur = toml::Value::try_from(Config::default()).unwrap();
+        let entries = preview(&frag, &cur);
+        let e = entries
+            .iter()
+            .find(|e| e.key == "ui.toolbar.buttons")
+            .expect("应产出该键的条目");
+        assert!(e.error.is_some(), "标量给 StructList 键应报类型错");
+        assert!(e.warning.is_some(), "写错了也要提示");
+    }
+
+    /// 名单里的每个键都必须是**真的登记键**——否则那条提示永远不会触发，
+    /// 而「提示没出现」没有任何信号。同 ALLOWED_UNREGISTERED_KEYS 的守门思路。
+    #[test]
+    fn risky_keys_are_all_registered() {
+        for (key, msg) in RISKY_KEYS {
+            assert!(
+                config_schema::is_known_key(key),
+                "{key} 不在 REGISTRY 里，这条风险提示永远不会触发"
+            );
+            assert!(!msg.trim().is_empty(), "{key} 的提示语不能为空");
         }
     }
 }

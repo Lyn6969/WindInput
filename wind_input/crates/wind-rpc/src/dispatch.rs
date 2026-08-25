@@ -231,10 +231,15 @@ fn patch_entries(
     Ok((entries, current, info))
 }
 
-/// `config.previewPatch { text }` → `{ ok, entries: [{ key, mapEntry?, current?, next, error? }], info? }`，只读。
+/// `config.previewPatch { text }` →
+/// `{ ok, entries: [{ key, mapEntry?, current?, next, error?, warning? }], info? }`，只读。
 ///
 /// `info` = 片段 `[package]` 段的说明元信息，供导入对话框在预览列表上方显示；
 /// 两字段都缺省时整个 `info` 不出现（前端不必区分「没写」与「写了空串」）。
+///
+/// `warning` = 该条**可以应用但导入界面须显著提示**（如会往工具栏放一个能启动程序的
+/// 按钮）。与 `error` 是两回事，且**不影响 `ok`**——`ok` 只回答「全都合法吗」，
+/// 要不要因为提示而不导入是用户的决定，不是校验结果。
 fn preview_patch(params: &Value) -> anyhow::Result<Value> {
     let (entries, _, info) = patch_entries(params)?;
     let ok = entries.iter().all(|e| e.error.is_none());
@@ -563,8 +568,32 @@ mod tests {
         assert_eq!(entries[0]["key"], json!("ui.candidate.per_page"));
         assert_eq!(entries[0]["next"], json!(9));
         assert!(entries[0].get("error").is_none(), "合法条目不应有 error");
+        assert!(entries[0].get("warning").is_none(), "寻常键不应有 warning");
         // 只读：不得触发热重载（也证明未走落盘通路）。
         assert!(!core.config_applied.load(Ordering::SeqCst));
+    }
+
+    /// 风险提示要真的过得了 RPC 面——`warning` 是 core 侧 `PatchEntry` 的新字段，
+    /// 序列化漏了的话设置端拿不到，而「提示没出现」没有任何信号。
+    ///
+    /// 同时钉住 `ok` 与 `warning` 正交：有提示 ≠ 不合法，导入按钮不该因此被禁用。
+    #[test]
+    fn preview_patch_surfaces_risk_warning_without_blocking() {
+        let core = FakeCore::new();
+        let st = DispatchState::new(core.clone(), "dev").unwrap();
+        let text =
+            "[[ui.toolbar.buttons]]\nid = \"x\"\nlabel = \"符\"\naction = 'proc.run(\"x.exe\")'\n";
+        let resp = dispatch(&st, req("config.previewPatch", json!({ "text": text })));
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert_eq!(r["ok"], json!(true), "有风险提示不代表不合法");
+        let entries = r["entries"].as_array().expect("entries 应为数组");
+        let e = entries
+            .iter()
+            .find(|e| e["key"] == json!("ui.toolbar.buttons"))
+            .expect("应含该键");
+        let w = e["warning"].as_str().expect("危险键必须带 warning");
+        assert!(w.contains("启动程序"), "提示要说清后果，实际：{w}");
     }
 
     /// Map 键在 RPC 面上逐条目呈现：`key` = 父 Map 键，条目名走 `mapEntry`（serde rename）。
