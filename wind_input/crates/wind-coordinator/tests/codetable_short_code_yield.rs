@@ -4,13 +4,14 @@
 //! 上真的打得出来**——记录沿途累积、判据在真实候选链上成立、让位作用在显示序上。
 //! 本仓的教训是这两层必须分开测：引擎/纯函数全绿而用户打不出，是反复出现过的形态。
 //!
-//! ## ⚠️ 档位从 0.119 起走**方案级 override**，不再是全局配置
+//! ## ⚠️ 档位统一走**方案级 override** 来设，别用全局配置
 //!
-//! 全局出厂已改成 0（关，理由见 `data/config.toml` 同名项），wubi86 则在自己的方案文件里
-//! 声明 3。方案级 `Some(_)` 恒覆盖全局 ⇒ 用 `cfg.schema.codetable.short_code_yield_level`
-//! 设档位从此无效，本文件统一走 `override_with_level`（见该函数注释）。
-//! `factory_wubi86_yields_without_any_user_config` 是唯一不压方案值的用例，它守的正是
-//! 「方案文件里那行真的被读到」。
+//! 全局出厂是 0（关），且出厂方案**一律不声明**这一项（理由见 `data/config.toml` 与
+//! `data/schemas/wubi86.schema.toml` 的同名注释）。方案级 `Some(_)` 恒覆盖全局，所以
+//! 本文件统一走 `override_with_level` 而不是 `cfg.schema.codetable.short_code_yield_level`：
+//! 后者眼下确实也能用，但只要哪天有方案声明了这一项，用它设的档位就会被静默覆盖，
+//! 而**整组用例一起假绿**（期望让位的用例照样让位，只是原因换了个）。
+//! `factory_wubi86_does_not_yield` 是唯一不压方案值的用例，它守的是「出厂即关」。
 //!
 //! ## ⚠️ 三条用例必须合看，缺一即可能假绿
 //!
@@ -34,9 +35,10 @@
 //! ⚠️ 这一族**必须用 `new_headless_with_store`**：shadow 规则存在 store 里，而
 //! `new_headless` 的 store 是 `None` —— 用它写这些断言，测的东西压根不存在。
 //!
-//! 用例选 `wqiy`（你 / 仰泳）而不是 `khtk`（路 / 路程）：后者在**发行词库里已经被
-//! `gen_dict` 的 `[demotion]` 让过位**了，首选本就是词，测不出算法层有没有干活。
-//! `[demotion]` 退役后 `khtk` 也会成为可用现场。
+//! 用例选 `wqiy`（你 / 仰泳）是历史原因：`khtk`（路 / 路程）当年在发行词库里已被
+//! `gen_dict` 的 `[demotion]` 让过位，首选本就是词，测不出算法层有没有干活。
+//! `[demotion]` 退役且词库重新生成后这条限制已消失（现产物 `khtk` 是「路」2383 >
+//! 「路程」1435，与极点上游序一致），两个码现在都是可用现场。
 //!
 //! 词典缺失时自动跳过 —— ⚠️ `build_dev/data` 不存在时**整族静默跳过而计数照绿**，
 //! 判据是耗时（正常 1s 量级 vs 跳过 0.0x s）。
@@ -76,7 +78,7 @@ fn press(coord: &Coordinator, code: &str) {
     }
 }
 
-/// 全局配置**不设档位**——出厂全局是 0（关），档位由方案侧给出。
+/// 全局配置**不设档位**——出厂全局是 0（关），各用例的档位由方案级 override 给出。
 fn wubi_config() -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into()];
@@ -87,10 +89,11 @@ fn wubi_config() -> Config {
 
 /// 把档位写进**方案级 override**（`schema_overrides/wubi86.toml`），而不是全局配置。
 ///
-/// ⚠️ 老写法 `cfg.schema.codetable.short_code_yield_level = level` 从 0.119 起测不出东西：
-/// 全局出厂改为 0（关）后，wubi86 在自己的方案文件里声明了 3，而方案级 `Some(_)` 恒覆盖
-/// 全局 ⇒ 档位 0 的两条反向对照会拿到 3 而变红，档位 2 的边界用例则会**假绿**（它期望
-/// 让位，3 也让位）。override 层深合并在方案文件之后，是唯一压得住它的落点。
+/// ⚠️ 别退回老写法 `cfg.schema.codetable.short_code_yield_level = level`。出厂方案眼下
+/// 不声明这一项，那样写**暂时**也跑得通——正因为如此它才危险：方案级 `Some(_)` 恒覆盖
+/// 全局，哪天哪个方案声明了它，档位 0 的两条反向对照会变红，而档位 2 的边界用例会
+/// **假绿**（它期望让位，方案里的值也让位）。override 层深合并在方案文件之后，是唯一
+/// 压得住方案值的落点。
 ///
 /// 每个用例一个目录（内容虽同，但并发写同一文件会撕裂），返回值直接喂
 /// `new_headless_with_override`。
@@ -121,15 +124,18 @@ fn candidates_for(level: usize, code: &str) -> Option<Vec<String>> {
     Some(coord.debug_all_candidate_texts())
 }
 
-/// 出厂守门：**什么都不配**（全局出厂 0 + 无 override）时，wubi86 照样让位。
+/// 出厂守门：**什么都不配**（全局出厂 0 + 无 override）时，wubi86 不让位。
 ///
-/// 这条测的是「方案文件里那行 `short_code_yield_level = 3` 真的被读到了」，也是本功能
-/// 唯一不经 override 的用例——上面所有用例都用 override 压掉了方案值，若只有它们，把
-/// `data/schemas/wubi86.schema.toml` 那行删掉不会有任何测试变红。
+/// 这是本功能唯一不经 override 的用例。上面所有用例都用 override 压掉了方案值，
+/// 若只有它们，给 `data/schemas/wubi86.schema.toml` 补回一行
+/// `short_code_yield_level = 3` 不会有任何测试变红——而每个五笔用户的候选顺序都变了，
+/// 且他在全局页把这一项关掉也没用。config 侧的对应守门是
+/// `wubi86_schema_does_not_declare_short_code_yield`（不需要词库，CI 上跑得到）。
 ///
-/// 同时它证明方案级 `Some(3)` 压过了全局的 0：`wubi_config()` 用的是 `Config::default()`。
+/// 它顺带钉住了词库原序「你」在前，这正是 `disabled_keeps_dictionary_order`
+/// 那条反向对照能成立的前提。
 #[test]
-fn factory_wubi86_yields_without_any_user_config() {
+fn factory_wubi86_does_not_yield() {
     let d = data_dir();
     if !dict_ready(&d) {
         eprintln!("跳过：五笔词库不存在");
@@ -141,8 +147,8 @@ fn factory_wubi86_yields_without_any_user_config() {
     let head: Vec<&str> = all.iter().take(6).map(|s| s.as_str()).collect();
     assert_eq!(
         all.first().map(|s| s.as_str()),
-        Some("仰泳"),
-        "wubi86 方案文件已声明 short_code_yield_level = 3，出厂即应让位，实际候选: {head:?}"
+        Some("你"),
+        "出厂应不让位（全局 0，且出厂方案刻意不声明这一项），实际候选: {head:?}"
     );
 }
 

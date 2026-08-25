@@ -7155,34 +7155,36 @@ smart_method = "delete_replace"
         );
     }
 
-    /// 出厂方案守门：wubi86 在自己的方案文件里把出简让全开到 3。
+    /// 出厂方案守门：wubi86 **不**声明出简让全，与第三方码表一样跟随全局。
     ///
-    /// 全局关掉之后，五笔用户的这项行为**只由这一行维持**。它容易在两种情形下静默消失：
-    /// 有人整理方案文件时把它当成「已上移到全局」的遗留删掉（文件顶部的注释正是这么写的，
-    /// 例外说明就在那里），或键名写错——`CodeTableSpec` 的字段都是 `Option` + `serde(default)`，
-    /// 写错的键会被静默忽略成 `None`，方案照常能用，只是让位没了。
+    /// 0.119 一度让 wubi86 自带 `short_code_yield_level = 3`，当天撤回。判据是
+    /// **用户在全局页做的事必须能作用到出厂方案上**：方案级的 `Some(_)` 恒覆盖全局，
+    /// 内置方案给自己配特例，等于把全局页那一项对它变成了摆设——而用户并不知道，
+    /// 「方案自带」那个标记藏在方案级码表配置里。理由详见 `wubi86.schema.toml` 同处注释。
     ///
-    /// 故断言走**真实的反序列化**而不是文本匹配：它同时验证了「这个键能被 `CodeTableSpec`
-    /// 接住」。行为层的对应用例是 wind-coordinator 的
-    /// `factory_wubi86_yields_without_any_user_config`（需要词库，CI 上跳过）。
+    /// 断言走**真实的反序列化**而不是文本匹配：`CodeTableSpec` 的字段是 `Option` +
+    /// `serde(default)`，于是「真的删掉」「注释掉」「键名写错」三者在这里等价，都是
+    /// `None`——正是我们想要的等价。用 `is_none()` 而不是比对某个具体值，是为了让
+    /// 补回**任何**档位都变红。
     #[test]
-    fn wubi86_schema_declares_short_code_yield() {
+    fn wubi86_schema_does_not_declare_short_code_yield() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../data/schemas")
             .join("wubi86.schema.toml");
         let Ok(text) = std::fs::read_to_string(&path) else {
             eprintln!(
-                "跳过 wubi86_schema_declares_short_code_yield：{} 不存在",
+                "跳过 wubi86_schema_does_not_declare_short_code_yield：{} 不存在",
                 path.display()
             );
             return;
         };
         let schema: crate::schema::Schema =
             toml::from_str(&text).expect("wubi86.schema.toml 应能解析成 Schema");
-        assert_eq!(
-            schema.engine.codetable.short_code_yield_level,
-            Some(3),
-            "wubi86 须自带出简让全（全局出厂已关，五笔的这项行为只靠方案文件这一行）"
+        assert!(
+            schema.engine.codetable.short_code_yield_level.is_none(),
+            "出厂方案不该自带出简让全档位（实际 {:?}）——它会让全局页那一项对五笔失效，\
+             理由见 wubi86.schema.toml 里同处的注释",
+            schema.engine.codetable.short_code_yield_level
         );
     }
 
