@@ -141,10 +141,9 @@ pub const MEMBER_REPEAT: &str = "quick_input.repeat";
 /// calc 在最前：它与 date 的输入形态互斥（表达式必含二元运算符，日期只有数字与点），
 /// 与 number 则**刻意共存**（`123*4` 先求值再转金额），而计算结果作首选是明确诉求。
 ///
-/// ★ number 在 date **之前**：只有一个小数点时（`12.25` / `2026.2`）数字与日期是真歧义，
-/// 而 `12.25` 作金额远比作月日常见。想要日期的人多打一个点即可——`12.25.` 会把数字整组
-/// 隔离掉（见 [`has_second_dot`]），日期自然提前。用「第二个点」表达「我要日期」比让
-/// 每次打金额都翻页更划算，且两个方向都有确定出口，不靠猜。
+/// ★ number 与 date **不会同时出候选**：小数点个数就是归属判据（见 [`has_second_dot`]），
+/// 一个点归数字、两个点归日期。故这两者的相对次序对任何一次输入都不再可观测，
+/// 此处保留原序只为不动 calc 与 number 的相对优先级。
 pub const LEGACY_EXPANSION: &[&str] = &[MEMBER_CALC, MEMBER_NUMBER, MEMBER_DATE, MEMBER_REPEAT];
 
 /// 是否为快捷输入家族的内置成员 id（含 `quick_input.repeat` 与旧值 `quick_input`）。
@@ -265,6 +264,32 @@ fn trim_pending_tail(s: &str) -> &str {
     if t.is_empty() { s } else { t }
 }
 
+/// 原始缓冲里是否已经出现**第二个**小数点——**数字与日期的归属判据**。
+///
+/// 一个小数点的输入（`12.25` / `2026.2`）在文法上是真歧义：既是合法小数，也是合法
+/// 月日 / 年月。本判据把它一刀切开——**一个点归数字，两个点归日期**，两组互斥：
+///
+/// - 数字只容一个小数点，第二个点一出现就不再可能是数字（打 `2026.2.3` 的中途
+///   不该冒出一屏金额读法）；
+/// - 反过来，只打一个点的人多半在打金额（`12.25` 作金额远比作月日常见），
+///   此时日期整组让开，想要日期多打一个点即可（`12.25.` / `2026.2.`）。
+///
+/// 两个方向都有确定出口，不靠猜，也不必为一次输入翻两屏候选。三段完整日期
+/// （`2025.12.25`）天然带两个点，用户无需为它多做任何事。
+///
+/// ⚠️ 必须看**裁剪前**的串。[`trim_pending_tail`] 抹掉尾点是为了让 `123.`（小数位
+/// 还没打）仍出「壹佰贰拾叁元整」，但它连带抹掉了「用户已经打下第二个点」这一信号：
+/// `2026.2.` 被裁成合法小数 `2026.2`，判据当场反转，两侧同时失效。
+///
+/// ★ 判据只能是点的**个数**，不能是「首段像不像年份」：`5000.5`（伍仟元伍角整）与
+/// `2000.5`（贰仟元伍角整）和年月形态完全同构，按首段范围砍会静默吃掉常见金额——
+/// 多几条候选是可见噪音，金额消失是不可见失败，两侧代价不对称。
+///
+/// 算式形态不受影响（`1.5*2.5` 走求值那条路，不经这里）。
+fn has_second_dot(buffer: &str) -> bool {
+    buffer.matches('.').count() > 1
+}
+
 // ───────────────────────── 日期 ─────────────────────────
 
 /// 解析 "m.d" 或 "y.m.d"；省略年份时 year=0。
@@ -294,8 +319,12 @@ fn parse_date_parts(s: &str) -> Option<(i32, u32, u32)> {
     }
 }
 
-/// 日期来源：完整日期优先，否则试年月。输入尾部的点号被容忍
-/// （`"2026.3."` 仍出「2026年3月」，此前会因第三段为空而候选全空）。
+/// 日期来源：完整日期优先，否则试年月。
+///
+/// **要求缓冲里已有第二个小数点**（见 [`has_second_dot`]）：`"2026.3"` 归数字、
+/// `"2026.3."` 归日期。尾点因而同时是「小数位还没打完」与「我要的是日期」两个信号，
+/// 后者由本闸门解释，前者交给 [`trim_pending_tail`] 裁掉，故 `"2026.3."` 出的是
+/// 完整的「2026年3月」而非因第三段为空而全空。
 ///
 /// 格式集（按序）：中文 → 全汉字 → ISO 扩展 → ISO 基本 → 斜杠。
 /// **不产出**中文补零写法（`2025年03月05日`）——GB/T 15835 的中文日期不加前导零，
@@ -313,12 +342,23 @@ pub fn generate_date_candidates(input: &str) -> Vec<String> {
 ///
 /// 「为空再试」而非「解析成功即归属」：用户把 date 一组删空时，`2025.12` 这种
 /// 既可解析为完整日期也可解析为年月的输入仍应给出年月候选。
+///
+/// ★ 闸门装在这里而不是 [`render_full_date`] / [`render_year_month`] 里：那两者是
+/// 纯解析，公开入口 [`generate_year_month_candidates`] 的语义就是「按年月渲染这串」，
+/// 不该被输入形态的归属判据管；只有 [`QuickSource::Date`] 这条**分派**路径才该管。
+/// 同理，设置页示例列走 [`generate_adjusted`]（受管），而 `quick_eval` 的示例值直接
+/// 构造 [`QuickValues`]（不受管）。
 fn render_date(
     input: &str,
     table: &FormatTable,
     adjust: &FormatAdjustMap,
     eval: Option<ExprEval>,
 ) -> Vec<Rendered> {
+    // 归属判据（见 [`has_second_dot`]）：一个点归数字、两个点归日期。**必须在
+    // `trim_pending_tail` 之前问**——它会把 `2026.2.` 裁回 `2026.2`，信号当场丢失。
+    if !has_second_dot(input) {
+        return Vec::new();
+    }
     let input = trim_pending_tail(input);
     let ymd = render_full_date(input, table, adjust, eval);
     if !ymd.is_empty() {
@@ -392,6 +432,9 @@ fn render_full_date(
 ///
 /// 首段 >31 是与「月.日」的分界：`12.25` 只可能是 12 月 25 日，`2025.12` 只可能是年月。
 /// 同样不产出中文补零写法（`2025年06月`）。格式集与完整日期同构：中文 → 全汉字 → ISO → 斜杠。
+///
+/// 这是**按年月渲染**的直接入口，不经 [`has_second_dot`] 那道归属判据——传 `"2025.12"`
+/// 照常出候选。走 [`QuickSource::Date`] 的调用方才受判据管。
 pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
     texts(render_year_month(
         input,
@@ -698,22 +741,6 @@ fn is_decimal_number(s: &str) -> bool {
         }
     }
     true
-}
-
-/// 原始缓冲里是否已经出现**第二个**小数点。
-///
-/// [`trim_pending_tail`] 抹掉尾点是为了让 `123.`（小数位还没打）仍出「壹佰贰拾叁元整」，
-/// 但它连带抹掉了「用户已经打下第二个点」这一信号：`2026.2.` 被裁成合法小数 `2026.2`，
-/// 于是打日期打到第三段时冒出一屏金额读法。数字只容一个小数点，第二个点一出现就
-/// 不再可能是数字，故这道判据必须看**裁剪前**的串。
-///
-/// ★ 判据只能是点的**个数**，不能是「首段像不像年份」：`5000.5`（伍仟元伍角整）与
-/// `2000.5`（贰仟元伍角整）和年月形态完全同构，按首段范围砍会静默吃掉常见金额——
-/// 多几条候选是可见噪音，金额消失是不可见失败，两侧代价不对称。
-///
-/// 算式形态不受影响（`1.5*2.5` 走求值那条路，不经这里）。
-fn has_second_dot(buffer: &str) -> bool {
-    buffer.matches('.').count() > 1
 }
 
 /// "123.45" → ("123","45")，"123" → ("123","")
@@ -1134,15 +1161,43 @@ mod tests {
 
     #[test]
     fn test_date_month_day_uses_current_year() {
-        let c = generate_date_candidates("12.25");
+        let c = generate_date_candidates("12.25.");
         let year = chrono::Local::now().year();
         assert!(c.iter().any(|s| s == &format!("{}年12月25日", year)));
     }
 
     #[test]
     fn test_date_invalid() {
-        assert!(generate_date_candidates("13.40").is_empty());
+        // 带第二个点，确保拦下它的是「月/日越界」而不是归属判据——写 `13.40`
+        // 的话这条会被闸门提前挡掉，测的就不再是解析。
+        assert!(generate_date_candidates("13.40.").is_empty());
         assert!(generate_date_candidates("abc").is_empty());
+    }
+
+    /// ★ 归属判据：一个点归数字、两个点归日期，两组互斥。
+    ///
+    /// 正反两向各要一例——只断言「一个点不出日期」的话，把 `render_date` 整个改成
+    /// 返回空也能全绿。
+    #[test]
+    fn test_date_requires_second_dot() {
+        // 一个点：日期整组让开（此前 `2026.2` 会连带冒出 4 条年月）
+        assert!(
+            generate_date_candidates("2026.2").is_empty(),
+            "实际: {:?}",
+            generate_date_candidates("2026.2")
+        );
+        assert!(generate_date_candidates("12.25").is_empty());
+        // 两个点：日期照常，且与旧的「一个点」形态逐条等价
+        assert_eq!(
+            generate_date_candidates("2026.2."),
+            vec!["2026年2月", "二〇二六年二月", "2026-02", "2026/02"]
+        );
+        assert_eq!(generate_date_candidates("12.25.")[0], "12月25日");
+        // 三段完整日期天然带两个点，用户无需多做任何事
+        assert_eq!(generate_date_candidates("2025.12.25")[0], "2025年12月25日");
+        // 判据看的是**裁剪前**的串：尾点若先被 `trim_pending_tail` 吃掉，
+        // `2026.2.` 会退回一个点而被自己挡住。
+        assert!(!generate_date_candidates("2026.2.").is_empty());
     }
 
     #[test]
@@ -1153,11 +1208,14 @@ mod tests {
 
     #[test]
     fn test_year_month_survives_trailing_dot() {
-        // 「2026.3.」输入到一半：此前第三段为空导致候选全空，现应维持年月候选
+        // 「2026.3.」输入到一半：第三段为空不得让候选全空，仍应给出年月。
+        // ★ 尾点在这里担着两个身份——归属判据靠它认出「我要日期」，
+        // `trim_pending_tail` 又要把它当「小数位还没打」裁掉。两者次序错了这条就红。
         let c = generate_date_candidates("2026.3.");
         assert_eq!(c, vec!["2026年3月", "二〇二六年三月", "2026-03", "2026/03"]);
-        assert_eq!(c, generate_date_candidates("2026.3"), "尾点不改变候选");
-        // 完整日期同理
+        // 第三段打出来后候选不变（尾点只是过渡态）
+        assert_eq!(generate_date_candidates("2026.3.")[0], "2026年3月");
+        // 完整日期的尾点同理被裁，不影响已成立的两点归属
         assert_eq!(
             generate_date_candidates("2025.12.25."),
             generate_date_candidates("2025.12.25")
@@ -1322,12 +1380,16 @@ mod tests {
     }
 
     #[test]
-    fn test_date_and_number_coexist() {
-        // ★ "12.25" 既是金额也是月日，一个点是真歧义：出厂让**数字在前**
-        // （`12.25` 作金额比作月日常见），日期紧随其后。
+    fn test_date_and_number_are_mutually_exclusive() {
+        // ★ "12.25" 既是金额也是月日，一个点是真歧义：归**数字**独占，
+        // 日期整组让开（此前两组同屏，日期垫在金额之后）。
         let c = generate_quick_input_candidates("12.25", 6);
         assert_eq!(c[0], "壹拾贰元贰角伍分");
-        assert!(c.contains(&"12月25日".to_string()), "实际: {:?}", c);
+        assert!(
+            !c.iter().any(|s| s.contains('月')),
+            "一个点不该出日期，实际: {:?}",
+            c
+        );
         // 想要日期就多打一个点：数字整组被隔离，日期独占候选面且首选是短月日
         let d = generate_quick_input_candidates("12.25.", 6);
         assert_eq!(d[0], "12月25日");
@@ -1336,12 +1398,20 @@ mod tests {
             "第二个点应隔离数字，实际: {:?}",
             d
         );
+        // 年月一侧同构：`2026.2` 归金额，`2026.2.` 归年月
+        let e = generate_quick_input_candidates("2026.2", 6);
+        assert_eq!(e[0], "贰仟零贰拾陆元贰角整");
+        assert!(!e.iter().any(|s| s.contains('月')), "实际: {:?}", e);
+        assert_eq!(
+            generate_quick_input_candidates("2026.2.", 6)[0],
+            "2026年2月"
+        );
     }
 
     #[test]
     fn test_month_day_forms_prefer_short_writing() {
         // 只打两段：不带年的短写法在前，补年的两条留作次选（用户没打年份，首选不替他补）
-        let c = generate_date_candidates("12.25");
+        let c = generate_date_candidates("12.25.");
         let year = chrono::Local::now().year();
         assert_eq!(
             c[..4],

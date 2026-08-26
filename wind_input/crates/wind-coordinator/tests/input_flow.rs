@@ -1989,9 +1989,12 @@ fn test_quick_input_power_operator() {
     assert_eq!(texts[1], "2+3^2=11", "实际: {:?}", texts);
 }
 
-/// 日期打到一半的尾点（`2026.3.`）不应清空候选——年月候选须维持。
+/// 协调器层的归属判据：**一个点归数字、两个点归日期**，两组互斥（见 `has_second_dot`）。
+///
+/// 逐键走完整链路而非直调 `wind_quick_input`：判据依赖「裁剪前的缓冲」，而缓冲是协调器
+/// 攒的——单元测试直接传字符串验不出「协调器有没有原样把点交下去」。
 #[test]
-fn test_quick_input_date_trailing_dot_keeps_year_month() {
+fn test_quick_input_date_requires_second_dot() {
     if !has_schemas() {
         return;
     }
@@ -2002,22 +2005,27 @@ fn test_quick_input_date_trailing_dot_keeps_year_month() {
     }
     press_vk(&coord, 0xBE, false); // .
     press_vk(&coord, 0x33, false); // 3
-    let before = coord.debug_page_texts();
+    // 一个点：日期整组让开，只剩数字读法。断言走全量候选，页内看不全。
+    let before = coord.debug_all_candidate_texts();
     assert!(
-        before.contains(&"2026年3月".to_string()),
-        "2026.3 应有年月候选，实际: {:?}",
+        !before.iter().any(|t| t.contains('月')),
+        "2026.3 只有一个点，不该有日期候选，实际: {:?}",
         before
     );
-    press_vk(&coord, 0xBE, false); // 第二个 . —— 此前候选在此清空
+    assert!(
+        before.iter().any(|t| t.contains('元')),
+        "2026.3 应照常出金额，实际: {:?}",
+        before
+    );
+    press_vk(&coord, 0xBE, false); // 第二个 . —— 归属在此翻转
     let after = coord.debug_page_texts();
     assert!(
         after.contains(&"2026年3月".to_string()),
-        "2026.3. 应维持年月候选，实际: {:?}",
+        "2026.3. 应给出年月候选（第三段为空不得让候选全空），实际: {:?}",
         after
     );
-    // ★ 同一步还要**收掉**金额与数字读法：第二个点一落下，用户显然在打日期第三段，
-    // 而尾点被裁掉后 `2026.3` 又是合法小数。判据看裁剪前的点数（见 `has_second_dot`）。
-    // 断言走协调器层的全量候选，不能只看当页——金额排在年月之后，页内可能看不到。
+    // 反向：同一步**收掉**金额。尾点被 `trim_pending_tail` 裁掉后 `2026.3` 又是合法
+    // 小数，判据若看裁剪后的串，这里会两组同屏。
     let all = coord.debug_all_candidate_texts();
     assert!(
         !all.iter().any(|t| t.contains('元')),
@@ -2126,8 +2134,8 @@ fn test_quick_input_member_removal_disables_source() {
     for vk in [0x32, 0x35] {
         press_vk(&coord2, vk, false); // 25
     }
-    // ⚠️ 断言走全量候选而非当页：出厂让 number 排在 date **之前**（`12.25` 作金额比作
-    // 月日常见），日期候选可能落到第二页去，按页内文本判断会误报「来源被关掉了」。
+    press_vk(&coord2, 0xBE, false); // 第二个 . —— 一个点归数字，日期要打到这里
+    // 断言走全量候选而非当页：这条测的是「来源在不在」，不该顺带绑死候选面的分页与排序。
     let texts2 = coord2.debug_all_candidate_texts();
     assert!(
         texts2.iter().any(|t| t.ends_with("月25日")),

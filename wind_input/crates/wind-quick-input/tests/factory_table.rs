@@ -76,12 +76,13 @@ fn builtin_output_equals_pre_refactor_hardcoding() {
             "2025/03/05"
         ]
     );
-    // 年月
+    // 年月。⚠️ 尾点不是笔误：走 `QuickSource::Date` 的输入要有第二个点才归日期
+    // （一个点归数字），见 `has_second_dot`。
     assert_eq!(
-        generate(QuickSource::Date, "2025.6", 6),
+        generate(QuickSource::Date, "2025.6.", 6),
         vec!["2025年6月", "二〇二五年六月", "2025-06", "2025/06"]
     );
-    // ⚠️ 两段日期（`12.25`）**不在这道闸门里**：它已分出 `month_day` 类，首选由
+    // ⚠️ 两段日期（`12.25.`）**不在这道闸门里**：它已分出 `month_day` 类，首选由
     // 「替用户补年的完整日期」改为不带年的 `12月25日`，是**有意的行为变更**。
     // 把新值抄进这里会让闸门从「公历行为永不变」退化成「当前实现等于当前实现」
     // ——与农历两条同一条纪律。正面覆盖见 lib.rs 的
@@ -166,7 +167,7 @@ fn out_of_range_date_keeps_solar_entries_only() {
 /// 年月类不出农历——农历月与公历月不一一对应。
 #[test]
 fn year_month_has_no_lunar_candidate() {
-    let got = generate(QuickSource::Date, "2025.6", 6);
+    let got = generate(QuickSource::Date, "2025.6.", 6);
     assert_eq!(
         got,
         vec!["2025年6月", "二〇二五年六月", "2025-06", "2025/06"]

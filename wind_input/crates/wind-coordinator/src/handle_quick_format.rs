@@ -401,10 +401,15 @@ impl Coordinator {
         //
         // 日期样本用**今天**：用户脑子里知道今天几号，一眼就能把 `$YC年$MC月$DC日`
         // 这类模板对上号；固定日期反而要他先换算。
+        //
+        // ⚠️ 后两条的尾点不是笔误：`QuickSource::Date` 要求缓冲里已有第二个小数点才
+        // 归日期（一个点归数字，见 `wind_quick_input::has_second_dot` 的判据）。少了它，
+        // month_day 与 year_month 两类的示例列会**整列空白**，而其余类别都正常——
+        // 看着像这两类的模板全写错了，实际是样本压根没走到渲染。
         let samples: [(QuickSource, String); 5] = [
             (QuickSource::Date, format!("{y}.{m}.{d}")),
-            (QuickSource::Date, format!("{m}.{d}")),
-            (QuickSource::Date, format!("{y}.{m}")),
+            (QuickSource::Date, format!("{m}.{d}.")),
+            (QuickSource::Date, format!("{y}.{m}.")),
             (QuickSource::Number, "1234.5".to_string()),
             (QuickSource::Calc, "1+2*3".to_string()),
         ];
