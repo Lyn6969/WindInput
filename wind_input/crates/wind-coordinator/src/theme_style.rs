@@ -7,6 +7,9 @@
 //! 让编译器全程沉默。改成枚举后 [`ThemeStyle::resolve_dark`] 是唯一的明暗出口，
 //! 新增分支必须在此显式回答，漏处理会编译失败而不是悄悄按亮色跑。
 
+// 两个消费点分别在 `cfg(windows)` 与 `cfg(target_os = "macos")` 的 `system_prefers_dark`
+// 里，其余平台（Android/Linux 的 headless 形态）走空实现，此 import 在那里即死代码。
+#[cfg(any(windows, target_os = "macos"))]
 use tracing::debug;
 
 /// 主题明暗设置（`ui.theme.style` 的运行时形态）。
