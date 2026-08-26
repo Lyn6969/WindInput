@@ -124,3 +124,38 @@ fn empty_action_is_a_no_op() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(coord.active_schema_id(), "wubi86");
 }
+
+/// ★ 回归：**裸表达式**（不带顶层 `$CC(...)` 标记）也必须能执行。
+///
+/// 这是 2026-08-26 用户真机报的 bug：按钮显示正常、日志无任何告警，点了却什么都不发生。
+/// 根因是 `run_command_candidate` 走 `evaluate_phrase`，那是**短语格式**——缺 `$CC` 标记
+/// 的源被当成字面文本，一个动作都不跑，且不报错。
+///
+/// 而 `data/config.toml` 与文档站教用户写的正是裸形式（`action = 'proc.run("…")'`），
+/// 端到端测试用的却是带标记的形式 ⇒ 测试全绿、文档教错。
+///
+/// 判据：**按钮的 action 本来就只可能是命令**，没有「这是文本还是命令」的歧义，
+/// 不该要求用户懂短语系统的标记语法。
+#[test]
+fn bare_expression_action_runs_without_cc_marker() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少方案数据");
+        return;
+    }
+    let mut cfg = Config::default();
+    cfg.schema.active = "wubi86".to_string();
+    cfg.schema.available = vec!["wubi86".to_string(), "pinyin".to_string()];
+    // 注意这里**没有** $CC 包裹——与文档教的写法一致。
+    cfg.ui.toolbar.buttons = vec![button("sw", r#"ime.schema("pinyin")"#)];
+
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    assert_eq!(coord.active_schema_id(), "wubi86", "前置：起于五笔");
+
+    coord.inject_ui_event(UiEvent::Toolbar(ToolbarAction::Custom(0)));
+
+    assert!(
+        wait_until(|| coord.active_schema_id() == "pinyin"),
+        "裸表达式必须照样执行；实际方案仍是 {}",
+        coord.active_schema_id()
+    );
+}

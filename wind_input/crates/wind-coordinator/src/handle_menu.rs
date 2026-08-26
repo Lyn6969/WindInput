@@ -1734,12 +1734,13 @@ impl Coordinator {
                 }
             }
         };
-        if btn.action.trim().is_empty() {
+        let action = btn.action.trim();
+        if action.is_empty() {
             // 配了按钮却没配动作：点了没反应是最难自查的一类，给一条日志。
             tracing::warn!("工具栏自定义按钮 {:?} 未配置 action", btn.id);
             return;
         }
-        self.spawn_command(btn.action, String::new());
+        self.spawn_command(wrap_command_source(action), String::new());
     }
 
     /// 焦点/激活切换路径专用：先用缓存值立即同步通知（无阻塞），
@@ -1912,6 +1913,30 @@ pub(crate) fn candidate_delete_menu(cand: &wind_candidate::Candidate) -> (&'stat
         // 系统词（码表/拼音）：shadow 软隐藏。
         ("隐藏候选", true)
     }
+}
+
+/// 把一段动作源补成 `run_command_candidate` 能执行的**短语格式**。
+///
+/// # 为什么需要这一步
+///
+/// `run_command_candidate` 走 `evaluate_phrase`，那是短语系统的格式——命令必须带顶层
+/// `$CC(…)` 标记。裸的 `proc.run("x.exe")` 会被当成**字面文本**，一个动作都不跑，
+/// **而且不报错**：症状是「按钮显示正常、日志一条告警都没有、点了什么都不发生」。
+/// 2026-08-26 用户真机报到这个 bug。
+///
+/// 判据：**按钮的 action 本来就只可能是命令**。`$CC` 标记存在的意义是让短语区分
+/// 「这条是要上屏的文本」还是「这条是要执行的命令」，而工具栏按钮没有这个歧义
+/// ——它不可能是文本。要求用户为一个不存在的歧义写一个标记，是把内部格式当成了 API。
+///
+/// 已带标记的原样放行：用户从短语那边抄一条过来照样能用，且不会被包成
+/// `$CC("", $CC(...))` 这种嵌套。
+///
+/// 第一个参数是**候选显示文本**，工具栏按钮不进候选列表，故给空串。
+fn wrap_command_source(action: &str) -> String {
+    if action.starts_with("$CC(") {
+        return action.to_string();
+    }
+    format!("$CC(\"\", {action})")
 }
 
 /// 返回当前鼠标光标的屏幕坐标；获取失败时返回 (0, 0)。
@@ -2187,6 +2212,40 @@ mod tests {
             "--dark",
             "无页时附加参数不得被丢弃"
         );
+    }
+}
+
+#[cfg(test)]
+mod command_source_tests {
+    //! 工具栏按钮 action → 短语格式的补全（`wrap_command_source`）。
+
+    use super::wrap_command_source;
+
+    /// 裸表达式补上标记。**这是本函数存在的全部理由**：不补的话
+    /// `evaluate_phrase` 把它当字面文本，一个动作都不跑且不报错。
+    #[test]
+    fn bare_expression_gets_wrapped() {
+        assert_eq!(
+            wrap_command_source(r#"proc.run("x.exe")"#),
+            r#"$CC("", proc.run("x.exe"))"#
+        );
+    }
+
+    /// 已带标记的原样放行——否则会包成 `$CC("", $CC(...))` 的嵌套。
+    #[test]
+    fn already_marked_source_is_untouched() {
+        let src = r#"$CC("切拼音", ime.schema("pinyin"))"#;
+        assert_eq!(wrap_command_source(src), src);
+    }
+
+    /// 含中文路径与双反斜杠的真实配置（用户 2026-08-26 报的那条）原样进包装，
+    /// 转义留给 cmdbar 的 lexer 处理——包装层**不得**碰字符串内容。
+    #[test]
+    fn windows_path_with_escapes_passes_through_verbatim() {
+        let action = r#"proc.run("D:\\Download\\知符\\知符.exe")"#;
+        let got = wrap_command_source(action);
+        assert!(got.contains(r#"D:\\Download\\知符\\知符.exe"#), "{got}");
+        assert_eq!(got, format!(r#"$CC("", {action})"#));
     }
 }
 
