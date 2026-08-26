@@ -3767,7 +3767,51 @@ BOOL CTextService::_InitIPCClient()
         if      (show == L"min")    nShow = SW_SHOWMINNOACTIVE;  // 最小化且不抢焦点
         else if (show == L"max")    nShow = SW_SHOWMAXIMIZED;
         else if (show == L"hidden") nShow = SW_HIDE;
+
+        // ── 启动期间把线程降为 DPI-unaware ────────────────────────────────
+        //
+        // 子进程若自身 manifest **未声明** DPI 感知，就继承**创建它的那个线程**的
+        // 上下文。而本回调跑在宿主应用进程里（借它的前台权限），于是被启动的程序
+        // 继承的既不是它自己该有的、也不是输入法的，而是**用户当时所在的那个宿主的**
+        // ——在微信里点和在记事本里点，同一个程序可以得到两种感知级别。
+        //
+        // 后果：宿主是 per-monitor-v2 时，一个本该 unaware 的老程序会被当成 PMv2，
+        // 于是它按 96 DPI 作画而系统不再替它缩放，高 DPI 屏上界面又小又错位。
+        // 2026-08-26 用户经工具栏自定义按钮启动外部程序时报到。
+        //
+        // 判据：**让「从输入法启动」与「用户自己双击启动」表现一致**。降为 unaware 后，
+        // 有 manifest 的程序照走自己的声明（manifest 优先，不受影响），没有 manifest 的
+        // 回到它本该有的 unaware，由系统做位图缩放——正是双击时的行为。
+        //
+        // 动态取符号（Win10 1607+），与 `LangBarItemButton.cpp` 的 `_LangBarIconSizePx`
+        // 同一惯例；取不到就退回原样调用，至少不比从前差。
+        //
+        // ⚠️ 必须无条件还原，且窗口开得**尽可能窄**（只包这一次 ShellExecuteW）：
+        // 本回调在宿主的 AsyncReader 线程上执行，留下一个被改写的上下文会让宿主后续
+        // 的窗口/坐标操作换一套语义——那种缺陷与"启动了一个程序"毫无表面关联。
+        //
+        // 为什么**只**改这一处（其余启动路径已逐条核过，不需要）：
+        //   - cmdbar 的 `open` 与 `proc.run` 都经 push_shell_exec 走到这里，一处覆盖两个；
+        //   - `proc.shell` 走 `cmd /C`，目标进程继承的是 **cmd.exe 自己的**感知级别
+        //     （它有 manifest），与输入法无关；
+        //   - 服务端的 open_path / open_app 目标是资源管理器、浏览器、本产品的设置程序
+        //     ——都带 manifest，manifest 优先，继承什么都不影响。
+        using SetThreadDpiAwarenessContextFn =
+            DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+        static auto pSetThreadDpiAwarenessContext =
+            reinterpret_cast<SetThreadDpiAwarenessContextFn>(
+                GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+
+        DPI_AWARENESS_CONTEXT prevCtx = nullptr;
+        if (pSetThreadDpiAwarenessContext != nullptr)
+            prevCtx = pSetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+
         HINSTANCE ret = ::ShellExecuteW(nullptr, pVerb, target.c_str(), pParams, pDir, nShow);
+
+        if (prevCtx != nullptr)
+            pSetThreadDpiAwarenessContext(prevCtx);
+        // ──────────────────────────────────────────────────────────────────
+
         if (reinterpret_cast<INT_PTR>(ret) <= 32)
             WIND_LOG_ERROR_FMT(L"ShellExecuteW failed: target=%s dir=%s verb=%s code=%d", target.c_str(), dir.c_str(), verb.c_str(), static_cast<int>(reinterpret_cast<INT_PTR>(ret)));
     });
