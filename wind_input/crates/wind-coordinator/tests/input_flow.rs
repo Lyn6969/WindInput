@@ -8821,22 +8821,24 @@ fn test_s2t_converts_top_code_commit() {
         eprintln!("跳过：缺少 opencc 数据");
         return;
     }
-    // 满码 cccc：显示首选「雙雙」，内部 text 仍是简体「双双」。
-    for c in "cccc".chars() {
+    // 满码 jfuj：显示首选「時間」，内部 text 仍是简体「时间」。
+    // 探针须选简繁不同的首选，否则断言恒真、验不出漏转（键名字类全码如 cccc 首选是
+    // 「又」，简繁同形，不能用）。
+    for c in "jfuj".chars() {
         press_letter(&coord, c);
     }
     let simplified = coord.debug_page_texts()[0].clone();
     let displayed = coord.debug_page_display_texts()[0].clone();
     assert_ne!(
         simplified, displayed,
-        "探针失效：cccc 的首选须简繁不同才验得出漏转（码表数据变动？换一个探针）"
+        "探针失效：jfuj 的首选须简繁不同才验得出漏转（码表数据变动？换一个探针）"
     );
-    // 第 5 码触发顶码：顶出前 4 码的显示首选，余码 c 续打。
+    // 第 5 码触发顶码：顶出前 4 码的显示首选，余码 j 续打。
     // 出厂 top_commit_mode=direct_commit → CommitThenDeferComposition；pre_confirm → InsertText。
-    let commit = match press_letter(&coord, 'c') {
+    let commit = match press_letter(&coord, 'j') {
         KeyAction::CommitThenDeferComposition { commit_text, .. } => commit_text,
         KeyAction::InsertText { text, .. } => text,
-        other => panic!("cccc + c 应触发顶码上屏，实际: {:?}", other),
+        other => panic!("jfuj + j 应触发顶码上屏，实际: {:?}", other),
     };
     assert_eq!(
         commit, displayed,
