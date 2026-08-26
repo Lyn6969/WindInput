@@ -1,8 +1,11 @@
 # 工具栏自定义：条目显隐排序 + 自定义快捷按钮
 
-状态：✅ **三阶段已实施**（主仓 `d9dced54` / `698673f9` / `cb5468e0`，设置仓
-`cf51bb3` / `188eb50`，文档站 `199d8ef` / `513f9a7`），**未真机验证**。
-实施中的四处偏离与新发现已回写本文（§5.2、§6.2、§11）。
+状态：✅ **已实施并真机验证**（2026-08-26 用户确认基本功能正确）。
+实施中的偏离、真机反馈与被推翻的结论已回写本文（§5.2、§6.2、§11、§12）。
+
+提交：主仓 `d9dced54` / `698673f9` / `cb5468e0` / `8abda3b8` / `14110a89` / `9c6ece6d`；
+设置仓 `cf51bb3` / `188eb50` / `efe29af` / `c38ff5c` / `fd9f6cf` / `dd7ac04`；
+文档站 `199d8ef` / `513f9a7` / `a6dd310` / `a6eef47`。
 起因：工具栏当前是硬编码的 `[方案][标点][全半角]([简繁])[设置]`（`wind-ui/src/toolbar.rs:355` 的
 `fn cells`），用户既不能关掉不用的格，也不能加自己的入口（如一个「符」按钮打开系统字符映射表）。
 
@@ -52,14 +55,16 @@
 # 留空 = 全部显示（旧配置无此键时行为不变）
 items = ["mode", "punct", "full_width", "s2t", "custom:sym", "settings"]
 
-# 自定义按钮定义（expert 档）
+# 自定义按钮定义
 [[ui.toolbar.buttons]]
 id = "sym"                          # 稳定标识，被 items 引用
 label = "符"                        # 1 个汉字或 2 个 ASCII（见 §5）
-tooltip = "打开字符映射表"           # 可选，悬停提示
 action = 'proc.run("charmap.exe")'  # cmdbar 表达式（见 §4）
 enabled = true                      # 缺省 true
 ```
+
+> ⚠️ **本节两处已变更**：`tooltip` 字段**不存在**（实施时删除，见 §11.3）；
+> 「expert 档、不做 GUI」的定位已被推翻，现在设置页可以新建/编辑/删除（见 §12.3）。
 
 ### 2.2 三条判据
 
@@ -118,7 +123,7 @@ pub enum ToolbarItem {
     Settings,
     /// `index` = 该按钮在 `ui.toolbar.buttons` 里的下标，点击时经
     /// `ToolbarAction::Custom(index)` 原样回传。
-    Custom { index: u8, label: String, tooltip: String },
+    Custom { index: u8, label: String },   // tooltip 字段已删，见 §11.3
 }
 ```
 
@@ -181,6 +186,10 @@ ToolbarAction::Custom(i) => {
     self.spawn_command(src, String::new());
 }
 ```
+
+> 🔴 **这段示例漏了一步，真机才发现**：`src` 必须先经 `wrap_command_source` 补上顶层
+> `$CC(…)` 标记，否则被当成字面文本、一个动作都不跑**且不报错**。见 §12.1——
+> 那正是本文这段示例（以及照它写的文档与出厂注释）导致的 bug。
 
 `Services`（`ime` / `dict` / `proc` / `open` / `clip` / `keys` / `config`）由 `init_cmdbar`
 （`handle_cmdbar.rs:30`）一次性装配存进 `OnceLock`，任何调用点 `self.cmdbar_services.get()`
@@ -322,8 +331,9 @@ ToolbarAction::Custom(i) => {
 
 - `settings_manifest.toml:2341`（section「工具栏」）加 `ui.toolbar.items`，形态 =
   宿主行 + `opens_dialog`，对话框复用 `build_toggle_rows_dialog`。
-- `ui.toolbar.buttons` 是 StructList，本期登记 `UNCOVERED_BY_DESIGN`（理由：expert 档、
-  面向配置文件），P3 再做编辑器。
+- `ui.toolbar.buttons` 登记 `UNCOVERED_BY_DESIGN`。⚠️ **理由已改写**：不再是「expert 档、
+  设计上不做控件」（那条被用户推翻，见 §12.3），而是「**没有独立清单项**——它由
+  `ui.toolbar.items` 那一项的对话框一并读写」。若日后给它单独立项，记得从名单撤出。
 - ⚠️ 五道守门闸门依次拦（`config-design-rules.md` §R6），照报错提示修。
 - ⚠️ `manifest.rs:3413` 的 `toolbar_items_hidden_on_macos` 断言了工具栏各键的平台可见性，
   新键要决定 `platform` 并同步这条测试。
@@ -340,9 +350,13 @@ ToolbarAction::Custom(i) => {
 |---|---|---|
 | **P1** | `items` 显隐排序 + 渲染重构 + `SetToolbarLayout` + 设置页对话框 | 是：不含任何执行能力，纯呈现 |
 | **P2** | `buttons` + cmdbar 接线 + label 截断 | 是：`debug_run_command` 可单测动作链 |
-| **P3** | 设置页按钮编辑器 + 导入确认框警示（§6.2） | 是 |
+| **P3** | 导入预览风险提示（§6.2） | 是 |
+| **P4** | 真机反馈三项 + 设置页按钮编辑器（§12） | 是 |
 
 P1 的设置页对话框只列内置 5 项；custom 项进对话框要等 P2 落地。
+
+⚠️ P4 里的「设置页按钮编辑器」原本写在 §8.2 的否决理由里（「不做专属控件」），
+真机后被用户要求做，见 §12.3。
 
 ---
 
@@ -396,3 +410,85 @@ P1 的设置页对话框只列内置 5 项；custom 项进对话框要等 P2 落
 
 ⚠️ 教训一般化：**改设置页 UI 后要截图自查**（`cargo run -- --page ui --screenshot <path>`，
 配 `--click X Y` 可展开对话框）。这个仓的测试覆盖的是数据契约，不是"画出来长什么样"。
+
+---
+
+## 十二、真机反馈（2026-08-26）：三条被推翻的判断
+
+装机实测后用户报了三件事，其中两件推翻了本文原先的结论。**这一节比前面任何一节都
+值得先读**——它们都不是实现错误，是设计判断在真实使用面前的失效。
+
+### 12.1 🔴 裸表达式的动作点了没反应（bug）
+
+现象：按钮显示正常、日志一条告警都没有、点下去什么都不发生。
+
+根因：`run_command_candidate` 走 `evaluate_phrase`，那是**短语格式**——命令必须带顶层
+`$CC(…)` 标记，裸的 `proc.run("x.exe")` 被当成字面文本，一个动作都不跑**且不报错**。
+
+而 §4.2 的接线示例、`data/config.toml` 的注释、文档站的例子，写的全是**裸形式**；
+端到端测试用的却是带标记的形式 ⇒ **测试验的写法与文档教的写法不是同一种**，全绿。
+
+修法是在 `run_toolbar_button` 里补标记（`wrap_command_source`），而不是改文档要求用户
+写 `$CC`。判据：**按钮的 action 本来就只可能是命令**，不存在「这是文本还是命令」的
+歧义，要求用户为一个不存在的歧义写一个标记，是把内部格式当成了 API。
+
+⚠️ `schema_direct_command.rs` 的模块注释早就记着这个坑（「初版把命令源写成裸的
+`ime.schema(...)`，被当成字面文本、一个动作都没跑」）。**读过，还是踩了。**
+
+### 12.2 关掉的格不记位置 → `-` 前缀
+
+原方案的 `items` 只存启用项，关掉即从数组里删除 ⇒ 位置信息随之丢失，重开只能补在
+声明序位。用户体感是「排好的顺序，关一下再开就乱了」。
+
+改为**写全序**，关着的加 `-` 前缀（`["mode", "-full_width", "punct"]`）。
+
+⛔ **不拆成 `items` + `hidden` 两个键**：顺序与启用态是同一件事的两面，拆开就是本仓
+栽过的「两张表要同步」形态。前缀让它保持单一真相源，REGISTRY 类型不变（仍是 StrList）。
+
+### 12.3 ⛔ 「设计上不做按钮编辑器」被推翻
+
+§8.2 原本登记 `ui.toolbar.buttons` 为 `UNCOVERED_BY_DESIGN`，理由是「expert 档、
+真要做 GUI 得先做一个动作编辑器，那是比工具栏本身大得多的一件事」。
+
+**用户要求做，且做完发现没那么大**：动作编辑收敛成「下拉选类型 + 一个参数框」，
+常用四种（启动程序 / 打开网址文件 / 输入法命令 / 模拟按键）覆盖绝大多数场景，
+复杂的落「自定义表达式」原样透传。
+
+★ 顺带解决了 12.1 的**根源**：GUI 里填的是**真实路径**，转义由
+`dialogs/action_expr.rs` 负责——用户不必知道反斜杠要写两个。这落实了本仓已有的原则
+「真实文本是唯一事实、转义只在系统边界发生」，GUI 就是那个边界。
+
+⚠️ 该模块**只保证「自己生成的表达式能被自己读回」**：cmdbar 的完整语法在 core 的
+lexer 里，在设置页重实现一遍就是同一套语法两处实现、迟早分叉。故认不出的形态一律
+原样显示、逐字保存，绝不猜。
+
+### 12.4 数据丢失：手写的按钮被设置页吃掉
+
+用户手写了 `custom:sym`，随后在设置页动了一下「显示内容」，那一条当场消失。
+
+根因是 writer 整表覆盖，而 `managed_order` **故意**只把界面管得着的条目排进行序
+（界面显示不了别的）——未知项该由写回函数按锚点插回。`mix_members` 早有这道保护
+（`apply_member_order`），我复用了它的 `managed_order` 却没搬这一半：
+**一个算法拆两半用，只搬走了显示的那一半。**
+
+★ 判据一般化：**复用一个「只处理它认识的那部分」的函数时，先问「它不认识的那部分
+原本由谁负责」**。那个负责者往往不在同一个函数里。
+
+⚠️ 第一版测试没抓住这条：变异掉 writer 里的调用，测试照绿——它们测的是零件
+（`merge_preserving_foreign` 本身），不是组合（writer 有没有用它）。而 writer 挂在
+`AppState` 上、需要 windui 运行时立不起来，端到端测不了。折中是把组合逻辑抽成
+`ordered_pairs_write_value`，让「怎么组合」只有一份实现且被测到。
+
+### 12.5 置灰 → toast
+
+「最后一格关不掉」初版用 `enabled_when` 置灰，判据是「置灰当场说明这个关不掉」。
+**实测被推翻**：灰掉的开关与正常开关差别太小、看不出来，点下去没反应反而更像卡住。
+改成受控点击（`on_toggle`）：照常可点，越界时弹 toast 明说为什么。
+
+### 12.6 DPI：启动的程序继承了**宿主**的感知级别
+
+见 `wind_tsf/src/TextService.cpp` 的 `SetShellExecCallback` 注释与 memory 条目
+`project_child_process_dpi_inheritance`。要点：`proc.run` 经 TSF DLL 执行
+`ShellExecuteW`，而 DLL 注入在宿主进程里 ⇒ 被启动的程序继承的是**用户当时所在那个
+宿主的** DPI 上下文，同一个按钮在不同程序里点会有不同表现。修法是调用前后临时降为
+`DPI_AWARENESS_CONTEXT_UNAWARE`。
