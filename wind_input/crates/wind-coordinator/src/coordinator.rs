@@ -855,15 +855,29 @@ pub(crate) fn should_reapply_initial(
 ///
 /// **数组顺序即渲染顺序**，故本函数保序、不去重排序。
 ///
-/// # 三条判据
+/// # `-` 前缀 = 「在这个位置，但不显示」
+///
+/// `["mode", "-full_width", "punct"]` 里的 `-full_width` 不渲染，但它**占着位置**：
+/// 用户在设置页把某格拖到第 2 位再关掉，重新打开时它还在第 2 位。
+///
+/// 若关闭的项直接从数组里删掉（本键最初的形态），位置信息就没了，重开时只能补在声明
+/// 序位——用户的体感是「我排好的顺序，关一下再开就乱了」。前缀让顺序与启用态留在**同一个
+/// 数组**里：拆成 `items` + `hidden` 两个键就是本仓栽过的「两张表要同步」形态
+/// （一边有一边没有，两种不一致都得有人处置）。
+///
+/// # 其余四条判据
 ///
 /// - **未知键跳过 + 告警**：拼错一个词只让那一格消失，其余照常——比整条回落默认更接近
-///   用户意图，且日志里查得到。
+///   用户意图，且日志里查得到。带 `-` 前缀的未知键同样告警：`-punkt` 是拼错，不是
+///   「刻意关掉一个不存在的格」。
 /// - **重复项保留**：同一个键写两次就画两格。不特殊处理是因为它无害且无歧义，而"静默
 ///   去重"会让用户以为自己没写对。
-/// - **结果为空则回落全集**：只在「写了但全是非法项」时可达（合法的"全部隐藏"表达是
-///   `visible = false`，见 `ToolbarConfig::items` 文档）。留着它是因为**空工具栏是一条
-///   看着像 bug 的路**——只剩一个拖动柄，而用户多半不知道那是自己配出来的。
+/// - **结果为空则回落全集**：合法的"全部隐藏"表达是 `visible = false`（见
+///   `ToolbarConfig::items` 文档）。留着它是因为**空工具栏是一条看着像 bug 的路**——
+///   只剩一个拖动柄，而用户多半不知道那是自己配出来的。
+///   ⚠️ 设置页那侧另有一道「至少留一格」的闸门，故这条只在**手写配置**时可达。
+/// - **`-` 只在最外层剥一次**：`--mode` 剥成 `-mode`，不是合法条目 ⇒ 告警跳过。
+///   不递归剥是有意的——`--mode` 只可能是手滑，把它解释成「关掉的关掉的 mode」没有意义。
 ///
 /// `custom:<id>` 条目里 `id` 的最大下标——`ToolbarAction::Custom` 的载荷是 `u8`
 /// （为保住 `Copy`，见其文档），故第 256 个及以后的按钮无法回指，解析时即拒绝。
@@ -885,15 +899,26 @@ pub(crate) fn parse_toolbar_items(
     }
     let mut out = Vec::with_capacity(items.len());
     for raw in items {
-        match raw.trim() {
-            "mode" => out.push(ToolbarItem::Mode),
-            "punct" => out.push(ToolbarItem::Punct),
-            "full_width" => out.push(ToolbarItem::FullWidth),
-            "s2t" => out.push(ToolbarItem::S2t),
-            "settings" => out.push(ToolbarItem::Settings),
+        let trimmed = raw.trim();
+        // `-` 前缀 = 关着的格：仍要**走完整解析**（拼错要告警），只是不产出渲染项。
+        // 用 `sink` 而不是「先判前缀再 continue」：后者会让 `-punkt` 这种拼错悄悄溜过去，
+        // 而它与 `punkt` 是同一个错误，用户同样需要日志线索。
+        let (key, shown) = match trimmed.strip_prefix('-') {
+            Some(rest) => (rest, false),
+            None => (trimmed, true),
+        };
+        // 关着的格解析进这个临时篮子，随即丢弃——只为触发与显示项完全相同的校验与告警。
+        let mut discard = Vec::new();
+        let sink = if shown { &mut out } else { &mut discard };
+        match key {
+            "mode" => sink.push(ToolbarItem::Mode),
+            "punct" => sink.push(ToolbarItem::Punct),
+            "full_width" => sink.push(ToolbarItem::FullWidth),
+            "s2t" => sink.push(ToolbarItem::S2t),
+            "settings" => sink.push(ToolbarItem::Settings),
             "" => {}
             other => match other.strip_prefix("custom:") {
-                Some(id) => push_custom_item(&mut out, id, buttons),
+                Some(id) => push_custom_item(sink, id, buttons),
                 // 前缀写错（如 `custom-sym`）落到这里，与拼错内置键同样处置。
                 None => warn!("ui.toolbar.items: 未知条目 {other:?}，已跳过"),
             },
@@ -9575,6 +9600,89 @@ mod toolbar_items_tests {
             parsed,
             DEFAULT_TOOLBAR_ITEMS.to_vec(),
             "键名的声明顺序必须与协议层默认项序列一致"
+        );
+    }
+
+    // ── `-` 前缀：关着但占位 ─────────────────────────────────────
+
+    /// 带前缀的项不渲染，其余照常——这是「关掉一格」的表达。
+    #[test]
+    fn dash_prefix_hides_the_item() {
+        assert_eq!(
+            parse(&["mode", "-full_width", "punct"]),
+            vec![ToolbarItem::Mode, ToolbarItem::Punct]
+        );
+    }
+
+    /// ★ 前缀存在的**全部理由**：关掉再打开，位置不变。
+    ///
+    /// 这条模拟设置页的一个来回——用户把 full_width 拖到第 2 位、关掉、再打开。
+    /// 若关闭时把它从数组里删掉，重新打开只能补在声明序位（第 3 位），用户看到的是
+    /// 「我排好的顺序，关一下再开就乱了」。
+    #[test]
+    fn toggling_off_and_on_preserves_position() {
+        let off = ["mode", "-full_width", "punct"];
+        let on = ["mode", "full_width", "punct"];
+        // 关着时不渲染它。
+        assert_eq!(parse(&off), vec![ToolbarItem::Mode, ToolbarItem::Punct]);
+        // 打开后回到**原位**（第 2 位），而不是声明序里的位置。
+        assert_eq!(
+            parse(&on),
+            vec![
+                ToolbarItem::Mode,
+                ToolbarItem::FullWidth,
+                ToolbarItem::Punct
+            ]
+        );
+    }
+
+    /// 自定义按钮同样可以被关着占位。
+    #[test]
+    fn dash_prefix_works_on_custom_items() {
+        let buttons = [btn("sym", "符")];
+        assert_eq!(
+            parse_with(&["mode", "-custom:sym"], &buttons),
+            vec![ToolbarItem::Mode]
+        );
+        assert_eq!(
+            parse_with(&["mode", "custom:sym"], &buttons),
+            vec![
+                ToolbarItem::Mode,
+                ToolbarItem::Custom {
+                    index: 0,
+                    label: "符".to_string(),
+                }
+            ]
+        );
+    }
+
+    /// 前缀不掩盖拼写错误：`-punkt` 与 `punkt` 是同一个错，都该跳过。
+    ///
+    /// （告警内容不便断言，这里钉的是「不因为带了前缀就被当成合法的关闭项」——
+    /// 若实现改成「见 `-` 就 continue」，本条仍绿，但下一条会红。）
+    #[test]
+    fn dash_prefix_does_not_legitimize_typos() {
+        assert_eq!(
+            parse(&["mode", "-punkt", "punct"]),
+            vec![ToolbarItem::Mode, ToolbarItem::Punct]
+        );
+    }
+
+    /// `-` 只剥一层：`--mode` 不是「关掉的关掉的 mode」，是手滑。
+    #[test]
+    fn double_dash_is_a_typo_not_a_double_negative() {
+        assert_eq!(parse(&["--mode", "punct"]), vec![ToolbarItem::Punct]);
+    }
+
+    /// 全部关闭 → 展开为空 → 回落全集。
+    ///
+    /// ⚠️ 这条只在**手写配置**时可达：设置页那侧有「至少留一格」的闸门。留着兜底是因为
+    /// 一条只剩拖动柄的空条看着像 bug，而用户多半不知道是自己配出来的。
+    #[test]
+    fn all_disabled_falls_back_to_full_set() {
+        assert_eq!(
+            parse(&["-mode", "-punct", "-full_width", "-s2t", "-settings"]),
+            DEFAULT_TOOLBAR_ITEMS.to_vec()
         );
     }
 
