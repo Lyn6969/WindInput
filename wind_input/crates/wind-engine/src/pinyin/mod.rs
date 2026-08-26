@@ -2543,7 +2543,7 @@ impl Engine for PinyinEngine {
                 .iter()
                 .filter(|c| {
                     !c.is_fuzzy
-                        && !(c.is_prefix && !c.is_promoted_completion)
+                        && (!c.is_prefix || c.is_promoted_completion)
                         && !c.is_partial
                         && c.code == completed
                 })
