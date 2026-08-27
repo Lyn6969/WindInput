@@ -36,6 +36,22 @@ pub struct CandidateMeta {
     pub is_temp_dict: bool,
     pub raw_weight: i32,
     pub freq_boost: i32,
+    /// 当前 `weight` 由**哪个词库层**贡献。
+    ///
+    /// 跨层同词合并时权重取各启用层的最大值（`composite::merge_search`），而
+    /// `code`/`natural_order`/`base_order` 仍属首个出现层——于是合并结果是「混血」的，
+    /// 光看一个权重数字无从判断它到底来自哪本词库。本字段随 weight 一起被继承，
+    /// 供悬停调试段标出来源（`权 5000 ←ext`）。
+    ///
+    /// 存在理由是**排查成本**：曾有一轮「扩展词库权重更高却没生效」的排查卡在这里——
+    /// 调试段只显示一个最终数字，分不清是「合并没取到 max」还是「取到了但被别的排序
+    /// 维度盖过」，两种根因在界面上长得一模一样。
+    ///
+    /// `Arc<str>` 而非 `String`：本字段在每条候选上都要填，而候选在按键热路径上成百上千地
+    /// 造；层名是固定的几个短串，克隆一次原子计数远比一次堆分配便宜。
+    /// `None` = 该候选不来自词库层（短语 / 命令 / 联想等），调试段不显示箭头。
+    #[serde(skip)]
+    pub weight_layer: Option<std::sync::Arc<str>>,
     /// 短语来源归属：`is_phrase` 候选时有意义，true=系统短语，false=用户短语。
     /// 仅供悬停调试提示区分来源（`wind_phrase::PhraseHit::is_system` 透传而来）。
     #[serde(default)]

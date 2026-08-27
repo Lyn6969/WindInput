@@ -76,7 +76,9 @@ impl DictManager {
 /// 仅在查询时被 composite 跳过；`set_enabled` 取 `&self`，故无需重建引擎即可即时启停。
 pub struct SystemDictLayer {
     dict: CachedDict,
-    name: String,
+    /// `Arc<str>` 而非 `String`：层名要随每条候选填进 `meta.weight_layer`（供调试段标出
+    /// 权重来源），而候选在按键热路径上成百上千地造——克隆一次原子计数远比堆分配便宜。
+    name: std::sync::Arc<str>,
     enabled: std::sync::atomic::AtomicBool,
     /// 层级基序档位（见 DictLayer::base_order）。设计者经 [[dictionaries]].base_order 配置。
     base_order: i32,
@@ -104,7 +106,7 @@ impl SystemDictLayer {
     pub fn with_enabled(dict: CachedDict, name: impl Into<String>, enabled: bool) -> Self {
         Self {
             dict,
-            name: name.into(),
+            name: std::sync::Arc::from(name.into().as_str()),
             enabled: std::sync::atomic::AtomicBool::new(enabled),
             base_order: 0,
             default_weight: None,
@@ -245,8 +247,11 @@ impl DictLayer for SystemDictLayer {
                 weight: self.effective_weight(hit.weight),
                 // 归一化会改写 `weight`，原值留在这里——否则排查问题时看到的数与词库里
                 // 的数对不上，而「候选权重为什么是这个」正是最常问的问题。
+                // `weight_layer` 同理，但答的是另一个问题：这个权重出自**哪本词库**。
+                // 跨层合并会让 weight 与 code 分属不同层，只看数字分不出来（见该字段文档）。
                 meta: CandidateMeta {
                     raw_weight: hit.weight,
+                    weight_layer: Some(self.name.clone()),
                     ..Default::default()
                 },
                 natural_order: hit.order,
@@ -273,8 +278,10 @@ impl DictLayer for SystemDictLayer {
                 weight: self.effective_weight(hit.weight),
                 // 归一化会改写 `weight`，原值留在这里——否则排查问题时看到的数与词库里
                 // 的数对不上，而「候选权重为什么是这个」正是最常问的问题。
+                // `weight_layer` 同理，但答的是另一个问题：这个权重出自**哪本词库**。
                 meta: CandidateMeta {
                     raw_weight: hit.weight,
+                    weight_layer: Some(self.name.clone()),
                     ..Default::default()
                 },
                 natural_order: hit.order,
@@ -368,5 +375,118 @@ mod tests {
         );
         assert_eq!(r[0].text, "甲", "覆盖同权后按 natural_order 出现序");
         assert_eq!(r[1].text, "乙");
+    }
+
+    /// 反向对照的基线：**不配 `default_weight` 时，扩展库的高权重如实参与跨库取最大值**。
+    ///
+    /// 与下一条配对存在。只有基线在，才能说明下一条的「没生效」是 `default_weight` 造成的，
+    /// 而不是跨库合并本身没做——否则两种根因在测试上长得一模一样。
+    #[test]
+    fn cross_layer_max_weight_with_real_system_layers() {
+        let mut main = CodetableDict::empty();
+        main.merge_single("a".into(), "工".into(), 800, 0);
+        let mut ext = CodetableDict::empty();
+        ext.merge_single("a".into(), "工".into(), 9999, 0);
+
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            CachedDict::Memory(main),
+            "main",
+        )));
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            CachedDict::Memory(ext),
+            "ext",
+        )));
+
+        let r = dm.search("a", 10);
+        assert_eq!(r.len(), 1, "同 text 跨层合并成一条");
+        assert_eq!(r[0].weight, 9999, "扩展库的高权重应如实生效");
+        assert_eq!(
+            r[0].meta.raw_weight, 800,
+            "raw_weight 留的是首个出现层（主库）的库内原值，只有 weight 是跨层继承的——\
+             排查时若只看 raw_weight 会误判成「扩展库权重没进来」"
+        );
+        assert_eq!(
+            r[0].meta.weight_layer.as_deref(),
+            Some("ext"),
+            "权重来源须随权重一起换到扩展库（悬停调试段据此显示 `权 9999 ←ext`）"
+        );
+    }
+
+    /// **`default_weight` 先抹平本库权重，再参与跨库取最大值。**
+    ///
+    /// 这是「扩展词库明明权重更高却没生效」的一条真实路径：库文件里写着 9999，但
+    /// `[[dictionaries]].default_weight` 把整库压成了一个档位，参与比较的是那个档位。
+    /// 换一个没配该项的词库就复现不出来——正是「同一版本、有人中招有人没有」的成因之一。
+    ///
+    /// 与归一化的分工别搞混：`weight_spec` 是**保序压缩**（不颠倒库内高低），
+    /// `default_weight` 是**抹平**（库内高低全部消失）。
+    #[test]
+    fn default_weight_flattens_before_cross_layer_max() {
+        let mut main = CodetableDict::empty();
+        main.merge_single("a".into(), "工".into(), 800, 0);
+        let mut ext = CodetableDict::empty();
+        ext.merge_single("a".into(), "工".into(), 9999, 0); // 库里权重远高于主库
+
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            CachedDict::Memory(main),
+            "main",
+        )));
+        dm.register_layer(Box::new(
+            SystemDictLayer::new(CachedDict::Memory(ext), "ext").with_default_weight(Some(100)),
+        ));
+
+        let r = dm.search("a", 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r[0].weight, 800,
+            "扩展库配了 default_weight=100，参与比较的是 100 而非词条原值 9999，\
+             故主库的 800 胜出"
+        );
+        assert_eq!(
+            r[0].meta.weight_layer.as_deref(),
+            Some("main"),
+            "主库胜出时来源标注须留在主库——标错会把排查引向扩展库"
+        );
+    }
+
+    /// 禁用的扩展库**完全不参与** max：关掉后回退到剩余启用库，开回来即恢复。
+    /// 与 composite 层的同名语义同轴，这里用真实 `SystemDictLayer` 再验一遍——
+    /// 层的 `enabled` 是它自己的原子标志，composite 的 mock 层验不到这份实现。
+    #[test]
+    fn disabled_system_layer_excluded_from_cross_layer_max() {
+        let mut main = CodetableDict::empty();
+        main.merge_single("a".into(), "工".into(), 800, 0);
+        let mut ext = CodetableDict::empty();
+        ext.merge_single("a".into(), "工".into(), 9999, 0);
+
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            CachedDict::Memory(main),
+            "main",
+        )));
+        // 扩展库初始即关闭（对齐方案配置 enabled=false 的加载路径）。
+        dm.register_layer(Box::new(SystemDictLayer::with_enabled(
+            CachedDict::Memory(ext),
+            "ext",
+            false,
+        )));
+
+        assert_eq!(
+            dm.search("a", 10)[0].weight,
+            800,
+            "扩展库关闭时不得把 9999 带进来"
+        );
+        assert!(dm.set_layer_enabled("ext", true));
+        assert_eq!(dm.search("a", 10)[0].weight, 9999, "开启后即时生效");
+        assert!(dm.set_layer_enabled("ext", false));
+        let back = dm.search("a", 10);
+        assert_eq!(back[0].weight, 800, "再关掉应回退，不留残值");
+        assert_eq!(
+            back[0].meta.weight_layer.as_deref(),
+            Some("main"),
+            "来源标注须跟着回退，不得残留已关闭的 ext"
+        );
     }
 }

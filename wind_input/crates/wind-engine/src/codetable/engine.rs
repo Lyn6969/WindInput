@@ -342,6 +342,10 @@ impl Engine for CodeTableEngine {
                     // 简码字在此被吃掉：打 `siv` 时「档」已由精确循环以 code="siv" 入列，
                     // 这条 code="sivg" 的同字条目被丢弃 —— 但 sivg 码位确实被一个常用字占着，
                     // 该事实必须留给「检索范围」过滤，否则同码位的生僻字（桜）会当孤儿码放行。
+                    //
+                    // ⚠️ **不要在此继承被丢弃那条的权重**：它是另一个码位的词条（这里丢的
+                    // 正是 code 更长的那条），权重属于 `(code, text)` 而非「字」。曾经加过，
+                    // 结果让精确候选带上了全码条目的权重——见 `merge_search` 里同一条原则。
                     candidates[idx].absorb_codes_from(&c);
                     continue;
                 }
@@ -638,6 +642,82 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    /// 双词库夹具：主库 + 扩展库各一层，返回引擎与 `DictManager`（后者用于热启停扩展库）。
+    fn engine_two_dicts(
+        main: &[(&str, &str, i32)],
+        ext: &[(&str, &str, i32)],
+    ) -> (CodeTableEngine, Arc<DictManager>) {
+        let build = |entries: &[(&str, &str, i32)]| {
+            let mut d = CodetableDict::empty();
+            for (i, (code, text, w)) in entries.iter().enumerate() {
+                d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+            }
+            CachedDict::Memory(d)
+        };
+        let dm = Arc::new(DictManager::new());
+        dm.register_layer(Box::new(SystemDictLayer::new(build(main), "main")));
+        dm.register_layer(Box::new(SystemDictLayer::new(build(ext), "ext")));
+        let e = CodeTableEngine::new(4, CommitOptions::default(), dm.clone());
+        (e, dm)
+    }
+
+    /// ★★★ 跨词库同词条合并的主键是 `(code, text)`，不是 `text`。
+    ///
+    /// ① 两库收录**同一条**（码相同）→ 按最高权重算，这是「多个词库有同一个 code+词、
+    ///    权重不同时以最高者为准」那条用户可见语义；关掉出该权重的库即回退。
+    /// ② 两库里该词**码不同** → 那是**两个词条**，权重各归各的码位，不得互相继承。
+    ///
+    /// ② 尤其要钉住：曾经按 text 无条件取 max，于是打 `a` 时精确候选「工」带上了扩展库
+    /// 全码 `ab` 那条的权重。码表方案里码长本身就是分档依据，简码条目凭空拿到全码条目的
+    /// 高权重会直接改掉首选。
+    ///
+    /// 两条必须并存：只有 ① 时，一个「无条件跨码位取 max」的实现照样全绿；只有 ② 时，
+    /// 一个「永不继承」的实现也全绿。
+    #[test]
+    fn cross_dict_weight_merges_by_code_and_text() {
+        // ① 同码：主库 100 / 扩展库 5000 → 取 5000，来源标注指向扩展库。
+        let (e, dm) = engine_two_dicts(&[("a", "工", 100)], &[("a", "工", 5000)]);
+        let pick = |e: &CodeTableEngine| {
+            e.convert("a", 50)
+                .unwrap()
+                .candidates
+                .into_iter()
+                .find(|c| c.text == "工")
+                .expect("应有候选「工」")
+        };
+        let gong = pick(&e);
+        assert_eq!(gong.weight, 5000, "同一词条被两库收录时按最高权重算");
+        assert_eq!(
+            gong.meta.weight_layer.as_deref(),
+            Some("ext"),
+            "权重来源须标为扩展库，否则调试段会把它记在主库头上"
+        );
+
+        // 关掉扩展库 → 回退到主库权重，来源标注一并回退（不得残留 ext）。
+        assert!(dm.set_layer_enabled("ext", false));
+        let gong_off = pick(&e);
+        assert_eq!(gong_off.weight, 100, "扩展库关闭后回退到主库权重");
+        assert_eq!(gong_off.meta.weight_layer.as_deref(), Some("main"));
+
+        // ② 异码：主库简码 a(100)、扩展库全码 ab(5000)，打 `a`。
+        let (e2, _) = engine_two_dicts(&[("a", "工", 100)], &[("ab", "工", 5000)]);
+        let gong2 = pick(&e2);
+        assert_eq!(gong2.code, "a", "打 a 命中的是简码那条");
+        assert_eq!(
+            gong2.weight, 100,
+            "权重须是简码 `a` 自己的 100——`ab` 是另一个词条，它的 5000 不得漂过来"
+        );
+        assert_eq!(
+            gong2.meta.weight_layer.as_deref(),
+            Some("main"),
+            "来源仍是主库：权重压根没换过"
+        );
+        assert!(
+            gong2.merged_codes.iter().any(|c| c == "ab"),
+            "被丢弃那条的**码位**仍要并入（检索范围过滤依赖它）——不继承的是权重，不是码位"
+        );
     }
 
     fn engine_opts(entries: &[(&str, &str, i32)], opts: CommitOptions) -> CodeTableEngine {
