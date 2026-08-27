@@ -1269,7 +1269,8 @@ impl Coordinator {
         // 清在这里等于只清一半；改由 `schema_generation` 代际校验统一失效，
         // 见 `Coordinator::schema_toggle_origin` 的字段说明。
         self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
-        self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
+        // 注释库**刻意不在此同步**：挂载集合与方案无关（`schemas` 白名单已下移到
+        // `comment_of` 的查询期求值），切方案不改变该挂载什么。见 `sync_comment_dicts`。
         self.invalidate_aux_code_table(); // 辅助码表各方案不同，切方案必须重挂（见函数注释）
         // ── 归位到「能用新方案打字」的状态：无条件，不受任何配置门控 ──────────────
         //

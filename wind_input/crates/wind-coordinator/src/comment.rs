@@ -43,6 +43,20 @@
 //! 出现 tooltip 自己的逐字 `[拼音]` 段和追加的那份，等于把重复做实了。悬停提示现回归由
 //! `ui.tooltip.*` 独家负责。
 //!
+//! # 三层：模式级 → 方案级 → 全局
+//!
+//! | 层 | 落点 |
+//! |---|---|
+//! | 模式级 | `input.{temp_english,temp_pinyin,url}` / `schema.mix_modes[]` / 方案文件 `[overlay]` |
+//! | 方案级 | 方案文件 `[candidate].comment_template_*` |
+//! | 全局 | `ui.candidate.comment_template_*` |
+//!
+//! 上两层是三态（键缺失=跟随下一层／非空=覆盖／空串=本层不显示注释），最底层必有值。
+//! 决策点 [`resolve_template`]，与 `layout::vertical_for` 同构。
+//!
+//! ★ **「没意见」的语义是「跟随下一层」而不是「跟随全局」**——加了方案层之后这两者
+//! 不再等价。设计与判据见 `docs/design/candidate-comment-layering.md`。
+//!
 //! # 为什么装配收在协调器
 //!
 //! 变量的数据源分属多个 crate —— `Candidate::comment`（wind-engine 产）、候选自身的
@@ -388,24 +402,79 @@ pub(crate) fn template_for<'a>(
     }
 }
 
+/// 方案级注释模板（`[candidate].comment_template_*`）。`None` = 本方案没意见。
+pub(crate) fn schema_template_of(
+    behavior: &wind_config::SchemaBehavior,
+    vertical: bool,
+) -> Option<&str> {
+    if vertical {
+        behavior.comment_template_vertical.as_deref()
+    } else {
+        behavior.comment_template_horizontal.as_deref()
+    }
+}
+
+/// 三层裁决：**模式级 → 方案级 → 全局**。
+///
+/// # ★ 「没意见」的语义是「跟随**下一层**」，不是「跟随全局」
+///
+/// 加了方案层之后这两者不再等价。唯一能区分本实现与旧的两层实现的格子是
+/// **「模式无意见 + 方案有意图 + 全局有值」**——旧实现给全局值，本实现给方案值。
+/// 测试 `schema_layer_wins_when_mode_absent` 钉住它。
+///
+/// 三态里的第三态（空串 = 不显示）**在每一层都成立**：`Some("")` 是一个有意见的层，
+/// 它压过下面所有层并渲染成空注释。故这里只能用 `Option::or`，不能顺手写成
+/// 「非空才算数」——那会让「本模式/本方案不要注释」变得无法表达。
+pub(crate) fn resolve_template<'a>(
+    mode: Option<&'a str>,
+    schema: Option<&'a str>,
+    global: &'a str,
+) -> &'a str {
+    mode.or(schema).unwrap_or(global)
+}
+
 impl crate::coordinator::Coordinator {
-    /// 当前生效的注释模板：模式级覆盖优先，无覆盖则取全局同方向那份。
+    /// 当前生效的注释模板：模式级 → 方案级 → 全局，见 [`resolve_template`]。
     ///
-    /// 借用 `cfg` 而非返回 String——它每次按键、每页候选前调一次，没必要为此分配。
+    /// 借用而非返回 String——它每次按键、每页候选前调一次，没必要为此分配。
+    ///
+    /// # ★ 方案层由调用方传入，而不是在这里取
+    ///
+    /// 方案级模板住在方案文件里，只能经 `EngineManager::active_behavior()` 拿到一个临时
+    /// `Arc<SchemaBehavior>`——借用它的 `&str` 活不过本函数。调用方（`notify_ui_update`）
+    /// 在候选循环外取一次存局部变量，模板借用它。
+    ///
+    /// ⛔ **不要改成把方案段快照进 `State`**（`[overlay]` 那份是那么做的）：快照要有失效点，
+    /// 而 `schema_generation` **不随 `invalidate_schema` 递增**（设置页改 `schema_overrides`
+    /// 不 bump 代际）⇒ 用户在设置页改完方案级模板，代际没变、快照不刷新，表现正是本仓
+    /// 反复栽的「设置了不生效、重启后生效」。`behavior_cache` 则已在 `invalidate_schema`
+    /// 里被清，每次现取才是对的。
+    ///
+    /// # ★ 方案层归属取 active，不取 `effective_data_schema`
+    ///
+    /// 注释模板是**呈现类**配置，与 `[candidate].layout` 同源取 active。临英/临拼/mix 的
+    /// 注释需求**已经由模式层表达**，方案层再按 effective 解析一次就是两层说同一件事，
+    /// 且两者可以互相矛盾。（注释**库**的过滤是数据类，另见 `ReverseLookup::comment_of`。）
     pub(crate) fn comment_template_for<'a>(
         &self,
         cfg: &'a Config,
         state: &'a State,
+        behavior: &'a wind_config::SchemaBehavior,
         vertical: bool,
     ) -> &'a str {
-        template_for(cfg, state.overlay_spec.as_ref(), state.active, vertical)
-            .unwrap_or_else(|| cfg.ui.candidate.comment_template(vertical))
+        resolve_template(
+            template_for(cfg, state.overlay_spec.as_ref(), state.active, vertical),
+            schema_template_of(behavior, vertical),
+            cfg.ui.candidate.comment_template(vertical),
+        )
     }
 
     /// 渲染该候选的注释段。`vertical` 决定用哪份模板。
     ///
     /// `reverse` 由调用方在候选循环**外**取一次读锁传入——每条候选各取一次锁在满页 9 条
     /// × 每次按键的频率下是不必要的争用。
+    /// `dict_schema` = 注释库白名单（`[[ui.comment_dicts]].schemas`）的求值作用域，
+    /// 由调用方按 `effective_data_schema` 解析一次传入。
     pub(crate) fn comment_for(
         &self,
         c: &Candidate,
@@ -413,9 +482,10 @@ impl crate::coordinator::Coordinator {
         max_chars: usize,
         reverse: &wind_reverse::ReverseLookup,
         pinyin_hint: bool,
+        dict_schema: &str,
     ) -> String {
         render(tpl, max_chars, |name, arg| {
-            self.eval_var(name, arg, c, reverse, pinyin_hint)
+            self.eval_var(name, arg, c, reverse, pinyin_hint, dict_schema)
         })
     }
 
@@ -514,7 +584,10 @@ impl crate::coordinator::Coordinator {
             "chaizi_code" if single => reverse.chaizi_code_of(text),
             "chaizi_code" => String::new(),
             "chaizi_all" => reverse.radicals_of(text, arg.unwrap_or(" ")),
-            "dict" => reverse.comment_of(text, None),
+            // 作用域取活跃方案：本入口（cmdbar `dict.rev`）是**低频**路径，就地取一次
+            // 比给整条求值链加一个参数划算；且它没有候选身份，也就没有临英那种
+            // 「数据归 english 桶」的语境可言。
+            "dict" => reverse.comment_of(text, None, &self.engine_mgr.active_schema_id()),
             _ => return None,
         })
     }
@@ -548,6 +621,7 @@ impl crate::coordinator::Coordinator {
         c: &Candidate,
         reverse: &wind_reverse::ReverseLookup,
         pinyin_hint: bool,
+        dict_schema: &str,
     ) -> Option<String> {
         // 判据是 `chars().count()` 而非 `len()`：扩展区汉字走代理对，按字节数会被当成词组。
         let single = c.text.chars().count() == 1;
@@ -597,7 +671,11 @@ impl crate::coordinator::Coordinator {
             // 用户挂载的注释词库（`[[ui.comment_dicts]]`）。键是**词**，故一份库可跨方案复用；
             // 候选自身的 `code` 作可选消歧（注释库声明了 code 列时才生效，跨方案对不上则
             // 回落该词首条，见 `ReverseLookup::comment_of`）。
-            "dict" => reverse.comment_of(&c.text, Some(&c.code)),
+            // 注释库的 `schemas` 白名单在**查询时**求值，作用域取 `dict_schema`
+            // （由调用方按 `effective_data_schema` 解析）：注释库是**数据类**资源，
+            // 归属与词频/短语同源——临英下要按 `english` 查，而不是主方案。
+            // 这与注释**模板**取 active（呈现类）刻意不同，见 `comment_template_for`。
+            "dict" => reverse.comment_of(&c.text, Some(&c.code), dict_schema),
             _ => return None,
         })
     }
@@ -734,6 +812,69 @@ mod mode_template_tests {
             None,
             "快照为 None 时不该 panic，跟随全局"
         );
+    }
+
+    /// ★ 方案层**不得**影响 `template_for` 本身——它只回答「模式怎么想」。
+    ///
+    /// 与 `layout::intent_for_answers_mode_layer_only` 同一条：分层的意义在于每层各答各的。
+    /// 若图省事把方案意图折进 `template_for`，「模式没意见」与「模式没意见但方案有意见」
+    /// 就再也分不开，将来想在两者之间插一层（如运行时手动值）便无处可插。
+    #[test]
+    fn template_for_answers_mode_layer_only() {
+        let c = base_cfg();
+        // 参数表里压根没有方案层，签名本身就是这条约束的载体；这里钉住「无模式 = None」，
+        // 使「顺手在 None 分支里读方案」的改动当场变红。
+        assert_eq!(template_for(&c, None, None, true), None);
+        assert_eq!(template_for(&c, None, None, false), None);
+    }
+}
+
+#[cfg(test)]
+mod schema_layer_tests {
+    //! 三层裁决（模式 → 方案 → 全局）的纯函数矩阵。端到端接线另见
+    //! `coordinator::mode_comment_e2e_tests`。
+    use super::*;
+
+    fn behavior(v: Option<&str>, h: Option<&str>) -> wind_config::SchemaBehavior {
+        wind_config::SchemaBehavior {
+            comment_template_vertical: v.map(str::to_string),
+            comment_template_horizontal: h.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// ★★★ 唯一能区分三层与两层实现的格子。
+    #[test]
+    fn schema_layer_wins_when_mode_absent() {
+        assert_eq!(resolve_template(None, Some("方案"), "全局"), "方案");
+    }
+
+    #[test]
+    fn mode_layer_wins_over_schema() {
+        assert_eq!(resolve_template(Some("模式"), Some("方案"), "全局"), "模式");
+    }
+
+    #[test]
+    fn global_applies_only_when_no_layer_has_opinion() {
+        assert_eq!(resolve_template(None, None, "全局"), "全局");
+    }
+
+    /// ★★ 空串在**每一层**都是「有意见」，压过下面所有层。
+    ///
+    /// 写成「非空才算数」的话，「本方案/本模式不要注释」就再也无法表达——
+    /// 而那正是这套三态最主要的用途。
+    #[test]
+    fn empty_string_is_an_opinion_at_every_layer() {
+        assert_eq!(resolve_template(None, Some(""), "全局"), "");
+        assert_eq!(resolve_template(Some(""), Some("方案"), "全局"), "");
+    }
+
+    /// 横竖各自独立三态：只覆盖竖排、横排跟随，是合法且常见的配置。
+    #[test]
+    fn schema_directions_are_independent() {
+        let b = behavior(Some("方案竖"), None);
+        assert_eq!(schema_template_of(&b, true), Some("方案竖"));
+        assert_eq!(schema_template_of(&b, false), None);
     }
 }
 

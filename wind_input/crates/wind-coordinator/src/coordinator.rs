@@ -1120,9 +1120,10 @@ pub struct Coordinator {
         std::sync::RwLock<std::collections::HashMap<String, wind_quick_input::FormatAdjust>>,
     /// 拆字资产当前生效状态（库解析路径 / 已下发字根字体），reload 变更检测用。
     pub(crate) chaizi_assets: Mutex<ChaiziAssets>,
-    /// 注释词库当前生效的解析路径列表（顺序即优先级），reload 变更检测用。
-    /// 见 `sync_comment_dicts`。
-    pub(crate) comment_dict_paths: Mutex<Vec<std::path::PathBuf>>,
+    /// 注释词库当前生效的 `(解析路径, 适用方案白名单)` 列表（顺序即优先级），
+    /// reload 变更检测用。白名单也进变更判据——只比路径的话，用户改完「适用方案」
+    /// 会因「路径没变」被判成空操作，表现是「改了要重启才生效」。见 `sync_comment_dicts`。
+    pub(crate) comment_dict_paths: Mutex<Vec<(std::path::PathBuf, Vec<String>)>>,
     /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
     pub(crate) pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
@@ -2908,15 +2909,21 @@ impl Coordinator {
     }
 
     /// 同步注释词库（`[[ui.comment_dicts]]`）到反查表：解析路径列表，与上次生效的比对，
-    /// **变了才重载**。调用点=启动、reload_user_config、切方案（switch/cycle）。
+    /// **变了才重载**。调用点=启动、reload_user_config。
     ///
-    /// 变更检测比的是**解析后的路径序列**（含顺序）而非配置结构：顺序即优先级，调换两个库
-    /// 的位置必须触发重载；而只改 `label` 这类不影响加载的字段则不该重载。有了 `.wcmt`
-    /// 缓存，重载本身只是重开 mmap，但切方案是高频操作，能不动就不动。
+    /// 变更检测比的是**解析后的 `(路径, 适用方案)` 序列**（含顺序）而非配置结构：顺序即
+    /// 优先级，调换两个库的位置必须触发重载；而只改 `label` 这类不影响加载的字段则不该重载。
     ///
-    /// **按活跃方案过滤**（`schemas` 字段，留空=全部）：一份大英汉词典挂在五笔方案上，
-    /// 每次输入都要多走一次注定查不到的二分。方案专属的库因此只在其方案下加载 ——
-    /// 这也是切方案要调本函数的原因。
+    /// # ★ 挂载**不按方案过滤**——`schemas` 是查询期判据
+    ///
+    /// 早先这里按 `active_schema_id()` 筛挂载集合，于是切方案就要重挂 mmap（成本几乎全在
+    /// 「读整份源文件算内容指纹」），而且判据本身是错的：临英背后是硬编码的 `english`
+    /// 方案，`schemas = ["english"]` 在五笔方案下永远挂不上。
+    ///
+    /// 现在白名单随 spec 一起交给 `ReverseLookup`，在 `comment_of` 查询时求值（见
+    /// [`wind_reverse::ReverseLookup::comment_of`]）。挂载集合于是只跟**配置**走、
+    /// 不随方案抖动 ⇒ **切方案不再需要调本函数**。mmap 的常驻内存与库大小无关，
+    /// 挂载全集的代价只是启动时每库一次指纹校验。
     ///
     /// 路径**以 `schemas/` 为基准**解析（`resolve_schema_resource`，用户目录优先、回落安装
     /// 目录），与拆字库、字根字体这些方案附属资源同一规则 —— 注释库本就是同类东西：
@@ -2928,21 +2935,17 @@ impl Coordinator {
             let rt = self.rt();
             rt.config.ui.comment_dicts.clone()
         };
-        let active = self.engine_mgr.active_schema_id();
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
-        for s in specs
-            .iter()
-            .filter(|s| s.enabled && !s.path.is_empty() && s.applies_to(&active))
-        {
+        let mut paths: Vec<(std::path::PathBuf, Vec<String>)> = Vec::new();
+        for s in specs.iter().filter(|s| s.enabled && !s.path.is_empty()) {
             match Config::resolve_schema_resource(data_dir.as_deref(), &s.path) {
                 // 按**解析后路径**去重：两条 spec 写不同的相对路径却指向同一个文件时
                 // （`a.dict.yaml` 与 `./a.dict.yaml`，或用户目录与安装目录同名文件都被
                 // 解析到同一处），只加载一次。重复加载除了浪费解析时间，还会让优先级
                 // 判定变得依赖「第几次出现」——去重后靠前那条恒胜出。
-                Some(p) if paths.contains(&p) => {
+                Some(p) if paths.iter().any(|(q, _)| *q == p) => {
                     info!("注释词库重复挂载，已跳过: {} (id={})", p.display(), s.id)
                 }
-                Some(p) => paths.push(p),
+                Some(p) => paths.push((p, s.schemas.clone())),
                 // 只 warn 不中断：一个库路径写错不该让其余库一起不加载。
                 None => warn!(
                     "注释词库不存在（用户/安装目录均未找到）: {} (id={})",
@@ -3059,10 +3062,9 @@ impl Coordinator {
                     self.engine_mgr.reload_from_config(&new_cfg);
                     // 主码表可能变更：拆字库/字根字体随之切换（变更检测，未变不动）。
                     self.sync_chaizi_assets();
-                    // 再同步一次注释库：上面那次用的是**重建前**的活跃方案，而重建可能换掉
-                    // 它（方案被删除、默认方案变更）。方案专属库（`schemas`）因此要在这里
-                    // 复核一遍——两次调用都有变更检测，未变的那次是空操作。
-                    self.sync_comment_dicts();
+                    // 注释库**不需要**在这里复核：它只跟 `[[ui.comment_dicts]]` 走，
+                    // 而那份配置在上面的非 schema_dirty 路径里已经同步过；方案集重建
+                    // 换掉活跃方案也不改变该挂载什么（`schemas` 是查询期判据）。
                     {
                         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         s.input_buffer.clear();
@@ -4452,8 +4454,19 @@ impl Coordinator {
         // 注释段（候选右侧灰字）模板，见 `crate::comment`。横竖各持一份、互不影响：
         // 两种排布的可用横向空间差一个数量级，能放什么本就不是同一个答案。
         // 模式级覆盖优先于全局（临英可只显示 ${dict}、临拼可整个关掉），见 `comment::template_for`。
+        // 方案级那一层住在方案文件里，只能取到临时 `Arc`——在候选循环外取一次存局部变量，
+        // 模板借用它（`comment_template_for` 的文档说明了为什么不快照进 State）。
+        let schema_behavior = self.engine_mgr.active_behavior();
+        let comment_vertical = self.desired_vertical(state);
         let comment_tpl =
-            self.comment_template_for(&rt.config, state, self.desired_vertical(state));
+            self.comment_template_for(&rt.config, state, &schema_behavior, comment_vertical);
+        // 注释段长度预算横竖各一份：横排全部候选共享一行宽度，竖排每行独占。
+        let comment_max = cand_cfg.comment_max_chars(comment_vertical);
+        // 注释**库**的 `schemas` 白名单作用域：与词频/短语同源取 `effective_data_schema`
+        // （临英归 english 桶）。⚠️ 与上面模板层取 active 刻意不同——库是数据、模板是呈现。
+        let comment_dict_schema = self
+            .effective_data_schema(state)
+            .unwrap_or_else(|| self.engine_mgr.active_schema_id());
         // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
         // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_in），
         // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
@@ -4508,9 +4521,10 @@ impl Coordinator {
                 let comment = self.comment_for(
                     c,
                     comment_tpl,
-                    cand_cfg.comment_max_chars,
+                    comment_max,
                     &reverse,
                     pinyin_hint,
+                    &comment_dict_schema,
                 );
                 // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
                 // （tooltip 各 provider 全关即真正为空，不显示气泡）。
@@ -6072,7 +6086,13 @@ impl Coordinator {
         if !c.code.is_empty() {
             parts.push(format!("码 {}", c.code));
         }
-        parts.push(format!("权 {}", c.weight));
+        // 权重后标出**贡献层**：跨词库同词合并时 weight 取各启用层的最大值，而 code 仍属
+        // 首个出现层，光看数字分不清它出自哪本词库。少了这一标注，「扩展词库权重没生效」
+        // 与「生效了但被别的排序维度盖过」在界面上长得一模一样。
+        parts.push(match &c.meta.weight_layer {
+            Some(layer) => format!("权 {} ←{layer}", c.weight),
+            None => format!("权 {}", c.weight),
+        });
         parts.push(format!("序 {}", c.natural_order));
         parts.push(format!("用 {count}次"));
         if c.has_shadow {
@@ -6094,10 +6114,39 @@ mod mode_comment_e2e_tests {
 
     /// 造协调器并把坐标预置成「已就绪」，使候选能立即下发。
     fn coord_with_ui(cfg: Config) -> (Arc<Coordinator>, std::sync::mpsc::Receiver<UiCommand>) {
-        let (c, rx) = Coordinator::new_headless_with_ui(cfg, None);
+        coord_with_ui_at(cfg, None)
+    }
+
+    /// 同上，但指定数据目录——方案级那一层住在方案文件里，没有 data_dir 就读不到。
+    fn coord_with_ui_at(
+        cfg: Config,
+        data_dir: Option<&std::path::Path>,
+    ) -> (Arc<Coordinator>, std::sync::mpsc::Receiver<UiCommand>) {
+        let (c, rx) = Coordinator::new_headless_with_ui(cfg, data_dir);
         *c.last_valid_caret.lock().unwrap() = (100, 200, 20);
         *c.composition_start.lock().unwrap() = (100, 200, true);
         (c, rx)
+    }
+
+    /// 写一个只声明注释模板的方案文件，返回它的 data_dir。
+    ///
+    /// ⚠️ **内置方案一项都不声明**（见 `short_code_yield` 那轮的结论），所以方案级路径
+    /// 出厂状态下走不到，夹具必须自造方案——拿 wubi86 当现成的只会得到一条恒绿的测试。
+    fn data_dir_with_schema(tag: &str, id: &str, candidate_section: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wind_cmt_schema_{}_{tag}", std::process::id()));
+        let schemas = dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(
+            schemas.join(format!("{id}.schema.toml")),
+            format!(
+                "[schema]\nid = \"{id}\"\nname = \"注释测试\"\n[engine]\ntype = \"codetable\"\n\
+                 [candidate]\n{candidate_section}\n"
+            ),
+        )
+        .unwrap();
+        dir
     }
 
     /// 直接驱动候选下发：造一条候选、进指定模式，然后走真实的 `notify_ui_update`。
@@ -6194,6 +6243,87 @@ mod mode_comment_e2e_tests {
             Some("全局码".to_string()),
             "退出模式后应自动算回全局，不依赖任何显式恢复"
         );
+    }
+
+    /// ★★★ 三层裁决的**唯一**判别格：模式无意见 + 方案有意图 + 全局有值。
+    ///
+    /// 两层实现（模式 → 全局）在这一格给「全局码」，三层实现给「方案码」。其余任何格子
+    /// 两种实现都同解——只测别的格子，把方案层整个删掉测试照样全绿。
+    ///
+    /// 同一个用例顺带钉住优先级方向：进模式后必须变回模式级那份，否则就是把方案层
+    /// 错插在了模式层之上。
+    #[test]
+    fn schema_layer_reaches_ui_and_mode_wins_over_it() {
+        let dir = data_dir_with_schema(
+            "wins",
+            "zz_cmt",
+            "comment_template_vertical = \"方案${code_hint}\"\n\
+             comment_template_horizontal = \"方案${code_hint}\"",
+        );
+        let mut cfg = cfg_with_templates();
+        cfg.schema.active = "zz_cmt".into();
+        cfg.input.temp_english.comment_template_vertical = Some("临英${code_hint}".into());
+        cfg.input.temp_english.comment_template_horizontal = Some("临英${code_hint}".into());
+        let (c, rx) = coord_with_ui_at(cfg, Some(&dir));
+
+        emit(&c, None);
+        assert_eq!(
+            last_comment(&rx),
+            Some("方案码".to_string()),
+            "模式没意见时必须落到方案层，而不是直接跳到全局"
+        );
+
+        emit(&c, Some(ModeKind::TempEnglish));
+        assert_eq!(
+            last_comment(&rx),
+            Some("临英码".to_string()),
+            "模式层排在方案层之上"
+        );
+
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 三态的第三态在**方案层**同样成立：空串 = 本方案不显示注释，不是「跟随全局」。
+    #[test]
+    fn schema_empty_template_hides_comment() {
+        let dir = data_dir_with_schema(
+            "empty",
+            "zz_cmt2",
+            "comment_template_vertical = \"\"\ncomment_template_horizontal = \"\"",
+        );
+        let mut cfg = cfg_with_templates();
+        cfg.schema.active = "zz_cmt2".into();
+        let (c, rx) = coord_with_ui_at(cfg, Some(&dir));
+
+        emit(&c, None);
+        assert_eq!(
+            last_comment(&rx),
+            Some(String::new()),
+            "方案层空串必须让本方案不显示注释，而不是回落全局"
+        );
+
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 方案没声明注释模板（**绝大多数方案的常态**，内置方案一项都不声明）时回落全局。
+    #[test]
+    fn schema_without_templates_follows_global() {
+        let dir = data_dir_with_schema("silent", "zz_cmt3", "layout = \"vertical\"");
+        let mut cfg = cfg_with_templates();
+        cfg.schema.active = "zz_cmt3".into();
+        let (c, rx) = coord_with_ui_at(cfg, Some(&dir));
+
+        emit(&c, None);
+        assert_eq!(
+            last_comment(&rx),
+            Some("全局码".to_string()),
+            "方案没意见就该跟随下一层（全局），不能被空 Option 渲染成空注释"
+        );
+
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

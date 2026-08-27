@@ -27,13 +27,13 @@ fn bench_comment_dict_load() {
     // 冷启：缓存目录为空，走解析 + 写盘
     let t0 = Instant::now();
     let mut rl = wind_reverse::ReverseLookup::default();
-    rl.reload_comments(std::slice::from_ref(&p), Some(&cache));
+    rl.reload_comments(&[(p.clone(), Vec::new())], Some(&cache));
     let cold = t0.elapsed();
 
     // 热启：缓存已在，走指纹校验 + mmap
     let t1 = Instant::now();
     let mut rl2 = wind_reverse::ReverseLookup::default();
-    rl2.reload_comments(std::slice::from_ref(&p), Some(&cache));
+    rl2.reload_comments(&[(p.clone(), Vec::new())], Some(&cache));
     let warm = t1.elapsed();
 
     let wcmt: u64 = std::fs::read_dir(&cache)
@@ -52,7 +52,7 @@ fn bench_comment_dict_load() {
     let mut hits = 0usize;
     for _ in 0..ROUNDS {
         for w in &probes {
-            if !rl2.comment_of(w, None).is_empty() {
+            if !rl2.comment_of(w, None, "").is_empty() {
                 hits += 1;
             }
         }

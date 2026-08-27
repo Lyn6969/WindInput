@@ -314,7 +314,7 @@ pub trait WebDataRpc: WebDataHost {
                 let ok = self.engine_mgr().switch_schema(str_param(params, "id")?);
                 if ok {
                     self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换
-                    self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
+                    // 注释库不随方案变化，见 `Coordinator::sync_comment_dicts`。
                 }
                 Ok(json!({ "ok": ok }))
             }

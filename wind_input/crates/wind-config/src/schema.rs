@@ -619,10 +619,31 @@ impl PunctIntent {
 ///
 /// 字段叫 `layout` 而不是 `candidate_layout`：段名已含 `candidate`，再写就是
 /// `candidate.candidate_layout`（违反 `config-design-rules` §R3 的路径冗余）。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// ## 注释模板：与 `[overlay]` 那两份**并存且语义不同**
+///
+/// 本段这两份是「本方案作为**常驻 active 方案**期间」的注释模板，
+/// [`OverlaySpec::comment_template_vertical`] 那两份是「本方案**被叠加激活期间**」的。
+/// 与 `layout` / `candidate_layout` 的并存关系完全同构——一个方案可以两段都写，
+/// 取值互不干扰。见 `docs/design/candidate-comment-layering.md` §1.2。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CandidateSpec {
     #[serde(default)]
     pub layout: crate::config::LayoutIntent,
+    /// 本方案的注释模板覆盖（竖排）。三态见 [`crate::config::CommentTemplateOverride`]：
+    /// 键缺失 = 跟随全局、非空 = 覆盖、空串 = 本方案不显示注释。
+    ///
+    /// 字段名与全局 `ui.candidate.comment_template_vertical`、与 `[overlay]` 同名字段
+    /// **逐字一致**：让「全局 / 方案 / 模式」在用户眼里是同一件事的三个层级，
+    /// 而不是三套发明出来的键名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: crate::config::CommentTemplateOverride,
+    /// 本方案的注释模板覆盖（横排）。见 [`Self::comment_template_vertical`]。
+    ///
+    /// 横竖**各自独立三态**：只覆盖竖排、横排仍跟随全局是合法且常见的配置
+    /// （竖排每行独占，横排全部候选共享一行宽度，能放什么本就不是同一个答案）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: crate::config::CommentTemplateOverride,
 }
 
 /// 方案级短语加载（`[phrases]` 段）。
@@ -674,6 +695,10 @@ fn default_true() -> bool {
 pub struct SchemaBehavior {
     pub punct: PunctIntent,
     pub candidate_layout: crate::config::LayoutIntent,
+    /// 方案级注释模板（竖排）。三态，见 [`CandidateSpec::comment_template_vertical`]。
+    pub comment_template_vertical: crate::config::CommentTemplateOverride,
+    /// 方案级注释模板（横排）。
+    pub comment_template_horizontal: crate::config::CommentTemplateOverride,
     pub phrases: PhrasesSpec,
 }
 
@@ -683,6 +708,8 @@ impl Schema {
         SchemaBehavior {
             punct: self.punct.mode,
             candidate_layout: self.candidate.layout,
+            comment_template_vertical: self.candidate.comment_template_vertical.clone(),
+            comment_template_horizontal: self.candidate.comment_template_horizontal.clone(),
             phrases: self.phrases.clone(),
         }
     }

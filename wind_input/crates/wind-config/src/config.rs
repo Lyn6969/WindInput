@@ -149,6 +149,16 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未随任何版本发布到用户手里（接进设置页的改动与本次迁移在同一个未发布版本内），
     // 且新旧默认值都是 "candidate"，能读到它的只有开发期配置。
     &["schema", "codetable", "frequency", "english_code_scope"],
+    // ⛔ `ui.candidate.comment_max_chars`（已拆成 `_vertical` / `_horizontal`）**刻意不登记**。
+    //
+    // 本清单的不变量是上一段那句「删掉不改变任何生效值」，而该键**仍在被读取**——
+    // [`Config::migrate_comment_max_chars_value`] 每次 load 都拿它补两个新键。
+    // 而 `prune_user_config` 是在**用户文件**上跑的（服务启动 D2 步），迁移只改**内存**、
+    // 从不落盘 ⇒ 登记进来的时序必然是「先把文件里的旧键删掉，下次启动再也迁不到」，
+    // 用户配的截断值静默归 0。
+    //
+    // ⇒ ★ 判据：**一个键只要还有值迁移在读它，就不能进本清单**；反过来，进本清单的前提是
+    // 它已经对生效值毫无影响。旧键留在用户文件里不算误导——它确实还在生效（经迁移）。
 ];
 
 /// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
@@ -3711,11 +3721,18 @@ pub struct UiCandidateConfig {
     /// **横排**候选的注释段模板。见 [`Self::comment_template_vertical`]。
     #[serde(default = "default_comment_template")]
     pub comment_template_horizontal: String,
-    /// 注释段的最大字数（0=不限），超出截断并加 `…`。
+    /// **竖排**注释段的最大字数（0=不限），超出截断并加 `…`。
     ///
     /// 默认 0：本项引入前注释段从无长度限制，非 0 的默认值会让存量用户的注释突然变短。
+    ///
+    /// 横竖各一份，与模板同理：横排全部候选共享一行宽度，竖排每行独占，长度预算差一个
+    /// 数量级。共用一份的话，为竖排放宽必然把横排也放宽。旧键 `comment_max_chars`
+    /// （横竖共用）已退役，值经 [`Config::migrate_comment_max_chars_value`] 抄进两份。
     #[serde(default)]
-    pub comment_max_chars: usize,
+    pub comment_max_chars_vertical: usize,
+    /// **横排**注释段的最大字数（0=不限）。见 [`Self::comment_max_chars_vertical`]。
+    #[serde(default)]
+    pub comment_max_chars_horizontal: usize,
     /// 自定义序号标签，一槽一项（如 `["a","s","d"]`、`["Ⅰ","Ⅱ","Ⅲ"]`；空表=全部默认 1-9）。
     ///
     /// **每槽是一个字符串而非一个字符**：序号标签本就有多字符形态（`(1)`、罗马数字、
@@ -3853,7 +3870,8 @@ impl Default for UiCandidateConfig {
             min_rows: 0,
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),
-            comment_max_chars: 0,
+            comment_max_chars_vertical: 0,
+            comment_max_chars_horizontal: 0,
             index_labels: Vec::new(),
             flip_when_above: false,
             swap_preedit_when_above: false,
@@ -3908,6 +3926,16 @@ impl UiCandidateConfig {
             &self.comment_template_vertical
         } else {
             &self.comment_template_horizontal
+        }
+    }
+
+    /// 当前排布对应的注释段最大字数（0=不限）。与 [`Self::comment_template`] 同构：
+    /// 取哪一份由排布决定，调用方不必各自 `if vertical`。
+    pub fn comment_max_chars(&self, vertical: bool) -> usize {
+        if vertical {
+            self.comment_max_chars_vertical
+        } else {
+            self.comment_max_chars_horizontal
         }
     }
 
@@ -4242,6 +4270,7 @@ impl Config {
         Self::migrate_enable_english_value(&mut merged);
         Self::migrate_force_vertical_value(&mut merged);
         Self::migrate_index_labels_value(&mut merged);
+        Self::migrate_comment_max_chars_value(&mut merged);
         Self::migrate_empty_code_behavior_value(&mut merged);
         let mut config: Config = merged.try_into()?;
         config.normalize();
@@ -4352,6 +4381,43 @@ impl Config {
         let n = split.len();
         cand.insert("index_labels".to_string(), toml::Value::Array(split));
         info!("Migrated ui.candidate.index_labels string → {n} 个槽位数组");
+    }
+
+    /// 存量迁移（**须在反序列化前**跑）：`ui.candidate.comment_max_chars`（横竖共用一份）
+    /// → `comment_max_chars_vertical` / `_horizontal` 各一份。
+    ///
+    /// 只在新键**缺失**时抄旧值：用户若已写了新键，那是更明确的意图，不该被旧键盖掉。
+    ///
+    /// ⛔ 旧键**不进** [`RETIRED_KEYS`]（理由见那份清单末尾）：本函数每次 load 都要读它，
+    /// 而那份清单是在用户文件上做删除、本函数只改内存 ⇒ 登记进去等于下次启动就迁不到了。
+    ///
+    /// ★ 这条迁移不可省：它是**非零默认**的键（默认 0=不限，但配过非 0 值的人正是在意
+    /// 长度的那批），不迁移的表现是「升级后注释突然不再截断」——而这类回归无人会报 bug，
+    /// 用户只会觉得候选栏变宽了。
+    fn migrate_comment_max_chars_value(merged: &mut toml::Value) {
+        let Some(cand) = merged
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("candidate"))
+            .and_then(|c| c.as_table_mut())
+        else {
+            return;
+        };
+        let Some(old) = cand
+            .get("comment_max_chars")
+            .and_then(toml::Value::as_integer)
+        else {
+            return;
+        };
+        let mut copied = Vec::new();
+        for k in ["comment_max_chars_vertical", "comment_max_chars_horizontal"] {
+            if !cand.contains_key(k) {
+                cand.insert(k.to_string(), toml::Value::Integer(old));
+                copied.push(k);
+            }
+        }
+        if !copied.is_empty() {
+            info!("Migrated ui.candidate.comment_max_chars={old} → {copied:?}");
+        }
     }
 
     /// 存量迁移（**须在反序列化前**跑，字段已从 [`QuickInputConfig`] 移除）：
@@ -7039,6 +7105,68 @@ active = "x"
             cfg.ui.candidate.index_labels,
             vec!["a", "s", "d", "f"],
             "旧的单字符标签原样保留，用户无需重配"
+        );
+    }
+
+    /// ★ `comment_max_chars`（横竖共用）→ 两个方向各一份。配过非 0 值的用户升级后
+    /// 注释必须仍按原长度截断，否则表现是「候选栏莫名变宽」，无人会报 bug。
+    #[test]
+    fn migrate_comment_max_chars_copies_into_both_directions() {
+        let mut v: toml::Value =
+            toml::from_str("[ui.candidate]\ncomment_max_chars = 12\n").unwrap();
+        Config::migrate_comment_max_chars_value(&mut v);
+        let cand = v.get("ui").unwrap().get("candidate").unwrap();
+        assert_eq!(
+            cand.get("comment_max_chars_vertical").unwrap().as_integer(),
+            Some(12)
+        );
+        assert_eq!(
+            cand.get("comment_max_chars_horizontal")
+                .unwrap()
+                .as_integer(),
+            Some(12)
+        );
+
+        // 幂等：每次启动都跑一遍，第二次不得再改。
+        let before = v.clone();
+        Config::migrate_comment_max_chars_value(&mut v);
+        assert_eq!(v, before, "二次迁移须无变化");
+    }
+
+    /// 用户已显式写了新键时，旧键**不得**覆盖它——新键是更明确的意图。
+    ///
+    /// ⚠️ 同时钉住「只补缺失的那一侧」：只写了竖排的用户，横排仍该从旧键拿到值。
+    #[test]
+    fn migrate_comment_max_chars_keeps_explicit_new_keys() {
+        let mut v: toml::Value = toml::from_str(
+            "[ui.candidate]\ncomment_max_chars = 12\ncomment_max_chars_vertical = 30\n",
+        )
+        .unwrap();
+        Config::migrate_comment_max_chars_value(&mut v);
+        let cand = v.get("ui").unwrap().get("candidate").unwrap();
+        assert_eq!(
+            cand.get("comment_max_chars_vertical").unwrap().as_integer(),
+            Some(30),
+            "显式新键不被旧键盖掉"
+        );
+        assert_eq!(
+            cand.get("comment_max_chars_horizontal")
+                .unwrap()
+                .as_integer(),
+            Some(12),
+            "缺失的那一侧仍从旧键补齐"
+        );
+    }
+
+    /// ⛔ 旧键**不得**进 `RETIRED_KEYS`：它还在被值迁移读取，而那份清单是在**用户文件**上
+    /// 做删除、迁移只改内存 ⇒ 登记进去 = 下次启动再也迁不到，用户配的值静默归 0。
+    ///
+    /// 这条测试钉的是一个「顺手补上去就出事」的改动，故必须显式存在。
+    #[test]
+    fn retired_keys_excludes_keys_still_read_by_migration() {
+        assert!(
+            !RETIRED_KEYS.contains(&["ui", "candidate", "comment_max_chars"].as_slice()),
+            "comment_max_chars 仍被 migrate_comment_max_chars_value 读取，不能退役"
         );
     }
 

@@ -64,6 +64,22 @@ pub struct ReverseLookup {
 struct CommentSource {
     /// 源文件路径（**不是**缓存路径）：重载时用来认出「这个库我已经开着了」。
     src: std::path::PathBuf,
+    /// 适用方案 id 白名单（`[[ui.comment_dicts]].schemas`）；**空 = 全部方案**。
+    ///
+    /// # ★ 为什么过滤在这里而不在挂载层
+    ///
+    /// 早先由 `sync_comment_dicts` 按活跃方案筛选**挂载集合**，于是每次切方案都要重挂
+    /// mmap，而热路径成本几乎全在「读整份源文件算内容指纹」（百万条 ~39ms）。更要命的是
+    /// 挂载层拿不到正确的语境：临英背后是硬编码的 `english` 方案，按 `active_schema_id`
+    /// 筛的话 `schemas = ["english"]` 在五笔方案下永远挂不上。
+    ///
+    /// 下移到查询点后：挂载集合只跟**配置**走（不随方案抖动），白名单按**查询发生时**的
+    /// 语境求值，临英/overlay 一并正确。mmap 的常驻内存与库大小无关，挂载全集的代价只是
+    /// 启动时每库一次指纹校验——一次性，且不在按键路径上。
+    ///
+    /// ⇒ ★ 与既有判据同构：**过滤要尽量靠近消费点**。模板里不写 `${dict}` 就根本不调用
+    /// `comment_of`（零开销），任何挂载层的过滤都做不到这一点。
+    schemas: Vec<String>,
     body: CommentBody,
 }
 
@@ -78,6 +94,13 @@ enum CommentBody {
 }
 
 impl CommentSource {
+    /// 本库是否适用于给定方案。空白名单 = 全部；`schema` 为空串（语境未知）时一律放行。
+    ///
+    /// 空串放行而非拒绝，与 `CommentDictSpec::applies_to` 的「留空=全部」同一取舍：
+    /// 「到处都显示」比「哪都不显示」好查得多。
+    fn applies_to(&self, schema: &str) -> bool {
+        self.schemas.is_empty() || schema.is_empty() || self.schemas.iter().any(|s| s == schema)
+    }
     fn lookup_by_code(&self, text: &str, code: &str) -> Option<&str> {
         match &self.body {
             CommentBody::Mmap(r) => r.lookup_by_code(text, code),
@@ -647,12 +670,17 @@ fn comment_cache_path(cache_root: &Path, src: &Path) -> std::path::PathBuf {
 ///
 /// 源文件读不出来（路径错、无权限）返回 `None` —— 那是配置问题，应当跳过并告警，
 /// 而不是降级成一个空表让人以为「库里没这个词」。
-fn load_comment_source(src: &Path, cache_dir: Option<&Path>) -> Option<CommentSource> {
+fn load_comment_source(
+    src: &Path,
+    schemas: &[String],
+    cache_dir: Option<&Path>,
+) -> Option<CommentSource> {
     use wind_dict::{cache_fp, commentdict, reader_pool};
 
     let wrap = |body| {
         Some(CommentSource {
             src: src.to_path_buf(),
+            schemas: schemas.to_vec(),
             body,
         })
     };
@@ -705,10 +733,10 @@ fn parse_or_warn(src: &Path) -> Option<Vec<(String, String, String)>> {
 /// 「只删自己认识的文件」比「这个目录归我管所以可以递归删」安全一个量级。
 ///
 /// 正被本进程映射的文件删不掉（Windows），失败即跳过，下次再清。
-fn prune_comment_cache(cache_root: &Path, paths: &[std::path::PathBuf]) {
-    let keep: HashSet<std::path::PathBuf> = paths
+fn prune_comment_cache(cache_root: &Path, specs: &[(std::path::PathBuf, Vec<String>)]) {
+    let keep: HashSet<std::path::PathBuf> = specs
         .iter()
-        .map(|p| comment_cache_path(cache_root, p))
+        .map(|(p, _)| comment_cache_path(cache_root, p))
         .collect();
     let mut stack = vec![cache_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -812,27 +840,38 @@ impl ReverseLookup {
 
     /// 重载注释库（挂载列表变更 / 开关切换时热切换）；空列表清空并释放映射。
     ///
-    /// `paths` **按优先级升序**（先到先得）：同一个词在多个库里都有注释时，取靠前那个库的。
+    /// `specs` 是 `(源文件路径, 适用方案白名单)` 对——白名单只影响**查询**（见
+    /// [`CommentSource::schemas`]），挂载集合与方案无关，故切方案不再走本函数。
+    ///
+    /// 路径 **按优先级升序**（先到先得）：同一个词在多个库里都有注释时，取靠前那个库的。
     /// 路径由调用方解析（用户目录优先），与拆字/拼音表同一约定 —— 本 crate 不依赖
     /// wind-config，解析职责一律上提。
     ///
     /// `cache_dir` 是 `.wcmt` 缓存的存放目录（通常是 `<cache>/comments`）。传 `None`
     /// 则全部走内存（测试与无缓存环境）。每个源文件各自缓存、各自校验新鲜度，
     /// 增删一个库不牵动其他库。
-    pub fn reload_comments(&mut self, paths: &[std::path::PathBuf], cache_dir: Option<&Path>) {
+    pub fn reload_comments(
+        &mut self,
+        specs: &[(std::path::PathBuf, Vec<String>)],
+        cache_dir: Option<&Path>,
+    ) {
         // 先接管旧列表、构建完新的再让它析构：仍在新列表里的库直接原样搬过去，既省掉
         // 一次「读整份源文件算内容指纹」，也让映射不必解除重建。
         //
-        // 这条路径是切方案（`schemas` 字段）走的，属于高频交互：若每次都重新校验，挂了
-        // 一份十万条词典的用户每切一次方案就要多读几 MB —— 而那份库通常压根没变。
+        // 挂了一份十万条词典的用户，每次热重载都重新校验就要多读几 MB —— 而那份库
+        // 通常压根没变。
         let mut old = std::mem::take(&mut self.comments);
-        for p in paths {
+        for (p, schemas) in specs {
             if let Some(i) = old.iter().position(|s| s.src == *p) {
                 // 顺序无所谓：`old` 之后只用于按路径查找
-                self.comments.push(old.swap_remove(i));
+                let mut reused = old.swap_remove(i);
+                // ★ 复用的是**映射**，不是整份规格：只按 path 认领会让改过 `schemas` 的库
+                // 仍按旧白名单查——表现是「设置里改了适用方案，重启才生效」。
+                reused.schemas.clone_from(schemas);
+                self.comments.push(reused);
                 continue;
             }
-            match load_comment_source(p, cache_dir) {
+            match load_comment_source(p, schemas, cache_dir) {
                 Some(src) => {
                     tracing::info!(
                         "已加载注释库 {}：{} 条{}",
@@ -853,7 +892,7 @@ impl ReverseLookup {
         // 的文件删不掉）。
         drop(old);
         if let Some(dir) = cache_dir {
-            prune_comment_cache(dir, paths);
+            prune_comment_cache(dir, specs);
         }
     }
 
@@ -867,17 +906,21 @@ impl ReverseLookup {
     /// 第一个库有该词但 code 对不上时就会截胡，后面库里精确匹配的那条永远轮不到。
     ///
     /// 全都没命中且词含 ASCII 字母时，再按大小写变形重试一遍（见 [`case_fallbacks`]）。
-    pub fn comment_of(&self, text: &str, code: Option<&str>) -> String {
+    pub fn comment_of(&self, text: &str, code: Option<&str>, schema: &str) -> String {
+        // ★ 白名单过滤对三遍扫描**统一施加**：漏掉任何一遍，那条路径就会从被排除的库里
+        // 取出注释，表现为「限定了方案，可有些词还是显示别的方案的注释」——只在大小写
+        // 回退这类少数路径上出现，最难查。
+        let applicable = || self.comments.iter().filter(|s| s.applies_to(schema));
         if let Some(c) = code.filter(|c| !c.is_empty())
-            && let Some(hit) = self.comments.iter().find_map(|s| s.lookup_by_code(text, c))
+            && let Some(hit) = applicable().find_map(|s| s.lookup_by_code(text, c))
         {
             return hit.to_string();
         }
-        if let Some(hit) = self.comments.iter().find_map(|s| s.lookup_first(text)) {
+        if let Some(hit) = applicable().find_map(|s| s.lookup_first(text)) {
             return hit.to_string();
         }
         for v in case_fallbacks(text) {
-            if let Some(hit) = self.comments.iter().find_map(|s| s.lookup_first(&v)) {
+            if let Some(hit) = applicable().find_map(|s| s.lookup_first(&v)) {
                 return hit.to_string();
             }
         }
@@ -1352,8 +1395,12 @@ mod tests {
         )
     }
 
-    /// 把若干「库」各写成一个 `.dict.yaml`，返回路径列表（顺序即优先级）。
-    fn write_libs(tag: &str, libs: &[&[(&str, &str, &str)]]) -> (PathBuf, Vec<PathBuf>) {
+    /// 把若干「库」各写成一个 `.dict.yaml`，返回 `reload_comments` 用的 spec 列表
+    /// （顺序即优先级）。白名单一律留空 = 全部方案适用；要测白名单的用例自行改写。
+    fn write_libs(
+        tag: &str,
+        libs: &[&[(&str, &str, &str)]],
+    ) -> (PathBuf, Vec<(PathBuf, Vec<String>)>) {
         let dir = std::env::temp_dir().join(format!("wind_cmt_{}_{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1368,7 +1415,7 @@ mod tests {
                 }
                 let p = dir.join(format!("lib{i}.dict.yaml"));
                 std::fs::write(&p, s).unwrap();
-                p
+                (p, Vec::new())
             })
             .collect();
         (dir, paths)
@@ -1431,19 +1478,19 @@ mod tests {
             ]],
         );
         for (name, rl) in &both {
-            assert_eq!(rl.comment_of("行", Some("tfhh")), "háng 行列", "{name}");
-            assert_eq!(rl.comment_of("行", Some("tfhx")), "xíng 走路", "{name}");
+            assert_eq!(rl.comment_of("行", Some("tfhh"), ""), "háng 行列", "{name}");
+            assert_eq!(rl.comment_of("行", Some("tfhx"), ""), "xíng 走路", "{name}");
             assert_eq!(
-                rl.comment_of("行", Some("hang")),
+                rl.comment_of("行", Some("hang"), ""),
                 "háng 行列",
                 "{name} 码不匹配回落首条"
             );
-            assert_eq!(rl.comment_of("行", None), "háng 行列", "{name}");
-            assert_eq!(rl.comment_of("好", Some("vb")), "hǎo 美好", "{name}");
-            assert_eq!(rl.comment_of("你好", None), "hello", "{name}");
-            assert_eq!(rl.comment_of("𠮷", None), "扩展区汉字", "{name}");
-            assert_eq!(rl.comment_of("没有的词", None), "", "{name}");
-            assert_eq!(rl.comment_of("", None), "", "{name}");
+            assert_eq!(rl.comment_of("行", None, ""), "háng 行列", "{name}");
+            assert_eq!(rl.comment_of("好", Some("vb"), ""), "hǎo 美好", "{name}");
+            assert_eq!(rl.comment_of("你好", None, ""), "hello", "{name}");
+            assert_eq!(rl.comment_of("𠮷", None, ""), "扩展区汉字", "{name}");
+            assert_eq!(rl.comment_of("没有的词", None, ""), "", "{name}");
+            assert_eq!(rl.comment_of("", None, ""), "", "{name}");
         }
         drop(both);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1465,17 +1512,17 @@ mod tests {
         );
         for (name, rl) in &both {
             assert_eq!(
-                rl.comment_of("行", Some("tfhh")),
+                rl.comment_of("行", Some("tfhh"), ""),
                 "五笔专用",
                 "{name}：精确 code 必须越过靠前库的通用条目"
             );
             assert_eq!(
-                rl.comment_of("行", None),
+                rl.comment_of("行", None, ""),
                 "通用释义",
                 "{name}：无 code 时靠前库优先"
             );
             assert_eq!(
-                rl.comment_of("行", Some("hang")),
+                rl.comment_of("行", Some("hang"), ""),
                 "通用释义",
                 "{name}：都对不上 code 时回落靠前库首条"
             );
@@ -1496,7 +1543,7 @@ mod tests {
 
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
-        assert_eq!(rl.comment_of("甲", None), "旧释义");
+        assert_eq!(rl.comment_of("甲", None, ""), "旧释义");
         let wcmt = find_wcmt(&cache)
             .into_iter()
             .next()
@@ -1507,7 +1554,7 @@ mod tests {
         drop(rl);
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
-        assert_eq!(rl.comment_of("甲", None), "旧释义");
+        assert_eq!(rl.comment_of("甲", None, ""), "旧释义");
         assert_eq!(
             std::fs::metadata(&wcmt).unwrap().modified().unwrap(),
             stamp1,
@@ -1518,14 +1565,14 @@ mod tests {
         // rename 覆盖，但旧 view 会继续指向替换前的数据（见 reader_pool 的同名测试）。
         drop(rl);
         std::fs::write(
-            &paths[0],
+            &paths[0].0,
             "name: t\ncolumns:\n  - text\n  - comment\n  - code\n...\n甲\t新释义\t\n",
         )
         .unwrap();
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
         assert_eq!(
-            rl.comment_of("甲", None),
+            rl.comment_of("甲", None, ""),
             "新释义",
             "源文件改了必须读到新内容——恒新鲜的缓存表现为「改了不生效，重启也没用」"
         );
@@ -1550,19 +1597,19 @@ mod tests {
         let cache = dir.join("cache");
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
-        assert_eq!(rl.comment_of("甲", None), "全局库");
+        assert_eq!(rl.comment_of("甲", None, ""), "全局库");
 
         // 源文件消失（等价于「这次重载没有去读它」的可观测代理）
-        std::fs::remove_file(&paths[0]).unwrap();
+        std::fs::remove_file(&paths[0].0).unwrap();
 
         // 去掉第二个库，模拟切到不挂它的方案
         rl.reload_comments(&paths[..1], Some(&cache));
         assert_eq!(
-            rl.comment_of("甲", None),
+            rl.comment_of("甲", None, ""),
             "全局库",
             "未变动的库必须原样复用——一旦重新校验指纹，每次切方案都要重读整份源文件"
         );
-        assert_eq!(rl.comment_of("乙", None), "", "已卸载的库不再参与查询");
+        assert_eq!(rl.comment_of("乙", None, ""), "", "已卸载的库不再参与查询");
 
         drop(rl);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1580,8 +1627,8 @@ mod tests {
         // 只留第一个库：第二个的缓存应被清理，第一个的保留（不能连坐）
         rl.reload_comments(&paths[..1], Some(&cache));
         assert_eq!(find_wcmt(&cache).len(), 1, "已卸载库的缓存应被清掉");
-        assert_eq!(rl.comment_of("甲", None), "一号库", "保留库不受影响");
-        assert_eq!(rl.comment_of("乙", None), "");
+        assert_eq!(rl.comment_of("甲", None, ""), "一号库", "保留库不受影响");
+        assert_eq!(rl.comment_of("乙", None, ""), "");
 
         drop(rl);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1648,13 +1695,16 @@ mod tests {
         let head = "name: t\ncolumns:\n  - text\n  - comment\n...\n";
         std::fs::write(a.join("x.dict.yaml"), format!("{head}词\tA 库\n")).unwrap();
         std::fs::write(b.join("x.dict.yaml"), format!("{head}词\tB 库\n")).unwrap();
-        let paths = vec![a.join("x.dict.yaml"), b.join("x.dict.yaml")];
+        let paths = vec![
+            (a.join("x.dict.yaml"), Vec::new()),
+            (b.join("x.dict.yaml"), Vec::new()),
+        ];
         let cache = base.join("cache");
 
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
         assert_eq!(find_wcmt(&cache).len(), 2, "同名库须各自持有缓存");
-        assert_eq!(rl.comment_of("词", None), "A 库", "靠前的库优先");
+        assert_eq!(rl.comment_of("词", None, ""), "A 库", "靠前的库优先");
 
         drop(rl);
         let _ = std::fs::remove_dir_all(&base);
@@ -1677,32 +1727,128 @@ mod tests {
         );
         for (name, rl) in &both {
             // 小写词条 ← 各种输入形态
-            assert_eq!(rl.comment_of("apple", None), "n.苹果", "{name} 精确");
+            assert_eq!(rl.comment_of("apple", None, ""), "n.苹果", "{name} 精确");
             assert_eq!(
-                rl.comment_of("Apple", None),
+                rl.comment_of("Apple", None, ""),
                 "n.苹果",
                 "{name} 首字母大写→小写"
             );
-            assert_eq!(rl.comment_of("APPLE", None), "n.苹果", "{name} 全大写→小写");
-            // 大写缩写 ← 小写输入（单向 to_lowercase 在这里必失败）
-            assert_eq!(rl.comment_of("ABC", None), "字母表", "{name} 精确");
-            assert_eq!(rl.comment_of("abc", None), "字母表", "{name} 小写→全大写");
             assert_eq!(
-                rl.comment_of("Abc", None),
+                rl.comment_of("APPLE", None, ""),
+                "n.苹果",
+                "{name} 全大写→小写"
+            );
+            // 大写缩写 ← 小写输入（单向 to_lowercase 在这里必失败）
+            assert_eq!(rl.comment_of("ABC", None, ""), "字母表", "{name} 精确");
+            assert_eq!(
+                rl.comment_of("abc", None, ""),
+                "字母表",
+                "{name} 小写→全大写"
+            );
+            assert_eq!(
+                rl.comment_of("Abc", None, ""),
                 "字母表",
                 "{name} 首字母大写→全大写"
             );
             // 专名
             assert_eq!(
-                rl.comment_of("beijing", None),
+                rl.comment_of("beijing", None, ""),
                 "北京",
                 "{name} 小写→首字母大写"
             );
             // 中文与未命中
-            assert_eq!(rl.comment_of("好", None), "hǎo", "{name}");
-            assert_eq!(rl.comment_of("nosuchword", None), "", "{name}");
+            assert_eq!(rl.comment_of("好", None, ""), "hǎo", "{name}");
+            assert_eq!(rl.comment_of("nosuchword", None, ""), "", "{name}");
         }
         drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★★ `schemas` 白名单是**查询期**判据，不是挂载期判据。
+    ///
+    /// 判据必须同时问两件事：① 两个库**都挂上了**（过滤若还在挂载层，这一条就红）；
+    /// ② 查询按传入方案分流。只断言 ② 的话，「挂载时筛掉 + 查询时不筛」这种旧实现
+    /// 在单方案用例下照样绿。
+    #[test]
+    fn schema_whitelist_filters_at_query_time() {
+        let (dir, mut paths) =
+            write_libs("wl", &[&[("甲", "英文库", "")], &[("乙", "通用库", "")]]);
+        paths[0].1 = vec!["english".into()];
+        let cache = dir.join("cache");
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+
+        assert_eq!(rl.comments.len(), 2, "两个库都要挂上——过滤不在挂载层");
+        assert_eq!(rl.comment_of("甲", None, "english"), "英文库");
+        assert_eq!(
+            rl.comment_of("甲", None, "wubi86"),
+            "",
+            "白名单外的方案查不到这份库"
+        );
+        assert_eq!(
+            rl.comment_of("乙", None, "wubi86"),
+            "通用库",
+            "空白名单 = 全部方案"
+        );
+        assert_eq!(
+            rl.comment_of("甲", None, ""),
+            "英文库",
+            "语境未知（空串）时放行——「到处都显示」比「哪都不显示」好查"
+        );
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 白名单必须施加到**三遍扫描的每一遍**。
+    ///
+    /// 只在前两遍加过滤时，本用例的大小写回退那一遍会把被排除的库里的注释捞出来——
+    /// 表现是「限定了方案，可有些词还是显示别的方案的注释」，且只在英文大小写不一致时
+    /// 出现，是最难自查的那种漏。
+    #[test]
+    fn schema_whitelist_applies_to_case_fallback_scan() {
+        let (dir, mut paths) = write_libs("wl-case", &[&[("apple", "n.苹果", "")]]);
+        paths[0].1 = vec!["english".into()];
+        let cache = dir.join("cache");
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+
+        assert_eq!(
+            rl.comment_of("APPLE", None, "english"),
+            "n.苹果",
+            "本方案内回退照常"
+        );
+        assert_eq!(
+            rl.comment_of("APPLE", None, "wubi86"),
+            "",
+            "大小写回退那一遍同样受白名单约束"
+        );
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 复用旧映射时必须**更新白名单**：只按路径认领会让改过 `schemas` 的库继续按旧
+    /// 白名单查，表现是「设置里改了适用方案，重启才生效」。
+    #[test]
+    fn reload_refreshes_whitelist_on_reused_source() {
+        let (dir, mut paths) = write_libs("wl-reuse", &[&[("甲", "释义", "")]]);
+        paths[0].1 = vec!["english".into()];
+        let cache = dir.join("cache");
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(rl.comment_of("甲", None, "wubi86"), "", "先限定在 english");
+
+        // 同一个路径、只改白名单 ⇒ 必然走「复用旧映射」那条分支
+        paths[0].1.clear();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(
+            rl.comment_of("甲", None, "wubi86"),
+            "释义",
+            "复用的是映射而不是整份规格，白名单要当场跟上"
+        );
+
+        drop(rl);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1711,11 +1857,11 @@ mod tests {
     fn exact_case_wins_over_fallback() {
         let (dir, both) = rl_both("case-exact", &[&[("US", "美国", ""), ("us", "我们", "")]]);
         for (name, rl) in &both {
-            assert_eq!(rl.comment_of("US", None), "美国", "{name}");
-            assert_eq!(rl.comment_of("us", None), "我们", "{name}");
+            assert_eq!(rl.comment_of("US", None, ""), "美国", "{name}");
+            assert_eq!(rl.comment_of("us", None, ""), "我们", "{name}");
             // 两者都不精确匹配时才回退，此处 Us→us（lower 先于 upper）
             assert_eq!(
-                rl.comment_of("Us", None),
+                rl.comment_of("Us", None, ""),
                 "我们",
                 "{name} 回退顺序：小写在先"
             );
@@ -1742,7 +1888,7 @@ mod tests {
             &[&[("苹果", "先挂载", "")], &[("苹果", "后挂载", "")]],
         );
         for (name, rl) in &both {
-            assert_eq!(rl.comment_of("苹果", None), "先挂载", "{name}");
+            assert_eq!(rl.comment_of("苹果", None, ""), "先挂载", "{name}");
         }
         drop(both);
         let _ = std::fs::remove_dir_all(&dir);
