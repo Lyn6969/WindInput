@@ -551,8 +551,8 @@ impl Coordinator {
             return None;
         }
         debug!("key_actions: toggle_schema -> {id}");
-        self.toggle_schema_by_id(id, trigger_vk);
-        Some(KeyAction::StatusUpdate(self.build_status()))
+        let commit = self.toggle_schema_by_id(id, trigger_vk);
+        Some(self.schema_switch_key_action(commit))
     }
 
     /// 执行 C 类 `switch_schema`（单向）。锁约束同 [`Self::run_toggle_schema_action`]。
@@ -567,8 +567,8 @@ impl Coordinator {
             return None;
         }
         debug!("key_actions: switch_schema -> {id}");
-        self.switch_schema_by_id(id);
-        Some(KeyAction::StatusUpdate(self.build_status()))
+        let commit = self.switch_schema_by_id(id);
+        Some(self.schema_switch_key_action(commit))
     }
 
     /// 执行 A 类状态切换，转交 `dispatch_hotkey`（这批动作的既有单点）。
@@ -579,12 +579,14 @@ impl Coordinator {
     /// 分发端不认的动词返回 `None` 不吞键：白名单已在 `BoundAction::parse` 拦过一道，
     /// 走到这里还失败说明两处不同步，此时让键落回正常输入比静默吃掉好查。
     fn run_dispatch_action(&self, action: &str) -> Option<KeyAction> {
-        if !self.dispatch_hotkey(action) {
+        // `_keyed`：本函数在按键路径上，`toggle_mode` / `switch_engine` 的编码要经
+        // 本次按键应答回给宿主，不能走 `dispatch_hotkey` 的 push 出口（见其文档）。
+        let Some(act) = self.dispatch_hotkey_keyed(action) else {
             warn!("key_actions: 动作 {action} 未被 dispatch_hotkey 接受，不动作");
             return None;
-        }
+        };
         debug!("key_actions: dispatch {action}");
-        Some(KeyAction::StatusUpdate(self.build_status()))
+        Some(act)
     }
 
     /// A/C 两类「不建 overlay、只改全局状态」的动作的统一分流口。
@@ -671,8 +673,9 @@ impl Coordinator {
             //   同一个 bug 就只在其中一种配置下复现，报障时表现为「换个配法就不灵」。
             BoundKeyDecision::NotBound => {
                 if self.schema_toggle_key_authorized(key_code) {
-                    self.toggle_schema_by_id(&self.engine_mgr.active_schema_id(), key_code);
-                    return Some(KeyAction::StatusUpdate(self.build_status()));
+                    let commit =
+                        self.toggle_schema_by_id(&self.engine_mgr.active_schema_id(), key_code);
+                    return Some(self.schema_switch_key_action(commit));
                 }
                 None
             }

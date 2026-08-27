@@ -126,7 +126,13 @@ impl MessageHandler for Coordinator {
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
         info!("Menu command: {}", command);
         match command {
-            "toggle_mode" => self.handle_toggle_mode().0,
+            // 菜单/托盘无按键上下文：切换前那串编码经 push 出口交还宿主（有文本则上屏，
+            // 否则清掉宿主里残留的组合），与热键路径同一策略。
+            "toggle_mode" => {
+                let (status, commit) = self.toggle_mode_with_commit();
+                self.push_switch_commit(&commit);
+                status
+            }
             "toggle_width" => {
                 {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -157,7 +163,8 @@ impl MessageHandler for Coordinator {
                 Some(self.build_status())
             }
             "switch_engine" => {
-                self.cycle_schema();
+                let commit = self.cycle_schema();
+                self.push_switch_commit(&commit);
                 Some(self.build_status())
             }
             "toggle_s2t" => {
@@ -706,16 +713,19 @@ impl MessageHandler for Coordinator {
                 //
                 // trigger_vk 传 0：全局热键在所有方案里都生效，不需要「回程键临时授权」
                 // 那套（那是方案级绑定专有的问题，见 `schema_toggle_key_authorized`）。
-                self.toggle_schema_by_id(id, 0);
-                return KeyAction::StatusUpdate(self.build_status());
+                let commit = self.toggle_schema_by_id(id, 0);
+                return self.schema_switch_key_action(commit);
             } else if let Some(id) = action.strip_prefix("switch_schema:") {
                 // 方案直达热键：切 active 方案。**不判 chinese_mode**——与循环键
                 // (`switch_engine`) 同策略。切方案在英文态下同样该生效，否则切到英文方案后
                 // 这条路径就失效了，用户回不到中文方案。
-                self.switch_schema_by_id(id);
-                return KeyAction::StatusUpdate(self.build_status());
-            } else if self.dispatch_hotkey(&action) {
-                return KeyAction::StatusUpdate(self.build_status());
+                let commit = self.switch_schema_by_id(id);
+                return self.schema_switch_key_action(commit);
+            } else if let Some(act) = self.dispatch_hotkey_keyed(&action) {
+                // 按键上下文走 `_keyed`：`toggle_mode` / `switch_engine` 会动输入状态，
+                // 它们的编码要经本次按键应答交还宿主（`dispatch_hotkey` 那条只能 push，
+                // 而 push 的空文本清不掉组合）。
+                return act;
             }
         }
 

@@ -3,7 +3,7 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 //! 简繁、方案切换、主题切换、mix 融合模式、引擎方案叠加。
 
-use crate::coordinator::{Coordinator, SchemaToggleOrigin, State, ToggleLanding};
+use crate::coordinator::{Coordinator, SchemaToggleOrigin, State, SwitchCommit, ToggleLanding};
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;
@@ -532,7 +532,9 @@ impl Coordinator {
     /// 用户侧表现为「按了没反应」，而下次重启/热重载又莫名切了过去（真机现场见
     /// [`Self::switch_schema_by_id`] 的说明）。
     pub(crate) fn cmd_set_schema(&self, id: &str) {
-        self.switch_schema_by_id(id);
+        // 命令在独立线程跑，没有按键应答可搭，编码走 push 出口（同菜单）。
+        let commit = self.switch_schema_by_id(id);
+        self.push_switch_commit(&commit);
     }
 
     /// 循环切换主题并持久化；dir="prev" 向前，其余向后。返回新主题显示名。
@@ -572,8 +574,15 @@ impl Coordinator {
         // 不分开判就只能二选一。重选当前方案仍要走收尾（用户点它多半就是想归位中文）；
         // 加载失败则必须提示且**不写盘**——否则 `schema.active` 指向一个没生效的方案，
         // 下次重启又莫名切了过去（同 `cmd_set_schema` 栽过的次生撕裂）。
-        if self.engine_mgr.active_schema_id() == id || self.engine_mgr.switch_schema(&id) {
+        // 目标可加载性用 `ensure_schema` **先**问一遍，好让下面的编码处置只发生在真会
+        // 切过去的时候：加载失败时用户还留在原方案，凭什么把他正在打的码清掉/上屏。
+        if self.engine_mgr.active_schema_id() == id || self.engine_mgr.ensure_schema(&id) {
+            // ★ 必须早于 `switch_schema`：上屏记账取的是当前活跃方案。
+            let commit = self.take_input_on_schema_switch();
+            self.engine_mgr.switch_schema(&id); // 已是当前方案时返回 false，收尾照走（幂等分支）
             self.finish_user_schema_switch(&id, "Selected schema");
+            // 菜单/托盘无按键上下文，编码只能经 push 出口交还宿主。
+            self.push_switch_commit(&commit);
         } else {
             let name = self.engine_mgr.schema_name(&id);
             self.show_tip(&format!(
@@ -1004,7 +1013,7 @@ impl Coordinator {
         }
     }
 
-    pub(crate) fn cycle_schema(&self) {
+    pub(crate) fn cycle_schema(&self) -> SwitchCommit {
         // 「无处可去」（`available` 里没有别的方案）时**仍然收尾**，与
         // [`Self::switch_schema_by_id`] 的幂等分支同一判据：用户按的是切换键，意图是
         // 「用这个方案打字」，而英文半角态 / CapsLock 开着时需要发生的恰恰只剩收尾里
@@ -1012,14 +1021,21 @@ impl Coordinator {
         //
         // 空 id 时跳过：那说明连活跃方案都没有（引擎尚未装配），此时 finish 会把
         // `schema.active` 写成空串——配置从此指向一个不存在的方案。
+        //
+        // 判空改问 `active_schema_id`（而非 cycle 之后的 target）是为了让编码处置排在
+        // `EngineManager::cycle_schema` **之前**——它自己就会改活跃方案，切完再取，
+        // 上屏记账会落到新方案头上。两者恒等价：cycle 返回的 id 恒非空，target 为空
+        // 当且仅当活跃方案为空。
+        if self.engine_mgr.active_schema_id().is_empty() {
+            return SwitchCommit::default();
+        }
+        let commit = self.take_input_on_schema_switch();
         let target = self
             .engine_mgr
             .cycle_schema()
             .unwrap_or_else(|| self.engine_mgr.active_schema_id());
-        if target.is_empty() {
-            return;
-        }
         self.finish_user_schema_switch(&target, "Cycled to schema");
+        commit
     }
 
     /// 切到指定方案。方案直达热键（`keys.schema_hotkeys`）与直通命令
@@ -1059,20 +1075,35 @@ impl Coordinator {
     /// 判据：**修好一个动作的收尾之后，要回头看它有没有「提前返回」的分支绕过那段收尾。**
     /// 托盘 `select_schema` 当时同批改对了（`active == id || switch_schema(..)`），这里没有，
     /// 于是又成了一处入口漂移——两处现已同构。
-    pub(crate) fn switch_schema_by_id(&self, schema_id: &str) {
+    pub(crate) fn switch_schema_by_id(&self, schema_id: &str) -> SwitchCommit {
         if self.engine_mgr.active_schema_id() == schema_id {
+            // 幂等分支也处置编码：这把键的语义是「我要用这个方案打字」，处置与否不该
+            // 取决于活跃方案碰巧是不是它——同一个键有时清有时不清最难解释。
+            let commit = self.take_input_on_schema_switch();
             self.restore_state_for_same_schema();
-            return;
+            return commit;
         }
-        if self.engine_mgr.switch_schema(schema_id) {
-            self.finish_user_schema_switch(schema_id, "Switched to schema");
-        } else {
+        // 先问可加载性再动编码：加载失败时用户还留在原方案，那串码必须原封不动
+        // （清掉 = 凭空吞掉用户输入，而他看到的只是一个「加载失败」提示）。
+        if !self.engine_mgr.ensure_schema(schema_id) {
             let name = self.engine_mgr.schema_name(schema_id);
             self.show_tip(&format!(
                 "{}加载失败",
                 if name.is_empty() { schema_id } else { &name }
             ));
+            return SwitchCommit::default();
         }
+        // ★ 取值必须早于 `switch_schema`：上屏记账取的是**当前**活跃方案（见
+        // `take_input_on_schema_switch`）。
+        let commit = self.take_input_on_schema_switch();
+        if self.engine_mgr.switch_schema(schema_id) {
+            self.finish_user_schema_switch(schema_id, "Switched to schema");
+        } else {
+            // 走到这里说明 `ensure_schema` 之后 `switch_schema` 仍返回 false ——
+            // 它只剩「已是当前方案」这一个理由，而那已被上面的幂等分支接走。
+            warn!("switch_schema({schema_id}) 在 ensure 成功后仍失败，方案未切换");
+        }
+        commit
     }
 
     /// 方案往返热键（`keys.key_actions` 的 `toggle_schema:<id>`）：切到目标方案，
@@ -1096,7 +1127,7 @@ impl Coordinator {
     /// 「已在目标方案」时**不是**一律回程，而是先问「此刻还完好停在上次送达的落点上吗」：
     /// 代际不等 ⇒ 来源作废、不动作；落点整体不等 ⇒ 重新落地（来源保留）；相等 ⇒ 回程。
     /// 判据为什么这么分，见 [`Coordinator::schema_toggle_origin`] 的字段说明。
-    pub(crate) fn toggle_schema_by_id(&self, schema_id: &str, trigger_vk: u32) {
+    pub(crate) fn toggle_schema_by_id(&self, schema_id: &str, trigger_vk: u32) -> SwitchCommit {
         let current = self.engine_mgr.active_schema_id();
         // take 而非 clone：无论走哪个分支，这条记录都到此为止——要么用掉（回程），要么按
         // 新落点重写（去程/重新落地），要么作废。连按第三次不该又拿陈旧记录弹回去。
@@ -1111,19 +1142,19 @@ impl Coordinator {
                 // 无记录（刚启动）：**no-op**。不切走是刻意的——此时没有任何依据说明用户
                 // 想去哪，随便挑一个（如循环到下一个方案）会把「往返键」变成「随机跳转键」。
                 debug!("toggle_schema: 已在 {schema_id} 且无来源记录，不动作");
-                return;
+                // 「不动作」包括不碰编码：按了没反应时凭空清掉用户正在打的码更糟。
+                return SwitchCommit::default();
             };
             // 代际不等 = 期间用别的方式切过方案。来源已是几步之前的地方，作废且**不动作**
             // （记录已 take 掉、不写回）。理由同上：宁可这一按没反应，也不要把人随机送走。
             if rec.landing.generation != self.engine_mgr.schema_generation() {
                 debug!("toggle_schema: 来源已失效（期间切过方案），不动作");
-                return;
+                return SwitchCommit::default();
             }
             // 落点完好 ⇒ 回程。
             if rec.landing == self.toggle_landing() {
                 debug!("toggle_schema: 回程 -> {}", rec.origin);
-                self.switch_schema_by_id(&rec.origin);
-                return;
+                return self.switch_schema_by_id(&rec.origin);
             }
             // 方案没动过，但中英态或 CapsLock 被别的途径改了 ⇒ 落点被扰动：这把键退回本义
             // 「去目标」，重新落地一次；**来源保留**，再按一次仍回得去。
@@ -1133,17 +1164,18 @@ impl Coordinator {
             //   `finish_user_schema_switch` 的断言。故 `restore_state_for_same_schema` 必定
             //   真的翻转了什么，不会命中它那条「没有实际变化时完全静默」的早退。
             debug!("toggle_schema: 落点被扰动，重新落地 -> {schema_id}");
-            self.switch_schema_by_id(schema_id);
+            let commit = self.switch_schema_by_id(schema_id);
             self.record_schema_toggle_origin(rec.origin, trigger_vk);
-            return;
+            return commit;
         }
 
-        self.switch_schema_by_id(schema_id);
+        let commit = self.switch_schema_by_id(schema_id);
         // 切换失败（方案加载不了）时 active 未变，不该记来源——否则下次按会把用户
         // 送去一个他从未离开过的地方。
         if self.engine_mgr.active_schema_id() == schema_id {
             self.record_schema_toggle_origin(current, trigger_vk);
         }
+        commit
     }
 
     /// 取当前的落点快照。
@@ -1300,9 +1332,12 @@ impl Coordinator {
                 state.chinese_punct = true;
             }
         }
-        state.input_buffer.clear();
-        state.candidates.clear();
-        state.preedit.clear();
+        // 编码/候选的清理**不在这里**：它属于「上屏还是丢弃」这一策略，已前移到
+        // [`Self::take_input_on_schema_switch`]（三个调用方都在切之前调它，源码扫描
+        // 测试 `schema_switch_takes_input_before_finish` 守着这条）。在这里补一份裸
+        // `clear()` 会把那条策略变成两处真相：`commit_on_switch` 想上屏的那串码，
+        // 取出来之后又被这里清一次看不出问题，直到有人给 finish 加了第四个调用方、
+        // 而那条路没走 take —— 编码就静默丢了。
         drop(state);
         if caps_cancelled || to_chinese {
             self.record_app_mode(true);
@@ -2230,8 +2265,11 @@ mod schema_switch_finish_guard {
             );
             // 幂等分支**不能是裸 return**：要么与切换尝试共用一个条件（都落到 finish），
             // 要么单独做状态归位。两者都行，唯独「什么都不做」不行。
+            // 判据只认「幂等分支与切换尝试共用同一个条件」这半边（`active == id ||`）。
+            // 右半边写什么不参与——它已经从 `switch_schema` 换成 `ensure_schema`（为了把
+            // 编码处置插在真正切换之前），把实现细节写进守卫只会让守卫比被守的代码更脆。
             let idempotent_handled = body.contains("restore_state_for_same_schema")
-                || body.contains("active_schema_id() == id || self.engine_mgr.switch_schema(&id)");
+                || body.contains("active_schema_id() == id ||");
             assert!(
                 idempotent_handled,
                 "{name}: 「已是该方案」时既没归位也没走收尾 ⇒ 英文态/大写态下按方案热键\
@@ -2293,6 +2331,49 @@ mod schema_switch_finish_guard {
             assert!(
                 body_of(name).contains("finish_user_schema_switch"),
                 "{name} 也必须走统一收尾"
+            );
+        }
+    }
+
+    /// 「未上屏编码」的处置必须发生在收尾**之前**，且每个入口都得做。
+    ///
+    /// 两条判据各防一种失效：
+    /// - **有没有做**：漏了就是用户报的原症状——切了方案，编码原样残留在宿主里；
+    /// - **早不早于 finish**：`take_input_on_schema_switch` 里的上屏走 `record_commit`，
+    ///   而那里的 `schema_id` 取的是当前活跃方案。排在切换之后，这串码会记到新方案头上
+    ///   （统计静默错账，没有任何可见信号）。
+    #[test]
+    fn schema_switch_takes_input_before_finish() {
+        for name in ["switch_schema_by_id", "cycle_schema", "select_schema"] {
+            let body = body_of(name);
+            let take = body.find("take_input_on_schema_switch").unwrap_or_else(|| {
+                panic!("{name} 必须处置切换前的未上屏编码，否则宿主组合区会残留")
+            });
+            let finish = body
+                .find("finish_user_schema_switch")
+                .unwrap_or_else(|| panic!("{name} 必须走统一收尾"));
+            assert!(
+                take < finish,
+                "{name}：编码处置要排在收尾之前，否则上屏记账会落到新方案头上"
+            );
+        }
+    }
+
+    /// 收尾里**不得**再手写清缓冲：那是「上屏还是丢弃」策略的一部分，只能有一处真相。
+    ///
+    /// 留一份裸 `clear()` 在这里看不出问题（清空是幂等的），直到有人给 finish 加了第四个
+    /// 调用方而那条路没走 take —— 编码就静默丢了，且四处调用方全都「看起来清过了」。
+    #[test]
+    fn finish_does_not_clear_input_itself() {
+        let body = body_of("finish_user_schema_switch");
+        for pat in [
+            "input_buffer.clear()",
+            "candidates.clear()",
+            "preedit.clear()",
+        ] {
+            assert!(
+                !body.contains(pat),
+                "finish_user_schema_switch 不得手写 {pat}：编码处置归 take_input_on_schema_switch"
             );
         }
     }

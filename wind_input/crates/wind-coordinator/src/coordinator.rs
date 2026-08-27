@@ -1007,6 +1007,29 @@ pub(crate) struct ToggleLanding {
     pub(crate) caps_lock: bool,
 }
 
+/// 一次「切换」对**切换前那串未上屏编码**的处置结果。
+///
+/// 两个字段各回答一个必须分开问的问题：
+/// - `text`：要不要上屏（`keys.commit_on_switch`：开则上屏原码，关则丢弃）；
+/// - `had_pending`：切换前**有没有**编码/候选在打。它单独决定要不要让宿主结束
+///   composition —— 丢弃分支下 `text` 恒空，但宿主里那串编码还在，不结束组合就会
+///   原样残留在应用里。「切英文后编码不清空」栽的正是这条判据（见
+///   `message_handler` 的 toggle_mode 分支注释）。
+///
+/// 出口有两个，按调用方有没有按键上下文选：[`Coordinator::schema_switch_key_action`]
+/// （按键路径，经 KeyAction 回给宿主）/ [`Coordinator::push_switch_commit`]（菜单、
+/// 全局热键、命令直通车，只能走 push 管道）。
+/// `#[must_use]`：丢弃它 = 编码已被取走（内部状态清了）却没人交给宿主 —— 用户那串码
+/// 凭空消失，且没有任何编译期或运行期信号。
+#[must_use]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SwitchCommit {
+    /// 待上屏文本；`keys.commit_on_switch` 关闭时恒空。
+    pub(crate) text: String,
+    /// 切换前是否有未上屏的编码/候选/独占模式缓冲。
+    pub(crate) had_pending: bool,
+}
+
 /// `toggle_schema:<id>` 的去程记录。字段语义见 `Coordinator::schema_toggle_origin`。
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaToggleOrigin {
@@ -5288,15 +5311,52 @@ impl Coordinator {
         self.show_tip(&text);
     }
 
-    /// 分发热键动作；返回是否已处理
+    /// `toggle_mode` 的分发内核：切中英，并**回传**切换前那串编码的处置结果。
+    ///
+    /// 抽出来是因为出口有两个（见 [`SwitchCommit`]）。此前 `dispatch_hotkey` 直接
+    /// `let (status, _)` 丢掉 commit_text，于是经热键表/菜单触发的中英切换既不上屏
+    /// 也不结束组合——与本次修的方案切换是同一个缺口，只是少了一个出口。
+    pub(crate) fn toggle_mode_with_commit(&self) -> (Option<StatusUpdateData>, SwitchCommit) {
+        let had_pending = self.has_pending_composition();
+        let (status, text) = self.handle_toggle_mode();
+        (status, SwitchCommit { text, had_pending })
+    }
+
+    /// **按键上下文**的热键分发：与 [`Self::dispatch_hotkey`] 共用同一张动作表，区别只在
+    /// 「切换前未上屏编码」的出口——这里经 `KeyAction` 交还宿主（`CommitText` 会顺带
+    /// `EndComposition`），那里只能 push。返回 `None` = 该动词未被接受，调用方不吞键。
+    ///
+    /// 只特判两个会动输入状态的动词，其余原样转交，故动作表仍然只有一处定义。
+    pub(crate) fn dispatch_hotkey_keyed(&self, action: &str) -> Option<KeyAction> {
+        match action {
+            "toggle_mode" => {
+                let (status, commit) = self.toggle_mode_with_commit();
+                status
+                    .is_some()
+                    .then(|| self.schema_switch_key_action(commit))
+            }
+            "switch_engine" => Some(self.schema_switch_key_action(self.cycle_schema())),
+            _ => self
+                .dispatch_hotkey(action)
+                .then(|| KeyAction::StatusUpdate(self.build_status())),
+        }
+    }
+
+    /// 分发热键动作；返回是否已处理。
+    ///
+    /// ⚠ **无按键上下文**的路径（全局热键 `WM_HOTKEY`、托盘/工具栏菜单）用本函数：
+    /// 会动输入状态的两个动词在这里把编码经 push 出口交给宿主。按键路径请走
+    /// [`Self::dispatch_hotkey_keyed`]，否则空文本清不掉宿主里的组合。
     pub(crate) fn dispatch_hotkey(&self, action: &str) -> bool {
         match action {
             "toggle_mode" => {
-                let (status, _) = self.handle_toggle_mode();
+                let (status, commit) = self.toggle_mode_with_commit();
+                self.push_switch_commit(&commit);
                 status.is_some()
             }
             "switch_engine" => {
-                self.cycle_schema();
+                let commit = self.cycle_schema();
+                self.push_switch_commit(&commit);
                 true
             }
             "toggle_full_width" => {
@@ -5606,6 +5666,82 @@ impl Coordinator {
             prefix.to_string()
         } else {
             String::new()
+        }
+    }
+
+    /// 切换前是否有未上屏的编码/候选/独占模式缓冲。
+    ///
+    /// 判据比中英切换那两处**宽**：多问 `preedit` 与 `active`。独占模式（临拼/混输/
+    /// 临英/辅助码）的码不落在 `input_buffer` 里，只看主缓冲会把「临拼态下切换」判成
+    /// 无待处理，于是不结束 composition —— 宿主里的引导符和码原样留着。
+    pub(crate) fn has_pending_composition(&self) -> bool {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        !s.input_buffer.is_empty()
+            || !s.preedit.is_empty()
+            || !s.committed_text.is_empty()
+            || !s.candidates.is_empty()
+            || s.active.is_some()
+    }
+
+    /// 方案切换时对未上屏编码的处置——与中英切换**同一条策略**（`keys.commit_on_switch`：
+    /// 开则上屏原码，关则丢弃），这也正是用户要求的「按中英切换那套来」。
+    ///
+    /// ★ 必须在 `EngineManager` 真正换掉活跃方案**之前**调用：上屏走 `record_commit`，
+    /// 而那里的 `schema_id` 取的是**当前**活跃方案。切完再取，这串码会记到新方案头上。
+    ///
+    /// 传 `chinese = false` 不是「切到英文」的意思——该参数在
+    /// [`Self::take_input_on_mode_switch`] 里只参与 `!chinese && commit_on_switch` 这一个
+    /// 判断，问的是「这串码还要不要」。切方案与切英文对它的答案相同：编码属于旧方案，
+    /// 新方案接不下去。
+    ///
+    /// ⚠ 取 `State` 锁，必须在**不持锁**时调用（与 `finish_user_schema_switch` 同约束）。
+    pub(crate) fn take_input_on_schema_switch(&self) -> SwitchCommit {
+        // 切方案 = 一段输入结束，与中英切换同义。须在取 state 锁之前调用（内部走词库 IO）。
+        self.terminate_auto_phrase("switch_schema");
+        let had_pending = self.has_pending_composition();
+        let text = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.take_input_on_mode_switch(&mut state, false)
+        };
+        SwitchCommit { text, had_pending }
+    }
+
+    /// **无按键上下文**的路径（托盘/工具栏菜单、全局热键、命令直通车）把处置结果交给宿主。
+    ///
+    /// 两条出口对应 `SwitchCommit` 的两个字段：有文本走 `CommitText`（C++ 侧提交时顺带
+    /// 结束 composition），无文本但切换前有编码则单独推 `ClearComposition`——push 通道的
+    /// `CommitText` 在 C++ `AsyncReader` 里被 `!response.text.empty()` 门控，
+    /// **空文本清不掉组合**，与按键路径那条「空文本也能 EndComposition」不同源。
+    pub(crate) fn push_switch_commit(&self, commit: &SwitchCommit) {
+        if !commit.text.is_empty() {
+            self.push_commit_text(&commit.text);
+        } else if commit.had_pending {
+            self.push_server
+                .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
+        }
+    }
+
+    /// **按键路径**把处置结果包成本次按键的应答。
+    ///
+    /// 与中英切换 keyup 分支同构：**空文本也要走 `InsertText`**——C++ 的 `CommitText`
+    /// 即便文本为空也会 `EndComposition`，清掉宿主里残留的编码；而 `StatusUpdate` 那条
+    /// 路不结束组合，正是「切了方案编码还挂在应用里」的根因。
+    /// `mode_changed = true` 让中英图标跟着刷新（切方案会归位中文）。
+    pub(crate) fn schema_switch_key_action(&self, commit: SwitchCommit) -> KeyAction {
+        if commit.text.is_empty() && !commit.had_pending {
+            return KeyAction::StatusUpdate(self.build_status());
+        }
+        let chinese_mode = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chinese_mode;
+        KeyAction::InsertText {
+            text: commit.text,
+            new_composition: None,
+            mode_changed: true,
+            chinese_mode,
+            has_new_composition: false,
         }
     }
 
